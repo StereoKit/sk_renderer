@@ -128,6 +128,7 @@ target_sources            (sk_renderer_test PRIVATE
 	example/scene_cubemap.c
 	example/scene_gltf.c
 	example/scene_shadows.c
+	example/scene_erosion.c
 	example/bloom.c
 )
 
@@ -140,7 +141,9 @@ skshaderc_compile_assets(sk_renderer_test ${ASSET_PATH}/shaders ""
     example/assets/shaders/bloom_composite.hlsl
     example/assets/shaders/bloom_downsample.hlsl
     example/assets/shaders/bloom_upsample.hlsl
+    example/assets/shaders/compute_flow.hlsl
     example/assets/shaders/compute_test.hlsl
+    example/assets/shaders/compute_water.hlsl
     example/assets/shaders/cubemap_mipgen.hlsl
     example/assets/shaders/cubemap_reflection.hlsl
     example/assets/shaders/cubemap_skybox.hlsl
@@ -152,6 +155,7 @@ skshaderc_compile_assets(sk_renderer_test ${ASSET_PATH}/shaders ""
     example/assets/shaders/shadow_caster.hlsl
     example/assets/shaders/shadow_receiver.hlsl
     example/assets/shaders/stereo_display.hlsl
+    example/assets/shaders/terrain_erosion.hlsl
     example/assets/shaders/test.hlsl
     example/assets/shaders/texture3d.hlsl
 )

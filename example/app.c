@@ -117,11 +117,12 @@ app_t* app_create() {
 	app->scene_types[6] = &scene_cubemap_vtable;
 	app->scene_types[7] = &scene_gltf_vtable;
 	app->scene_types[8] = &scene_shadows_vtable;
-	app->scene_count = 9;
+	app->scene_types[9] = &scene_erosion_vtable;
+	app->scene_count = 10;
 
 	// Start with the first scene
 	app->scene_index = -1;
-	_switch_scene(app, 7);
+	_switch_scene(app, 9);
 
 	skr_log (skr_log_info, "Application created successfully!");
 	skr_logf(skr_log_info, "Available scenes: %d (use arrow keys to switch)", app->scene_count);

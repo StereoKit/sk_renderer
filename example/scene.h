@@ -46,6 +46,7 @@ extern const scene_vtable_t scene_3d_texture_vtable;
 extern const scene_vtable_t scene_cubemap_vtable;
 extern const scene_vtable_t scene_gltf_vtable;
 extern const scene_vtable_t scene_shadows_vtable;
+extern const scene_vtable_t scene_erosion_vtable;
 
 // Helper macros for scene methods (vtable passed separately)
 #define scene_create(vtable)                                     ((vtable)->create())
