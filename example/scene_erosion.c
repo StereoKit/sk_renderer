@@ -28,10 +28,13 @@ typedef struct {
 	skr_compute_t  compute_flow;
 	skr_compute_t  compute_water;
 
-	// Height and water textures
-	skr_tex_t      height_tex;
+	// Terrain textures (ping-pong for height modification)
+	skr_tex_t      height_tex_ping;
+	skr_tex_t      height_tex_pong;
 	skr_tex_t      water_tex_ping;
 	skr_tex_t      water_tex_pong;
+	skr_tex_t      sediment_tex_ping;
+	skr_tex_t      sediment_tex_pong;
 	skr_tex_t      flow_tex;
 
 	// Compute parameters
@@ -188,27 +191,34 @@ static scene_t* _scene_erosion_create() {
 			float ny = y / (float)scene->terrain_size;
 
 			// Multi-octave Perlin noise
-			float height = _octave_perlin(nx * 4.0f, ny * 4.0f, 3, 0.5f);
+			float height = _octave_perlin(nx * 4.0f, ny * 4.0f, 6, 0.5f);
 			height = (height + 1.0f) * 0.5f; // Normalize to 0-1
 
 			height_data[x + y * scene->terrain_size] = height;
 		}
 	}
 
-	// Create height texture (R32 format for single channel float)
+	// Create height textures (R32 format, ping-pong for erosion)
 	skr_tex_sampler_t height_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
+
 	skr_tex_create(skr_tex_fmt_r32,
-		skr_tex_flags_readable,
+		skr_tex_flags_readable | skr_tex_flags_compute,
 		height_sampler,
-		(skr_vec3i_t){scene->terrain_size, scene->terrain_size, 1}, 1, 1, height_data, &scene->height_tex);
-	skr_tex_set_name(&scene->height_tex, "height_map");
+		(skr_vec3i_t){scene->terrain_size, scene->terrain_size, 1}, 1, 1, height_data, &scene->height_tex_ping);
+	skr_tex_set_name(&scene->height_tex_ping, "height_ping");
+
+	skr_tex_create(skr_tex_fmt_r32,
+		skr_tex_flags_readable | skr_tex_flags_compute,
+		height_sampler,
+		(skr_vec3i_t){scene->terrain_size, scene->terrain_size, 1}, 1, 1, height_data, &scene->height_tex_pong);
+	skr_tex_set_name(&scene->height_tex_pong, "height_pong");
 	free(height_data);
 
 	// Create water textures (ping-pong buffers for compute)
 	// Initialize with 0.05 water everywhere
 	float* water_data = malloc(scene->terrain_size * scene->terrain_size * sizeof(float));
 	for (int i = 0; i < scene->terrain_size * scene->terrain_size; i++) {
-		water_data[i] = 0.05f;
+		water_data[i] = 0.02f;
 	}
 	skr_tex_sampler_t water_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
 
@@ -225,11 +235,29 @@ static scene_t* _scene_erosion_create() {
 	skr_tex_set_name(&scene->water_tex_pong, "water_pong");
 	free(water_data);
 
+	// Create sediment textures (ping-pong buffers for compute)
+	// Initialize with zero sediment
+	float* sediment_data = calloc(scene->terrain_size * scene->terrain_size, sizeof(float));
+	skr_tex_sampler_t sediment_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
+
+	skr_tex_create(skr_tex_fmt_r32,
+		skr_tex_flags_readable | skr_tex_flags_compute,
+		sediment_sampler,
+		(skr_vec3i_t){scene->terrain_size, scene->terrain_size, 1}, 1, 1, sediment_data, &scene->sediment_tex_ping);
+	skr_tex_set_name(&scene->sediment_tex_ping, "sediment_ping");
+
+	skr_tex_create(skr_tex_fmt_r32,
+		skr_tex_flags_readable | skr_tex_flags_compute,
+		sediment_sampler,
+		(skr_vec3i_t){scene->terrain_size, scene->terrain_size, 1}, 1, 1, sediment_data, &scene->sediment_tex_pong);
+	skr_tex_set_name(&scene->sediment_tex_pong, "sediment_pong");
+	free(sediment_data);
+
 	// Create flow direction texture (RGBA32 for flow vectors)
-	uint32_t* flow_data = calloc(scene->terrain_size * scene->terrain_size, sizeof(uint32_t));
+	uint32_t* flow_data = calloc(scene->terrain_size * scene->terrain_size, sizeof(skr_vec4_t));
 	skr_tex_sampler_t flow_sampler = { .sample = skr_tex_sample_point, .address = skr_tex_address_clamp };
 
-	skr_tex_create(skr_tex_fmt_rgba32,
+	skr_tex_create(skr_tex_fmt_rgba128,
 		skr_tex_flags_readable | skr_tex_flags_compute,
 		flow_sampler,
 		(skr_vec3i_t){scene->terrain_size, scene->terrain_size, 1}, 1, 1, flow_data, &scene->flow_tex);
@@ -246,7 +274,7 @@ static scene_t* _scene_erosion_create() {
 	}, &scene->terrain_material);
 
 	// Bind textures to terrain material
-	skr_material_set_tex(&scene->terrain_material, "height_map", &scene->height_tex);
+	skr_material_set_tex(&scene->terrain_material, "height_map", &scene->height_tex_ping);
 	skr_material_set_tex(&scene->terrain_material, "water_map", &scene->water_tex_ping);
 	skr_material_set_tex(&scene->terrain_material, "flow_map", &scene->flow_tex);
 
@@ -267,24 +295,27 @@ static scene_t* _scene_erosion_create() {
 
 	compute_params_t compute_params = {
 		.terrain_size    = (float)scene->terrain_size,
-		.timestep        = 0.01f,
+		.timestep        = 0.03f,
 		.water_threshold = 0.1f,
 		.padding         = 0
 	};
 	skr_buffer_create(&compute_params, 1, sizeof(compute_params_t), skr_buffer_type_constant, skr_use_dynamic, &scene->compute_params_buffer);
 
 	// Set up compute bindings for flow calculation
-	skr_compute_set_tex   (&scene->compute_flow, "height_map", &scene->height_tex);
+	skr_compute_set_tex   (&scene->compute_flow, "height_map", &scene->height_tex_ping);
 	skr_compute_set_tex   (&scene->compute_flow, "water_map",  &scene->water_tex_ping);
 	skr_compute_set_tex   (&scene->compute_flow, "out_flow",   &scene->flow_tex);
 	skr_compute_set_buffer(&scene->compute_flow, "$Global",    &scene->compute_params_buffer);
 
 	// Set up compute bindings for water simulation (ping-pong)
-	skr_compute_set_tex   (&scene->compute_water, "height_map",  &scene->height_tex);
-	skr_compute_set_tex   (&scene->compute_water, "flow_map",    &scene->flow_tex);
-	skr_compute_set_tex   (&scene->compute_water, "water_in",    &scene->water_tex_ping);
-	skr_compute_set_tex   (&scene->compute_water, "water_out",   &scene->water_tex_pong);
-	skr_compute_set_buffer(&scene->compute_water, "$Global",     &scene->compute_params_buffer);
+	skr_compute_set_tex   (&scene->compute_water, "height_in",    &scene->height_tex_ping);
+	skr_compute_set_tex   (&scene->compute_water, "flow_map",     &scene->flow_tex);
+	skr_compute_set_tex   (&scene->compute_water, "water_in",     &scene->water_tex_ping);
+	skr_compute_set_tex   (&scene->compute_water, "sediment_in",  &scene->sediment_tex_ping);
+	skr_compute_set_tex   (&scene->compute_water, "height_out",   &scene->height_tex_pong);
+	skr_compute_set_tex   (&scene->compute_water, "water_out",    &scene->water_tex_pong);
+	skr_compute_set_tex   (&scene->compute_water, "sediment_out", &scene->sediment_tex_pong);
+	skr_compute_set_buffer(&scene->compute_water, "$Global",      &scene->compute_params_buffer);
 
 	return (scene_t*)scene;
 }
@@ -299,9 +330,12 @@ static void _scene_erosion_destroy(scene_t* base) {
 	skr_shader_destroy(&scene->water_shader);
 	skr_compute_destroy(&scene->compute_flow);
 	skr_compute_destroy(&scene->compute_water);
-	skr_tex_destroy(&scene->height_tex);
+	skr_tex_destroy(&scene->height_tex_ping);
+	skr_tex_destroy(&scene->height_tex_pong);
 	skr_tex_destroy(&scene->water_tex_ping);
 	skr_tex_destroy(&scene->water_tex_pong);
+	skr_tex_destroy(&scene->sediment_tex_ping);
+	skr_tex_destroy(&scene->sediment_tex_pong);
 	skr_tex_destroy(&scene->flow_tex);
 	skr_buffer_destroy(&scene->compute_params_buffer);
 
@@ -312,32 +346,48 @@ static void _scene_erosion_update(scene_t* base, float delta_time) {
 	scene_erosion_t* scene = (scene_erosion_t*)base;
 	scene->rotation += delta_time * 0.2f;
 
-	// Execute compute shaders (ping-pong between textures)
+	// Execute compute shaders (ping-pong between textures for height, water, and sediment)
 	skr_compute_t* water_compute = &scene->compute_water;
 
 	// Update bindings based on iteration
 	if (scene->compute_iteration % 2 == 0) {
-		// Flow compute needs to read from ping
-		skr_compute_set_tex(&scene->compute_flow, "water_map", &scene->water_tex_ping);
+		// Flow compute: read from ping
+		skr_compute_set_tex(&scene->compute_flow, "height_map", &scene->height_tex_ping);
+		skr_compute_set_tex(&scene->compute_flow, "water_map",  &scene->water_tex_ping);
 
 		// Water compute: ping -> pong
-		skr_compute_set_tex(water_compute, "water_in",  &scene->water_tex_ping);
-		skr_compute_set_tex(water_compute, "water_out", &scene->water_tex_pong);
-		skr_material_set_tex(&scene->terrain_material, "water_map", &scene->water_tex_pong);
+		skr_compute_set_tex(water_compute, "height_in",    &scene->height_tex_ping);
+		skr_compute_set_tex(water_compute, "water_in",     &scene->water_tex_ping);
+		skr_compute_set_tex(water_compute, "sediment_in",  &scene->sediment_tex_ping);
+		skr_compute_set_tex(water_compute, "height_out",   &scene->height_tex_pong);
+		skr_compute_set_tex(water_compute, "water_out",    &scene->water_tex_pong);
+		skr_compute_set_tex(water_compute, "sediment_out", &scene->sediment_tex_pong);
+
+		// Update render material to use pong outputs
+		skr_material_set_tex(&scene->terrain_material, "height_map", &scene->height_tex_pong);
+		skr_material_set_tex(&scene->terrain_material, "water_map",  &scene->water_tex_pong);
 	} else {
-		// Flow compute needs to read from pong
-		skr_compute_set_tex(&scene->compute_flow, "water_map", &scene->water_tex_pong);
+		// Flow compute: read from pong
+		skr_compute_set_tex(&scene->compute_flow, "height_map", &scene->height_tex_pong);
+		skr_compute_set_tex(&scene->compute_flow, "water_map",  &scene->water_tex_pong);
 
 		// Water compute: pong -> ping
-		skr_compute_set_tex(water_compute, "water_in",  &scene->water_tex_pong);
-		skr_compute_set_tex(water_compute, "water_out", &scene->water_tex_ping);
-		skr_material_set_tex(&scene->terrain_material, "water_map", &scene->water_tex_ping);
+		skr_compute_set_tex(water_compute, "height_in",    &scene->height_tex_pong);
+		skr_compute_set_tex(water_compute, "water_in",     &scene->water_tex_pong);
+		skr_compute_set_tex(water_compute, "sediment_in",  &scene->sediment_tex_pong);
+		skr_compute_set_tex(water_compute, "height_out",   &scene->height_tex_ping);
+		skr_compute_set_tex(water_compute, "water_out",    &scene->water_tex_ping);
+		skr_compute_set_tex(water_compute, "sediment_out", &scene->sediment_tex_ping);
+
+		// Update render material to use ping outputs
+		skr_material_set_tex(&scene->terrain_material, "height_map", &scene->height_tex_ping);
+		skr_material_set_tex(&scene->terrain_material, "water_map",  &scene->water_tex_ping);
 	}
 
 	// First pass: calculate flow directions based on water surface height
 	skr_compute_execute(&scene->compute_flow, scene->terrain_size / 8, scene->terrain_size / 8, 1);
 
-	// Second pass: simulate water flow using calculated directions
+	// Second pass: simulate water flow, erosion, and deposition
 	skr_compute_execute(water_compute, scene->terrain_size / 8, scene->terrain_size / 8, 1);
 	scene->compute_iteration++;
 }
@@ -362,7 +412,7 @@ static bool _scene_erosion_get_camera(scene_t* base, scene_camera_t* out_camera)
 	// Orbit camera around the terrain
 	float radius = scene->terrain_scale * 0.8f;
 	float height = scene->terrain_height_scale * 2;
-	float angle = scene->rotation;
+	float angle = 0.5f;// scene->rotation;
 
 	out_camera->position = HMM_V3(cosf(angle) * radius, height, sinf(angle) * radius);
 	out_camera->target   = HMM_V3(0.0f, scene->terrain_height_scale * 0.3f, 0.0f);

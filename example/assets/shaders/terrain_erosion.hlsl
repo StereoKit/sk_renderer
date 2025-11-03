@@ -121,13 +121,20 @@ float4 ps(psIn input) : SV_TARGET {
 	}
 
 	// Water visualization
-	float water_threshold = 0.01;
+	float  water_threshold  = 0.02;
+	float3 water_color      = float3(0.1, 0.3, 0.6);
+	float3 water_color_deep = float3(0.05, 0.15, 0.3);
 	if (input.water > water_threshold) {
 		// Blue water color
-		float3 water_color = float3(0.1, 0.3, 0.6);
-		float  water_blend = 1;// saturate((input.water - water_threshold) * 2.0);
-		terrain_color = lerp(terrain_color, water_color, water_blend);
+		float water_blend = saturate((input.water-water_threshold)*10);
+		terrain_color = lerp(water_color, water_color_deep, water_blend);
 		normal = float3(0, 1, 0); // Flatten normal for water surface
+	}
+	else {
+		float water_blend = input.water / water_threshold;
+		water_blend = water_blend * water_blend;
+		terrain_color = lerp(terrain_color, water_color, water_blend);
+		normal = lerp(normal, float3(0, 1, 0), water_blend);
 	}
 
 	float  diffuse  = saturate(dot(normal, light_dir)) * 0.8;
@@ -137,11 +144,27 @@ float4 ps(psIn input) : SV_TARGET {
 	float3 final_color = terrain_color * lighting;
 
 	// Visualize flow magnitude in the red channel
-	float4 flow_data      = flow_map.Sample(flow_map_sampler, input.uv);
-	float  flow_magnitude = flow_data.z;
+	float4 flow_data      = flow_map.Sample(flow_map_sampler, input.uv)* input.water;
 
-	// Add flow visualization to red channel
-	final_color.r += flow_magnitude * 2.0; // Scale for visibility
+	// Visualize flow direction as lines
+	// Calculate direction from center of UV texel
+	float2 px     = input.uv * 256;
+	float2 px_off = frac(px) - float2(0.5, 0.5);
+	float2 px_dir = -normalize(px_off);
+
+	// Dot product with flow direction - high values when aligned
+	float2 flow_dir   = float2(flow_data.x - flow_data.z, flow_data.y - flow_data.w);
+	float  flow_mag   = length(flow_dir);
+	float2 flow_dir_n = flow_dir/flow_mag;
+	float  flow_alignment = saturate((dot(px_dir, flow_dir_n) - 0.95) / 0.05f);
+
+	// Visualize alignment (brighter when flow aligns with radial direction)
+	float3 flow_vis = float3(0, 0, 0);
+	flow_vis = float3(1, 1, 1) * flow_alignment * saturate(flow_mag * 50.0);// * (saturate((saturate(flow_magnitude * 5.0) - length(px_off*2)) * 100) );
+
+	return float4(final_color+flow_vis, 1);
+
+	//return float4(flow_magnitude.xxx*10, 1);
 
 	return float4(final_color, 1.0);
 }
