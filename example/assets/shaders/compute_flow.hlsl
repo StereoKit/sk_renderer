@@ -1,14 +1,23 @@
 // Flow direction calculation compute shader
 // Determines which direction water should flow based on terrain height
 
+struct FlowData {
+	float outflow_right;  // Absolute water amount flowing right
+	float outflow_up;     // Absolute water amount flowing up
+	float outflow_left;   // Absolute water amount flowing left
+	float outflow_down;   // Absolute water amount flowing down
+};
+
 float    terrain_size;
 float    timestep;
 float    water_threshold;
-uint     padding;
+float    rainfall_rate;      // Not used in flow compute, but needed for struct layout
+float    evaporation_rate;   // Not used in flow compute, but needed for struct layout
+float3   padding;
 
-Texture2D    <float>  height_map : register(t1);
-Texture2D    <float>  water_map  : register(t2);
-RWTexture2D  <float4> out_flow   : register(u3);
+Texture2D           <float>    height_map : register(t1);
+Texture2D           <float>    water_map  : register(t2);
+RWStructuredBuffer  <FlowData> out_flow   : register(u3);
 
 [numthreads(8, 8, 1)]
 void cs(uint3 dispatchThreadID : SV_DispatchThreadID) {
@@ -18,50 +27,50 @@ void cs(uint3 dispatchThreadID : SV_DispatchThreadID) {
 	if (pos.x >= size || pos.y >= size) return;
 
 	// Get current terrain height and water depth
-	float center_terrain = height_map[pos].r;
-	float center_water   = water_map [pos].r;
-	float center_surface = center_terrain + center_water; // Total water surface height
+	float curr_height_terrain = height_map[pos].r;
+	float curr_height_water   = water_map [pos].r;
+	float curr_height_total   = curr_height_terrain + curr_height_water; // Total water surface height
 
 	// Sample neighboring surface heights (terrain + water)
-	float surface_left, surface_right, surface_down, surface_up;
+	float left_height_total, right_height_total, down_height_total, up_height_total;
 
 	if (pos.x > 0) {
 		float terrain = height_map[pos + int2(-1, 0)].r;
-		float water   = water_map[ pos + int2(-1, 0)].r;
-		surface_left = terrain + water;
+		float water   = water_map [pos + int2(-1, 0)].r;
+		left_height_total = terrain + water;
 	} else {
-		surface_left = center_surface;
+		left_height_total = curr_height_total;
 	}
 
 	if (pos.x < size - 1) {
 		float terrain = height_map[pos + int2(1, 0)].r;
 		float water   = water_map [pos + int2(1, 0)].r;
-		surface_right = terrain + water;
+		right_height_total = terrain + water;
 	} else {
-		surface_right = center_surface;
+		right_height_total = curr_height_total;
 	}
 
 	if (pos.y > 0) {
 		float terrain = height_map[pos + int2(0, -1)].r;
 		float water   = water_map [pos + int2(0, -1)].r;
-		surface_down = terrain + water;
+		down_height_total = terrain + water;
 	} else {
-		surface_down = center_surface;
+		down_height_total = curr_height_total;
 	}
 
 	if (pos.y < size - 1) {
 		float terrain = height_map[pos + int2(0, 1)].r;
 		float water   = water_map [pos + int2(0, 1)].r;
-		surface_up = terrain + water;
+		up_height_total = terrain + water;
 	} else {
-		surface_up = center_surface;
+		up_height_total = curr_height_total;
 	}
 
 	// Calculate surface height differences (negative means downhill)
-	float diff_left  = surface_left  - center_surface;
-	float diff_right = surface_right - center_surface;
-	float diff_down  = surface_down  - center_surface;
-	float diff_up    = surface_up    - center_surface;
+	float diff_left  = left_height_total  - curr_height_total;
+	float diff_right = right_height_total - curr_height_total;
+	float diff_down  = down_height_total  - curr_height_total;
+	float diff_up    = up_height_total    - curr_height_total;
 
 	// Calculate total downhill slope
 	float total_slope = 0.0;
@@ -72,38 +81,36 @@ void cs(uint3 dispatchThreadID : SV_DispatchThreadID) {
 
 	// Calculate water output to each direction
 	// Water is distributed proportionally to the slope in each direction
-	float water_amount = center_water;
-	float max_flow = water_amount * timestep;  // Max water that can flow this step
+	float water_amount = curr_height_water;
 
-	// Outflow to each neighbor (as percentage of cell's current water)
+	// Stability constraint: prevent oscillations by ensuring outflow doesn't create uphill gradients
+	// After water flows out, our surface must remain >= lowest neighbor's surface. 
+	float min_neighbor_height = min(min(left_height_total, right_height_total), min(down_height_total, up_height_total));
+	float max_safe_outflow    = max(0.0, (curr_height_total - min_neighbor_height) * 0.25); // we could flow a bit more, but 1/4 * min_neighbor is the worst case scenario
+
+	float max_flow = min(water_amount * timestep, max_safe_outflow);  // Max water that can flow this step
+
+	// Outflow to each neighbor (absolute water amounts)
 	float outflow_right = 0.0;
 	float outflow_up    = 0.0;
 	float outflow_left  = 0.0;
 	float outflow_down  = 0.0;
 
-	if (total_slope > 0.00001 && water_amount > 0.00001) {
-		// Calculate percentage flowing to each direction
-		float pct_left  = (diff_left  < 0) ? (abs(diff_left)  / total_slope) : 0.0;
-		float pct_right = (diff_right < 0) ? (abs(diff_right) / total_slope) : 0.0;
-		float pct_down  = (diff_down  < 0) ? (abs(diff_down)  / total_slope) : 0.0;
-		float pct_up    = (diff_up    < 0) ? (abs(diff_up)    / total_slope) : 0.0;
-
-		// Calculate total outflow as percentage of cell's water
-		float total_outflow_pct = min(max_flow / water_amount, 1.0);
-
-		// Distribute outflow to each direction proportionally
-		outflow_right = pct_right * total_outflow_pct;
-		outflow_up    = pct_up    * total_outflow_pct;
-		outflow_left  = pct_left  * total_outflow_pct;
-		outflow_down  = pct_down  * total_outflow_pct;
+	if (total_slope > 0.0 && water_amount > 0.0) {
+		// Distribute water proportionally to downhill slopes
+		outflow_right = (diff_right < 0) ? (abs(diff_right) / total_slope) * max_flow : 0.0;
+		outflow_up    = (diff_up    < 0) ? (abs(diff_up)    / total_slope) * max_flow : 0.0;
+		outflow_left  = (diff_left  < 0) ? (abs(diff_left)  / total_slope) * max_flow : 0.0;
+		outflow_down  = (diff_down  < 0) ? (abs(diff_down)  / total_slope) * max_flow : 0.0;
 	}
 
-	// Store flow data
-	// Each component represents outflow to that neighbor as a percentage of this cell's water
-	// .x = outflow to right
-	// .y = outflow to up
-	// .z = outflow to left
-	// .w = outflow to down
-	// Sum of all components = total_outflow / center_water
-	out_flow[pos] = float4(outflow_right, outflow_up, outflow_left, outflow_down);
+	// Store flow data in structured buffer
+	uint index = pos.x + pos.y * size;
+	FlowData flow_data;
+	flow_data.outflow_right = outflow_right;
+	flow_data.outflow_up    = outflow_up;
+	flow_data.outflow_left  = outflow_left;
+	flow_data.outflow_down  = outflow_down;
+
+	out_flow[index] = flow_data;
 }

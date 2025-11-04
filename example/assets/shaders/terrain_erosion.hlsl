@@ -5,14 +5,23 @@
 struct Inst {
 	float4x4 world;
 };
-StructuredBuffer<Inst> inst : register(t2, space0);
+
+struct FlowData {
+	float outflow_right;  // Absolute water amount flowing right
+	float outflow_up;     // Absolute water amount flowing up
+	float outflow_left;   // Absolute water amount flowing left
+	float outflow_down;   // Absolute water amount flowing down
+};
+
+StructuredBuffer<Inst>     inst     : register(t2, space0);
+StructuredBuffer<FlowData> flow_map : register(t5);
 
 Texture2D    height_map         : register(t3);
 SamplerState height_map_sampler : register(s3);
 Texture2D    water_map          : register(t4);
 SamplerState water_map_sampler  : register(s4);
-Texture2D    flow_map           : register(t5);
-SamplerState flow_map_sampler   : register(s5);
+Texture2D    debug_tex          : register(t6);
+SamplerState debug_tex_sampler  : register(s6);
 
 struct vsIn {
 	float3 pos   : SV_POSITION;
@@ -49,7 +58,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	// Add water height if above threshold
 	float water_threshold = 0.01;
 	if (water > water_threshold) {
-		displaced_pos.y += water;
+		//displaced_pos.y += water;
 	}
 
 	// Transform to world space
@@ -144,7 +153,16 @@ float4 ps(psIn input) : SV_TARGET {
 	float3 final_color = terrain_color * lighting;
 
 	// Visualize flow magnitude in the red channel
-	float4 flow_data      = flow_map.Sample(flow_map_sampler, input.uv)* input.water;
+	uint2 flow_pos = uint2(input.uv * 256);
+	uint flow_index = flow_pos.x + flow_pos.y * 256;
+	FlowData flow_data_struct = flow_map[flow_index];
+
+	float4 flow_data = float4(
+		flow_data_struct.outflow_right,
+		flow_data_struct.outflow_up,
+		flow_data_struct.outflow_left,
+		flow_data_struct.outflow_down
+	) * input.water;
 
 	// Visualize flow direction as lines
 	// Calculate direction from center of UV texel
@@ -161,6 +179,23 @@ float4 ps(psIn input) : SV_TARGET {
 	// Visualize alignment (brighter when flow aligns with radial direction)
 	float3 flow_vis = float3(0, 0, 0);
 	flow_vis = float3(1, 1, 1) * flow_alignment * saturate(flow_mag * 50.0);// * (saturate((saturate(flow_magnitude * 5.0) - length(px_off*2)) * 100) );
+
+	// Debug visualization - uncomment to overlay debug data:
+	float4 debug_data = debug_tex.Sample(debug_tex_sampler, input.uv);
+
+	// Option 1: Show debug as overlay (blend with terrain)
+	//final_color = lerp(final_color, debug_data.rgb, saturate(length(debug_data.rgb)));
+
+	// Option 2: Replace terrain color entirely with debug data
+	//return float4(debug_data.rgb + flow_vis*2,1);
+
+	// Option 3: Show debug only where it's non-zero (overlay)
+	//if (length(debug_data.rgb) > 0.01) {
+	//	final_color = debug_data.rgb;
+	//}
+
+	// Option 4: Mix debug with flow visualization
+	//final_color += debug_data.rgb;
 
 	return float4(final_color+flow_vis, 1);
 
