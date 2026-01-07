@@ -451,6 +451,7 @@ typedef struct skr_material_info_t {
 	skr_compare_         depth_test;
 	skr_blend_state_t    blend_state;
 	bool                 alpha_to_coverage;
+	bool                 depth_clamp;   // Clamp depth to [0,1] instead of clipping (useful for shadow mapping)
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)
@@ -482,6 +483,9 @@ SKR_API void              skr_thread_shutdown              (void);
 SKR_API skr_future_t      skr_future_get                   (void);
 SKR_API bool              skr_future_check                 (const skr_future_t* future);
 SKR_API void              skr_future_wait                  (const skr_future_t* future);
+
+SKR_API void              skr_cmd_begin                    (void);
+SKR_API skr_future_t      skr_cmd_end                      (void);
 
 SKR_API void              skr_callback_log                 (void (*callback)(skr_log_ level, const char* text));
 SKR_API void              skr_log                          (skr_log_ level, const char* text, ...);
@@ -530,7 +534,7 @@ SKR_API skr_tex_sampler_t skr_tex_get_sampler              (const skr_tex_t*    
 SKR_API skr_err_          skr_tex_set_data                 (      skr_tex_t* ref_tex, const skr_tex_data_t* data);
 SKR_API void              skr_tex_generate_mips            (      skr_tex_t* ref_tex, const skr_shader_t* opt_compute_shader);
 SKR_API void              skr_tex_set_name                 (      skr_tex_t* ref_tex, const char* name);
-SKR_API bool              skr_tex_fmt_is_supported         (skr_tex_fmt_ format);
+SKR_API bool              skr_tex_fmt_is_supported         (skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample);
 SKR_API void              skr_tex_fmt_block_info           (skr_tex_fmt_ format, uint32_t* opt_out_block_width, uint32_t* opt_out_block_height, uint32_t* opt_out_bytes_per_block);
 SKR_API uint32_t          skr_tex_fmt_to_native            (skr_tex_fmt_ format);
 SKR_API skr_tex_fmt_      skr_tex_fmt_from_native          (uint32_t native_format);

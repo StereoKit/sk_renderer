@@ -662,39 +662,6 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		.flags         = (out_tex->flags & skr_tex_flags_cubemap) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
 	};
 
-	// Check if MSAA depth format is supported, try fallbacks if not
-	if (is_msaa_depth) {
-		VkImageFormatProperties format_props;
-		VkResult check = vkGetPhysicalDeviceImageFormatProperties(
-			_skr_vk.physical_device, vk_format, image_type, VK_IMAGE_TILING_OPTIMAL, usage, 0, &format_props);
-		
-		if (check != VK_SUCCESS || !(format_props.sampleCounts & out_tex->samples)) {
-			skr_tex_fmt_ fallbacks[] = { skr_tex_fmt_depth32, skr_tex_fmt_depth24s8, skr_tex_fmt_depth16 };
-			bool found = false;
-			
-			for (int i = 0; i < 3; i++) {
-				if (fallbacks[i] == format) continue;
-				VkFormat fallback_fmt = skr_tex_fmt_to_native(fallbacks[i]);
-				check = vkGetPhysicalDeviceImageFormatProperties(
-					_skr_vk.physical_device, fallback_fmt, image_type, VK_IMAGE_TILING_OPTIMAL, usage, 0, &format_props);
-				
-				if (check == VK_SUCCESS && (format_props.sampleCounts & out_tex->samples)) {
-					format = fallbacks[i];
-					vk_format = fallback_fmt;
-					out_tex->format = format;
-					image_info.format = vk_format;
-					found = true;
-					break;
-				}
-			}
-			
-			if (!found) {
-				skr_log(skr_log_critical, "No supported MSAA depth format found");
-				return skr_err_unsupported;
-			}
-		}
-	}
-
 	VkResult vr = vkCreateImage(_skr_vk.device, &image_info, NULL, &out_tex->image);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "vkCreateImage failed");
@@ -772,7 +739,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	}
 
 	// Store texture properties
-	out_tex->sampler = _skr_sampler_create_vk(_skr_vk.device, sampler);
+	out_tex->sampler = _skr_sampler_cache_acquire(sampler);
 
 	return skr_err_success;
 }
@@ -782,7 +749,7 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
-	_skr_cmd_destroy_sampler    (NULL, ref_tex->sampler);
+	_skr_sampler_cache_release(ref_tex->sampler_settings);
 	_skr_cmd_destroy_image_view (NULL, ref_tex->view);
 
 	// Only destroy image/memory if we own them (not external)
@@ -824,13 +791,13 @@ skr_tex_sampler_t skr_tex_get_sampler(const skr_tex_t* tex) {
 void skr_tex_set_sampler(skr_tex_t* ref_tex, skr_tex_sampler_t sampler) {
 	if (!ref_tex || ref_tex->image == VK_NULL_HANDLE) return;
 
-	// Destroy old sampler (deferred until GPU is done with it)
+	// Release old sampler from cache
 	if (ref_tex->sampler != VK_NULL_HANDLE) {
-		_skr_cmd_destroy_sampler(NULL, ref_tex->sampler);
+		_skr_sampler_cache_release(ref_tex->sampler_settings);
 	}
 
-	// Create new sampler and update settings
-	ref_tex->sampler          = _skr_sampler_create_vk(_skr_vk.device, sampler);
+	// Acquire new sampler from cache and update settings
+	ref_tex->sampler          = _skr_sampler_cache_acquire(sampler);
 	ref_tex->sampler_settings = sampler;
 }
 
@@ -984,6 +951,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		return;
 	}
 
+	// Lock pipeline cache for the duration of this mipmap generation
+	_skr_pipeline_lock();
+
 	// Register render pass format with pipeline system (cached for reuse)
 	VkFormat format = skr_tex_fmt_to_native(ref_tex->format);
 	skr_pipeline_renderpass_key_t rp_key = {
@@ -1000,6 +970,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	// Get cached render pass
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(renderpass_idx);
 	if (render_pass == VK_NULL_HANDLE) {
+		_skr_pipeline_unlock();
 		skr_material_destroy(&material);
 		return;
 	}
@@ -1008,6 +979,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 	if (!ctx.cmd) {
 		skr_log(skr_log_warning, "Failed to acquire command buffer for mipmap generation");
+		_skr_pipeline_unlock();
 		skr_material_destroy(&material);
 		return;
 	}
@@ -1025,6 +997,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	if (pipeline == VK_NULL_HANDLE) {
 		skr_log(skr_log_warning, "Failed to get pipeline for mipmap generation");
 		_skr_cmd_release(ctx.cmd);
+		_skr_pipeline_unlock();
 		skr_material_destroy(&material);
 		return;
 	}
@@ -1218,14 +1191,18 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
 			bind_source.slot                                               // Source texture (per-mip, handled above)
 		};
+
+		_skr_bind_pool_lock();
 		int32_t fail_idx = _skr_material_add_writes(
-			material.binds, material.bind_count,
+			_skr_bind_pool_get(material.bind_start), material.bind_count,
 			ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 			writes,       sizeof(writes      )/sizeof(writes      [0]),
 			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
 			&write_ct, &buffer_ct, &image_ct
 		);
+		_skr_bind_pool_unlock();
+
 		if (fail_idx >= 0) {
 			const sksc_shader_meta_t* meta = material.key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
@@ -1258,6 +1235,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	skr_material_destroy(&material);
 
 	_skr_cmd_release(ctx.cmd);
+	_skr_pipeline_unlock();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1314,18 +1292,168 @@ VkSampler _skr_sampler_create_vk(VkDevice device, skr_tex_sampler_t settings) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Sampler cache implementation
+///////////////////////////////////////////////////////////////////////////////
 
-bool skr_tex_fmt_is_supported(skr_tex_fmt_ format) {
+#define SKR_SAMPLER_CACHE_INITIAL_CAPACITY 16
+
+static bool _skr_sampler_settings_equal(skr_tex_sampler_t a, skr_tex_sampler_t b) {
+	return a.sample         == b.sample &&
+	       a.address        == b.address &&
+	       a.sample_compare == b.sample_compare &&
+	       a.anisotropy     == b.anisotropy;
+}
+
+void _skr_sampler_cache_init(void) {
+	_skr_sampler_cache_t* cache = &_skr_vk.sampler_cache;
+
+	mtx_init(&cache->mutex, mtx_plain);
+
+	cache->capacity = SKR_SAMPLER_CACHE_INITIAL_CAPACITY;
+	cache->count    = 0;
+	cache->entries  = _skr_calloc(cache->capacity, sizeof(_skr_sampler_entry_t));
+}
+
+void _skr_sampler_cache_shutdown(void) {
+	_skr_sampler_cache_t* cache = &_skr_vk.sampler_cache;
+
+	// Destroy all cached samplers
+	for (uint32_t i = 0; i < cache->count; i++) {
+		if (cache->entries[i].sampler != VK_NULL_HANDLE) {
+			vkDestroySampler(_skr_vk.device, cache->entries[i].sampler, NULL);
+		}
+	}
+
+	mtx_destroy(&cache->mutex);
+
+	_skr_free(cache->entries);
+	*cache = (_skr_sampler_cache_t){0};
+}
+
+VkSampler _skr_sampler_cache_acquire(skr_tex_sampler_t settings) {
+	_skr_sampler_cache_t* cache = &_skr_vk.sampler_cache;
+	VkSampler result = VK_NULL_HANDLE;
+
+	mtx_lock(&cache->mutex);
+
+	// Search for existing sampler with matching settings
+	for (uint32_t i = 0; i < cache->count; i++) {
+		if (_skr_sampler_settings_equal(cache->entries[i].settings, settings)) {
+			cache->entries[i].ref_count++;
+			result = cache->entries[i].sampler;
+			goto done;
+		}
+	}
+
+	// Not found, create new sampler (this can be slow, but happens rarely)
+	result = _skr_sampler_create_vk(_skr_vk.device, settings);
+	if (result == VK_NULL_HANDLE) {
+		goto done;
+	}
+
+	// Grow cache if needed
+	if (cache->count >= cache->capacity) {
+		uint32_t new_capacity = cache->capacity * 2;
+		_skr_sampler_entry_t* new_entries = _skr_realloc(cache->entries, new_capacity * sizeof(_skr_sampler_entry_t));
+		if (!new_entries) {
+			skr_log(skr_log_warning, "Failed to grow sampler cache, sampler will not be cached");
+			// Return the sampler anyway - it just won't be cached for reuse
+			goto done;
+		}
+		cache->entries  = new_entries;
+		cache->capacity = new_capacity;
+	}
+
+	// Add new entry
+	cache->entries[cache->count++] = (_skr_sampler_entry_t){
+		.settings  = settings,
+		.sampler   = result,
+		.ref_count = 1,
+	};
+
+done:
+	mtx_unlock(&cache->mutex);
+	return result;
+}
+
+void _skr_sampler_cache_release(skr_tex_sampler_t settings) {
+	_skr_sampler_cache_t* cache = &_skr_vk.sampler_cache;
+
+	mtx_lock(&cache->mutex);
+
+	// Find the entry and decrement ref count
+	// We don't destroy samplers when ref hits zero because the GPU might still
+	// be using them. Samplers are tiny (~64 bytes) and reused, so keeping them
+	// until shutdown is fine. They'll be destroyed in _skr_sampler_cache_shutdown.
+	for (uint32_t i = 0; i < cache->count; i++) {
+		if (_skr_sampler_settings_equal(cache->entries[i].settings, settings)) {
+			if (cache->entries[i].ref_count > 0) {
+				cache->entries[i].ref_count--;
+			}
+			mtx_unlock(&cache->mutex);
+			return;
+		}
+	}
+
+	mtx_unlock(&cache->mutex);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+bool skr_tex_fmt_is_supported(skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample) {
 	VkFormat vk_format = skr_tex_fmt_to_native(format);
 	if (vk_format == VK_FORMAT_UNDEFINED) {
 		return false;
 	}
 
-	VkFormatProperties props;
-	vkGetPhysicalDeviceFormatProperties(_skr_vk.physical_device, vk_format, &props);
+	// Check if this is a depth format
+	bool is_depth = (
+		format == skr_tex_fmt_depth16 ||
+		format == skr_tex_fmt_depth32 ||
+		format == skr_tex_fmt_depth32s8 ||
+		format == skr_tex_fmt_depth24s8 ||
+		format == skr_tex_fmt_depth16s8);
 
-	// Check if format supports either optimal tiling (for sampling/rendering) or linear tiling
-	return (props.optimalTilingFeatures != 0) || (props.linearTilingFeatures != 0);
+	// Build usage flags based on tex_flags
+	VkImageUsageFlags usage = 0;
+
+	if (flags & skr_tex_flags_writeable) {
+		if (is_depth) { usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; } 
+		else          { usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; }
+	}
+	if (flags & skr_tex_flags_readable) { usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT; }
+	if (flags & skr_tex_flags_dynamic)  { usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; }
+	if (flags & skr_tex_flags_compute)  { usage |= VK_IMAGE_USAGE_STORAGE_BIT; }
+
+	// Default: sampled texture
+	if (usage == 0 || !(flags & skr_tex_flags_writeable)) {
+		// For MSAA depth textures, don't add SAMPLED_BIT as it's often not supported
+		bool is_msaa_depth = (multisample > 1) && is_depth;
+		if (!is_msaa_depth) { usage |= VK_IMAGE_USAGE_SAMPLED_BIT; }
+	}
+
+	VkSampleCountFlagBits samples = (multisample > 1) ? (VkSampleCountFlagBits)multisample : VK_SAMPLE_COUNT_1_BIT;
+
+	VkImageFormatProperties format_props;
+	VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+		_skr_vk.physical_device,
+		vk_format,
+		VK_IMAGE_TYPE_2D,
+		VK_IMAGE_TILING_OPTIMAL,
+		usage,
+		0,
+		&format_props);
+
+	if (result != VK_SUCCESS) {
+		return false;
+	}
+
+	// Check if requested sample count is supported
+	if (multisample > 1 && !(format_props.sampleCounts & samples)) {
+		return false;
+	}
+
+	return true;
 }
 
 void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, uint32_t* opt_out_block_height, uint32_t* opt_out_bytes_per_block) {
@@ -1495,9 +1623,9 @@ skr_err_ skr_tex_create_external(skr_tex_external_info_t info, skr_tex_t* out_te
 		}
 	}
 
-	// Create sampler
+	// Acquire sampler from cache
 	out_tex->sampler_settings = info.sampler;
-	out_tex->sampler          = _skr_sampler_create_vk(_skr_vk.device, info.sampler);
+	out_tex->sampler          = _skr_sampler_cache_acquire(info.sampler);
 
 	return skr_err_success;
 }

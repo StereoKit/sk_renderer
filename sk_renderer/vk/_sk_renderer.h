@@ -53,11 +53,76 @@ typedef struct skr_destroy_list_t {
 	mtx_t    mutex;  // Thread-safe access for cross-thread destruction
 } skr_destroy_list_t;
 
+// Sampler cache for deduplicating VkSampler objects
+// Most textures use one of a handful of sampler configurations
+typedef struct {
+	skr_tex_sampler_t settings;
+	VkSampler         sampler;
+	uint32_t          ref_count;
+} _skr_sampler_entry_t;
+
+typedef struct {
+	_skr_sampler_entry_t* entries;
+	uint32_t              count;
+	uint32_t              capacity;
+	mtx_t                 mutex;
+} _skr_sampler_cache_t;
+
+// Bind pool for material resource bindings
+// Manages consecutive runs of slots for safe lifetime management
+typedef struct {
+	uint32_t start;
+	uint32_t count;
+} _skr_bind_range_t;
+
+typedef struct {
+	skr_material_bind_t* binds;
+	uint32_t             capacity;
+	_skr_bind_range_t*   free_ranges;
+	uint32_t             free_range_count;
+	uint32_t             free_range_capacity;
+	mtx_t                mutex;
+} _skr_bind_pool_t;
+
+///////////////////////////////////////////////////////////////////////////////
+// Bump Allocator - provides (buffer, offset) pairs with overflow support
+///////////////////////////////////////////////////////////////////////////////
+
+// Result of a bump allocation
+typedef struct skr_bump_result_t {
+	skr_buffer_t* buffer;
+	uint32_t      offset;
+} skr_bump_result_t;
+
+// Bump allocator with automatic overflow handling
+typedef struct skr_bump_alloc_t {
+	// Main buffer (resized between frames based on high-water mark)
+	skr_buffer_t     main_buffer;
+	uint32_t         main_used;
+	bool             main_valid;
+
+	// Overflow buffers (created mid-frame if main is exhausted)
+	skr_buffer_t*    overflow;
+	uint32_t         overflow_count;
+	uint32_t         overflow_capacity;
+
+	// High-water mark for next-frame sizing
+	uint32_t         high_water_mark;
+
+	// Configuration
+	skr_buffer_type_ buffer_type;
+	uint32_t         alignment;  // Minimum alignment for allocations (e.g., 256 for UBOs)
+} skr_bump_alloc_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
 typedef struct {
 	VkCommandBuffer    cmd;
 	VkFence            fence;
 	VkDescriptorPool   descriptor_pool;  // Per-command descriptor pool (for non-push-descriptor fallback)
 	skr_destroy_list_t destroy_list;
+	skr_bump_alloc_t   const_bump;       // Bump allocator for constant buffers (compute $Globals, system, material params)
+	skr_bump_alloc_t   storage_bump;     // Bump allocator for storage buffers (instance data)
 	bool               alive;
 	uint64_t           generation;  // Incremented each time this slot is reused
 } _skr_cmd_ring_slot_t;
@@ -67,6 +132,8 @@ typedef struct {
 	VkCommandBuffer     cmd;
 	VkDescriptorPool    descriptor_pool;  // Per-command descriptor pool (VK_NULL_HANDLE if push descriptors enabled)
 	skr_destroy_list_t* destroy_list;
+	skr_bump_alloc_t*   const_bump;       // Bump allocator for constant buffers
+	skr_bump_alloc_t*   storage_bump;     // Bump allocator for storage buffers
 } _skr_cmd_ctx_t;
 
 typedef struct {
@@ -103,6 +170,7 @@ typedef struct {
 	VkDebugUtilsMessengerEXT debug_messenger;
 	bool                     validation_enabled;
 	bool                     has_push_descriptors;  // VK_KHR_push_descriptor support
+	bool                     has_depth_clamp;       // VkPhysicalDeviceFeatures::depthClamp support
 	bool                     initialized;
 
 	// Memory allocators
@@ -151,6 +219,12 @@ typedef struct {
 
 	// Deferred destruction
 	skr_destroy_list_t       destroy_list;
+
+	// Material bind pool
+	_skr_bind_pool_t         bind_pool;
+
+	// Sampler cache
+	_skr_sampler_cache_t     sampler_cache;
 } _skr_vk_t;
 
 extern _skr_vk_t _skr_vk;
@@ -169,6 +243,27 @@ bool                  _skr_format_has_stencil               (VkFormat format);
 // Material descriptor caching. Returns -1 on success, or the failing bind index if a resource is missing.
 int32_t               _skr_material_add_writes              (const skr_material_bind_t* binds, uint32_t bind_ct, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct);
 const char*           _skr_material_bind_name               (const sksc_shader_meta_t* meta, int32_t bind_idx);
+
+// Bind pool management
+void                  _skr_bind_pool_init                   (void);
+void                  _skr_bind_pool_shutdown               (void);
+int32_t               _skr_bind_pool_alloc                  (uint32_t count);  // Returns start index, -1 on failure
+void                  _skr_bind_pool_free                   (int32_t start, uint32_t count);
+skr_material_bind_t*  _skr_bind_pool_get                    (int32_t start);   // Get pointer to slot (NULL if invalid)
+void                  _skr_bind_pool_lock                   (void);            // Lock pool for safe pointer access
+void                  _skr_bind_pool_unlock                 (void);            // Unlock pool after done with pointer
+
+// Sampler cache management
+void                  _skr_sampler_cache_init               (void);
+void                  _skr_sampler_cache_shutdown           (void);
+VkSampler             _skr_sampler_cache_acquire            (skr_tex_sampler_t settings);  // Get or create sampler, increment ref
+void                  _skr_sampler_cache_release            (skr_tex_sampler_t settings);  // Decrement ref, destroy if zero
+
+// Bump allocator management
+void                  _skr_bump_alloc_init                  (skr_bump_alloc_t* ref_alloc, skr_buffer_type_ type, uint32_t alignment);
+void                  _skr_bump_alloc_destroy               (skr_bump_alloc_t* ref_alloc);
+void                  _skr_bump_alloc_reset                 (skr_bump_alloc_t* ref_alloc);  // Call at frame start: resize main buffer, clean overflow
+skr_bump_result_t     _skr_bump_alloc_write                 (skr_bump_alloc_t* ref_alloc, const void* data, uint32_t size);  // Allocate + write, returns buffer+offset
 
 // Render list sorting
 void                  _skr_render_list_sort                 (skr_render_list_t* ref_list);
@@ -227,6 +322,9 @@ void                  _skr_cmd_destroy_swapchain            (skr_destroy_list_t*
 void                  _skr_cmd_destroy_surface              (skr_destroy_list_t* opt_ref_list, VkSurfaceKHR             handle);
 void                  _skr_cmd_destroy_debug_messenger      (skr_destroy_list_t* opt_ref_list, VkDebugUtilsMessengerEXT handle);
 void                  _skr_cmd_destroy_memory               (skr_destroy_list_t* opt_ref_list, VkDeviceMemory           handle);
+
+// Custom deferred destruction (non-Vulkan types)
+void                  _skr_cmd_destroy_bind_pool_slots      (skr_destroy_list_t* opt_ref_list, int32_t start, uint32_t count);
 
 // Descriptor helper (allocates and binds descriptor set, handles push descriptors vs fallback)
 void                  _skr_bind_descriptors                 (VkCommandBuffer cmd, VkDescriptorPool pool, VkPipelineBindPoint bind_point, VkPipelineLayout layout, VkDescriptorSetLayout desc_layout, VkWriteDescriptorSet* writes, uint32_t write_count);

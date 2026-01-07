@@ -128,6 +128,8 @@ target_sources(sk_renderer_test PRIVATE
 	scene_cloth.c
 	scene_text.c
 	scene_tex_copy.c
+	scene_lifetime_stress.c
+	scene_gaussian_splat.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c
@@ -183,6 +185,11 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/texture3d.hlsl
 	assets/shaders/unlit.hlsl
 	assets/shaders/video.hlsl
+	assets/shaders/gaussian_splat.hlsl
+	assets/shaders/gpu_sort_init.hlsl
+	assets/shaders/gpu_sort_upsweep.hlsl
+	assets/shaders/gpu_sort_scan.hlsl
+	assets/shaders/gpu_sort_downsweep.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

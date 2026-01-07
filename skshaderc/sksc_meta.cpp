@@ -923,6 +923,24 @@ bool sksc_meta_check_dup_buffers(const sksc_shader_meta_t *ref_meta) {
 
 ///////////////////////////////////////////
 
+bool sksc_meta_check_dup_resources(const sksc_shader_meta_t *ref_meta, const char **out_name1, const char **out_name2, uint32_t *out_slot) {
+	for (size_t i = 0; i < ref_meta->resource_count; i++) {
+		for (size_t t = i + 1; t < ref_meta->resource_count; t++) {
+			// Check if slots match and they're the same register type (both textures, both storage, etc.)
+			if (ref_meta->resources[i].bind.slot          == ref_meta->resources[t].bind.slot &&
+			    ref_meta->resources[i].bind.register_type == ref_meta->resources[t].bind.register_type) {
+				if (out_name1) *out_name1 = ref_meta->resources[i].name;
+				if (out_name2) *out_name2 = ref_meta->resources[t].name;
+				if (out_slot)  *out_slot  = ref_meta->resources[i].bind.slot;
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+///////////////////////////////////////////
+
 void sksc_line_col(const char *from_text, const char *at, int32_t *out_line, int32_t *out_column) {
 	if (out_line  ) *out_line   = -1;
 	if (out_column) *out_column = -1;

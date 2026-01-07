@@ -15,6 +15,194 @@
 #include <assert.h>
 
 ///////////////////////////////////////////////////////////////////////////////
+// Bind pool implementation
+///////////////////////////////////////////////////////////////////////////////
+
+#define SKR_BIND_POOL_INITIAL_CAPACITY 256
+#define SKR_BIND_POOL_FREE_INITIAL     16
+
+void _skr_bind_pool_init(void) {
+	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
+
+	mtx_init(&pool->mutex, mtx_plain);
+
+	pool->capacity            = SKR_BIND_POOL_INITIAL_CAPACITY;
+	pool->binds               = (_skr_calloc(pool->capacity, sizeof(skr_material_bind_t)));
+	pool->free_range_capacity = SKR_BIND_POOL_FREE_INITIAL;
+	pool->free_range_count    = 1;
+	pool->free_ranges         = (_skr_malloc(pool->free_range_capacity * sizeof(_skr_bind_range_t)));
+
+	// Initially all slots are free as one contiguous range
+	pool->free_ranges[0] = (_skr_bind_range_t){ .start = 0, .count = pool->capacity };
+}
+
+void _skr_bind_pool_shutdown(void) {
+	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
+
+	mtx_destroy(&pool->mutex);
+
+	_skr_free(pool->binds);
+	_skr_free(pool->free_ranges);
+	*pool = (_skr_bind_pool_t){0};
+}
+
+int32_t _skr_bind_pool_alloc(uint32_t count) {
+	if (count == 0) return -1;
+
+	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
+	int32_t result = -1;
+
+	mtx_lock(&pool->mutex);
+
+	// First-fit search through free ranges
+	for (uint32_t i = 0; i < pool->free_range_count; i++) {
+		if (pool->free_ranges[i].count >= count) {
+			uint32_t start = pool->free_ranges[i].start;
+
+			// Shrink or remove this range
+			if (pool->free_ranges[i].count == count) {
+				// Remove range by swapping with last
+				pool->free_ranges[i] = pool->free_ranges[--pool->free_range_count];
+			} else {
+				// Shrink range
+				pool->free_ranges[i].start += count;
+				pool->free_ranges[i].count -= count;
+			}
+
+			// Zero out the allocated slots
+			memset(&pool->binds[start], 0, count * sizeof(skr_material_bind_t));
+			result = (int32_t)start;
+			goto done;
+		}
+	}
+
+	// No suitable range found, grow the pool
+	uint32_t old_capacity = pool->capacity;
+	uint32_t new_capacity = pool->capacity * 2;
+	while (new_capacity - old_capacity < count) {
+		new_capacity *= 2;
+	}
+
+	skr_material_bind_t* new_binds = _skr_realloc(pool->binds, new_capacity * sizeof(skr_material_bind_t));
+	if (!new_binds) {
+		skr_log(skr_log_critical, "Failed to grow bind pool");
+		goto done;
+	}
+	pool->binds    = new_binds;
+	pool->capacity = new_capacity;
+
+	// Zero new memory
+	memset(&pool->binds[old_capacity], 0, (new_capacity - old_capacity) * sizeof(skr_material_bind_t));
+
+	// Add the new free space (minus what we're about to allocate)
+	uint32_t remaining = (new_capacity - old_capacity) - count;
+	if (remaining > 0) {
+		// Grow free range array if needed
+		if (pool->free_range_count >= pool->free_range_capacity) {
+			uint32_t new_range_capacity = pool->free_range_capacity * 2;
+			_skr_bind_range_t* new_ranges = _skr_realloc(pool->free_ranges, new_range_capacity * sizeof(_skr_bind_range_t));
+			if (!new_ranges) {
+				skr_log(skr_log_warning, "Failed to grow bind pool free range array");
+				// Not fatal - we just can't track this free space
+			} else {
+				pool->free_ranges         = new_ranges;
+				pool->free_range_capacity = new_range_capacity;
+				pool->free_ranges[pool->free_range_count++] = (_skr_bind_range_t){
+					.start = old_capacity + count,
+					.count = remaining
+				};
+			}
+		} else {
+			pool->free_ranges[pool->free_range_count++] = (_skr_bind_range_t){
+				.start = old_capacity + count,
+				.count = remaining
+			};
+		}
+	}
+
+	result = (int32_t)old_capacity;
+
+done:
+	mtx_unlock(&pool->mutex);
+	return result;
+}
+
+void _skr_bind_pool_free(int32_t start, uint32_t count) {
+	if (start < 0 || count == 0) return;
+
+	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
+
+	mtx_lock(&pool->mutex);
+
+	// Clear the freed slots (helps catch use-after-free)
+	memset(&pool->binds[start], 0, count * sizeof(skr_material_bind_t));
+
+	// Try to coalesce with adjacent ranges
+	uint32_t freed_start = (uint32_t)start;
+	uint32_t freed_end   = freed_start + count;
+
+	for (uint32_t i = 0; i < pool->free_range_count; i++) {
+		uint32_t range_end = pool->free_ranges[i].start + pool->free_ranges[i].count;
+
+		// Check if this range is immediately before the freed region
+		if (range_end == freed_start) {
+			pool->free_ranges[i].count += count;
+
+			// Check if we can also merge with a range after
+			for (uint32_t j = 0; j < pool->free_range_count; j++) {
+				if (j != i && pool->free_ranges[j].start == freed_end) {
+					pool->free_ranges[i].count += pool->free_ranges[j].count;
+					pool->free_ranges[j] = pool->free_ranges[--pool->free_range_count];
+					break;
+				}
+			}
+			goto done;
+		}
+
+		// Check if this range is immediately after the freed region
+		if (pool->free_ranges[i].start == freed_end) {
+			pool->free_ranges[i].start  = freed_start;
+			pool->free_ranges[i].count += count;
+			goto done;
+		}
+	}
+
+	// No adjacent range found, add new range
+	if (pool->free_range_count >= pool->free_range_capacity) {
+		uint32_t new_capacity = pool->free_range_capacity * 2;
+		_skr_bind_range_t* new_ranges = _skr_realloc(pool->free_ranges, new_capacity * sizeof(_skr_bind_range_t));
+		if (!new_ranges) {
+			skr_log(skr_log_warning, "Failed to grow bind pool free range array during free");
+			goto done;  // Can't track this free space, but memory is cleared
+		}
+		pool->free_ranges         = new_ranges;
+		pool->free_range_capacity = new_capacity;
+	}
+	pool->free_ranges[pool->free_range_count++] = (_skr_bind_range_t){
+		.start = freed_start,
+		.count = count
+	};
+
+done:
+	mtx_unlock(&pool->mutex);
+}
+
+skr_material_bind_t* _skr_bind_pool_get(int32_t start) {
+	// NOTE: Caller should hold the pool lock via _skr_bind_pool_lock() if there's
+	// any chance of concurrent _skr_bind_pool_alloc() calls that might grow the pool.
+	if (start < 0 || (uint32_t)start >= _skr_vk.bind_pool.capacity) return NULL;
+	return &_skr_vk.bind_pool.binds[start];
+}
+
+void _skr_bind_pool_lock(void) {
+	mtx_lock(&_skr_vk.bind_pool.mutex);
+}
+
+void _skr_bind_pool_unlock(void) {
+	mtx_unlock(&_skr_vk.bind_pool.mutex);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_material) {
 	if (!out_material) return skr_err_invalid_parameter;
@@ -35,6 +223,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		.depth_test        = info.depth_test,
 		.blend_state       = info.blend_state,
 		.alpha_to_coverage = info.alpha_to_coverage,
+		.depth_clamp       = info.depth_clamp,
 		.stencil_front     = info.stencil_front,
 		.stencil_back      = info.stencil_back,
 	};
@@ -68,11 +257,21 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		}
 	}
 
-	// Allocate memory for our material resource binds
+	// Allocate bindings from global pool
 	out_material->bind_count = meta->resource_count + meta->buffer_count;
-	out_material->binds      = (skr_material_bind_t*)_skr_calloc(out_material->bind_count, sizeof(skr_material_bind_t));
-	for (uint32_t i = 0; i < meta->buffer_count;   i++) out_material->binds[i                   ].bind = meta->buffers  [i].bind;
-	for (uint32_t i = 0; i < meta->resource_count; i++) out_material->binds[i+meta->buffer_count].bind = meta->resources[i].bind;
+	out_material->bind_start = _skr_bind_pool_alloc(out_material->bind_count);
+	if (out_material->bind_start < 0 && out_material->bind_count > 0) {
+		skr_log(skr_log_critical, "Failed to allocate material bindings from pool");
+		_skr_free(out_material->param_buffer);
+		if (out_material->key.shader->meta) {
+			sksc_shader_meta_release(out_material->key.shader->meta);
+		}
+		*out_material = (skr_material_t){};
+		return skr_err_out_of_memory;
+	}
+	skr_material_bind_t* binds = _skr_bind_pool_get(out_material->bind_start);
+	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i                   ].bind = meta->buffers  [i].bind;
+	for (uint32_t i = 0; i < meta->resource_count; i++) binds[i+meta->buffer_count].bind = meta->resources[i].bind;
 
 	// Check if we have a buffer bound to the system buffer slot
 	out_material->has_system_buffer = false;
@@ -97,7 +296,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 
 	if (out_material->pipeline_material_idx < 0) {
 		skr_log(skr_log_critical, "Failed to register material with pipeline system");
-		_skr_free(out_material->binds);
+		_skr_bind_pool_free(out_material->bind_start, out_material->bind_count);
 		_skr_free(out_material->param_buffer);
 		if (out_material->key.shader->meta) {
 			sksc_shader_meta_release(out_material->key.shader->meta);
@@ -130,9 +329,11 @@ void skr_material_destroy(skr_material_t* ref_material) {
 		_skr_pipeline_unregister_material(ref_material->pipeline_material_idx);
 	}
 
-	// Free allocated memory
+	// Free allocated memory (param_buffer is CPU-side, can free immediately)
 	_skr_free(ref_material->param_buffer);
-	_skr_free(ref_material->binds);
+
+	// Defer bind pool slot release until GPU is done with this material
+	_skr_cmd_destroy_bind_pool_slots(NULL, ref_material->bind_start, ref_material->bind_count);
 
 	if (ref_material->key.shader && ref_material->key.shader->meta) {
 		sksc_shader_meta_release(ref_material->key.shader->meta);
@@ -140,6 +341,7 @@ void skr_material_destroy(skr_material_t* ref_material) {
 
 	*ref_material = (skr_material_t){};
 	ref_material->pipeline_material_idx = -1;
+	ref_material->bind_start            = -1;
 }
 
 void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_tex_t* texture) {
@@ -150,7 +352,7 @@ void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_te
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
 		if (meta->resources[i].name_hash == hash) {
 			idx  = i;
-			break; 
+			break;
 		}
 	}
 
@@ -159,7 +361,10 @@ void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_te
 		return;
 	}
 
-	ref_material->binds[meta->buffer_count + idx].texture = texture;
+	_skr_bind_pool_lock();
+	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
+	binds[meta->buffer_count + idx].texture = texture;
+	_skr_bind_pool_unlock();
 }
 
 void skr_material_set_buffer(skr_material_t* ref_material, const char* name, skr_buffer_t* buffer) {
@@ -170,12 +375,15 @@ void skr_material_set_buffer(skr_material_t* ref_material, const char* name, skr
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
 		if (meta->buffers[i].name_hash == hash) {
 			idx = i;
-			break; 
+			break;
 		}
 	}
 
+	_skr_bind_pool_lock();
+	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
 	if (idx >= 0) {
-		ref_material->binds[idx].buffer = buffer;
+		binds[idx].buffer = buffer;
+		_skr_bind_pool_unlock();
 		return;
 	}
 
@@ -183,16 +391,16 @@ void skr_material_set_buffer(skr_material_t* ref_material, const char* name, skr
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
 		if (meta->resources[i].name_hash == hash) {
 			idx  = i;
-			break; 
+			break;
 		}
 	}
 
 	if (idx >= 0) {
-		ref_material->binds[meta->buffer_count + idx].buffer = buffer;
+		binds[meta->buffer_count + idx].buffer = buffer;
 	} else {
 		skr_log(skr_log_warning, "Buffer name '%s' not found", name);
 	}
-	return;
+	_skr_bind_pool_unlock();
 }
 
 void skr_material_set_params(skr_material_t* ref_material, const void* data, uint32_t size) {
@@ -313,13 +521,20 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 		case skr_register_constant: { // cbuffer, (b in HLSL)
 			if (*ref_write_ct >= write_max || *ref_buffer_ct >= buffer_max) continue;
 
-			skr_buffer_t* buffer = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_BUFFER];
-			if (!buffer)  buffer = binds[i].buffer;
+			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_BUFFER];
+			uint32_t      offset  = 0;
+			uint32_t      range   = 0;
+			if (!buffer) {
+				buffer = binds[i].buffer;
+				offset = binds[i].buffer_offset;
+				range  = binds[i].buffer_range;
+			}
 			if (!buffer) return (int32_t)i;
 
 			ref_buffer_infos[*ref_buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = buffer->buffer,
-				.range  = buffer->size,
+				.offset = offset,
+				.range  = range > 0 ? range : buffer->size,
 			};
 			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
 				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -334,13 +549,20 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 		case skr_register_read_buffer: { // StructuredBuffer, (t in HLSL)
 			if (*ref_write_ct >= write_max || *ref_buffer_ct >= buffer_max) continue;
 
-			skr_buffer_t* buffer = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_TEXTURE];
-			if (!buffer)  buffer = binds[i].buffer;
+			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_TEXTURE];
+			uint32_t      offset  = 0;
+			uint32_t      range   = 0;
+			if (!buffer) {
+				buffer = binds[i].buffer;
+				offset = binds[i].buffer_offset;
+				range  = binds[i].buffer_range;
+			}
 			if (!buffer) return (int32_t)i;
 
 			ref_buffer_infos[*ref_buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = buffer->buffer,
-				.range  = buffer->size,
+				.offset = offset,
+				.range  = range > 0 ? range : buffer->size,
 			};
 			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
 				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -379,13 +601,20 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 		case skr_register_readwrite: { // RWStructuredBuffer (u in HLSL)
 			if (*ref_write_ct >= write_max || *ref_buffer_ct >= buffer_max) continue;
 
-			skr_buffer_t* buffer = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_UAV];
-			if (!buffer)  buffer = binds[i].buffer;
+			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_UAV];
+			uint32_t      offset  = 0;
+			uint32_t      range   = 0;
+			if (!buffer) {
+				buffer = binds[i].buffer;
+				offset = binds[i].buffer_offset;
+				range  = binds[i].buffer_range;
+			}
 			if (!buffer) return (int32_t)i;
 
 			ref_buffer_infos[*ref_buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = buffer->buffer,
-				.range  = buffer->size,
+				.offset = offset,
+				.range  = range > 0 ? range : buffer->size,
 			};
 			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
 				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,

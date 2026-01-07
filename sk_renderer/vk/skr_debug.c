@@ -98,18 +98,23 @@ void _skr_append_renderpass_config(char* ref_str, size_t str_size, const skr_pip
 	if (!ref_str || !rp_key) return;
 
 	const char* color_str =
-		rp_key->color_format == VK_FORMAT_UNDEFINED           ? "none" :
-		rp_key->color_format == VK_FORMAT_B8G8R8A8_SRGB       ? "bgra8_srgb" :
-		rp_key->color_format == VK_FORMAT_B8G8R8A8_UNORM      ? "bgra8" :
-		rp_key->color_format == VK_FORMAT_R8G8B8A8_SRGB       ? "rgba8_srgb" :
-		rp_key->color_format == VK_FORMAT_R8G8B8A8_UNORM      ? "rgba8" :
-		rp_key->color_format == VK_FORMAT_R16G16B16A16_SFLOAT ? "rgba16f" :
-		rp_key->color_format == VK_FORMAT_R32G32B32A32_SFLOAT ? "rgba32f" : "?";
+		rp_key->color_format == VK_FORMAT_UNDEFINED               ? "none" :
+		rp_key->color_format == VK_FORMAT_B8G8R8A8_SRGB           ? "bgra8_srgb" :
+		rp_key->color_format == VK_FORMAT_B8G8R8A8_UNORM          ? "bgra8" :
+		rp_key->color_format == VK_FORMAT_R8G8B8A8_SRGB           ? "rgba8_srgb" :
+		rp_key->color_format == VK_FORMAT_R8G8B8A8_UNORM          ? "rgba8" :
+		rp_key->color_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? "rg11b10" :
+		rp_key->color_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32  ? "rgb9e5" :
+		rp_key->color_format == VK_FORMAT_R16G16B16A16_SFLOAT     ? "rgba16f" :
+		rp_key->color_format == VK_FORMAT_R32G32B32A32_SFLOAT     ? "rgba32f" : "?";
 
 	const char* depth_str =
-		rp_key->depth_format == VK_FORMAT_UNDEFINED  ? "none" :
-		rp_key->depth_format == VK_FORMAT_D16_UNORM  ? "d16" :
-		rp_key->depth_format == VK_FORMAT_D32_SFLOAT ? "d32" : "?";
+		rp_key->depth_format == VK_FORMAT_UNDEFINED          ? "no-depth" :
+		rp_key->depth_format == VK_FORMAT_D16_UNORM          ? "d16" :
+		rp_key->depth_format == VK_FORMAT_D16_UNORM_S8_UINT  ? "d16s8" :
+		rp_key->depth_format == VK_FORMAT_D24_UNORM_S8_UINT  ? "d24s8" :
+		rp_key->depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT ? "d32s8" :
+		rp_key->depth_format == VK_FORMAT_D32_SFLOAT         ? "d32" : "?";
 
 	size_t pos = strlen(ref_str);
 	snprintf(ref_str + pos, str_size - pos, "%s_%s_x%d", color_str, depth_str, rp_key->samples);

@@ -118,6 +118,9 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.realloc_func = settings.realloc_func ? settings.realloc_func : realloc;
 	_skr_vk.free_func    = settings.free_func    ? settings.free_func    : free;
 
+	_skr_bind_pool_init();
+	_skr_sampler_cache_init();
+
 	// Set up bind slot configuration (use defaults if not provided)
 	if (settings.bind_settings) {
 		_skr_vk.bind_settings = *settings.bind_settings;
@@ -557,11 +560,15 @@ bool skr_init(skr_settings_t settings) {
 	VkPhysicalDeviceFeatures available_features;
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
 
+	// Track feature availability
+	_skr_vk.has_depth_clamp = available_features.depthClamp;
+
 	// Enable features we need (only if available)
 	VkPhysicalDeviceFeatures device_features = {
 		.samplerAnisotropy = available_features.samplerAnisotropy,
 		.sampleRateShading = VK_FALSE, // Not using sample shading yet
 		.fillModeNonSolid  = VK_FALSE, // Not using wireframe
+		.depthClamp        = available_features.depthClamp,
 	};
 
 	VkDeviceCreateInfo device_info = {
@@ -712,11 +719,14 @@ void skr_shutdown(void) {
 	skr_tex_destroy(&_skr_vk.default_tex_gray);
 	skr_tex_destroy(&_skr_vk.default_tex_black);
 
-	_skr_cmd_shutdown     ();
-	_skr_pipeline_shutdown();
+	_skr_cmd_shutdown      ();  // Executes per-command destroy lists (may free bind pool slots)
+	_skr_pipeline_shutdown ();
 
-	_skr_destroy_list_execute(&_skr_vk.destroy_list);
+	_skr_destroy_list_execute(&_skr_vk.destroy_list);  // Execute global destroy list
 	_skr_destroy_list_free   (&_skr_vk.destroy_list);
+
+	_skr_bind_pool_shutdown();     // Free bind pool after all deferred destroys are done
+	_skr_sampler_cache_shutdown(); // Destroy cached samplers after GPU is idle
 
 	// Free dynamic arrays
 	if (_skr_vk.pending_transitions)      _skr_free(_skr_vk.pending_transitions);

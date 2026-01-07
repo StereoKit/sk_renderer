@@ -38,26 +38,12 @@ skr_err_ skr_render_list_create(skr_render_list_t* out_list) {
 		return skr_err_out_of_memory;
 	}
 
-	// Buffers will be lazily created in skr_renderer_draw() when needed
-	out_list->system_buffer_valid = false;
-	out_list->instance_buffer_valid = false;
-	out_list->material_param_buffer_valid = false;
-
 	return skr_err_success;
 }
 
 void skr_render_list_destroy(skr_render_list_t* ref_list) {
 	if (!ref_list) return;
 
-	if (ref_list->instance_buffer_valid) {
-		skr_buffer_destroy(&ref_list->instance_buffer);
-	}
-	if (ref_list->material_param_buffer_valid) {
-		skr_buffer_destroy(&ref_list->material_param_buffer);
-	}
-	if (ref_list->system_buffer_valid) {
-		skr_buffer_destroy(&ref_list->system_buffer);
-	}
 	_skr_free(ref_list->instance_data);
 	_skr_free(ref_list->instance_data_sorted);
 	_skr_free(ref_list->material_data);
@@ -77,7 +63,7 @@ void skr_render_list_clear(skr_render_list_t* ref_list) {
 // Bits 63-32 (32 bits): alpha_mode * 10000 + queue_offset (separates opaque/a2c/transparent)
 // Bits 31-16 (16 bits): pipeline_material_idx (groups by shader/render state)
 // Bits 15-0  (16 bits): mesh pointer hash (groups same mesh for instancing)
-static inline uint64_t _skr_render_sort_key(skr_material_t* material, skr_mesh_t* mesh) {
+static inline uint64_t _skr_render_sort_key(skr_material_t* material, VkBuffer first_vertex_buffer) {
 	// Derive alpha mode: 0 = opaque, 1 = alpha-to-coverage, 2 = transparent
 	uint32_t alpha_mode = 0;
 	if (material->key.alpha_to_coverage) {
@@ -88,8 +74,8 @@ static inline uint64_t _skr_render_sort_key(skr_material_t* material, skr_mesh_t
 	// Combine alpha mode and queue_offset into sections (bias queue to handle negatives)
 	uint32_t queue   = alpha_mode * 10000 + (uint32_t)(material->queue_offset + 1000);
 	uint16_t mat_idx = (uint16_t)material->pipeline_material_idx;
-	// Use pointer bits for mesh grouping (shift past alignment, take 16 bits)
-	uint16_t mesh_id = (uint16_t)((uintptr_t)mesh >> 4);
+	// Use VkBuffer handle bits for mesh grouping (shift past alignment, take 16 bits)
+	uint16_t mesh_id = (uint16_t)((uintptr_t)first_vertex_buffer >> 4);
 	return ((uint64_t)queue << 32) | ((uint64_t)mat_idx << 16) | mesh_id;
 }
 
@@ -108,13 +94,50 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 		ref_list->capacity = new_capacity;
 	}
 
-	// Add item
+	// Add item - copy mesh/material data so originals can be destroyed
 	skr_render_item_t* item = &ref_list->items[ref_list->count++];
-	item->mesh               = mesh;
-	item->material           = material;
-	item->sort_key           = _skr_render_sort_key(material, mesh);
+
+	// Copy mesh Vulkan handles
+	item->vertex_buffer_count = (uint8_t)mesh->vertex_buffer_count;
+	for (uint32_t i = 0; i < mesh->vertex_buffer_count && i < SKR_MAX_VERTEX_BUFFERS; i++) {
+		item->vertex_buffers[i] = mesh->vertex_buffers[i].buffer;
+	}
+	item->index_buffer      = mesh->index_buffer.buffer;
+	item->index_format      = (uint8_t)mesh->ind_format_vk;
+	item->vert_count        = mesh->vert_count;
+	item->ind_count         = mesh->ind_count;
+	item->pipeline_vert_idx = (uint16_t)mesh->vert_type->pipeline_idx;
+
+	// Copy material data
+	item->pipeline_material_idx  = (uint16_t)material->pipeline_material_idx;
+	item->param_buffer_size      = (uint16_t)material->param_buffer_size;
+	item->has_system_buffer      = material->has_system_buffer ? 1 : 0;
+	item->instance_buffer_stride = (uint16_t)material->instance_buffer_stride;
+	item->bind_start             = material->bind_start;
+	item->bind_count             = (uint8_t)material->bind_count;
+
+	// Copy material param_buffer data (so material can be destroyed after add)
+	item->param_data_offset = ref_list->material_data_used;
+	if (material->param_buffer && material->param_buffer_size > 0) {
+		// Resize material data if needed
+		while (ref_list->material_data_used + material->param_buffer_size > ref_list->material_data_capacity) {
+			uint32_t new_capacity = ref_list->material_data_capacity * 2;
+			uint8_t* new_data     = _skr_realloc(ref_list->material_data, new_capacity);
+			if (!new_data) {
+				skr_log(skr_log_critical, "Failed to grow render list material data");
+				return;
+			}
+			ref_list->material_data          = new_data;
+			ref_list->material_data_capacity = new_capacity;
+		}
+		memcpy(&ref_list->material_data[ref_list->material_data_used], material->param_buffer, material->param_buffer_size);
+		ref_list->material_data_used += material->param_buffer_size;
+	}
+
+	// Render item data
+	item->sort_key           = _skr_render_sort_key(material, item->vertex_buffers[0]);
 	item->instance_offset    = ref_list->instance_data_used;
-	item->instance_data_size = single_instance_data_size;
+	item->instance_data_size = (uint16_t)single_instance_data_size;
 	item->instance_count     = instance_count;
 	item->first_index        = first_index;
 	item->index_count        = index_count;

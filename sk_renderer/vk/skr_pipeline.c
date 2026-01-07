@@ -8,6 +8,7 @@
 #include "skr_pipeline.h"
 #include "skr_conversions.h"
 
+#include <threads.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,7 @@ typedef struct {
 	int32_t                          renderpass_capacity;
 	int32_t                          vertformat_count;
 	int32_t                          vertformat_capacity;
+	mtx_t                            mutex;           // Thread safety for cache access
 } _skr_pipeline_cache_t;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -100,6 +102,15 @@ static void _skr_pipeline_grow_pipelines_array(VkPipeline** ref_pipelines, int32
 
 void _skr_pipeline_init(void) {
 	_skr_pipeline_cache = (_skr_pipeline_cache_t){};
+	mtx_init(&_skr_pipeline_cache.mutex, mtx_recursive);
+}
+
+void _skr_pipeline_lock(void) {
+	mtx_lock(&_skr_pipeline_cache.mutex);
+}
+
+void _skr_pipeline_unlock(void) {
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
 
 void _skr_pipeline_shutdown(void) {
@@ -153,6 +164,7 @@ void _skr_pipeline_shutdown(void) {
 		_skr_free(_skr_pipeline_cache.vertformats);
 	}
 
+	mtx_destroy(&_skr_pipeline_cache.mutex);
 	_skr_pipeline_cache = (_skr_pipeline_cache_t){};
 }
 
@@ -181,6 +193,8 @@ static void _skr_pipeline_grow_materials(_skr_pipeline_cache_t* ref_cache, int32
 }
 
 int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key) {
+	mtx_lock(&_skr_pipeline_cache.mutex);
+
 	// Find existing or free slot
 	int32_t free_slot = -1;
 	for (int32_t i = 0; i < _skr_pipeline_cache.material_capacity; i++) {
@@ -188,11 +202,11 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 			// Check if this material already exists
 			if (memcmp(&_skr_pipeline_cache.materials[i].key, key, sizeof(_skr_pipeline_material_key_t)) == 0) {
 				_skr_pipeline_cache.materials[i].ref_count++;
+				mtx_unlock(&_skr_pipeline_cache.mutex);
 				return i;
 			}
 		} else if (free_slot == -1) {
 			free_slot = i;
-			break;
 		}
 	}
 
@@ -224,6 +238,7 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 	_skr_append_material_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)_skr_pipeline_cache.materials[free_slot].descriptor_layout, name);
 
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 	return free_slot;
 }
 
@@ -252,6 +267,8 @@ static void _skr_pipeline_grow_renderpasses(_skr_pipeline_cache_t* ref_cache, in
 }
 
 int32_t _skr_pipeline_register_renderpass(const skr_pipeline_renderpass_key_t* key) {
+	mtx_lock(&_skr_pipeline_cache.mutex);
+
 	// Find existing or free slot
 	int32_t free_slot = -1;
 	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_capacity; i++) {
@@ -259,11 +276,11 @@ int32_t _skr_pipeline_register_renderpass(const skr_pipeline_renderpass_key_t* k
 			// Check if this render pass already exists
 			if (memcmp(&_skr_pipeline_cache.renderpasses[i].key, key, sizeof(skr_pipeline_renderpass_key_t)) == 0) {
 				_skr_pipeline_cache.renderpasses[i].ref_count++;
+				mtx_unlock(&_skr_pipeline_cache.mutex);
 				return i;
 			}
 		} else if (free_slot == -1) {
 			free_slot = i;
-			break;
 		}
 	}
 
@@ -282,15 +299,18 @@ int32_t _skr_pipeline_register_renderpass(const skr_pipeline_renderpass_key_t* k
 		_skr_pipeline_cache.renderpass_count = free_slot + 1;
 	}
 
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 	return free_slot;
 }
 
 void _skr_pipeline_unregister_material(int32_t material_idx) {
-	if (material_idx < 0 || material_idx >= _skr_pipeline_cache.material_capacity) return;
-	if (_skr_pipeline_cache.materials[material_idx].ref_count <= 0) return;
+	mtx_lock(&_skr_pipeline_cache.mutex);
+
+	if (material_idx < 0 || material_idx >= _skr_pipeline_cache.material_capacity) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
+	if (_skr_pipeline_cache.materials[material_idx].ref_count <= 0)                { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	_skr_pipeline_cache.materials[material_idx].ref_count--;
-	if (_skr_pipeline_cache.materials[material_idx].ref_count > 0) return;
+	if (_skr_pipeline_cache.materials[material_idx].ref_count > 0) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	// Destroy all pipelines using this material
 	for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
@@ -304,14 +324,18 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 	// Destroy material resources
 	_skr_cmd_destroy_pipeline_layout      (NULL, _skr_pipeline_cache.materials[material_idx].layout);
 	_skr_cmd_destroy_descriptor_set_layout(NULL, _skr_pipeline_cache.materials[material_idx].descriptor_layout);
+
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
 
 void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
-	if (renderpass_idx < 0 || renderpass_idx >= _skr_pipeline_cache.renderpass_capacity) return;
-	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count <= 0) return;
+	mtx_lock(&_skr_pipeline_cache.mutex);
+
+	if (renderpass_idx < 0 || renderpass_idx >= _skr_pipeline_cache.renderpass_capacity) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
+	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count <= 0)                 { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count--;
-	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count > 0) return;
+	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count > 0) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	// Destroy all pipelines using this render pass
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
@@ -322,6 +346,8 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 		}
 	}
 	_skr_cmd_destroy_render_pass(NULL, _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass);
+
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
 
 static void _skr_pipeline_grow_vertformats(_skr_pipeline_cache_t* ref_cache, int32_t min_capacity) {
@@ -364,6 +390,8 @@ static bool _skr_vert_type_equals(const skr_vert_type_t* a, const skr_vert_type_
 }
 
 int32_t _skr_pipeline_register_vertformat(skr_vert_type_t vert_type) {
+	mtx_lock(&_skr_pipeline_cache.mutex);
+
 	// Find existing or free slot
 	int32_t free_slot = -1;
 	for (int32_t i = 0; i < _skr_pipeline_cache.vertformat_capacity; i++) {
@@ -371,11 +399,11 @@ int32_t _skr_pipeline_register_vertformat(skr_vert_type_t vert_type) {
 			// Check if this vertex format already exists (deep comparison)
 			if (_skr_vert_type_equals(&_skr_pipeline_cache.vertformats[i].vert_type, &vert_type)) {
 				_skr_pipeline_cache.vertformats[i].ref_count++;
+				mtx_unlock(&_skr_pipeline_cache.mutex);
 				return i;
 			}
 		} else if (free_slot == -1) {
 			free_slot = i;
-			break;
 		}
 	}
 
@@ -393,15 +421,18 @@ int32_t _skr_pipeline_register_vertformat(skr_vert_type_t vert_type) {
 		_skr_pipeline_cache.vertformat_count = free_slot + 1;
 	}
 
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 	return free_slot;
 }
 
 void _skr_pipeline_unregister_vertformat(int32_t vertformat_idx) {
-	if (vertformat_idx < 0 || vertformat_idx >= _skr_pipeline_cache.vertformat_capacity) return;
-	if (_skr_pipeline_cache.vertformats[vertformat_idx].ref_count <= 0) return;
+	mtx_lock(&_skr_pipeline_cache.mutex);
+
+	if (vertformat_idx < 0 || vertformat_idx >= _skr_pipeline_cache.vertformat_capacity) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
+	if (_skr_pipeline_cache.vertformats[vertformat_idx].ref_count <= 0)                  { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	_skr_pipeline_cache.vertformats[vertformat_idx].ref_count--;
-	if (_skr_pipeline_cache.vertformats[vertformat_idx].ref_count > 0) return;
+	if (_skr_pipeline_cache.vertformats[vertformat_idx].ref_count > 0) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	// Destroy all pipelines using this vertex format
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
@@ -411,6 +442,8 @@ void _skr_pipeline_unregister_vertformat(int32_t vertformat_idx) {
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
+
+	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
 
 VkPipeline _skr_pipeline_get(int32_t material_idx, int32_t renderpass_idx, int32_t vertformat_idx) {
@@ -669,7 +702,7 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 	// Rasterization
 	VkPipelineRasterizationStateCreateInfo rasterizer = {
 		.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-		.depthClampEnable        = VK_FALSE,
+		.depthClampEnable        = mat_key->depth_clamp && _skr_vk.has_depth_clamp ? VK_TRUE : VK_FALSE,
 		.rasterizerDiscardEnable = VK_FALSE,
 		.polygonMode             = VK_POLYGON_MODE_FILL,
 		.cullMode                = _skr_to_vk_cull(mat_key->cull),

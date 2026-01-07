@@ -34,6 +34,7 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 	*out_file = {};
 	 out_file->meta = (sksc_shader_meta_t*)malloc(sizeof(sksc_shader_meta_t));
 	*out_file->meta = {};
+	 out_file->meta->global_buffer_id = -1;
 	 out_file->meta->references = 1;
 
 	array_t<sksc_shader_file_stage_t> stages       = {};
@@ -79,6 +80,13 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 	if (!sksc_meta_check_dup_buffers(out_file->meta)) {
 		sksc_log(sksc_log_level_err, "Found constant buffers re-using slot ids");
+		return false;
+	}
+
+	const char *dup_name1, *dup_name2;
+	uint32_t    dup_slot;
+	if (!sksc_meta_check_dup_resources(out_file->meta, &dup_name1, &dup_name2, &dup_slot)) {
+		sksc_log(sksc_log_level_err, "Resources '%s' and '%s' are both bound to the same slot (t%u)", dup_name1, dup_name2, dup_slot);
 		return false;
 	}
 

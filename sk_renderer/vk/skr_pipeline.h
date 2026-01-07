@@ -39,7 +39,18 @@ void                  _skr_pipeline_unregister_renderpass(int32_t renderpass_idx
 void                  _skr_pipeline_unregister_vertformat(int32_t vertformat_idx);
 
 // Get or create pipeline for a material/renderpass/vertformat triplet
+// NOTE: These get functions do NOT lock internally for performance. The caller
+// must ensure thread safety by either:
+// 1. Calling from within a locked region (_skr_pipeline_lock/_skr_pipeline_unlock)
+// 2. Ensuring no concurrent modifications (single-threaded use)
 VkPipeline            _skr_pipeline_get                  (int32_t material_idx, int32_t renderpass_idx, int32_t vertformat_idx);
 VkPipelineLayout      _skr_pipeline_get_layout           (int32_t material_idx  );
 VkDescriptorSetLayout _skr_pipeline_get_descriptor_layout(int32_t material_idx  );
 VkRenderPass          _skr_pipeline_get_renderpass       (int32_t renderpass_idx);
+
+// Thread safety: Lock the pipeline cache for a region of operations.
+// Use these to protect multiple get calls during rendering.
+// Registration functions lock internally, so they can be called without
+// explicitly locking (and will block if another thread holds the lock).
+void                  _skr_pipeline_lock                 (void);
+void                  _skr_pipeline_unlock               (void);

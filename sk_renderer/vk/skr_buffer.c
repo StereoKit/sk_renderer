@@ -163,7 +163,7 @@ bool skr_buffer_is_valid(const skr_buffer_t* buffer) {
 void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_bytes) {
 	if (!ref_buffer || !data) return;
 
-	if (ref_buffer->use == skr_use_dynamic && ref_buffer->mapped) {
+	if ((ref_buffer->use & skr_use_dynamic) && ref_buffer->mapped) {
 		memcpy(ref_buffer->mapped, data, size_bytes < ref_buffer->size ? size_bytes : ref_buffer->size);
 	} else {
 		skr_log(skr_log_critical, "skr_buffer_set only supports dynamic buffers");
@@ -173,7 +173,7 @@ void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_by
 void skr_buffer_get(const skr_buffer_t *buffer, void *ref_buffer, uint32_t buffer_size) {
 	if (!buffer || !ref_buffer) return;
 
-	if (buffer->use != skr_use_dynamic) {
+	if (!(buffer->use & skr_use_dynamic)) {
 		skr_log(skr_log_critical, "skr_buffer_get only supports dynamic buffers");
 		return;
 	}
@@ -209,4 +209,125 @@ void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
 	_skr_cmd_destroy_memory(NULL, ref_buffer->memory);
 
 	*ref_buffer = (skr_buffer_t){};
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Bump Allocator
+///////////////////////////////////////////////////////////////////////////////
+
+void _skr_bump_alloc_init(skr_bump_alloc_t* ref_alloc, skr_buffer_type_ type, uint32_t alignment) {
+	*ref_alloc = (skr_bump_alloc_t){
+		.buffer_type    = type,
+		.alignment      = alignment > 0 ? alignment : 1,
+		.high_water_mark = 0,
+	};
+}
+
+void _skr_bump_alloc_destroy(skr_bump_alloc_t* ref_alloc) {
+	if (!ref_alloc) return;
+
+	// Destroy main buffer
+	if (ref_alloc->main_valid) {
+		skr_buffer_destroy(&ref_alloc->main_buffer);
+	}
+
+	// Destroy all overflow buffers
+	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
+		skr_buffer_destroy(&ref_alloc->overflow[i]);
+	}
+	_skr_free(ref_alloc->overflow);
+
+	*ref_alloc = (skr_bump_alloc_t){};
+}
+
+void _skr_bump_alloc_reset(skr_bump_alloc_t* ref_alloc) {
+	if (!ref_alloc) return;
+
+	// Resize main buffer if high-water mark exceeds current capacity
+	uint32_t main_capacity = ref_alloc->main_valid ? ref_alloc->main_buffer.size : 0;
+	if (ref_alloc->high_water_mark > main_capacity) {
+		// Destroy old main buffer
+		if (ref_alloc->main_valid) {
+			skr_buffer_destroy(&ref_alloc->main_buffer);
+			ref_alloc->main_valid = false;
+		}
+
+		// Create new buffer sized to high-water mark (with some headroom)
+		uint32_t new_size = ref_alloc->high_water_mark + (ref_alloc->high_water_mark / 4);  // +25% headroom
+		if (new_size < 4096) new_size = 4096;  // Minimum 4KB
+
+		skr_buffer_create(NULL, new_size, 1, ref_alloc->buffer_type, skr_use_dynamic, &ref_alloc->main_buffer);
+		ref_alloc->main_valid = true;
+	}
+
+	// Reset main buffer offset
+	ref_alloc->main_used = 0;
+
+	// Destroy overflow buffers from previous frame (GPU is done with them now)
+	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
+		skr_buffer_destroy(&ref_alloc->overflow[i]);
+	}
+	ref_alloc->overflow_count = 0;
+
+	// Reset high-water mark for this frame
+	ref_alloc->high_water_mark = 0;
+}
+
+skr_bump_result_t _skr_bump_alloc_write(skr_bump_alloc_t* ref_alloc, const void* data, uint32_t size) {
+	skr_bump_result_t result = { .buffer = NULL, .offset = 0 };
+	if (!ref_alloc || !data || size == 0) return result;
+
+	// Align the allocation
+	uint32_t aligned_offset = (ref_alloc->main_used + ref_alloc->alignment - 1) & ~(ref_alloc->alignment - 1);
+	uint32_t main_capacity = ref_alloc->main_valid ? ref_alloc->main_buffer.size : 0;
+
+	// Try to allocate from main buffer
+	if (ref_alloc->main_valid && aligned_offset + size <= main_capacity) {
+		// Write to main buffer
+		memcpy((uint8_t*)ref_alloc->main_buffer.mapped + aligned_offset, data, size);
+		ref_alloc->main_used = aligned_offset + size;
+
+		// Track high-water mark
+		if (ref_alloc->main_used > ref_alloc->high_water_mark) {
+			ref_alloc->high_water_mark = ref_alloc->main_used;
+		}
+
+		result.buffer = &ref_alloc->main_buffer;
+		result.offset = aligned_offset;
+		return result;
+	}
+
+	// Main buffer is full or doesn't exist - create overflow buffer
+	// Grow overflow array if needed
+	if (ref_alloc->overflow_count >= ref_alloc->overflow_capacity) {
+		uint32_t new_cap = ref_alloc->overflow_capacity == 0 ? 4 : ref_alloc->overflow_capacity * 2;
+		skr_buffer_t* new_overflow = _skr_realloc(ref_alloc->overflow, new_cap * sizeof(skr_buffer_t));
+		if (!new_overflow) {
+			skr_log(skr_log_critical, "Failed to grow bump allocator overflow array");
+			return result;
+		}
+		ref_alloc->overflow = new_overflow;
+		ref_alloc->overflow_capacity = new_cap;
+	}
+
+	// Create overflow buffer for this allocation
+	skr_buffer_t* overflow = &ref_alloc->overflow[ref_alloc->overflow_count];
+	*overflow = (skr_buffer_t){};
+
+	skr_buffer_create(data, size, 1, ref_alloc->buffer_type, skr_use_dynamic, overflow);
+	ref_alloc->overflow_count++;
+
+	// Track total usage in high-water mark (main + all overflow buffers)
+	uint32_t overflow_total = 0;
+	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
+		overflow_total += ref_alloc->overflow[i].size;
+	}
+	uint32_t total_used = ref_alloc->main_used + overflow_total;
+	if (total_used > ref_alloc->high_water_mark) {
+		ref_alloc->high_water_mark = total_used;
+	}
+
+	result.buffer = overflow;
+	result.offset = 0;
+	return result;
 }

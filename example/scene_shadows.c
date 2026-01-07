@@ -115,9 +115,10 @@ static scene_t* _scene_shadows_create(void) {
 	// Load shadow caster shader
 	scene->shadow_caster_shader = su_shader_load("shaders/shadow_caster.hlsl.sks", "shadow_caster");
 	skr_material_create((skr_material_info_t){
-		.shader     = &scene->shadow_caster_shader,
-		.write_mask = skr_write_depth,
-		.depth_test = skr_compare_less,
+		.shader      = &scene->shadow_caster_shader,
+		.write_mask  = skr_write_depth,
+		.depth_test  = skr_compare_less,
+		.depth_clamp = true, // Clamp depth to prevent shadow acne from near/far clipping
 	}, &scene->shadow_caster_material);
 
 	// Load shadow receiver shader

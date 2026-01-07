@@ -33,7 +33,8 @@ bool                        sksc_hlsl_to_bytecode      (const char *filename, co
 
 array_t<sksc_meta_item_t>   sksc_meta_find_defaults    (const char *hlsl_text);
 void                        sksc_meta_assign_defaults  (array_t<sksc_ast_default_t> ast_defaults, array_t<sksc_meta_item_t> comment_overrides, sksc_shader_meta_t *ref_meta);
-bool                        sksc_meta_check_dup_buffers(const sksc_shader_meta_t *ref_meta);
-bool                        sksc_spirv_to_meta         (const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *meta);
+bool                        sksc_meta_check_dup_buffers  (const sksc_shader_meta_t *ref_meta);
+bool                        sksc_meta_check_dup_resources(const sksc_shader_meta_t *ref_meta, const char **out_name1, const char **out_name2, uint32_t *out_slot);
+bool                        sksc_spirv_to_meta           (const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *meta);
 
 bool                        sksc_spirv_to_glsl         (const sksc_shader_file_stage_t *src_stage, const sksc_settings_t *settings, skr_shader_lang_ lang, sksc_shader_file_stage_t *out_stage, const sksc_shader_meta_t *meta, array_t<sksc_meta_item_t> var_meta);

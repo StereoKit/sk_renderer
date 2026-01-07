@@ -47,24 +47,6 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 	return *cached_fb;
 }
 
-static void _skr_ensure_buffer(skr_buffer_t* ref_buffer, bool* ref_valid, const void* data, uint32_t size, skr_buffer_type_ type, const char* name) {
-	bool needs_recreate = !*ref_valid || ref_buffer->size < size;
-
-	if (needs_recreate) {
-		// Destroy old buffer if it exists
-		if (*ref_valid) {
-			skr_buffer_destroy(ref_buffer);
-		}
-		// Create new buffer with required size
-		skr_buffer_create(data, size, 1, type, skr_use_dynamic, ref_buffer);
-		skr_buffer_set_name(ref_buffer, name);
-		*ref_valid = true;
-	} else {
-		// Buffer is valid and large enough, just update contents
-		skr_buffer_set(ref_buffer, data, size);
-	}
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 // Deferred Texture Transition System
 ///////////////////////////////////////////////////////////////////////////////
@@ -194,6 +176,11 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	// Require at least one attachment (color or depth)
 	if (!color && !depth) return;
 
+	// Lock pipeline cache for the duration of this render pass.
+	// This protects all pipeline get operations during drawing.
+	// Unlocked in skr_renderer_end_pass.
+	_skr_pipeline_lock();
+
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 
 	// Flush all pending texture transitions BEFORE starting render pass
@@ -207,13 +194,13 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		.resolve_format  = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT) ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
 		.samples         = color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
 		.depth_store_op  = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-		.color_load_op   = VK_ATTACHMENT_LOAD_OP_CLEAR,  // Always clear for main render pass
+		.color_load_op   = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
 	};
 	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass(&rp_key);
 
 	// Get render pass from pipeline system
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(_skr_vk.current_renderpass_idx);
-	if (render_pass == VK_NULL_HANDLE) return;
+	if (render_pass == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
 	// Determine which texture to use for framebuffer caching
 	// Priority: resolve target (for MSAA) > color > depth
@@ -227,7 +214,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	// Get or create cached framebuffer
 	VkFramebuffer framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, fb_cache_target, render_pass, color, depth, opt_resolve, depth != NULL);
 
-	if (framebuffer == VK_NULL_HANDLE) return;
+	if (framebuffer == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
 	// Transition depth texture to attachment layout if needed
 	// Automatic system handles the optimization:
@@ -325,6 +312,9 @@ void skr_renderer_end_pass() {
 	_skr_vk.current_color_texture = NULL;
 	_skr_vk.current_depth_texture = NULL;
 	_skr_cmd_release(cmd);
+
+	// Unlock pipeline cache (locked in skr_renderer_begin_pass)
+	_skr_pipeline_unlock();
 }
 
 void skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer) {
@@ -397,6 +387,9 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	uint32_t width  = bounds_px.w > 0 ? bounds_px.w : to->size.x;
 	uint32_t height = bounds_px.h > 0 ? bounds_px.h : to->size.y;
 
+	// Lock pipeline cache for this blit operation
+	_skr_pipeline_lock();
+
 	// Register render pass format with pipeline system
 	// Use DONT_CARE for full blit (discard previous contents), LOAD for partial (preserve)
 	skr_pipeline_renderpass_key_t rp_key = {
@@ -413,6 +406,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	// Get render pass from pipeline system
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(renderpass_idx);
 	if (render_pass == VK_NULL_HANDLE) {
+		_skr_pipeline_unlock();
 		return;
 	}
 
@@ -426,42 +420,49 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	uint32_t buffer_ct = 0;
 	uint32_t image_ct  = 0;
 
-	skr_buffer_t param_buffer = {0};
+	skr_bump_result_t param_bump = {0};
 	if (material->param_buffer_size > 0) {
-		skr_buffer_create(material->param_buffer, 1, material->param_buffer_size, skr_buffer_type_constant, skr_use_dynamic, &param_buffer);
-
-		buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-			.buffer = param_buffer.buffer,
-			.range  = param_buffer.size,
-		};
-		writes[write_ct++] = (VkWriteDescriptorSet){
-			.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-			.descriptorCount = 1,
-			.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo     = &buffer_infos[buffer_ct++],
-		};
+		param_bump = _skr_bump_alloc_write(ctx.const_bump, material->param_buffer, material->param_buffer_size);
+		if (param_bump.buffer) {
+			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
+				.buffer = param_bump.buffer->buffer,
+				.offset = param_bump.offset,
+				.range  = material->param_buffer_size,
+			};
+			writes[write_ct++] = (VkWriteDescriptorSet){
+				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
+				.descriptorCount = 1,
+				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo     = &buffer_infos[buffer_ct++],
+			};
+		}
 	}
 
 	// Material texture and buffer binds
 	const sksc_shader_meta_t* meta = material->key.shader->meta;
 	const int32_t ignore_slots[] = { SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot };
-	int32_t fail_idx = _skr_material_add_writes(material->binds, material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+
+	_skr_bind_pool_lock();
+	skr_material_bind_t* mat_binds = _skr_bind_pool_get(material->bind_start);
+	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 		writes,       sizeof(writes      )/sizeof(writes      [0]),
 		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
 		&write_ct, &buffer_ct, &image_ct);
 	if (fail_idx >= 0) {
+		_skr_bind_pool_unlock();
 		skr_log(skr_log_critical, "Blit missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		return;
 	}
 
 	// Transition any source textures in material to shader-read layout
 	for (uint32_t i=0; i<meta->resource_count; i++) {
-		skr_material_bind_t* res = &material->binds[meta->buffer_count + i];
+		skr_material_bind_t* res = &mat_binds[meta->buffer_count + i];
 		if (res->texture)
 			_skr_tex_transition_for_shader_read(ctx.cmd, res->texture, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 	}
+	_skr_bind_pool_unlock();
 
 	// Transition target texture to color attachment layout
 	_skr_tex_transition(ctx.cmd, to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -560,8 +561,9 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	// Automatic system tracks that it's currently in COLOR_ATTACHMENT_OPTIMAL
 	_skr_tex_transition_for_shader_read(ctx.cmd, to, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-	skr_buffer_destroy(&param_buffer);
 	_skr_cmd_release(ctx.cmd);
+
+	_skr_pipeline_unlock();
 }
 
 void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_t system_data_size, int32_t instance_multiplier) {
@@ -572,54 +574,46 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 	VkCommandBuffer cmd = ctx.cmd;
 
 	_skr_render_list_sort(list);
+	// Material param data is already copied at add-time into list->material_data
 
-	// This consolidates all material params into a single buffer
-	list->material_data_used = 0;
-	skr_material_t* prev_material = NULL;
-	for (uint32_t i = 0; i < list->count; i++) {
-		skr_material_t* material = list->items[i].material;
-		if (material == prev_material) continue;
+	// Upload data to bump allocators from command context
+	skr_bump_result_t system_bump   = {0};
+	skr_bump_result_t material_bump = {0};
+	skr_bump_result_t instance_bump = {0};
 
-		// Resize material param data if needed
-		while (list->material_data_used + material->param_buffer_size > list->material_data_capacity) {
-			list->material_data_capacity = list->material_data_capacity * 2;
-			list->material_data          = _skr_realloc(list->material_data, list->material_data_capacity);
-		}
-
-		memcpy(&list->material_data[list->material_data_used], material->param_buffer, material->param_buffer_size);
-		list->material_data_used += material->param_buffer_size;
-
-		prev_material = material;
+	if (system_data && system_data_size > 0) {
+		system_bump = _skr_bump_alloc_write(ctx.const_bump, system_data, system_data_size);
+	}
+	if (list->material_data_used > 0) {
+		material_bump = _skr_bump_alloc_write(ctx.const_bump, list->material_data, list->material_data_used);
+	}
+	if (list->instance_data_used > 0) {
+		instance_bump = _skr_bump_alloc_write(ctx.storage_bump, list->instance_data, list->instance_data_used);
 	}
 
-	// Upload data to our material and instance buffers
-	if (system_data && system_data_size > 0) _skr_ensure_buffer(&list->system_buffer,         &list->system_buffer_valid,         system_data,         system_data_size,         skr_buffer_type_constant, "system_buffer");
-	if (list->material_data_used        > 0) _skr_ensure_buffer(&list->material_param_buffer, &list->material_param_buffer_valid, list->material_data, list->material_data_used, skr_buffer_type_constant, "renderlist_material_params");
-	if (list->instance_data_used        > 0) _skr_ensure_buffer(&list->instance_buffer,       &list->instance_buffer_valid,       list->instance_data, list->instance_data_used, skr_buffer_type_storage,  "renderlist_inst_data");
-
 	// Draw items with batching
-	VkPipeline bound_pipeline       = VK_NULL_HANDLE;
-	uint32_t   material_data_offset = 0;
-	prev_material = NULL;
+	VkPipeline bound_pipeline = VK_NULL_HANDLE;
 	for (uint32_t i = 0; i < list->count; ) {
 		const skr_render_item_t* item = &list->items[i];
 
-		// Get pipeline from the cache
-		VkPipeline pipeline = _skr_pipeline_get(item->material->pipeline_material_idx, _skr_vk.current_renderpass_idx, item->mesh->vert_type->pipeline_idx);
+		// Get pipeline from the cache (using inlined indices)
+		VkPipeline pipeline = _skr_pipeline_get(item->pipeline_material_idx, _skr_vk.current_renderpass_idx, item->pipeline_vert_idx);
 		assert(pipeline != VK_NULL_HANDLE && "Is the Vertex format out of scope?");
 
 		// Find consecutive items with same mesh/material/draw-params for batching
+		// Compare inlined data instead of pointers
 		uint32_t batch_count     = 1;
 		uint32_t total_instances = item->instance_count;
 		uint32_t total_inst_data = item->instance_data_size * item->instance_count;
 		while (i + batch_count < list->count) {
 			const skr_render_item_t* next = &list->items[i + batch_count];
 			// Can only batch if mesh, material, AND draw parameters all match
-			if (next->mesh          != item->mesh        ||
-			    next->material      != item->material    ||
-			    next->first_index   != item->first_index ||
-			    next->index_count   != item->index_count ||
-			    next->vertex_offset != item->vertex_offset)
+			if (next->vertex_buffers[0]      != item->vertex_buffers[0]      ||
+			    next->pipeline_material_idx  != item->pipeline_material_idx  ||
+			    next->bind_start             != item->bind_start             ||
+			    next->first_index            != item->first_index            ||
+			    next->index_count            != item->index_count            ||
+			    next->vertex_offset          != item->vertex_offset)
 				break;
 			total_instances += next->instance_count;
 			total_inst_data += next->instance_data_size * next->instance_count;
@@ -640,12 +634,12 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		uint32_t buffer_ct = 0;
 		uint32_t image_ct  = 0;
 
-		// Material parameter buffer
-		if (item->material->param_buffer_size > 0) {
+		// Material parameter buffer (using inlined param_buffer_size and param_data_offset)
+		if (item->param_buffer_size > 0 && material_bump.buffer) {
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = list->material_param_buffer.buffer,
-				.offset = material_data_offset,
-				.range  = item->material->param_buffer_size,
+				.buffer = material_bump.buffer->buffer,
+				.offset = material_bump.offset + item->param_data_offset,
+				.range  = item->param_buffer_size,
 			};
 			writes[write_ct++] = (VkWriteDescriptorSet){
 				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -656,11 +650,12 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			};
 		}
 
-		// System data buffer
-		if (item->material->has_system_buffer) {
+		// System data buffer (using inlined has_system_buffer)
+		if (item->has_system_buffer && system_bump.buffer) {
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = list->system_buffer.buffer,
-				.range  = list->system_buffer.size,
+				.buffer = system_bump.buffer->buffer,
+				.offset = system_bump.offset,
+				.range  = system_data_size,
 			};
 			writes[write_ct++] = (VkWriteDescriptorSet){
 				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -671,15 +666,15 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			};
 		}
 
-		// Instance data buffer
-		if (item->material->instance_buffer_stride > 0) {
-			if (item->instance_data_size != item->material->instance_buffer_stride) {
-				skr_log(skr_log_warning, "Instance data size mismatch: shader %s expects %u bytes, got %u bytes",
-					item->material->key.shader->meta->name, item->material->instance_buffer_stride, item->instance_data_size);
+		// Instance data buffer (using inlined instance_buffer_stride)
+		if (item->instance_buffer_stride > 0 && instance_bump.buffer) {
+			if (item->instance_data_size != item->instance_buffer_stride) {
+				skr_log(skr_log_warning, "Instance data size mismatch: shader expects %u bytes, got %u bytes",
+					item->instance_buffer_stride, item->instance_data_size);
 			}
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = list->instance_buffer.buffer,
-				.offset = item->instance_offset,
+				.buffer = instance_bump.buffer->buffer,
+				.offset = instance_bump.offset + item->instance_offset,
 				.range  = total_inst_data,
 			};
 			writes[write_ct++] = (VkWriteDescriptorSet){
@@ -695,35 +690,51 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
 			SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
 			SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
-		// Material texture and buffer binds
-		const skr_material_t* mat = item->material;
-		const sksc_shader_meta_t* meta = mat->key.shader->meta;
-		int32_t fail_idx = _skr_material_add_writes(mat->binds, mat->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+
+		// Material texture and buffer binds (using inlined bind_start/bind_count)
+		_skr_bind_pool_lock();
+		const skr_material_bind_t* binds = _skr_bind_pool_get(item->bind_start);
+		int32_t fail_idx = _skr_material_add_writes(binds, item->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 			writes,       sizeof(writes      )/sizeof(writes      [0]),
 			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
 			&write_ct, &buffer_ct, &image_ct);
+
 		if (fail_idx >= 0) {
-			skr_log(skr_log_critical, "Draw missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
+			int32_t       slot = binds[fail_idx].bind.slot;
+			skr_register_ type = (skr_register_)binds[fail_idx].bind.register_type;
+			char          reg_char;
+			int32_t       reg_num;
+			switch (type) {
+			case skr_register_constant:      reg_char = 'b'; reg_num = slot - SKR_BIND_SHIFT_BUFFER;  break;
+			case skr_register_texture:
+			case skr_register_read_buffer:   reg_char = 't'; reg_num = slot - SKR_BIND_SHIFT_TEXTURE; break;
+			case skr_register_readwrite:
+			case skr_register_readwrite_tex: reg_char = 'u'; reg_num = slot - SKR_BIND_SHIFT_UAV;     break;
+			default:                         reg_char = '?'; reg_num = slot;                          break;
+			}
+			skr_log(skr_log_critical, "Draw call missing binding for register(%c%d)", reg_char, reg_num);
+			_skr_bind_pool_unlock();
 			i += batch_count;
 			continue;
 		}
+		_skr_bind_pool_unlock();
 
-		// Push all descriptors at once
+		// Push all descriptors at once (using inlined pipeline_material_idx)
 		_skr_bind_descriptors(cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-		                      _skr_pipeline_get_layout(mat->pipeline_material_idx),
-		                      _skr_pipeline_get_descriptor_layout(mat->pipeline_material_idx),
+		                      _skr_pipeline_get_layout(item->pipeline_material_idx),
+		                      _skr_pipeline_get_descriptor_layout(item->pipeline_material_idx),
 		                      writes, write_ct);
 
-		// Bind vertex buffers
-		if (item->mesh->vertex_buffer_count > 0) {
-			VkBuffer     buffers[16];
-			VkDeviceSize offsets[16];
+		// Bind vertex buffers (using inlined VkBuffer handles)
+		if (item->vertex_buffer_count > 0) {
+			VkBuffer     buffers[SKR_MAX_VERTEX_BUFFERS];
+			VkDeviceSize offsets[SKR_MAX_VERTEX_BUFFERS];
 			uint32_t     bind_count = 0;
 
-			for (uint32_t j = 0; j < item->mesh->vertex_buffer_count; j++) {
-				if (skr_buffer_is_valid(&item->mesh->vertex_buffers[j])) {
-					buffers[bind_count] = item->mesh->vertex_buffers[j].buffer;
+			for (uint32_t j = 0; j < item->vertex_buffer_count; j++) {
+				if (item->vertex_buffers[j] != VK_NULL_HANDLE) {
+					buffers[bind_count] = item->vertex_buffers[j];
 					offsets[bind_count] = 0;
 					bind_count++;
 				}
@@ -734,22 +745,17 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			}
 		}
 
-		// Draw with instancing
+		// Draw with instancing (using inlined mesh data)
 		uint32_t draw_instances = total_instances * instance_multiplier;
-		if (skr_buffer_is_valid(&item->mesh->index_buffer)) {
-			vkCmdBindIndexBuffer(cmd, item->mesh->index_buffer.buffer, 0, item->mesh->ind_format_vk);
-			uint32_t draw_index_count = item->index_count > 0 ? item->index_count : item->mesh->ind_count;
+		if (item->index_buffer != VK_NULL_HANDLE) {
+			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (VkIndexType)item->index_format);
+			uint32_t draw_index_count = item->index_count > 0 ? (uint32_t)item->index_count : item->ind_count;
 			vkCmdDrawIndexed(cmd, draw_index_count, draw_instances, item->first_index, item->vertex_offset, 0);
 		} else {
-			vkCmdDraw(cmd, item->mesh->vert_count, draw_instances, 0, 0);
+			vkCmdDraw(cmd, item->vert_count, draw_instances, 0, 0);
 		}
 
 		i += batch_count;
-
-		if (item->material != prev_material) {
-			prev_material         = item->material;
-			material_data_offset += item->material->param_buffer_size;
-		}
 	}
 	_skr_cmd_release(cmd);
 }
@@ -778,24 +784,24 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	uint32_t buffer_ct = 0;
 	uint32_t image_ct  = 0;
 
-	// Create temporary material parameter buffer if needed
-	skr_buffer_t temp_material_buffer = {0};
-	bool temp_buffer_valid = false;
+	// Upload material parameters to bump allocator if needed
+	skr_bump_result_t material_bump = {0};
 	if (material->param_buffer_size > 0) {
-		_skr_ensure_buffer(&temp_material_buffer, &temp_buffer_valid, material->param_buffer,
-		                   material->param_buffer_size, skr_buffer_type_constant, "immediate_material_params");
-		buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-			.buffer = temp_material_buffer.buffer,
-			.offset = 0,
-			.range  = material->param_buffer_size,
-		};
-		writes[write_ct++] = (VkWriteDescriptorSet){
-			.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-			.descriptorCount = 1,
-			.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo     = &buffer_infos[buffer_ct++],
-		};
+		material_bump = _skr_bump_alloc_write(ctx.const_bump, material->param_buffer, material->param_buffer_size);
+		if (material_bump.buffer) {
+			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
+				.buffer = material_bump.buffer->buffer,
+				.offset = material_bump.offset,
+				.range  = material->param_buffer_size,
+			};
+			writes[write_ct++] = (VkWriteDescriptorSet){
+				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
+				.descriptorCount = 1,
+				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo     = &buffer_infos[buffer_ct++],
+			};
+		}
 	}
 
 	// No system buffer or instance buffer for immediate draws
@@ -806,11 +812,15 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 
 	// Add material texture and buffer bindings
 	const sksc_shader_meta_t* meta = material->key.shader->meta;
-	int32_t fail_idx = _skr_material_add_writes(material->binds, material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+
+	_skr_bind_pool_lock();
+	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 		writes,       sizeof(writes      )/sizeof(writes      [0]),
 		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
 		&write_ct, &buffer_ct, &image_ct);
+	_skr_bind_pool_unlock();
+
 	if (fail_idx >= 0) {
 		skr_log(skr_log_critical, "Immediate draw missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		_skr_cmd_release(cmd);
@@ -849,12 +859,6 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 		vkCmdDrawIndexed(cmd, draw_index_count, instance_count, first_index, vertex_offset, 0);
 	} else {
 		vkCmdDraw(cmd, mesh->vert_count, instance_count, 0, 0);
-	}
-
-	// Clean up temporary material buffer (deferred to command completion)
-	if (material->param_buffer_size > 0) {
-		_skr_cmd_destroy_buffer(ctx.destroy_list, temp_material_buffer.buffer);
-		_skr_cmd_destroy_memory(ctx.destroy_list, temp_material_buffer.memory);
 	}
 
 	_skr_cmd_release(cmd);

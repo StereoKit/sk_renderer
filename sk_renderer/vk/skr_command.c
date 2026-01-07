@@ -31,11 +31,19 @@ void _skr_cmd_shutdown() {
 	mtx_lock(&_skr_vk.thread_pool_mutex);
 	for (uint32_t i = 0; i < skr_MAX_THREAD_POOLS; i++) {
 		_skr_vk_thread_t *thread = &_skr_vk.thread_pools[i];
-		
+
+		// Clear active_cmd and last_submitted so buffer destroys go directly to immediate destruction
+		thread->active_cmd     = NULL;
+		thread->last_submitted = NULL;
+
 		for (uint32_t c = 0; c < skr_MAX_COMMAND_RING; c++) {
 			// Execute and free any remaining destroy lists
 			_skr_destroy_list_execute(&thread->cmd_ring[c].destroy_list);
 			_skr_destroy_list_free   (&thread->cmd_ring[c].destroy_list);
+
+			// Destroy bump allocators
+			_skr_bump_alloc_destroy(&thread->cmd_ring[c].const_bump);
+			_skr_bump_alloc_destroy(&thread->cmd_ring[c].storage_bump);
 
 			if (thread->cmd_ring[c].fence != VK_NULL_HANDLE)
 				vkDestroyFence(_skr_vk.device, thread->cmd_ring[c].fence, NULL);
@@ -125,6 +133,10 @@ void skr_thread_shutdown() {
 
 	_skr_vk_thread_t *thread = &_skr_vk.thread_pools[_skr_thread_idx];
 
+	// Clear active_cmd and last_submitted so buffer destroys go directly to immediate destruction
+	thread->active_cmd     = NULL;
+	thread->last_submitted = NULL;
+
 	// Clean up command ring - wait on each fence individually and destroy
 	for (uint32_t c = 0; c < skr_MAX_COMMAND_RING; c++) {
 		if (thread->cmd_ring[c].fence != VK_NULL_HANDLE) {
@@ -133,6 +145,10 @@ void skr_thread_shutdown() {
 
 		_skr_destroy_list_execute(&thread->cmd_ring[c].destroy_list);
 		_skr_destroy_list_free   (&thread->cmd_ring[c].destroy_list);
+
+		// Destroy bump allocators
+		_skr_bump_alloc_destroy(&thread->cmd_ring[c].const_bump);
+		_skr_bump_alloc_destroy(&thread->cmd_ring[c].storage_bump);
 
 		if (thread->cmd_ring[c].fence != VK_NULL_HANDLE)
 			vkDestroyFence(_skr_vk.device, thread->cmd_ring[c].fence, NULL);
@@ -208,6 +224,8 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 		}, NULL, &slot->fence);
 		slot->destroy_list = _skr_destroy_list_create();
+		_skr_bump_alloc_init(&slot->const_bump,   skr_buffer_type_constant, 256);  // 256-byte alignment for UBOs
+		_skr_bump_alloc_init(&slot->storage_bump, skr_buffer_type_storage,  16);   // 16-byte alignment for storage
 
 		// Create descriptor pool for non-push-descriptor fallback
 		if (!_skr_vk.has_push_descriptors) {
@@ -246,6 +264,9 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 		if (slot->descriptor_pool != VK_NULL_HANDLE) {
 			vkResetDescriptorPool(_skr_vk.device, slot->descriptor_pool, 0);
 		}
+		// Reset bump allocators - resizes main buffer if needed, clears overflow
+		_skr_bump_alloc_reset(&slot->const_bump);
+		_skr_bump_alloc_reset(&slot->storage_bump);
 	}
 
 	vkBeginCommandBuffer(slot->cmd, &(VkCommandBufferBeginInfo){
@@ -303,12 +324,14 @@ bool _skr_cmd_try_get_active(_skr_cmd_ctx_t* out_ctx) {
 
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
-	
+
 	if (pool->active_cmd) {
 		*out_ctx = (_skr_cmd_ctx_t){
-			.cmd              = pool->active_cmd->cmd,
-			.descriptor_pool  = pool->active_cmd->descriptor_pool,
-			.destroy_list     = &pool->active_cmd->destroy_list,
+			.cmd             = pool->active_cmd->cmd,
+			.descriptor_pool = pool->active_cmd->descriptor_pool,
+			.destroy_list    = &pool->active_cmd->destroy_list,
+			.const_bump      = &pool->active_cmd->const_bump,
+			.storage_bump    = &pool->active_cmd->storage_bump,
 		};
 		return true;
 	}
@@ -323,12 +346,14 @@ _skr_cmd_ctx_t _skr_cmd_acquire() {
 
 	if (pool->ref_count == 0)
 		pool->active_cmd = _skr_cmd_ring_begin(pool);
-	
+
 	pool->ref_count++;
 	return (_skr_cmd_ctx_t){
 		.cmd             = pool->active_cmd->cmd,
 		.descriptor_pool = pool->active_cmd->descriptor_pool,
 		.destroy_list    = &pool->active_cmd->destroy_list,
+		.const_bump      = &pool->active_cmd->const_bump,
+		.storage_bump    = &pool->active_cmd->storage_bump,
 	};
 }
 
@@ -483,4 +508,27 @@ void skr_future_wait(const skr_future_t* future) {
 
 	// Block until fence signals
 	vkWaitForFences(_skr_vk.device, 1, &slot->fence, VK_TRUE, UINT64_MAX);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Command Batching API - for grouping multiple GPU operations
+///////////////////////////////////////////////////////////////////////////////
+
+void skr_cmd_begin() {
+	_skr_cmd_acquire();
+}
+
+skr_future_t skr_cmd_end() {
+	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
+	assert(pool && pool->ref_count > 0 && "Unbalanced skr_cmd_begin/end");
+
+	// Capture future before potentially clearing active_cmd
+	skr_future_t future = {
+		.slot       = pool->active_cmd,
+		.generation = pool->active_cmd->generation,
+	};
+
+	_skr_cmd_release(pool->active_cmd->cmd);
+
+	return future;
 }

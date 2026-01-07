@@ -1,6 +1,8 @@
 /build*
 /bin
 /android/debug.keystore
+.cache/
+.ferrc/
 .vscode
 .claude
 CLAUDE.md

@@ -168,8 +168,6 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 	_skr_free(ref_compute->binds);
 	_skr_free(ref_compute->param_buffer);
 
-	skr_buffer_destroy(&ref_compute->param_gpu_buffer);
-
 	*ref_compute = (skr_compute_t){};
 }
 
@@ -322,27 +320,32 @@ void skr_compute_get_param(const skr_compute_t* compute, const char* name, sksc_
 void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uint32_t z) {
 	if (!skr_compute_is_valid(ref_compute)) return;
 
-	// Upload parameter buffer if it exists and is dirty
-	if (ref_compute->param_buffer && ref_compute->param_dirty) {
-		if (!skr_buffer_is_valid(&ref_compute->param_gpu_buffer)) {
-			skr_buffer_create(ref_compute->param_buffer, 1, ref_compute->param_buffer_size, skr_buffer_type_constant, skr_use_dynamic, &ref_compute->param_gpu_buffer);
-		} else {
-			skr_buffer_set(&ref_compute->param_gpu_buffer, ref_compute->param_buffer, ref_compute->param_buffer_size);
-		}
-		ref_compute->param_dirty = false;
-	}
-
-	// Auto-bind $Global buffer if it exists
 	const sksc_shader_meta_t* meta = ref_compute->shader->meta;
-	if (meta->global_buffer_id >= 0 && skr_buffer_is_valid(&ref_compute->param_gpu_buffer)) {
-		ref_compute->binds[meta->global_buffer_id].buffer = &ref_compute->param_gpu_buffer;
-	}
 
+	// Acquire command buffer first so we have a valid future
 	_skr_cmd_ctx_t  ctx = _skr_cmd_acquire();
 	VkCommandBuffer cmd = ctx.cmd;
 	if (!cmd) {
 		skr_log(skr_log_warning, "skr_compute_execute failed to acquire command buffer");
 		return;
+	}
+
+	// Upload parameter buffer to bump allocator if it exists
+	if (ref_compute->param_buffer && meta->global_buffer_id >= 0) {
+		// Write to command buffer's bump allocator
+		skr_bump_result_t result = _skr_bump_alloc_write(ctx.const_bump, ref_compute->param_buffer, ref_compute->param_buffer_size);
+
+		if (!result.buffer) {
+			skr_log(skr_log_warning, "skr_compute_execute: bump allocator failed");
+			_skr_cmd_release(cmd);
+			return;
+		}
+
+		// Set up bind with offset
+		ref_compute->binds[meta->global_buffer_id].buffer        = result.buffer;
+		ref_compute->binds[meta->global_buffer_id].buffer_offset = result.offset;
+		ref_compute->binds[meta->global_buffer_id].buffer_range  = ref_compute->param_buffer_size;
+		ref_compute->param_dirty = false;
 	}
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ref_compute->pipeline);
@@ -379,10 +382,10 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 	vkCmdDispatch(cmd, x, y, z);
 
 	// Add memory barrier for storage resources to ensure writes are visible to next operation
-	// This now includes both compute→compute and compute→fragment transitions
+	// This includes compute→compute, compute→vertex, and compute→fragment transitions
 	vkCmdPipelineBarrier(cmd,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,  // Fixed: include fragment shader
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		0, 1, &(VkMemoryBarrier){
 			.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
 			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
@@ -395,24 +398,34 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indirect_args) {
 	if (!skr_compute_is_valid(ref_compute) || !indirect_args) return;
 
-	// Upload parameter buffer if it exists and is dirty
-	if (ref_compute->param_buffer && ref_compute->param_dirty) {
-		if (!skr_buffer_is_valid(&ref_compute->param_gpu_buffer)) {
-			skr_buffer_create(ref_compute->param_buffer, 1, ref_compute->param_buffer_size, skr_buffer_type_constant, skr_use_dynamic, &ref_compute->param_gpu_buffer);
-		} else {
-			skr_buffer_set(&ref_compute->param_gpu_buffer, ref_compute->param_buffer, ref_compute->param_buffer_size);
+	const sksc_shader_meta_t* meta = ref_compute->shader->meta;
+
+	// Acquire command buffer first so we have a valid future
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+	VkCommandBuffer cmd = ctx.cmd;
+	if (!cmd) {
+		skr_log(skr_log_warning, "skr_compute_execute_indirect failed to acquire command buffer");
+		return;
+	}
+
+	// Upload parameter buffer to bump allocator if it exists
+	if (ref_compute->param_buffer && meta->global_buffer_id >= 0) {
+		// Write to command buffer's bump allocator
+		skr_bump_result_t result = _skr_bump_alloc_write(ctx.const_bump, ref_compute->param_buffer, ref_compute->param_buffer_size);
+
+		if (!result.buffer) {
+			skr_log(skr_log_warning, "skr_compute_execute_indirect: bump allocator failed");
+			_skr_cmd_release(cmd);
+			return;
 		}
+
+		// Set up bind with offset
+		ref_compute->binds[meta->global_buffer_id].buffer        = result.buffer;
+		ref_compute->binds[meta->global_buffer_id].buffer_offset = result.offset;
+		ref_compute->binds[meta->global_buffer_id].buffer_range  = ref_compute->param_buffer_size;
 		ref_compute->param_dirty = false;
 	}
 
-	// Auto-bind $Global buffer if it exists
-	const sksc_shader_meta_t* meta = ref_compute->shader->meta;
-	if (meta->global_buffer_id >= 0 && skr_buffer_is_valid(&ref_compute->param_gpu_buffer)) {
-		ref_compute->binds[meta->global_buffer_id].buffer = &ref_compute->param_gpu_buffer;
-	}
-
-	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
-	VkCommandBuffer cmd = ctx.cmd;
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ref_compute->pipeline);
 
 	VkWriteDescriptorSet   writes      [32];

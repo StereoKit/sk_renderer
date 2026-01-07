@@ -226,9 +226,6 @@ static void _scene_video_destroy(scene_t* base) {
 		thrd_join(w->thread, NULL);
 	}
 
-	// Wait for GPU to finish using video textures
-	vkDeviceWaitIdle(skr_get_vk_device());
-
 	// Now safe to destroy video (worker has exited, GPU is idle)
 	if (w->video) {
 		video_destroy(w->video);
