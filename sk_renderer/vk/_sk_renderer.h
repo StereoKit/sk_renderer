@@ -102,7 +102,9 @@ typedef struct skr_bump_alloc_t {
 	bool             main_valid;
 
 	// Overflow buffers (created mid-frame if main is exhausted)
-	skr_buffer_t*    overflow;
+	// Array of pointers to individually-allocated buffers, so that
+	// growing the pointer array doesn't invalidate previous results.
+	skr_buffer_t**   overflow;
 	uint32_t         overflow_count;
 	uint32_t         overflow_capacity;
 

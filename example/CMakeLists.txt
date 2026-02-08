@@ -156,6 +156,7 @@ target_sources(sk_renderer_test PRIVATE
 	scene_tex_compress.c
 	scene_stars.c
 	scene_yuv_test.c
+	scene_gi.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c
@@ -228,6 +229,15 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gpu_sort_scan.hlsl
 	assets/shaders/gpu_sort_downsweep.hlsl
 	assets/shaders/stars.hlsl
+	assets/shaders/pbr_shadow.hlsl
+	assets/shaders/pbr_gi.hlsl
+	assets/shaders/gi_accumulate.hlsl
+	assets/shaders/gi_capture.hlsl
+	assets/shaders/gi_clear.hlsl
+	assets/shaders/gi_debug.hlsl
+	assets/shaders/gi_propagate.hlsl
+	assets/shaders/gi_voxelize.hlsl
+	assets/shaders/gi_voxel_to_sh.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

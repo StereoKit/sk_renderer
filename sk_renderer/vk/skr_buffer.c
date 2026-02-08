@@ -325,9 +325,10 @@ void _skr_bump_alloc_destroy(skr_bump_alloc_t* ref_alloc) {
 		skr_buffer_destroy(&ref_alloc->main_buffer);
 	}
 
-	// Destroy all overflow buffers
+	// Destroy all overflow buffers (individually allocated)
 	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		skr_buffer_destroy(&ref_alloc->overflow[i]);
+		skr_buffer_destroy(ref_alloc->overflow[i]);
+		_skr_free(ref_alloc->overflow[i]);
 	}
 	_skr_free(ref_alloc->overflow);
 
@@ -359,7 +360,8 @@ void _skr_bump_alloc_reset(skr_bump_alloc_t* ref_alloc) {
 
 	// Destroy overflow buffers from previous frame (GPU is done with them now)
 	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		skr_buffer_destroy(&ref_alloc->overflow[i]);
+		skr_buffer_destroy(ref_alloc->overflow[i]);
+		_skr_free(ref_alloc->overflow[i]);
 	}
 	ref_alloc->overflow_count = 0;
 
@@ -392,10 +394,11 @@ skr_bump_result_t _skr_bump_alloc_write(skr_bump_alloc_t* ref_alloc, const void*
 	}
 
 	// Main buffer is full or doesn't exist - create overflow buffer
-	// Grow overflow array if needed
+	// Grow pointer array if needed (only the pointer array can realloc,
+	// individual buffers are stable so previous results stay valid)
 	if (ref_alloc->overflow_count >= ref_alloc->overflow_capacity) {
 		uint32_t new_cap = ref_alloc->overflow_capacity == 0 ? 4 : ref_alloc->overflow_capacity * 2;
-		skr_buffer_t* new_overflow = _skr_realloc(ref_alloc->overflow, new_cap * sizeof(skr_buffer_t));
+		skr_buffer_t** new_overflow = _skr_realloc(ref_alloc->overflow, new_cap * sizeof(skr_buffer_t*));
 		if (!new_overflow) {
 			skr_log(skr_log_critical, "Failed to grow bump allocator overflow array");
 			return result;
@@ -404,17 +407,22 @@ skr_bump_result_t _skr_bump_alloc_write(skr_bump_alloc_t* ref_alloc, const void*
 		ref_alloc->overflow_capacity = new_cap;
 	}
 
-	// Create overflow buffer for this allocation
-	skr_buffer_t* overflow = &ref_alloc->overflow[ref_alloc->overflow_count];
+	// Allocate individual overflow buffer (stable address, never moved by realloc)
+	skr_buffer_t* overflow = _skr_malloc(sizeof(skr_buffer_t));
+	if (!overflow) {
+		skr_log(skr_log_critical, "Failed to allocate bump overflow buffer");
+		return result;
+	}
 	*overflow = (skr_buffer_t){0};
 
 	skr_buffer_create(data, size, 1, ref_alloc->buffer_type, skr_use_dynamic, overflow);
+	ref_alloc->overflow[ref_alloc->overflow_count] = overflow;
 	ref_alloc->overflow_count++;
 
 	// Track total usage in high-water mark (main + all overflow buffers)
 	uint32_t overflow_total = 0;
 	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		overflow_total += ref_alloc->overflow[i].size;
+		overflow_total += ref_alloc->overflow[i]->size;
 	}
 	uint32_t total_used = ref_alloc->main_used + overflow_total;
 	if (total_used > ref_alloc->high_water_mark) {

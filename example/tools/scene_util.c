@@ -806,6 +806,7 @@ typedef struct {
 	skr_vec4_t base_color_factor;
 	skr_vec3_t emissive_factor;
 	skr_vec4_t tex_trans;  // Texture transform: {offset.x, offset.y, scale.x, scale.y}
+	bool       double_sided;
 } _su_gltf_material_data_t;
 
 struct su_gltf_t {
@@ -881,10 +882,10 @@ static void _su_gltf_extract_node(
 	if (node->mesh && gltf->mesh_count < SU_GLTF_MAX_MESHES) {
 		cgltf_mesh* mesh = node->mesh;
 
-		// Process first primitive only (for simplicity)
-		if (mesh->primitives_count > 0) {
-			cgltf_primitive* prim = &mesh->primitives[0];
-			if (prim->type != cgltf_primitive_type_triangles) goto recurse;
+		for (int32_t p = 0; p < (int32_t)mesh->primitives_count; p++) {
+			if (gltf->mesh_count >= SU_GLTF_MAX_MESHES) break;
+			cgltf_primitive* prim = &mesh->primitives[p];
+			if (prim->type != cgltf_primitive_type_triangles) continue;
 
 			int32_t mesh_idx = gltf->mesh_count;
 			gltf->transforms[mesh_idx] = world_transform;
@@ -897,6 +898,7 @@ static void _su_gltf_extract_node(
 			mat_data->base_color_factor = (skr_vec4_t){1.0f, 1.0f, 1.0f, 1.0f};
 			mat_data->emissive_factor   = (skr_vec3_t){0.0f, 0.0f, 0.0f};
 			mat_data->tex_trans         = (skr_vec4_t){0.0f, 0.0f, 1.0f, 1.0f};  // Default: no offset, scale 1
+			mat_data->double_sided      = false;
 
 			// Find accessors
 			cgltf_accessor* pos_accessor   = NULL;
@@ -1014,6 +1016,7 @@ static void _su_gltf_extract_node(
 				mat_data->roughness_factor  = pbr->roughness_factor;
 				mat_data->base_color_factor = (skr_vec4_t){pbr->base_color_factor[0], pbr->base_color_factor[1], pbr->base_color_factor[2], pbr->base_color_factor[3]};
 				mat_data->emissive_factor   = (skr_vec3_t){mat->emissive_factor[0], mat->emissive_factor[1], mat->emissive_factor[2]};
+				mat_data->double_sided      = mat->double_sided;
 
 				// Extract texture transform from base color texture (KHR_texture_transform)
 				if (pbr->base_color_texture.has_transform) {
@@ -1164,7 +1167,7 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 
 		skr_material_create((skr_material_info_t){
 			.shader     = gltf->shader,
-			.cull       = skr_cull_back,
+			.cull       = md->double_sided ? skr_cull_none : skr_cull_back,
 			.write_mask = skr_write_default,
 			.depth_test = skr_compare_less,
 		}, &gltf->materials[i]);
@@ -1291,14 +1294,19 @@ su_bounds_t su_gltf_get_bounds(su_gltf_t* gltf) {
 }
 
 void su_gltf_add_to_render_list(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform) {
+	su_gltf_add_to_render_list_override(gltf, list, opt_transform, NULL);
+}
+
+void su_gltf_add_to_render_list_override(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform, skr_material_t* opt_material) {
 	if (!gltf || gltf->state != su_gltf_state_ready) return;
 
 	for (int32_t i = 0; i < gltf->mesh_count; i++) {
-		float4x4 world = gltf->transforms[i];
+		float4x4        world = gltf->transforms[i];
+		skr_material_t* mat   = opt_material ? opt_material : &gltf->materials[i];
 		if (opt_transform) {
 			world = float4x4_mul(*opt_transform, world);
 		}
-		skr_render_list_add(list, &gltf->meshes[i], &gltf->materials[i], &world, sizeof(float4x4), 1);
+		skr_render_list_add(list, &gltf->meshes[i], mat, &world, sizeof(float4x4), 1);
 	}
 }
 

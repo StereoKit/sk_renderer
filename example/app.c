@@ -192,10 +192,13 @@ app_t* app_create(int32_t start_scene) {
 	app->scene_types[14] = &scene_tex_compress_vtable;
 	app->scene_types[15] = &scene_stars_vtable;
 	app->scene_types[16] = &scene_yuv_test_vtable;
-	app->scene_count = 17;
+	app->scene_types[17] = &scene_gi_vtable;
+	app->scene_count = 18;
 #ifdef SKR_HAS_VIDEO
 	app->scene_types[app->scene_count++] = &scene_video_vtable;
 #endif
+
+	start_scene = 17;
 
 	su_log(su_log_info, "Application created successfully!");
 	su_log(su_log_info, "Available scenes: %d (use arrow keys to switch)", app->scene_count);

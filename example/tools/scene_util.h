@@ -327,6 +327,11 @@ su_bounds_t su_gltf_get_bounds(su_gltf_t* gltf);
 // Does nothing if model is not ready yet
 void su_gltf_add_to_render_list(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform);
 
+// Add GLTF model meshes to a render list with a material override
+// opt_material: If non-NULL, all meshes use this material instead of their own
+// Useful for shadow caster passes where a cheap depth-only material is needed
+void su_gltf_add_to_render_list_override(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform, skr_material_t* opt_material);
+
 #ifdef __cplusplus
 }
 #endif
