@@ -69,7 +69,10 @@ typedef struct {
 	// GLTF model
 	su_gltf_t*     model;
 	char*          model_path;
-	skr_shader_t   shader;        // pbr_shadow shader
+	skr_shader_t   shader;            // pbr_gi shader (per-pixel GI)
+	skr_shader_t   shader_vertex_gi;  // pbr_gi_vertex shader (per-vertex GI)
+	skr_shader_t   shader_cubemap;    // pbr_cubemap shader (cubemap irradiance, no GI)
+	int32_t        gi_mode;           // 0=per-pixel, 1=per-vertex, 2=none (cubemap)
 	float          model_scale;
 
 	// Placeholder while loading
@@ -104,6 +107,8 @@ typedef struct {
 	// Floor
 	skr_mesh_t     floor_mesh;
 	skr_material_t floor_material;
+	skr_material_t floor_material_vtx;      // per-vertex GI variant
+	skr_material_t floor_material_cubemap;  // cubemap irradiance variant
 	skr_tex_t      floor_texture;
 
 	// GI probe system (single buffer, continuous temporal accumulation)
@@ -119,7 +124,6 @@ typedef struct {
 	skr_material_t     gi_capture_material;  // cull_none, backfaces black
 	skr_buffer_t       gi_const_buffer;      // GI constant buffer (b12)
 	int32_t            gi_frame;             // 0 to GI_CYCLE_LENGTH-1
-	bool               gi_enabled;
 	float              gi_intensity;
 	float              gi_sh_decay;          // SH EMA decay per frame (0.98 = ~50 frame window)
 	uint32_t           gi_total_frames;      // Monotonic frame counter for random seeds
@@ -287,8 +291,10 @@ static void _load_model(scene_gi_t* scene, const char* path) {
 	skr_material_info_t infos[] = {
 		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_none,                                 .depth_test = skr_compare_less },
+		{ .shader = &scene->shader_vertex_gi,  .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
+		{ .shader = &scene->shader_cubemap,    .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 	};
-	scene->model      = su_gltf_load_ex(path, infos, 2);
+	scene->model      = su_gltf_load_ex(path, infos, 4);
 	scene->model_path = strdup(path);
 
 	su_log(su_log_info, "GI: Loading model: %s", path);
@@ -332,8 +338,10 @@ static scene_t* _scene_gi_create(void) {
 	scene->placeholder_mesh = su_mesh_create_sphere(16, 12, 1.0f, gray);
 	skr_mesh_set_name(&scene->placeholder_mesh, "gi_placeholder_sphere");
 
-	// PBR+GI shader (extends pbr_shadow with GI probe sampling)
-	scene->shader = su_shader_load("shaders/pbr_gi.hlsl.sks", "pbr_gi");
+	// PBR shaders (per-pixel GI, per-vertex GI, cubemap-only)
+	scene->shader            = su_shader_load("shaders/pbr_gi.hlsl.sks",        "pbr_gi");
+	scene->shader_vertex_gi  = su_shader_load("shaders/pbr_gi_vertex.hlsl.sks", "pbr_gi_vertex");
+	scene->shader_cubemap    = su_shader_load("shaders/pbr_cubemap.hlsl.sks",   "pbr_cubemap");
 
 	// Placeholder material
 	skr_material_create((skr_material_info_t){
@@ -404,8 +412,31 @@ static scene_t* _scene_gi_create(void) {
 	skr_material_set_param(&scene->floor_material, "emission_factor",  sksc_shader_var_float, 4, &floor_emission);
 	skr_material_set_param(&scene->floor_material, "tex_trans",        sksc_shader_var_float, 4, &floor_tex_trans);
 
+	// Floor material (per-vertex GI variant)
+	skr_material_create((skr_material_info_t){
+		.shader     = &scene->shader_vertex_gi,
+		.write_mask = skr_write_default,
+		.depth_test = skr_compare_less,
+	}, &scene->floor_material_vtx);
+	skr_material_set_tex  (&scene->floor_material_vtx, "albedo_tex",      &scene->floor_texture);
+	skr_material_set_tex  (&scene->floor_material_vtx, "emission_tex",    &scene->black_texture);
+	skr_material_set_param(&scene->floor_material_vtx, "color",           sksc_shader_var_float, 4, &floor_color);
+	skr_material_set_param(&scene->floor_material_vtx, "emission_factor", sksc_shader_var_float, 4, &floor_emission);
+	skr_material_set_param(&scene->floor_material_vtx, "tex_trans",       sksc_shader_var_float, 4, &floor_tex_trans);
+
+	// Floor material (cubemap irradiance variant)
+	skr_material_create((skr_material_info_t){
+		.shader     = &scene->shader_cubemap,
+		.write_mask = skr_write_default,
+		.depth_test = skr_compare_less,
+	}, &scene->floor_material_cubemap);
+	skr_material_set_tex  (&scene->floor_material_cubemap, "albedo_tex",      &scene->floor_texture);
+	skr_material_set_tex  (&scene->floor_material_cubemap, "emission_tex",    &scene->black_texture);
+	skr_material_set_param(&scene->floor_material_cubemap, "color",           sksc_shader_var_float, 4, &floor_color);
+	skr_material_set_param(&scene->floor_material_cubemap, "emission_factor", sksc_shader_var_float, 4, &floor_emission);
+	skr_material_set_param(&scene->floor_material_cubemap, "tex_trans",       sksc_shader_var_float, 4, &floor_tex_trans);
+
 	// GI probe system
-	scene->gi_enabled    = true;
 	scene->gi_intensity  = 1.0f;
 	scene->gi_volume_min = (float3){-10.0f, -0.5f, -10.0f};
 	scene->gi_volume_max = (float3){ 10.0f, 10.0f,  10.0f};
@@ -483,8 +514,8 @@ static scene_t* _scene_gi_create(void) {
 	skr_buffer_set_name(&scene->gi_const_buffer, "gi_constants");
 
 	// GI debug visualization
-	scene->gi_show_probes  = true;
-	scene->show_floor      = true;
+	scene->gi_show_probes  = false;
+	scene->show_floor      = false;
 	scene->gi_debug_shader = su_shader_load("shaders/gi_debug.hlsl.sks", "gi_debug");
 	skr_material_create((skr_material_info_t){
 		.shader     = &scene->gi_debug_shader,
@@ -514,12 +545,14 @@ static scene_t* _scene_gi_create(void) {
 	skr_mesh_set_name(&scene->gi_slice_mesh, "gi_slice_cube");
 
 	// /home/koujaku/Art/Modeling/BounceRoom.glb
-	// Load default assets (shader 0 = PBR, shader 1 = GI capture)
+	// Load default assets (shader 0=per-pixel, 1=capture, 2=per-vertex, 3=cubemap)
 	skr_material_info_t model_infos[] = {
 		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_none,                                 .depth_test = skr_compare_less },
+		{ .shader = &scene->shader_vertex_gi,  .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
+		{ .shader = &scene->shader_cubemap,    .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 	};
-	scene->model      = su_gltf_load_ex("LightingRoom.glb", model_infos, 2);
+	scene->model      = su_gltf_load_ex("LightingRoom.glb", model_infos, 4);
 	scene->model_path = strdup("LightingRoom.glb");
 	scene->model_scale = 4;
 	_load_skybox(scene, "cubemap.jpg");
@@ -540,6 +573,8 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_tex_destroy     (&scene->white_texture);
 	skr_tex_destroy     (&scene->black_texture);
 	skr_shader_destroy  (&scene->shader);
+	skr_shader_destroy  (&scene->shader_vertex_gi);
+	skr_shader_destroy  (&scene->shader_cubemap);
 
 	// Skybox
 	_destroy_skybox(scene);
@@ -554,6 +589,8 @@ static void _scene_gi_destroy(scene_t* base) {
 	// Floor
 	skr_mesh_destroy    (&scene->floor_mesh);
 	skr_material_destroy(&scene->floor_material);
+	skr_material_destroy(&scene->floor_material_vtx);
+	skr_material_destroy(&scene->floor_material_cubemap);
 	skr_tex_destroy     (&scene->floor_texture);
 
 	// GI probes
@@ -607,11 +644,12 @@ static void _scene_gi_update(scene_t* base, float delta_time) {
 	const float max_distance       = 40.0f;
 
 	if (!io->WantCaptureMouse) {
-		if (io->MouseDown[0]) {
+		// Skip first-frame delta to avoid jump from previous touch position
+		if (io->MouseDown[0] && io->MouseDownDuration[0] > 0.0f) {
 			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
 			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
 		}
-		if (io->MouseDown[1]) {
+		if (io->MouseDown[1] && io->MouseDownDuration[1] > 0.0f) {
 			float cos_yaw = cosf(scene->cam_yaw);
 			float sin_yaw = sinf(scene->cam_yaw);
 			float3 right  = { cos_yaw, 0.0f, -sin_yaw };
@@ -815,7 +853,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 
 	// --- GI probe capture (continuous temporal accumulation) ---
 	// Voxel decay once at cycle start, SH decay handled per-frame by EMA.
-	if (scene->gi_enabled && (!scene->gi_stepping || scene->gi_step_next)) {
+	if (scene->gi_mode != 2 && (!scene->gi_stepping || scene->gi_step_next)) {
 		scene->gi_step_next = false;
 
 		if (scene->gi_frame == 0) {
@@ -943,7 +981,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
 		gi_buffer_data_t gi_data = {
 			.gi_volume_min = scene->gi_volume_min,
-			.gi_intensity  = scene->gi_enabled ? scene->gi_intensity : 0.0f,
+			.gi_intensity  = scene->gi_mode != 2 ? scene->gi_intensity : 0.0f,
 			.gi_volume_inv = {
 				1.0f / vol_size.x,
 				1.0f / vol_size.y,
@@ -956,6 +994,11 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		skr_renderer_set_global_texture(7, &scene->gi_sh_g);
 		skr_renderer_set_global_texture(8, &scene->gi_sh_b);
 		skr_renderer_set_global_texture(9, &scene->gi_voxel[1 - scene->gi_voxel_write]); // voxel read buffer
+	}
+
+	// Bind cubemap globally for cubemap irradiance shader (t5)
+	if (scene->cubemap_ready) {
+		skr_renderer_set_global_texture(5, &scene->cubemap_texture);
 	}
 
 	// --- Shadow pass ---
@@ -994,11 +1037,13 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		skr_render_list_add(ref_render_list, &scene->skybox_mesh, &scene->skybox_material, NULL, 0, 1);
 	}
 
-	// Floor
-	if (scene->show_floor)
-		skr_render_list_add(ref_render_list, &scene->floor_mesh, &scene->floor_material, &floor_instance, sizeof(float4x4), 1);
+	// Floor (select material based on GI mode)
+	if (scene->show_floor) {
+		skr_material_t *floor_mats[] = { &scene->floor_material, &scene->floor_material_vtx, &scene->floor_material_cubemap };
+		skr_render_list_add(ref_render_list, &scene->floor_mesh, floor_mats[scene->gi_mode], &floor_instance, sizeof(float4x4), 1);
+	}
 
-	// GLTF model
+	// GLTF model (shader set 0=per-pixel, 2=per-vertex, 3=cubemap)
 	if (state != su_gltf_state_ready) {
 		float4x4 world = float4x4_trs(
 			(float3){0.0f, 1.0f, 0.0f},
@@ -1007,7 +1052,8 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		);
 		skr_render_list_add(ref_render_list, &scene->placeholder_mesh, &scene->placeholder_material, &world, sizeof(float4x4), 1);
 	} else {
-		su_gltf_add_to_render_list(scene->model, ref_render_list, &model_transform);
+		int32_t shader_sets[] = { 0, 2, 3 };
+		su_gltf_add_to_render_list_shader(scene->model, ref_render_list, &model_transform, shader_sets[scene->gi_mode]);
 	}
 
 	// --- Slice visualization (shows active capture slab when stepping) ---
@@ -1178,43 +1224,48 @@ static void _scene_gi_render_ui(scene_t* base) {
 
 	// GI probes
 	igText("GI Probes");
-	igCheckbox("Enabled", &scene->gi_enabled);
-	igSliderFloat("Intensity", &scene->gi_intensity, 0.0f, 5.0f, "%.2f", 0);
-	igCheckbox("Show Probes", &scene->gi_show_probes);
 	{
-		const char* modes[] = { "SH Irradiance", "UVW Coords", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
-		igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
+		const char* gi_modes[] = { "Per-Pixel", "Per-Vertex", "None" };
+		igCombo_Str_arr("GI Mode", &scene->gi_mode, gi_modes, 3, 0);
 	}
-	igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
-	igSliderInt("Rays/Probe", &scene->gi_ray_count, 1, 32, "%d", 0);
-	igSliderFloat("Env Mip", &scene->gi_env_mip, 0.0f, 10.0f, "%.1f", 0);
-	igSliderFloat("Env Strength", &scene->gi_env_strength, 0.0f, 5.0f, "%.2f", 0);
+	if (scene->gi_mode != 2) {
+		igSliderFloat("Intensity", &scene->gi_intensity, 0.0f, 5.0f, "%.2f", 0);
+		igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
+		igSliderInt("Rays/Probe", &scene->gi_ray_count, 1, 32, "%d", 0);
+		igSliderFloat("Env Mip", &scene->gi_env_mip, 0.0f, 10.0f, "%.1f", 0);
+		igSliderFloat("Env Strength", &scene->gi_env_strength, 0.0f, 5.0f, "%.2f", 0);
+	}
 
-	// GI capture preview
-	if (scene->gi_enabled) {
-		const char *axis_names[] = {"X", "Y", "Z"};
-		// gi_frame points to the next frame to capture; show the last-captured
-		// frame so the label matches the preview image.
-		int32_t show_frame = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
-		int32_t axis  = show_frame / GI_GRID_SIZE;
-		int32_t layer = show_frame % GI_GRID_SIZE;
-		igText("Capture: %s layer %d", axis_names[axis], layer);
-
-		if (scene->gi_stepping) {
-			if (igButton("Next", (ImVec2){0, 0})) scene->gi_step_next = true;
-			igSameLine(0, 4);
-			if (igButton("Resume", (ImVec2){0, 0})) scene->gi_stepping = false;
-		} else {
-			if (igButton("Pause", (ImVec2){0, 0})) scene->gi_stepping = true;
+	if (igCollapsingHeader_TreeNodeFlags("Debug", 0)) {
+		igCheckbox("Show Probes", &scene->gi_show_probes);
+		{
+			const char* modes[] = { "SH Irradiance", "UVW Coords", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
+			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
 		}
 
-		ImVec2 avail;
-		igGetContentRegionAvail(&avail);
-		float  img_size = avail.x > 0 ? avail.x : 128;
-		igImage((ImTextureID)(uintptr_t)&scene->gi_capture_color,
-			(ImVec2){img_size, img_size},
-			(ImVec2){0, 0}, (ImVec2){1, 1},
-			(ImVec4){1, 1, 1, 1}, (ImVec4){0.5f, 0.5f, 0.5f, 0.5f});
+		if (scene->gi_mode != 2) {
+			const char *axis_names[] = {"X", "Y", "Z"};
+			int32_t show_frame = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
+			int32_t axis  = show_frame / GI_GRID_SIZE;
+			int32_t layer = show_frame % GI_GRID_SIZE;
+			igText("Capture: %s layer %d", axis_names[axis], layer);
+
+			if (scene->gi_stepping) {
+				if (igButton("Next", (ImVec2){0, 0})) scene->gi_step_next = true;
+				igSameLine(0, 4);
+				if (igButton("Resume", (ImVec2){0, 0})) scene->gi_stepping = false;
+			} else {
+				if (igButton("Pause", (ImVec2){0, 0})) scene->gi_stepping = true;
+			}
+
+			ImVec2 avail;
+			igGetContentRegionAvail(&avail);
+			float  img_size = avail.x > 0 ? avail.x : 128;
+			igImage((ImTextureID)(uintptr_t)&scene->gi_capture_color,
+				(ImVec2){img_size, img_size},
+				(ImVec2){0, 0}, (ImVec2){1, 1},
+				(ImVec4){1, 1, 1, 1}, (ImVec4){0.5f, 0.5f, 0.5f, 0.5f});
+		}
 	}
 
 	igSeparator();
