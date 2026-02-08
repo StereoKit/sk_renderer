@@ -145,6 +145,11 @@ typedef struct {
 	skr_mesh_t         gi_debug_mesh;
 	bool               gi_show_probes;
 	int32_t            gi_debug_mode;    // 0=SH, 1=UVW, 2=L0, 3=SH detail
+	bool               gi_stepping;     // Pause auto-advance, step manually
+	bool               gi_step_next;    // Advance one layer then pause
+	skr_shader_t       gi_slice_shader;
+	skr_material_t     gi_slice_material;
+	skr_mesh_t         gi_slice_mesh;
 	bool               show_floor;
 
 	// Camera state
@@ -300,9 +305,9 @@ static scene_t* _scene_gi_create(void) {
 	scene->base.size   = sizeof(scene_gi_t);
 	scene->model_scale = 1.0f;
 	scene->time        = 0.0f;
-	scene->light_angle     = 20.0f;
-	scene->light_elevation = 0.76f;
-	scene->light_color     = (float3){2, 2, 1.75f};
+	scene->light_angle     = 240.0f;
+	scene->light_elevation = 0.2f;
+	scene->light_color     = (float3){.83f, .49f, .38f};
 
 	// Camera defaults
 #ifdef __ANDROID__
@@ -490,6 +495,24 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_debug_mesh = su_mesh_create_sphere(8, 6, 1.0f, (skr_vec4_t){1, 1, 1, 1});
 	skr_mesh_set_name(&scene->gi_debug_mesh, "gi_debug_probe_sphere");
 
+	// Slice visualization cube (shows active capture slab when stepping)
+	scene->gi_slice_shader = su_shader_load("shaders/unlit.hlsl.sks", "gi_slice");
+	skr_material_create((skr_material_info_t){
+		.shader       = &scene->gi_slice_shader,
+		.cull         = skr_cull_none,
+		.write_mask   = skr_write_rgba,
+		.depth_test   = skr_compare_less,
+		.blend_state  = skr_blend_alpha,
+		.queue_offset = 100,
+	}, &scene->gi_slice_material);
+	skr_vec4_t slice_colors[6] = {
+		{0, 1, 1, 0.15f}, {0, 1, 1, 0.15f}, // cyan
+		{0, 1, 1, 0.15f}, {0, 1, 1, 0.15f},
+		{0, 1, 1, 0.15f}, {0, 1, 1, 0.15f},
+	};
+	scene->gi_slice_mesh = su_mesh_create_cube(1.0f, slice_colors);
+	skr_mesh_set_name(&scene->gi_slice_mesh, "gi_slice_cube");
+
 	// /home/koujaku/Art/Modeling/BounceRoom.glb
 	// Load default assets (shader 0 = PBR, shader 1 = GI capture)
 	skr_material_info_t model_infos[] = {
@@ -556,6 +579,9 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_mesh_destroy    (&scene->gi_debug_mesh);
 	skr_material_destroy(&scene->gi_debug_material);
 	skr_shader_destroy  (&scene->gi_debug_shader);
+	skr_mesh_destroy    (&scene->gi_slice_mesh);
+	skr_material_destroy(&scene->gi_slice_material);
+	skr_shader_destroy  (&scene->gi_slice_shader);
 
 	free(scene);
 }
@@ -662,9 +688,8 @@ static void _scene_gi_update(scene_t* base, float delta_time) {
 
 // Build an orthographic view/proj for capturing one axis-aligned direction.
 // axis: 0=X, 1=Y, 2=Z. dir_sign: +1 or -1.
-// layer_pos: world-space position along the capture axis for this layer.
-// Camera is placed AT the layer position, looking outward along dir_sign.
-// Near clips right at the layer; objects behind the layer are behind the camera.
+// layer_pos: world-space position at the cell EDGE along the capture axis.
+// Camera looks through the full cell depth (near=0, far=cell_size).
 static void _gi_build_capture_camera(
 	float3 vol_min, float3 vol_max,
 	int32_t axis, float dir_sign, float layer_pos,
@@ -705,14 +730,13 @@ static void _gi_build_capture_camera(
 		half_b = (vol_max.y - vol_min.y) * 0.5f;
 	}
 
-	// Far plane clips to half a cell — camera is at cell center, so half a cell
-	// reaches the cell edge. The +dir and -dir captures together cover the full
-	// cell without bleeding into neighboring cells.
+	// Camera is at cell edge, far plane covers full cell depth.
+	// Both +dir and -dir see the entire cell from opposite edges.
 	float cell_size;
 	if      (axis == 0) cell_size = (vol_max.x - vol_min.x) / GI_GRID_SIZE;
 	else if (axis == 1) cell_size = (vol_max.y - vol_min.y) / GI_GRID_SIZE;
 	else                cell_size = (vol_max.z - vol_min.z) / GI_GRID_SIZE;
-	float far_dist = cell_size * 0.5f;
+	float far_dist = cell_size;
 
 	*out_proj     = float4x4_orthographic(-half_a, half_a, -half_b, half_b, GI_CAM_NEAR, far_dist);
 	*out_viewproj = float4x4_mul(*out_proj, *out_view);
@@ -791,7 +815,9 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 
 	// --- GI probe capture (continuous temporal accumulation) ---
 	// Voxel decay once at cycle start, SH decay handled per-frame by EMA.
-	if (scene->gi_enabled) {
+	if (scene->gi_enabled && (!scene->gi_stepping || scene->gi_step_next)) {
+		scene->gi_step_next = false;
+
 		if (scene->gi_frame == 0) {
 			// Clear voxel texture at cycle start
 			skr_compute_set_tex  (&scene->gi_decay_compute, "voxel", &scene->gi_voxel[scene->gi_voxel_write]);
@@ -803,12 +829,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		int32_t axis  = scene->gi_frame / GI_GRID_SIZE;  // 0=X, 1=Y, 2=Z
 		int32_t layer = scene->gi_frame % GI_GRID_SIZE;
 
-		// Compute layer world position (cell-centered: texel i at (i+0.5)/N)
 		float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
-		float  layer_pos;
-		if      (axis == 0) { layer_pos = scene->gi_volume_min.x + (layer + 0.5f) * vol_size.x / GI_GRID_SIZE; }
-		else if (axis == 1) { layer_pos = scene->gi_volume_min.y + (layer + 0.5f) * vol_size.y / GI_GRID_SIZE; }
-		else                { layer_pos = scene->gi_volume_min.z + (layer + 0.5f) * vol_size.z / GI_GRID_SIZE; }
 
 		// During captures: set gi_intensity=0 so pbr_gi shader doesn't sample GI (no feedback)
 		gi_buffer_data_t gi_capture_data = {
@@ -829,9 +850,18 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		skr_renderer_set_global_texture(8, &scene->gi_sh_b);
 
 		// Capture +direction and -direction
+		// Camera at cell EDGE looking through the full cell depth.
+		// +dir: camera at near edge (layer * cell_size), looking forward
+		// -dir: camera at far edge ((layer+1) * cell_size), looking back
 		float dir_signs[2] = { 1.0f, -1.0f };
 		for (int32_t d = 0; d < 2; d++) {
 			float    dir_sign = dir_signs[d];
+			float    edge_offset = (dir_sign > 0) ? (float)layer : (float)(layer + 1);
+			float    layer_pos;
+			if      (axis == 0) { layer_pos = scene->gi_volume_min.x + edge_offset * vol_size.x / GI_GRID_SIZE; }
+			else if (axis == 1) { layer_pos = scene->gi_volume_min.y + edge_offset * vol_size.y / GI_GRID_SIZE; }
+			else                { layer_pos = scene->gi_volume_min.z + edge_offset * vol_size.z / GI_GRID_SIZE; }
+
 			float4x4 cap_view, cap_proj, cap_viewproj;
 			_gi_build_capture_camera(scene->gi_volume_min, scene->gi_volume_max,
 				axis, dir_sign, layer_pos, &cap_view, &cap_proj, &cap_viewproj);
@@ -980,6 +1010,39 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		su_gltf_add_to_render_list(scene->model, ref_render_list, &model_transform);
 	}
 
+	// --- Slice visualization (shows active capture slab when stepping) ---
+	if (scene->gi_stepping) {
+		float3 vol_size  = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
+		float3 cell_size = {
+			vol_size.x / GI_GRID_SIZE,
+			vol_size.y / GI_GRID_SIZE,
+			vol_size.z / GI_GRID_SIZE,
+		};
+		// gi_frame was already incremented after the capture, so use -1 to
+		// show the slab that matches the capture preview image.
+		int32_t prev_frame = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
+		int32_t axis  = prev_frame / GI_GRID_SIZE;
+		int32_t layer = prev_frame % GI_GRID_SIZE;
+
+		float3 center = {
+			scene->gi_volume_min.x + vol_size.x * 0.5f,
+			scene->gi_volume_min.y + vol_size.y * 0.5f,
+			scene->gi_volume_min.z + vol_size.z * 0.5f,
+		};
+		float3 scale = vol_size;
+
+		if      (axis == 0) { center.x = scene->gi_volume_min.x + (layer + 0.5f) * cell_size.x; scale.x = cell_size.x; }
+		else if (axis == 1) { center.y = scene->gi_volume_min.y + (layer + 0.5f) * cell_size.y; scale.y = cell_size.y; }
+		else                { center.z = scene->gi_volume_min.z + (layer + 0.5f) * cell_size.z; scale.z = cell_size.z; }
+
+		float4x4 slice_world = float4x4_trs(
+			center,
+			float4_quat_from_euler((float3){0, 0, 0}),
+			scale
+		);
+		skr_render_list_add(ref_render_list, &scene->gi_slice_mesh, &scene->gi_slice_material, &slice_world, sizeof(float4x4), 1);
+	}
+
 	// --- Debug probe visualization ---
 	if (scene->gi_show_probes) {
 		uint32_t dm = (uint32_t)scene->gi_debug_mode;
@@ -992,37 +1055,23 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		};
 		float probe_radius = fminf(fminf(cell_size.x, cell_size.y), cell_size.z) * 0.07f;
 
-		// Batch probes in chunks to avoid huge stack allocations
-		#define PROBE_BATCH 1024
-		float4x4 probe_transforms[PROBE_BATCH];
-		int32_t  batch_count = 0;
+		int32_t total_probes = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
+		float4  probe_data[GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE];
+		int32_t i = 0;
 
 		for (int32_t z = 0; z < GI_GRID_SIZE; z++) {
 			for (int32_t y = 0; y < GI_GRID_SIZE; y++) {
 				for (int32_t x = 0; x < GI_GRID_SIZE; x++) {
-					float3 pos = {
+					probe_data[i++] = (float4){
 						scene->gi_volume_min.x + (x + 0.5f) * cell_size.x,
 						scene->gi_volume_min.y + (y + 0.5f) * cell_size.y,
 						scene->gi_volume_min.z + (z + 0.5f) * cell_size.z,
+						probe_radius,
 					};
-					probe_transforms[batch_count] = float4x4_trs(
-						pos,
-						(float4){0, 0, 0, 1},
-						(float3){probe_radius, probe_radius, probe_radius}
-					);
-					batch_count++;
-
-					if (batch_count == PROBE_BATCH) {
-						skr_render_list_add(ref_render_list, &scene->gi_debug_mesh, &scene->gi_debug_material, probe_transforms, sizeof(float4x4), batch_count);
-						batch_count = 0;
-					}
 				}
 			}
 		}
-		if (batch_count > 0) {
-			skr_render_list_add(ref_render_list, &scene->gi_debug_mesh, &scene->gi_debug_material, probe_transforms, sizeof(float4x4), batch_count);
-		}
-		#undef PROBE_BATCH
+		skr_render_list_add(ref_render_list, &scene->gi_debug_mesh, &scene->gi_debug_material, probe_data, sizeof(float4), total_probes);
 	}
 }
 
@@ -1080,12 +1129,6 @@ static void _scene_gi_render_ui(scene_t* base) {
 	scene_gi_t* scene = (scene_gi_t*)base;
 
 	// Model info
-	su_gltf_state_ state = su_gltf_get_state(scene->model);
-	const char* state_str = state == su_gltf_state_ready   ? "Ready" :
-	                        state == su_gltf_state_loading ? "Loading..." : "Failed";
-
-	igText("Model: %s", _get_filename(scene->model_path));
-	igText("Status: %s", state_str);
 	igSliderFloat("Scale", &scene->model_scale, 0.1f, 5.0f, "%.2f", 0);
 	igCheckbox("Show Floor", &scene->show_floor);
 
@@ -1137,14 +1180,11 @@ static void _scene_gi_render_ui(scene_t* base) {
 	igText("GI Probes");
 	igCheckbox("Enabled", &scene->gi_enabled);
 	igSliderFloat("Intensity", &scene->gi_intensity, 0.0f, 5.0f, "%.2f", 0);
-	igText("Cycle: %d/%d", scene->gi_frame, GI_CYCLE_LENGTH);
 	igCheckbox("Show Probes", &scene->gi_show_probes);
 	{
 		const char* modes[] = { "SH Irradiance", "UVW Coords", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
 		igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
 	}
-	igDragFloat3("Vol Min", &scene->gi_volume_min.x, 0.5f, -50.0f, 50.0f, "%.1f", 0);
-	igDragFloat3("Vol Max", &scene->gi_volume_max.x, 0.5f, -50.0f, 50.0f, "%.1f", 0);
 	igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
 	igSliderInt("Rays/Probe", &scene->gi_ray_count, 1, 32, "%d", 0);
 	igSliderFloat("Env Mip", &scene->gi_env_mip, 0.0f, 10.0f, "%.1f", 0);
@@ -1153,9 +1193,20 @@ static void _scene_gi_render_ui(scene_t* base) {
 	// GI capture preview
 	if (scene->gi_enabled) {
 		const char *axis_names[] = {"X", "Y", "Z"};
-		int32_t axis  = scene->gi_frame / GI_GRID_SIZE;
-		int32_t layer = scene->gi_frame % GI_GRID_SIZE;
+		// gi_frame points to the next frame to capture; show the last-captured
+		// frame so the label matches the preview image.
+		int32_t show_frame = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
+		int32_t axis  = show_frame / GI_GRID_SIZE;
+		int32_t layer = show_frame % GI_GRID_SIZE;
 		igText("Capture: %s layer %d", axis_names[axis], layer);
+
+		if (scene->gi_stepping) {
+			if (igButton("Next", (ImVec2){0, 0})) scene->gi_step_next = true;
+			igSameLine(0, 4);
+			if (igButton("Resume", (ImVec2){0, 0})) scene->gi_stepping = false;
+		} else {
+			if (igButton("Pause", (ImVec2){0, 0})) scene->gi_stepping = true;
+		}
 
 		ImVec2 avail;
 		igGetContentRegionAvail(&avail);

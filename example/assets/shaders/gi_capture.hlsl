@@ -95,7 +95,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 
 float4 ps(psIn input, bool is_front : SV_IsFrontFace) : SV_TARGET {
 	// Backfaces: render black (contributes opacity to voxels without radiance)
-	if (!is_front) return float4(0, 0, 0, 1);
+	//if (!is_front) return float4(0, 0, 0, 0);
 
 	// Albedo
 	float4 albedo = albedo_tex.Sample(albedo_tex_s, input.uv) * input.color;

@@ -15,7 +15,7 @@ uint debug_mode;
 ///////////////////////////////////////////
 
 struct Inst {
-	float4x4 world;
+	float4 pos_scale; // xyz=position, w=uniform scale
 };
 StructuredBuffer<Inst> inst : register(t2, space0);
 
@@ -74,9 +74,11 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	uint view_idx = id % view_count;
 	uint inst_idx = id / view_count;
 
-	output.world_pos = mul(float4(input.pos, 1), inst[inst_idx].world).xyz;
+	float  scale = inst[inst_idx].pos_scale.w;
+	float3 center = inst[inst_idx].pos_scale.xyz;
+	output.world_pos = input.pos * scale + center;
 	output.pos       = mul(float4(output.world_pos, 1), viewproj[view_idx]);
-	output.normal    = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
+	output.normal    = input.norm; // uniform scale, normal unchanged
 	output.layer     = view_idx;
 	return output;
 }
