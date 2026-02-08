@@ -279,7 +279,11 @@ static void _load_model(scene_gi_t* scene, const char* path) {
 	}
 	free(scene->model_path);
 
-	scene->model      = su_gltf_load(path, &scene->shader);
+	skr_material_info_t infos[] = {
+		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
+		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_none,                                 .depth_test = skr_compare_less },
+	};
+	scene->model      = su_gltf_load_ex(path, infos, 2);
 	scene->model_path = strdup(path);
 
 	su_log(su_log_info, "GI: Loading model: %s", path);
@@ -298,7 +302,7 @@ static scene_t* _scene_gi_create(void) {
 	scene->time        = 0.0f;
 	scene->light_angle     = 20.0f;
 	scene->light_elevation = 0.76f;
-	scene->light_color     = (float3){4, 4, 3.5f};
+	scene->light_color     = (float3){2, 2, 1.75f};
 
 	// Camera defaults
 #ifdef __ANDROID__
@@ -333,20 +337,14 @@ static scene_t* _scene_gi_create(void) {
 		.write_mask = skr_write_default,
 		.depth_test = skr_compare_less,
 	}, &scene->placeholder_material);
-	skr_material_set_tex  (&scene->placeholder_material, "albedo_tex",    &scene->white_texture);
-	skr_material_set_tex  (&scene->placeholder_material, "emission_tex",  &scene->black_texture);
-	skr_material_set_tex  (&scene->placeholder_material, "metal_tex",     &scene->white_texture);
-	skr_material_set_tex  (&scene->placeholder_material, "occlusion_tex", &scene->white_texture);
+	skr_material_set_tex  (&scene->placeholder_material, "albedo_tex",   &scene->white_texture);
+	skr_material_set_tex  (&scene->placeholder_material, "emission_tex", &scene->black_texture);
 	skr_vec4_t mat_color = {0.5f, 0.5f, 0.5f, 1.0f};
-	skr_material_set_param(&scene->placeholder_material, "color", sksc_shader_var_float, 4, &mat_color);
+	skr_material_set_param(&scene->placeholder_material, "color",            sksc_shader_var_float, 4, &mat_color);
 	skr_vec4_t emission = {0.0f, 0.0f, 0.0f, 1.0f};
-	skr_material_set_param(&scene->placeholder_material, "emission_factor", sksc_shader_var_float, 4, &emission);
+	skr_material_set_param(&scene->placeholder_material, "emission_factor",  sksc_shader_var_float, 4, &emission);
 	skr_vec4_t tex_trans = {0.0f, 0.0f, 1.0f, 1.0f};
-	skr_material_set_param(&scene->placeholder_material, "tex_trans", sksc_shader_var_float, 4, &tex_trans);
-	float mat_metallic  = 0.0f;
-	float mat_roughness = 0.8f;
-	skr_material_set_param(&scene->placeholder_material, "metallic",  sksc_shader_var_float, 1, &mat_metallic);
-	skr_material_set_param(&scene->placeholder_material, "roughness", sksc_shader_var_float, 1, &mat_roughness);
+	skr_material_set_param(&scene->placeholder_material, "tex_trans",        sksc_shader_var_float, 4, &tex_trans);
 
 	// Shadow map
 	skr_tex_create(
@@ -392,20 +390,14 @@ static scene_t* _scene_gi_create(void) {
 	}, &scene->floor_material);
 	scene->floor_texture = su_tex_create_checkerboard(512, 32, 0xFFFFFFFF, 0xFF888888, true);
 	skr_tex_set_name(&scene->floor_texture, "gi_floor_checker");
-	skr_material_set_tex  (&scene->floor_material, "albedo_tex",    &scene->floor_texture);
-	skr_material_set_tex  (&scene->floor_material, "emission_tex",  &scene->black_texture);
-	skr_material_set_tex  (&scene->floor_material, "metal_tex",     &scene->white_texture);
-	skr_material_set_tex  (&scene->floor_material, "occlusion_tex", &scene->white_texture);
-	skr_vec4_t floor_color    = {1.0f, 1.0f, 1.0f, 1.0f};
-	skr_vec4_t floor_emission = {0.0f, 0.0f, 0.0f, 0.0f};
+	skr_material_set_tex  (&scene->floor_material, "albedo_tex",   &scene->floor_texture);
+	skr_material_set_tex  (&scene->floor_material, "emission_tex", &scene->black_texture);
+	skr_vec4_t floor_color     = {1.0f, 1.0f, 1.0f, 1.0f};
+	skr_vec4_t floor_emission  = {0.0f, 0.0f, 0.0f, 0.0f};
 	skr_vec4_t floor_tex_trans = {0.0f, 0.0f, 1.0f, 1.0f};
-	float      floor_metallic  = 0.0f;
-	float      floor_roughness = 0.9f;
-	skr_material_set_param(&scene->floor_material, "color",           sksc_shader_var_float, 4, &floor_color);
-	skr_material_set_param(&scene->floor_material, "emission_factor", sksc_shader_var_float, 4, &floor_emission);
-	skr_material_set_param(&scene->floor_material, "tex_trans",       sksc_shader_var_float, 4, &floor_tex_trans);
-	skr_material_set_param(&scene->floor_material, "metallic",        sksc_shader_var_float, 1, &floor_metallic);
-	skr_material_set_param(&scene->floor_material, "roughness",       sksc_shader_var_float, 1, &floor_roughness);
+	skr_material_set_param(&scene->floor_material, "color",            sksc_shader_var_float, 4, &floor_color);
+	skr_material_set_param(&scene->floor_material, "emission_factor",  sksc_shader_var_float, 4, &floor_emission);
+	skr_material_set_param(&scene->floor_material, "tex_trans",        sksc_shader_var_float, 4, &floor_tex_trans);
 
 	// GI probe system
 	scene->gi_enabled    = true;
@@ -478,6 +470,7 @@ static scene_t* _scene_gi_create(void) {
 		.depth_test = skr_compare_less,
 		.cull       = skr_cull_none,
 	}, &scene->gi_capture_material);
+	skr_material_set_tex(&scene->gi_capture_material, "albedo_tex", &scene->floor_texture);
 
 	// GI constant buffer
 	gi_buffer_data_t gi_data = {0};
@@ -498,8 +491,12 @@ static scene_t* _scene_gi_create(void) {
 	skr_mesh_set_name(&scene->gi_debug_mesh, "gi_debug_probe_sphere");
 
 	// /home/koujaku/Art/Modeling/BounceRoom.glb
-	// Load default assets
-	scene->model      = su_gltf_load("LightingRoom.glb", &scene->shader);
+	// Load default assets (shader 0 = PBR, shader 1 = GI capture)
+	skr_material_info_t model_infos[] = {
+		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
+		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_none,                                 .depth_test = skr_compare_less },
+	};
+	scene->model      = su_gltf_load_ex("LightingRoom.glb", model_infos, 2);
 	scene->model_path = strdup("LightingRoom.glb");
 	scene->model_scale = 4;
 	_load_skybox(scene, "cubemap.jpg");
@@ -864,12 +861,13 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE});
 			skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_GRID_SIZE, GI_GRID_SIZE});
 
-			// Add floor and model to capture list with simplified capture material
-			// (cull_none so backfaces are captured, backfaces render as black)
+			// Add floor and model to capture list
+			// Floor uses standalone capture material; model uses shader set 1
+			// (capture shader with cull_none, backfaces render as black)
 			if (scene->show_floor)
 				skr_render_list_add(&scene->gi_capture_list, &scene->floor_mesh, &scene->gi_capture_material, &floor_instance, sizeof(float4x4), 1);
 			if (state == su_gltf_state_ready) {
-				su_gltf_add_to_render_list_override(scene->model, &scene->gi_capture_list, &model_transform, &scene->gi_capture_material);
+				su_gltf_add_to_render_list_shader(scene->model, &scene->gi_capture_list, &model_transform, 1);
 			}
 
 			skr_renderer_draw    (&scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), 1);
@@ -1148,7 +1146,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 	igDragFloat3("Vol Min", &scene->gi_volume_min.x, 0.5f, -50.0f, 50.0f, "%.1f", 0);
 	igDragFloat3("Vol Max", &scene->gi_volume_max.x, 0.5f, -50.0f, 50.0f, "%.1f", 0);
 	igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
-	igSliderInt("Rays/Probe", &scene->gi_ray_count, 1, 8, "%d", 0);
+	igSliderInt("Rays/Probe", &scene->gi_ray_count, 1, 32, "%d", 0);
 	igSliderFloat("Env Mip", &scene->gi_env_mip, 0.0f, 10.0f, "%.1f", 0);
 	igSliderFloat("Env Strength", &scene->gi_env_strength, 0.0f, 5.0f, "%.2f", 0);
 

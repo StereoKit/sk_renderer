@@ -116,7 +116,7 @@ float4 ps(psIn input, bool is_front : SV_IsFrontFace) : SV_TARGET {
 
 	// Simple diffuse: NdotL * shadow * light_color
 	float diffuse = saturate(ndotl) * shadow;
-	float3 lit = albedo.rgb * light_color * diffuse * 0.5;
+	float3 lit = albedo.rgb * light_color * diffuse;
 
 	return float4(lit, albedo.a);
 }

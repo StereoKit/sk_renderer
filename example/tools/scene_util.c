@@ -785,8 +785,9 @@ void su_shutdown(void) {
 // GLTF Loading
 ///////////////////////////////////////////////////////////////////////////////
 
-#define SU_GLTF_MAX_MESHES   64
-#define SU_GLTF_MAX_TEXTURES 32
+#define SU_GLTF_MAX_MESHES       64
+#define SU_GLTF_MAX_TEXTURES     32
+#define SU_GLTF_MAX_SHADER_SETS  4
 
 // Texture types for PBR materials
 typedef enum {
@@ -810,13 +811,14 @@ typedef struct {
 } _su_gltf_material_data_t;
 
 struct su_gltf_t {
-	su_gltf_state_  state;
-	char            filepath[256];
-	skr_shader_t*   shader;  // Borrowed reference
+	su_gltf_state_      state;
+	char                filepath[256];
+	skr_material_info_t shader_infos[SU_GLTF_MAX_SHADER_SETS];
+	int32_t             shader_count;
 
 	// GPU resources (created on loader thread)
 	skr_mesh_t      meshes   [SU_GLTF_MAX_MESHES];
-	skr_material_t  materials[SU_GLTF_MAX_MESHES];
+	skr_material_t  materials[SU_GLTF_MAX_SHADER_SETS][SU_GLTF_MAX_MESHES];
 	float4x4        transforms[SU_GLTF_MAX_MESHES];
 	su_bounds_t     mesh_bounds[SU_GLTF_MAX_MESHES];  // Per-mesh bounds (world space)
 	su_bounds_t     bounds;                           // Overall model bounds
@@ -1161,30 +1163,36 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 		if (mb->max.z > gltf->bounds.max.z) gltf->bounds.max.z = mb->max.z;
 	}
 
-	// Create materials with default textures
-	for (int32_t i = 0; i < gltf->mesh_count; i++) {
-		_su_gltf_material_data_t* md = &mat_data[i];
+	// Create materials for each shader set
+	for (int32_t s = 0; s < gltf->shader_count; s++) {
+		skr_material_info_t info = gltf->shader_infos[s];
 
-		skr_material_create((skr_material_info_t){
-			.shader     = gltf->shader,
-			.cull       = md->double_sided ? skr_cull_none : skr_cull_back,
-			.write_mask = skr_write_default,
-			.depth_test = skr_compare_less,
-		}, &gltf->materials[i]);
+		for (int32_t i = 0; i < gltf->mesh_count; i++) {
+			_su_gltf_material_data_t* md = &mat_data[i];
 
-		// Set default fallback textures
-		skr_material_set_tex(&gltf->materials[i], "albedo_tex",    &gltf->white_texture);
-		skr_material_set_tex(&gltf->materials[i], "emission_tex",  &gltf->black_texture);
-		skr_material_set_tex(&gltf->materials[i], "metal_tex",     &gltf->default_metal_texture);
-		skr_material_set_tex(&gltf->materials[i], "occlusion_tex", &gltf->white_texture);
+			// GLTF double_sided overrides cull_back → cull_none, but
+			// respects templates that already specify cull_none
+			skr_material_info_t mat_info = info;
+			if (md->double_sided && mat_info.cull == skr_cull_back)
+				mat_info.cull = skr_cull_none;
 
-		// Set material parameters
-		skr_material_set_param(&gltf->materials[i], "color",           sksc_shader_var_float, 4, &md->base_color_factor);
-		skr_vec4_t emission = {md->emissive_factor.x, md->emissive_factor.y, md->emissive_factor.z, 1.0f};
-		skr_material_set_param(&gltf->materials[i], "emission_factor", sksc_shader_var_float, 4, &emission);
-		skr_material_set_param(&gltf->materials[i], "tex_trans",       sksc_shader_var_float, 4, &md->tex_trans);
-		skr_material_set_param(&gltf->materials[i], "metallic",        sksc_shader_var_float, 1, &md->metallic_factor);
-		skr_material_set_param(&gltf->materials[i], "roughness",       sksc_shader_var_float, 1, &md->roughness_factor);
+			skr_material_create(mat_info, &gltf->materials[s][i]);
+
+			// Set default fallback textures (params that don't exist
+			// in the shader are silently ignored)
+			skr_material_set_tex(&gltf->materials[s][i], "albedo_tex",    &gltf->white_texture);
+			skr_material_set_tex(&gltf->materials[s][i], "emission_tex",  &gltf->black_texture);
+			skr_material_set_tex(&gltf->materials[s][i], "metal_tex",     &gltf->default_metal_texture);
+			skr_material_set_tex(&gltf->materials[s][i], "occlusion_tex", &gltf->white_texture);
+
+			// Set material parameters
+			skr_material_set_param(&gltf->materials[s][i], "color",           sksc_shader_var_float, 4, &md->base_color_factor);
+			skr_vec4_t emission = {md->emissive_factor.x, md->emissive_factor.y, md->emissive_factor.z, 1.0f};
+			skr_material_set_param(&gltf->materials[s][i], "emission_factor", sksc_shader_var_float, 4, &emission);
+			skr_material_set_param(&gltf->materials[s][i], "tex_trans",       sksc_shader_var_float, 4, &md->tex_trans);
+			skr_material_set_param(&gltf->materials[s][i], "metallic",        sksc_shader_var_float, 1, &md->metallic_factor);
+			skr_material_set_param(&gltf->materials[s][i], "roughness",       sksc_shader_var_float, 1, &md->roughness_factor);
+		}
 	}
 
 	// Meshes ready - can start rendering with default materials
@@ -1226,12 +1234,13 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 				}
 			}
 
-			// Bind texture to material if loaded
+			// Bind texture to all shader set materials
 			if (texture_loaded[tex_idx]) {
 				const char* bind_names[] = {"albedo_tex", "metal_tex", NULL, "occlusion_tex", "emission_tex"};
 				const char* bind_name    = bind_names[tex_type];
 				if (bind_name) {
-					skr_material_set_tex(&gltf->materials[m], bind_name, &gltf->textures[tex_idx]);
+					for (int32_t s = 0; s < gltf->shader_count; s++)
+						skr_material_set_tex(&gltf->materials[s][m], bind_name, &gltf->textures[tex_idx]);
 				}
 			}
 		}
@@ -1243,18 +1252,29 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 	su_log(su_log_info, "GLTF: Ready (%d meshes, %d textures)", gltf->mesh_count, gltf->texture_count);
 }
 
-su_gltf_t* su_gltf_load(const char* filename, skr_shader_t* shader) {
+su_gltf_t* su_gltf_load_ex(const char* filename, const skr_material_info_t* material_infos, int32_t material_info_count) {
 	su_gltf_t* gltf = calloc(1, sizeof(su_gltf_t));
 	if (!gltf) return NULL;
 
-	gltf->state  = su_gltf_state_loading;
-	gltf->shader = shader;
+	gltf->state        = su_gltf_state_loading;
+	gltf->shader_count = material_info_count < SU_GLTF_MAX_SHADER_SETS ? material_info_count : SU_GLTF_MAX_SHADER_SETS;
+	for (int32_t i = 0; i < gltf->shader_count; i++)
+		gltf->shader_infos[i] = material_infos[i];
 	snprintf(gltf->filepath, sizeof(gltf->filepath), "%s", filename);
 
-	// Enqueue for async loading
 	_su_loader_enqueue(_su_load_type_gltf, gltf);
 
 	return gltf;
+}
+
+su_gltf_t* su_gltf_load(const char* filename, skr_shader_t* shader) {
+	skr_material_info_t info = {
+		.shader     = shader,
+		.cull       = skr_cull_back,
+		.write_mask = skr_write_default,
+		.depth_test = skr_compare_less,
+	};
+	return su_gltf_load_ex(filename, &info, 1);
 }
 
 void su_gltf_destroy(su_gltf_t* gltf) {
@@ -1264,8 +1284,9 @@ void su_gltf_destroy(su_gltf_t* gltf) {
 	// For now, sk_renderer's deferred destruction handles in-flight resources
 
 	for (int32_t i = 0; i < gltf->mesh_count; i++) {
-		skr_mesh_destroy    (&gltf->meshes[i]);
-		skr_material_destroy(&gltf->materials[i]);
+		skr_mesh_destroy(&gltf->meshes[i]);
+		for (int32_t s = 0; s < gltf->shader_count; s++)
+			skr_material_destroy(&gltf->materials[s][i]);
 	}
 
 	for (int32_t i = 0; i < SU_GLTF_MAX_TEXTURES; i++) {
@@ -1294,7 +1315,20 @@ su_bounds_t su_gltf_get_bounds(su_gltf_t* gltf) {
 }
 
 void su_gltf_add_to_render_list(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform) {
-	su_gltf_add_to_render_list_override(gltf, list, opt_transform, NULL);
+	su_gltf_add_to_render_list_shader(gltf, list, opt_transform, 0);
+}
+
+void su_gltf_add_to_render_list_shader(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform, int32_t shader_index) {
+	if (!gltf || gltf->state != su_gltf_state_ready) return;
+	if (shader_index < 0 || shader_index >= gltf->shader_count) return;
+
+	for (int32_t i = 0; i < gltf->mesh_count; i++) {
+		float4x4 world = gltf->transforms[i];
+		if (opt_transform) {
+			world = float4x4_mul(*opt_transform, world);
+		}
+		skr_render_list_add(list, &gltf->meshes[i], &gltf->materials[shader_index][i], &world, sizeof(float4x4), 1);
+	}
 }
 
 void su_gltf_add_to_render_list_override(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform, skr_material_t* opt_material) {
@@ -1302,7 +1336,7 @@ void su_gltf_add_to_render_list_override(su_gltf_t* gltf, skr_render_list_t* lis
 
 	for (int32_t i = 0; i < gltf->mesh_count; i++) {
 		float4x4        world = gltf->transforms[i];
-		skr_material_t* mat   = opt_material ? opt_material : &gltf->materials[i];
+		skr_material_t* mat   = opt_material ? opt_material : &gltf->materials[0][i];
 		if (opt_transform) {
 			world = float4x4_mul(*opt_transform, world);
 		}

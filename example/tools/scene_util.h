@@ -307,8 +307,14 @@ typedef struct {
 	float3 max;
 } su_bounds_t;
 
-// Load a GLTF model asynchronously
-// Returns immediately with a valid handle that will be populated over time
+// Load a GLTF model asynchronously with multiple shader/material sets
+// Each material_info provides a shader and pipeline state template. For each
+// mesh, a material is created per template with GLTF textures and params
+// bound. GLTF double_sided overrides cull_back→cull_none but respects
+// templates that already specify cull_none.
+su_gltf_t* su_gltf_load_ex(const char* filename, const skr_material_info_t* material_infos, int32_t material_info_count);
+
+// Load a GLTF model asynchronously (single shader convenience wrapper)
 // filename: Path to .gltf or .glb file
 // shader: PBR shader to use for materials (caller retains ownership)
 su_gltf_t* su_gltf_load(const char* filename, skr_shader_t* shader);
@@ -322,10 +328,14 @@ su_gltf_state_ su_gltf_get_state(su_gltf_t* gltf);
 // Get the overall bounding box of the model (only valid when state is ready)
 su_bounds_t su_gltf_get_bounds(su_gltf_t* gltf);
 
-// Add GLTF model meshes to a render list for drawing
+// Add GLTF model meshes to a render list for drawing (uses shader set 0)
 // transform: Optional additional transform to apply (can be NULL for identity)
 // Does nothing if model is not ready yet
 void su_gltf_add_to_render_list(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform);
+
+// Add GLTF model meshes to a render list using a specific shader set
+// shader_index: Index into the material_infos array from su_gltf_load_ex
+void su_gltf_add_to_render_list_shader(su_gltf_t* gltf, skr_render_list_t* list, const float4x4* opt_transform, int32_t shader_index);
 
 // Add GLTF model meshes to a render list with a material override
 // opt_material: If non-NULL, all meshes use this material instead of their own

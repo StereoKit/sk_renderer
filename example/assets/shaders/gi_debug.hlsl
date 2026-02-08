@@ -104,6 +104,7 @@ float4 ps(psIn input) : SV_TARGET {
 	if (debug_mode == 4) {
 		float4 voxel = gi_voxel.SampleLevel(gi_voxel_s, voxel_uvw, 0);
 		float3 col = voxel.a > 0.01 ? voxel.rgb / voxel.a : float3(0, 0, 0);
+		if (voxel.a < 0.01) discard;
 		return float4(col, 1.0);
 	}
 
