@@ -53,5 +53,9 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	else if (axis == 1) texel = uint3(px, depth_idx, py);
 	else                texel = uint3(px, py, depth_idx);
 
-	voxel_tex[texel] += float4(color.rgb, 1.0);
+	// Face bit from view_index: captures from +X see -X faces (bit 1=2), etc.
+	const uint face_bits[6] = { 2, 1, 8, 4, 32, 16 };
+	uint face_bit = face_bits[view_index];
+
+	voxel_tex[texel] += float4(color.rgb, (float)face_bit);
 }

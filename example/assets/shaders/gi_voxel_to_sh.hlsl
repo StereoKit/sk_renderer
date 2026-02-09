@@ -6,14 +6,20 @@
 // environment cubemap at a low mip. Results project into SH via exponential
 // moving average. Hammersley-like sampling with per-probe Cranley-Patterson
 // rotation gives fast, uniform sphere coverage with minimal fireflies.
+//
+// Backface culling uses a 6-bit face mask packed in voxel alpha (set during
+// voxelization from capture direction). Bit encoding:
+//   bit 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
+// A ray is blocked only if the voxel has a face on the side the ray enters.
+// Rays from surface probes that would exit through local geometry are skipped.
 
-Texture3D<float4>   voxel_tex   : register(t0);
-SamplerState        voxel_tex_s : register(s0);
-TextureCube<float4> env_cubemap   : register(t1);
-SamplerState        env_cubemap_s : register(s1);
-RWTexture3D<float4> sh_r        : register(u0);
-RWTexture3D<float4> sh_g        : register(u1);
-RWTexture3D<float4> sh_b        : register(u2);
+Texture3D<float4>   voxel_tex    : register(t0);
+SamplerState        voxel_tex_s  : register(s0);
+TextureCube<float4> env_cubemap  : register(t1);
+SamplerState        env_cubemap_s: register(s1);
+RWTexture3D<float4> sh_r         : register(u0);
+RWTexture3D<float4> sh_g         : register(u1);
+RWTexture3D<float4> sh_b         : register(u2);
 
 uint  grid_size;
 uint  frame_seed;
@@ -46,6 +52,19 @@ float _radical_inverse(uint bits) {
 	return float(bits) * 2.3283064365386963e-10;
 }
 
+// Build a 6-bit mask of which voxel faces a ray would enter through,
+// based on ray direction. Computed once per ray, used for all steps.
+uint _ray_entry_mask(float3 dir) {
+	uint m = 0;
+	if (dir.x > 0) m |= 2u;  // ray going +X enters through -X face
+	if (dir.x < 0) m |= 1u;  // ray going -X enters through +X face
+	if (dir.y > 0) m |= 8u;  // ray going +Y enters through -Y face
+	if (dir.y < 0) m |= 4u;  // ray going -Y enters through +Y face
+	if (dir.z > 0) m |= 32u; // ray going +Z enters through -Z face
+	if (dir.z < 0) m |= 16u; // ray going -Z enters through +Z face
+	return m;
+}
+
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
 	if (id.x >= grid_size || id.y >= grid_size || id.z >= grid_size) return;
@@ -60,6 +79,9 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 	// Weight per ray: 4*pi*(1-decay)/ray_count for correct steady-state integral
 	float w = 12.56637 * (1.0 - sh_decay) / (float)ray_count;
+
+	// Load origin voxel face mask once per probe (for exit test)
+	uint origin_face_mask = uint(voxel_tex.Load(int4(id, 0)).a + 0.5);
 
 	float4 total_r = float4(0, 0, 0, 0);
 	float4 total_g = float4(0, 0, 0, 0);
@@ -77,6 +99,15 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		float phi = 6.28318530718 * u2;
 		float3 dir = float3(r * cos(phi), r * sin(phi), z);
 
+		// Precompute which faces this ray would enter through
+		uint entry_mask = _ray_entry_mask(dir);
+
+		// Skip rays that go behind local geometry: if the origin voxel has a
+		// face matching the ray's entry direction, the ray is heading into the
+		// solid side of the surface.
+		if (origin_face_mask != 0 && (origin_face_mask & entry_mask) != 0)
+			continue;
+
 		// Ray march through voxel volume: first hit wins
 		float3 radiance = float3(0, 0, 0);
 		bool   hit      = false;
@@ -88,11 +119,18 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			    pos.y < 0 || pos.y >= 1.0 ||
 			    pos.z < 0 || pos.z >= 1.0) break;
 
-			float4 voxel = voxel_tex.SampleLevel(voxel_tex_s, pos, 0);
-			if (voxel.a < 0.01) continue;
+			// Use Load() for integer-exact face mask from alpha
+			int3 texel_pos = clamp(int3(pos * (float)grid_size), int3(0,0,0),
+			                       int3(grid_size-1, grid_size-1, grid_size-1));
+			float4 voxel = voxel_tex.Load(int4(texel_pos, 0));
 
-			radiance = voxel.rgb / voxel.a;
-			hit      = true;
+			uint face_mask = uint(voxel.a + 0.5);
+			if (face_mask == 0) continue; // empty voxel
+			if ((face_mask & entry_mask) == 0) continue; // no face on ray's entry side
+
+			uint count = countbits(face_mask);
+			radiance   = voxel.rgb / (float)count;
+			hit        = true;
 			break;
 		}
 

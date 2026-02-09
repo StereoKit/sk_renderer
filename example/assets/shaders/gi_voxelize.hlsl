@@ -12,6 +12,7 @@ uint  layer_index; // 0-31
 uint  grid_size;   // 32
 uint  flip_x;      // flip pixel X before mapping to texel
 uint  flip_y;      // flip pixel Y before mapping to texel
+uint  face_bit;    // 6-bit face mask for this capture direction
 
 [numthreads(8, 8, 1)]
 void cs(uint3 id : SV_DispatchThreadID) {
@@ -31,5 +32,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 	// Accumulate radiance (rgb) and opacity (a).
 	// Each voxel receives 6 captures per cycle (2 per axis).
-	voxel_tex[texel] += float4(color.rgb, color.a > 0 ? 1.0 : 0.0);
+	voxel_tex[texel] += float4(color.rgb, color.a > 0 ? (float)face_bit : 0.0);
 }

@@ -34,7 +34,7 @@ static const float   SHADOW_MAP_FAR        = 50.0f;
 #define GI_GRID_SIZE       32
 #define GI_CYCLE_LENGTH    (GI_GRID_SIZE * 3) // 96 frames per full update
 #define GI_CAM_DISTANCE    50.0f
-#define GI_CAM_NEAR        0.0f
+#define GI_CAM_NEAR        0.000f
 
 ///////////////////////////////////////////
 // Shadow buffer (matches ShadowBuffer in pbr_shadow.hlsl / shadow_receiver.hlsl)
@@ -121,7 +121,7 @@ typedef struct {
 	skr_compute_t      gi_decay_compute;
 	skr_render_list_t  gi_capture_list;
 	skr_shader_t       gi_capture_shader;    // Simplified diffuse for captures
-	skr_material_t     gi_capture_material;  // cull_none, backfaces black
+	skr_material_t     gi_capture_material;
 	skr_buffer_t       gi_const_buffer;      // GI constant buffer (b12)
 	int32_t            gi_frame;             // 0 to GI_CYCLE_LENGTH-1
 	float              gi_intensity;
@@ -301,7 +301,7 @@ static void _load_model(scene_gi_t* scene, const char* path) {
 
 	skr_material_info_t infos[] = {
 		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
-		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_none,                                 .depth_test = skr_compare_less },
+		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_back,                                  .depth_test = skr_compare_less },
 		{ .shader = &scene->shader_vertex_gi,  .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 		{ .shader = &scene->shader_cubemap,    .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 	};
@@ -528,13 +528,13 @@ static scene_t* _scene_gi_create(void) {
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_b", &scene->gi_sh_b);
 	skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
-	// GI capture render list and simplified capture material (no backface culling)
+	// GI capture render list and simplified capture material
 	skr_render_list_create(&scene->gi_capture_list);
 	scene->gi_capture_shader = su_shader_load("shaders/gi_capture.hlsl.sks", "gi_capture");
 	skr_material_create((skr_material_info_t){
 		.shader     = &scene->gi_capture_shader,
 		.depth_test = skr_compare_less,
-		.cull       = skr_cull_none,
+		.cull       = skr_cull_back,
 	}, &scene->gi_capture_material);
 	skr_material_set_tex(&scene->gi_capture_material, "albedo_tex", &scene->floor_texture);
 
@@ -578,7 +578,7 @@ static scene_t* _scene_gi_create(void) {
 	// Load default assets (shader 0=per-pixel, 1=capture, 2=per-vertex, 3=cubemap)
 	skr_material_info_t model_infos[] = {
 		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
-		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_none,                                 .depth_test = skr_compare_less },
+		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_back,                                  .depth_test = skr_compare_less },
 		{ .shader = &scene->shader_vertex_gi,  .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 		{ .shader = &scene->shader_cubemap,    .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 	};
@@ -782,9 +782,9 @@ static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds
 		scene_max.z = fmaxf(scene_max.z,  10.0f);
 	}
 
-	// Pad by one voxel on each side: content fits in (N-2) voxels
+	// Pad by ~1.137 voxels on each side to offset grid from unit-aligned geometry
 	float3 tight_size = float3_sub(scene_max, scene_min);
-	float3 padding    = float3_mul_s(tight_size, 1.0f / (float)(GI_GRID_SIZE - 2));
+	float3 padding    = float3_mul_s(tight_size, 1.137f / (float)(GI_GRID_SIZE - 2.0f * 1.137f));
 	scene->gi_volume_min = float3_sub(scene_min, padding);
 	scene->gi_volume_max = float3_add(scene_max, padding);
 
@@ -1013,9 +1013,10 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	scene_gi_t* scene = (scene_gi_t*)base;
 
 	// Compute light direction from angle/elevation
+	float elevation = fmaxf(-0.999999f, fminf(0.999999f, scene->light_elevation));
 	float angle_rad  = scene->light_angle * (3.14159265f / 180.0f);
-	float horiz      = sqrtf(1.0f - scene->light_elevation * scene->light_elevation);
-	scene->light_dir = (float3){ horiz * cosf(angle_rad), -scene->light_elevation, horiz * sinf(angle_rad) };
+	float horiz      = sqrtf(1.0f - elevation * elevation);
+	scene->light_dir = (float3){ horiz * cosf(angle_rad), -elevation, horiz * sinf(angle_rad) };
 
 	// Environment cubemap setup
 	if (scene->cubemap_ready && ref_system_buffer) {
@@ -1191,11 +1192,19 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 				if      (axis == 0) { flip_x_val = (dir_sign > 0) ? 0 : 1; }
 				else if (axis == 1) { flip_x_val = (dir_sign > 0) ? 1 : 0; }
 				else                { flip_x_val = (dir_sign > 0) ? 1 : 0; }
+
+				// Face bit from capture direction: camera looking +axis sees surfaces facing -axis
+				uint32_t face_bit;
+				if      (axis == 0) face_bit = (dir_sign > 0) ? 2  : 1;
+				else if (axis == 1) face_bit = (dir_sign > 0) ? 8  : 4;
+				else                face_bit = (dir_sign > 0) ? 32 : 16;
+
 				skr_compute_set_tex  (&scene->gi_voxelize_compute, "voxel_tex",   &scene->gi_voxel[scene->gi_voxel_write]);
 				skr_compute_set_param(&scene->gi_voxelize_compute, "axis",        sksc_shader_var_uint, 1, &(uint32_t){axis});
 				skr_compute_set_param(&scene->gi_voxelize_compute, "layer_index", sksc_shader_var_uint, 1, &(uint32_t){layer});
 				skr_compute_set_param(&scene->gi_voxelize_compute, "flip_x",      sksc_shader_var_uint, 1, &flip_x_val);
 				skr_compute_set_param(&scene->gi_voxelize_compute, "flip_y",      sksc_shader_var_uint, 1, &flip_y_val);
+				skr_compute_set_param(&scene->gi_voxelize_compute, "face_bit",    sksc_shader_var_uint, 1, &face_bit);
 				skr_compute_execute(&scene->gi_voxelize_compute, (GI_GRID_SIZE + 7) / 8, (GI_GRID_SIZE + 7) / 8, 1);
 			}
 
@@ -1239,7 +1248,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		skr_renderer_set_global_texture(6, &scene->gi_sh_r);
 		skr_renderer_set_global_texture(7, &scene->gi_sh_g);
 		skr_renderer_set_global_texture(8, &scene->gi_sh_b);
-		skr_renderer_set_global_texture(9, &scene->gi_voxel[1 - scene->gi_voxel_write]); // voxel read buffer
+		skr_renderer_set_global_texture(9,  &scene->gi_voxel[1 - scene->gi_voxel_write]); // voxel read buffer
 	}
 
 	// Bind cubemap globally for cubemap irradiance shader (t5)
@@ -1463,7 +1472,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 	// Light direction (editable)
 	igText("Light");
 	igSliderFloat("Angle",     &scene->light_angle,     0.0f, 360.0f, "%.0f deg", 0);
-	igSliderFloat("Elevation", &scene->light_elevation,  0.0f, 1.0f,  "%.2f",     0);
+	igSliderFloat("Elevation", &scene->light_elevation, -1, 1,  "%.2f",     0);
 	igColorEdit3("Color", &scene->light_color.x, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 
 	igSeparator();
@@ -1477,7 +1486,9 @@ static void _scene_gi_render_ui(scene_t* base) {
 	if (scene->gi_mode != 2) {
 		const char* voxel_modes[] = { "Layer Scan", "Fast", "Fast Periodic" };
 		if (igCombo_Str_arr("Voxel Mode", &scene->gi_voxel_mode, voxel_modes, 3, 0)) {
-			scene->gi_frame = 0;
+			scene->gi_frame    = 0;
+			scene->gi_stepping = false;
+			scene->gi_step_next = false;
 		}
 		igSliderFloat("Intensity", &scene->gi_intensity, 0.0f, 5.0f, "%.2f", 0);
 		igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
@@ -1489,11 +1500,11 @@ static void _scene_gi_render_ui(scene_t* base) {
 	if (igCollapsingHeader_TreeNodeFlags("Debug", 0)) {
 		igCheckbox("Show Probes", &scene->gi_show_probes);
 		{
-			const char* modes[] = { "SH Irradiance", "UVW Coords", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
+			const char* modes[] = { "SH Irradiance", "Face Mask", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
 			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
 		}
 
-		if (scene->gi_mode != 2) {
+		if (scene->gi_mode != 2 && scene->gi_voxel_mode == 0) {
 			const char *axis_names[] = {"X", "Y", "Z"};
 			int32_t show_frame = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
 			int32_t axis  = show_frame / GI_GRID_SIZE;
