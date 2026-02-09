@@ -26,16 +26,34 @@ struct psIn {
 };
 
 psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
-	const float size = 0.01;
+	const float size = 0.002;
 
 	uint particle_idx = vertex_id / 6;
 	uint corner       = vertex_id % 6;
 
 	Particle p = particles[particle_idx];
 
-	// Simulate on first vertex of first view only
+	// Billboard quad: 2 triangles, 6 vertices
+	float2 offsets[6] = {
+		float2(-1, -1), // tri 0
+		float2( 1, -1),
+		float2( 1,  1),
+		float2(-1, -1), // tri 1
+		float2( 1,  1),
+		float2(-1,  1),
+	};
+
+	// Render from input buffer position - all 6 corners agree
+	float4 view_pos = mul(float4(p.position, 1), view[view_idx]);
+	view_pos.xy += offsets[corner] * size;
+
+	// Color based on particle speed
+	float  speed_val  = length(p.velocity);
+	float  speed_t    = saturate(speed_val / max_speed) * 2;
+	float3 base_color = lerp(color_slow, color_fast, speed_t);
+
+	// Simulate on first vertex of first view only, write to output buffer
 	if (corner == 0 && view_idx == 0) {
-		// Moving attractors
 		float3 attractors[3];
 		attractors[0] = float3(cos(sim_time * 0.5) * 2.0, sin(sim_time * 0.7) * 1.5, sin(sim_time * 0.5) * 2.0);
 		attractors[1] = float3(sin(sim_time * 0.6) * 2.5, cos(sim_time * 0.4) * 2.0, cos(sim_time * 0.6) * 1.5);
@@ -54,14 +72,15 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 			}
 		}
 
-		// Gravitational force from nearest 2
+		// Gravitational force from nearest 2, with repulsive core
+		const float core = 1.5;
 		float3 force = float3(0, 0, 0);
 		for (int a = 0; a < 2; a++) {
 			int    idx     = (a == 0) ? idx1 : idx2;
 			float3 diff    = attractors[idx] - p.position;
 			float  dist_sq = dot(diff, diff) + 0.1;
 			float  dist    = sqrt(dist_sq);
-			force += (diff / dist) * (strength / dist_sq);
+			force += (diff / dist) * (strength * (dist - core) / (dist_sq * dist));
 		}
 
 		// Integrate velocity and position
@@ -76,25 +95,6 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 
 		particles_out[particle_idx] = p;
 	}
-
-	// Billboard quad: 2 triangles, 6 vertices
-	float2 offsets[6] = {
-		float2(-1, -1), // tri 0
-		float2( 1, -1),
-		float2( 1,  1),
-		float2(-1, -1), // tri 1
-		float2( 1,  1),
-		float2(-1,  1),
-	};
-
-	// Transform center to view space, expand there (+X = right, +Y = up), then project
-	float4 view_pos = mul(float4(p.position, 1), view[view_idx]);
-	view_pos.xy += offsets[corner] * size;
-
-	// Color based on particle speed
-	float  speed_val  = length(p.velocity);
-	float  speed_t    = saturate(speed_val / max_speed) * 2;
-	float3 base_color = lerp(color_slow, color_fast, speed_t);
 
 	psIn output;
 	output.pos   = mul(view_pos, projection[view_idx]);

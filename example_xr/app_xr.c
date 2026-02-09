@@ -35,7 +35,7 @@ static bool _xr_file_read(const char* filename, void** out_data, size_t* out_siz
 static const scene_vtable_t* s_scene_types[] = {
 	&scene_meshes_vtable,
 	&scene_reaction_diffusion_vtable,
-	//&scene_orbital_particles_vtable,
+	&scene_orbital_particles_vtable,
 	&scene_impostor_vtable,
 	//&scene_array_texture_vtable,
 	&scene_3d_texture_vtable,
