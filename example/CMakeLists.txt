@@ -236,5 +236,5 @@ target_skapp_assets(sk_renderer_test
 ###############################################################################
 
 if(NOT ANDROID)
-	add_custom_target(run DEPENDS sk_renderer_test COMMAND $<TARGET_FILE:sk_renderer_test>)
+	add_custom_target(run DEPENDS sk_renderer_test-package COMMAND $<TARGET_FILE:sk_renderer_test>)
 endif()
