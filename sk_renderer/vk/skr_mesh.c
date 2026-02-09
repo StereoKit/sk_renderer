@@ -128,15 +128,28 @@ skr_err_ skr_mesh_create(const skr_vert_type_t* vert_type, skr_index_fmt_ ind_ty
 	// Zero out immediately
 	*out_mesh = (skr_mesh_t){0};
 
-	if (!vert_type || vert_count == 0) {
+	if (vert_count == 0) {
 		return skr_err_invalid_parameter;
+	}
+
+	// If no vertex type is provided, use a static empty type for vertex-
+	// pulling patterns (null vertex buffer + StructuredBuffer + SV_VertexID)
+	static skr_vert_type_t _empty_vert_type      = {0};
+	static bool            _empty_type_registered = false;
+	if (!vert_type) {
+		if (!_empty_type_registered) {
+			_empty_vert_type.pipeline_idx = _skr_pipeline_register_vertformat(_empty_vert_type);
+			_empty_type_registered        = true;
+		}
+		vert_type = &_empty_vert_type;
 	}
 
 	// Set up mesh metadata
 	out_mesh->vert_type  = vert_type;
 	out_mesh->ind_format = ind_type;
+	out_mesh->vert_count = vert_count;
 
-	// Use the set functions to create the buffers
+	// Create buffers from provided data (skips if vert_data is NULL)
 	skr_err_ err = skr_mesh_set_data(out_mesh, vert_data, vert_count, opt_ind_data, ind_count);
 	if (err != skr_err_success) {
 		*out_mesh = (skr_mesh_t){0};

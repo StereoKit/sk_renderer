@@ -17,12 +17,13 @@
 // Star field scene - displays randomly distributed stars as single-pixel triangles
 // Stars are uniformly distributed on a sphere using proper spherical distribution
 
-#define STAR_COUNT     50000
+#define STAR_COUNT     20000
 #define STAR_DISTANCE  40.0f
 
 typedef struct {
 	scene_t        base;
 	skr_mesh_t     star_mesh;
+	skr_buffer_t   star_buffer;
 	skr_shader_t   shader;
 	skr_material_t material;
 	float          time;
@@ -38,14 +39,11 @@ typedef struct {
 	float3 cam_target_vel;
 } scene_stars_t;
 
-// Vertex format for stars: position + vertex index (in UV.x) + brightness (in color)
-// We use UV.x to store 0, 1, or 2 to identify which vertex of the triangle this is
+// Per-star data stored in a StructuredBuffer, indexed by SV_VertexID / 3
 typedef struct {
 	skr_vec3_t position;
-	skr_vec3_t normal;   // unused but needed for standard vertex format
-	skr_vec2_t uv;       // uv.x = vertex index (0, 1, 2), uv.y = unused
-	uint32_t   color;    // brightness encoded in all channels
-} star_vertex_t;
+	float      brightness;
+} star_data_t;
 
 // Simple LCG random number generator for reproducible results
 static uint32_t _star_rand_state = 12345;
@@ -83,70 +81,28 @@ static scene_t* _scene_stars_create(void) {
 	// Seed the random number generator for reproducible star positions
 	_star_rand_seed(42);
 
-	// Allocate vertices and indices
-	// Each star = 3 vertices + 3 indices
-	int32_t        vertex_count = STAR_COUNT * 3;
-	int32_t        index_count  = STAR_COUNT * 3;
-	star_vertex_t* vertices     = malloc(vertex_count * sizeof(star_vertex_t));
-	uint32_t*      indices      = malloc(index_count  * sizeof(uint32_t));
+	// Generate star data: position + brightness per star
+	star_data_t* star_data = malloc(STAR_COUNT * sizeof(star_data_t));
+	if (!star_data) { free(scene); return NULL; }
 
-	if (!vertices || !indices) {
-		free(vertices);
-		free(indices);
-		free(scene);
-		return NULL;
-	}
-
-	// Generate stars with uniform distribution on sphere
 	for (int32_t i = 0; i < STAR_COUNT; i++) {
-		// Uniform distribution on sphere:
-		// z = random(-1, 1)
-		// theta = random(0, 2*pi)
-		// x = sqrt(1 - z^2) * cos(theta)
-		// y = sqrt(1 - z^2) * sin(theta)
-		float z       = _star_randf() * 2.0f - 1.0f;
-		float theta   = _star_randf() * 2.0f * 3.14159265359f;
-		float r       = sqrtf(1.0f - z * z);
-		float x       = r * cosf(theta);
-		float y       = r * sinf(theta);
+		float z     = _star_randf() * 2.0f - 1.0f;
+		float theta = _star_randf() * 2.0f * 3.14159265359f;
+		float rad   = sqrtf(1.0f - z * z);
 
-		// Scale to star distance
-		skr_vec3_t pos = {
-			x * STAR_DISTANCE,
-			y * STAR_DISTANCE,
-			z * STAR_DISTANCE
+		star_data[i] = (star_data_t){
+			.position   = { rad * cosf(theta) * STAR_DISTANCE, rad * sinf(theta) * STAR_DISTANCE, z * STAR_DISTANCE },
+			.brightness = powf(powf(_star_randf(), 2.5f), 2.2f),
 		};
-
-		// Random brightness (0 to 1) with sRGB to linear conversion
-		float    brightness_srgb   = powf(_star_randf(), 2.5f); // exponent of 2.5 to bias towards dimmer stars, more stars are further away IRL
-		float    brightness_linear = powf(brightness_srgb, 2.2f);
-		uint8_t  bright_u8         = (uint8_t)(brightness_linear * 255.0f);
-		uint32_t color             = (0xFF << 24) | (bright_u8 << 16) | (bright_u8 << 8) | bright_u8;
-
-		// Create 3 vertices at the same position, with vertex index in UV.x
-		int32_t base_vertex = i * 3;
-		for (int32_t v = 0; v < 3; v++) {
-			vertices[base_vertex + v] = (star_vertex_t){
-				.position = pos,
-				.normal   = {0, 1, 0},
-				.uv       = {(float)v, brightness_linear}, // vertex index in x, brightness in y for shader
-				.color    = color,
-			};
-		}
-
-		// Create indices for the triangle
-		int32_t base_index = i * 3;
-		indices[base_index + 0] = base_vertex + 0;
-		indices[base_index + 1] = base_vertex + 1;
-		indices[base_index + 2] = base_vertex + 2;
 	}
 
-	// Create mesh
-	skr_mesh_create(&su_vertex_type, skr_index_fmt_u32, vertices, vertex_count, indices, index_count, &scene->star_mesh);
-	skr_mesh_set_name(&scene->star_mesh, "star_mesh");
+	// Storage buffer for star data, indexed by SV_VertexID / 3 in the shader
+	skr_buffer_create(star_data, STAR_COUNT, sizeof(star_data_t), skr_buffer_type_storage, skr_use_static, &scene->star_buffer);
+	skr_buffer_set_name(&scene->star_buffer, "star_data");
+	free(star_data);
 
-	free(vertices);
-	free(indices);
+	// Null vertex buffer mesh: vert_count drives vkCmdDraw, all data comes from the StructuredBuffer
+	skr_mesh_create(NULL, skr_index_fmt_u32, NULL, STAR_COUNT * 3, NULL, 0, &scene->star_mesh);
 
 	// Load shader
 	scene->shader = su_shader_load("shaders/stars.hlsl.sks", "stars_shader");
@@ -154,10 +110,11 @@ static scene_t* _scene_stars_create(void) {
 	// Create opaque material - stars are too small to overlap
 	skr_material_create((skr_material_info_t){
 		.shader       = &scene->shader,
-		.cull         = skr_cull_none,  // Stars visible from all directions
+		.cull         = skr_cull_none,
 		.depth_test   = skr_compare_less,
 		.write_mask   = skr_write_default,
 	}, &scene->material);
+	skr_material_set_buffer(&scene->material, "stars", &scene->star_buffer);
 
 	return (scene_t*)scene;
 }
@@ -166,6 +123,7 @@ static void _scene_stars_destroy(scene_t* base) {
 	scene_stars_t* scene = (scene_stars_t*)base;
 
 	skr_mesh_destroy    (&scene->star_mesh);
+	skr_buffer_destroy  (&scene->star_buffer);
 	skr_material_destroy(&scene->material);
 	skr_shader_destroy  (&scene->shader);
 
@@ -246,9 +204,8 @@ static void _scene_stars_render(scene_t* base, int32_t width, int32_t height, sk
 	(void)width;
 	(void)height;
 
-	// Identity transform - stars are already in world space at the correct distance
-	float4x4 transform = float4x4_identity();
-	skr_render_list_add(ref_render_list, &scene->star_mesh, &scene->material, &transform, sizeof(float4x4), 1);
+	// No instance data - stars are already in world space, SV_InstanceID is just view_idx
+	skr_render_list_add(ref_render_list, &scene->star_mesh, &scene->material, NULL, 0, 1);
 }
 
 static bool _scene_stars_get_camera(scene_t* base, scene_camera_t* out_camera) {
