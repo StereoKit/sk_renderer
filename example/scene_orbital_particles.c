@@ -12,34 +12,39 @@
 #include <math.h>
 #include <float.h>
 
+// Single-pass GPU particle system: the vertex shader both simulates and renders
+// particles in one draw call, with no separate compute pass. Each particle is a
+// billboard quad (6 verts), and the first vertex of each particle runs the
+// physics simulation and writes the result to a ping-pong output buffer. All 6
+// vertices then read the particle's position to expand a view-space quad.
+
 #define PARTICLE_COUNT 250000
-#define ATTRACTOR_COUNT 3
 
-
-// Create particle params buffer for rendering (colors)
+// Particle params: rendering colors + simulation parameters, all packed into
+// the shader's $Global cbuffer via loose uniforms.
 typedef struct {
 	float3 color_slow;
 	float  max_speed;
 	float3 color_fast;
-	float  _pad;
+	float  sim_time;
+	float  delta_time;
+	float  damping;
+	float  strength;
+	float  _pad3;
 } particle_params_t;
 
-// Orbital particles scene - displays particles orbiting around moving attractors
+// Orbital particles scene - VS UAV single-pass particle simulation + rendering
 typedef struct {
 	scene_t           base;
-	skr_mesh_t        pyramid_mesh;
+	skr_mesh_t        particle_mesh;
 	skr_shader_t      shader;
-	skr_shader_t      compute_shader;
 	skr_material_t    material;
-	skr_tex_t         white_texture;
-	particle_params_t particle_params;
-	skr_compute_t     compute_ping;
-	skr_compute_t     compute_pong;
+	particle_params_t params;
 	skr_buffer_t      particle_buffer_a;
 	skr_buffer_t      particle_buffer_b;
 
 	float   time;
-	int32_t compute_iteration;
+	int32_t frame;
 } scene_orbital_particles_t;
 
 // Particle data
@@ -47,11 +52,6 @@ typedef struct {
 	float3 position;
 	float3 velocity;
 } particle_t;
-
-// Instance data - just translation!
-typedef struct {
-	float3 position;
-} instance_data_t;
 
 // Helper function for random hash
 static float _hash_f(int32_t aPosition, uint32_t aSeed) {
@@ -74,73 +74,28 @@ static scene_t* _scene_orbital_particles_create(void) {
 	scene_orbital_particles_t* scene = calloc(1, sizeof(scene_orbital_particles_t));
 	if (!scene) return NULL;
 
-	scene->base.size         = sizeof(scene_orbital_particles_t);
-	scene->time              = 0.0f;
-	scene->compute_iteration = 0;
+	scene->base.size = sizeof(scene_orbital_particles_t);
+	scene->time      = 0.0f;
+	scene->frame     = 0;
 
-	skr_vec4_t color = {1,1,1,1};
+	// Null vertex buffer mesh: 6 verts per particle (billboard quad), all data from StructuredBuffer
+	skr_mesh_create(NULL, skr_index_fmt_u32, NULL, PARTICLE_COUNT * 6, NULL, 0, &scene->particle_mesh);
 
-	// Create simple 3-sided pyramid (tetrahedron) mesh
-	const float h = 0.5f;  // Height
-	const float r = 0.5f;  // Base radius
-	su_vertex_t pyramid_vertices[] = {
-		// Base triangle
-		{ .position = { 0.0f,    -h/2, 0.0f}, .normal = { 0.0f, -1.0f,  0.0f}, .uv = {0.5f, 0.5f}, .color = 0xFFFFFFFF },
-		{ .position = { r,       -h/2, 0.0f}, .normal = { 0.0f, -1.0f,  0.0f}, .uv = {1.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = {-r*0.5f,  -h/2,  r*0.866f}, .normal = { 0.0f, -1.0f,  0.0f}, .uv = {0.0f, 1.0f}, .color = 0xFFFFFFFF },
-		{ .position = {-r*0.5f,  -h/2, -r*0.866f}, .normal = { 0.0f, -1.0f,  0.0f}, .uv = {0.0f, 0.0f}, .color = 0xFFFFFFFF },
-		// Apex
-		{ .position = { 0.0f,     h/2, 0.0f}, .normal = { 0.0f,  1.0f,  0.0f}, .uv = {0.5f, 0.5f}, .color = 0xFFFFFFFF },
-		// Front right face
-		{ .position = { 0.0f,    -h/2, 0.0f}, .normal = { 0.866f, 0.5f,  0.0f}, .uv = {0.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = { r,       -h/2, 0.0f}, .normal = { 0.866f, 0.5f,  0.0f}, .uv = {1.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = { 0.0f,     h/2, 0.0f}, .normal = { 0.866f, 0.5f,  0.0f}, .uv = {0.5f, 1.0f}, .color = 0xFFFFFFFF },
-		// Back left face
-		{ .position = { r,       -h/2, 0.0f}, .normal = {-0.433f, 0.5f,  0.75f}, .uv = {0.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = {-r*0.5f,  -h/2,  r*0.866f}, .normal = {-0.433f, 0.5f,  0.75f}, .uv = {1.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = { 0.0f,     h/2, 0.0f}, .normal = {-0.433f, 0.5f,  0.75f}, .uv = {0.5f, 1.0f}, .color = 0xFFFFFFFF },
-		// Back right face
-		{ .position = {-r*0.5f,  -h/2,  r*0.866f}, .normal = {-0.433f, 0.5f, -0.75f}, .uv = {0.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = {-r*0.5f,  -h/2, -r*0.866f}, .normal = {-0.433f, 0.5f, -0.75f}, .uv = {1.0f, 0.0f}, .color = 0xFFFFFFFF },
-		{ .position = { 0.0f,     h/2, 0.0f}, .normal = {-0.433f, 0.5f, -0.75f}, .uv = {0.5f, 1.0f}, .color = 0xFFFFFFFF },
-	};
-	uint16_t pyramid_indices[] = {
-		// Base
-		0, 2, 1,
-		0, 3, 2,
-		0, 1, 3,
-		// Sides
-		5, 6, 7,    // Front right
-		8, 9, 10,   // Back left
-		11, 12, 13, // Back right
-	};
-	skr_mesh_create(&su_vertex_type, skr_index_fmt_u16, pyramid_vertices, 14, pyramid_indices, 18, &scene->pyramid_mesh);
-	skr_mesh_set_name(&scene->pyramid_mesh, "tetrahedron");
-
-	// Load shader
+	// Load shader (VS does both simulation + rendering)
 	scene->shader = su_shader_load("shaders/orbital_particles.hlsl.sks", "orbital_particles_shader");
 	skr_material_create((skr_material_info_t){
 		.shader       = &scene->shader,
-		.cull         = skr_cull_back,
+		.cull         = skr_cull_none,
 		.write_mask   = skr_write_default,
 		.depth_test   = skr_compare_less,
 	}, &scene->material);
 
-	// Create white 1x1 texture
-	scene->white_texture = su_tex_create_solid_color(0xFFFFFFFF);
-	skr_tex_set_name(&scene->white_texture, "white_1x1");
-
-	// Load compute shader
-	scene->compute_shader = su_shader_load("shaders/orbital_particles_compute.hlsl.sks", NULL);
-	skr_compute_create(&scene->compute_shader, &scene->compute_ping);
-	skr_compute_create(&scene->compute_shader, &scene->compute_pong);
-
 	// Initialize particles in a sphere
 	particle_t* particles = malloc(PARTICLE_COUNT * sizeof(particle_t));
 	for (int i = 0; i < PARTICLE_COUNT; i++) {
-		float theta   = _hash_f(i, 0) * 3.14159f * 2.0f;
-		float phi     = _hash_f(i, 1) * 3.14159f;
-		float radius  = _hash_f(i, 2) * 5.0f + 1.0f;
+		float theta  = _hash_f(i, 0) * 3.14159f * 2.0f;
+		float phi    = _hash_f(i, 1) * 3.14159f;
+		float radius = _hash_f(i, 2) * 5.0f + 1.0f;
 
 		particles[i].velocity = (float3){0, 0, 0};
 		particles[i].position = (float3){
@@ -150,48 +105,20 @@ static scene_t* _scene_orbital_particles_create(void) {
 		};
 	}
 
-	// Create particle buffers for ping-pong compute
+	// Create ping-pong particle buffers for VS UAV read/write
 	skr_buffer_create(particles, PARTICLE_COUNT, sizeof(particle_t), skr_buffer_type_storage, skr_use_compute_readwrite, &scene->particle_buffer_a);
 	skr_buffer_create(particles, PARTICLE_COUNT, sizeof(particle_t), skr_buffer_type_storage, skr_use_compute_readwrite, &scene->particle_buffer_b);
 	free(particles);
 
-	// Create compute params buffer
-	typedef struct {
-		float    time;
-		float    delta_time;
-		float    damping;
-		float    max_speed;
-		float    strength;
-		uint32_t particle_count;
-	} compute_params_t;
-
-	// Set up compute bindings
-	skr_compute_set_buffer(&scene->compute_ping, "input",   &scene->particle_buffer_a);
-	skr_compute_set_buffer(&scene->compute_ping, "output",  &scene->particle_buffer_b);
-
-	skr_compute_set_buffer(&scene->compute_pong, "input",   &scene->particle_buffer_b);
-	skr_compute_set_buffer(&scene->compute_pong, "output",  &scene->particle_buffer_a);
-
-	// Set initial compute parameters using reflection API
-	skr_compute_set_param(&scene->compute_ping, "time",           sksc_shader_var_float, 1, &(float){0.0f});
-	skr_compute_set_param(&scene->compute_ping, "delta_time",     sksc_shader_var_float, 1, &(float){0.0f});
-	skr_compute_set_param(&scene->compute_ping, "damping",        sksc_shader_var_float, 1, &(float){0.98f});
-	skr_compute_set_param(&scene->compute_ping, "max_speed",      sksc_shader_var_float, 1, &(float){5.0f});
-	skr_compute_set_param(&scene->compute_ping, "strength",       sksc_shader_var_float, 1, &(float){2.0f});
-	skr_compute_set_param(&scene->compute_ping, "particle_count", sksc_shader_var_uint,  1, &(uint32_t){PARTICLE_COUNT});
-
-	skr_compute_set_param(&scene->compute_pong, "time",           sksc_shader_var_float, 1, &(float){0.0f});
-	skr_compute_set_param(&scene->compute_pong, "delta_time",     sksc_shader_var_float, 1, &(float){0.0f});
-	skr_compute_set_param(&scene->compute_pong, "damping",        sksc_shader_var_float, 1, &(float){0.98f});
-	skr_compute_set_param(&scene->compute_pong, "max_speed",      sksc_shader_var_float, 1, &(float){5.0f});
-	skr_compute_set_param(&scene->compute_pong, "strength",       sksc_shader_var_float, 1, &(float){2.0f});
-	skr_compute_set_param(&scene->compute_pong, "particle_count", sksc_shader_var_uint,  1, &(uint32_t){PARTICLE_COUNT});
-
-	scene->particle_params = (particle_params_t){
-		.color_slow = {0.818f, 0.0100f, 0.0177f},  // Red (sRGB 0.92, 0.1, 0.14 -> linear)
+	scene->params = (particle_params_t){
+		.color_slow = {0.818f, 0.0100f, 0.0177f},
 		.max_speed  = 5.0f,
-		.color_fast = {0.955f, 0.758f, 0.0177f},   // Yellow (sRGB 0.98, 0.89, 0.14 -> linear)
-		._pad       = 0.0f
+		.color_fast = {0.955f, 0.758f, 0.0177f},
+		.sim_time   = 0.0f,
+		.delta_time = 0.0f,
+		.damping    = 0.98f,
+		.strength   = 4.0f,
+		._pad3      = 0.0f,
 	};
 
 	return (scene_t*)scene;
@@ -200,48 +127,36 @@ static scene_t* _scene_orbital_particles_create(void) {
 static void _scene_orbital_particles_destroy(scene_t* base) {
 	scene_orbital_particles_t* scene = (scene_orbital_particles_t*)base;
 
-	skr_mesh_destroy(&scene->pyramid_mesh);
+	skr_mesh_destroy    (&scene->particle_mesh);
 	skr_material_destroy(&scene->material);
-	skr_compute_destroy(&scene->compute_ping);
-	skr_compute_destroy(&scene->compute_pong);
-	skr_shader_destroy(&scene->compute_shader);
-	skr_shader_destroy(&scene->shader);
-	skr_tex_destroy(&scene->white_texture);
-	skr_buffer_destroy(&scene->particle_buffer_a);
-	skr_buffer_destroy(&scene->particle_buffer_b);
+	skr_shader_destroy  (&scene->shader);
+	skr_buffer_destroy  (&scene->particle_buffer_a);
+	skr_buffer_destroy  (&scene->particle_buffer_b);
 
 	free(scene);
 }
 
 static void _scene_orbital_particles_update(scene_t* base, float delta_time) {
 	scene_orbital_particles_t* scene = (scene_orbital_particles_t*)base;
-	scene->time += delta_time;
-
-	// Update compute params for current compute shader
-	skr_compute_t* current = (scene->compute_iteration % 2 == 0) ? &scene->compute_ping : &scene->compute_pong;
-	skr_compute_set_param(current, "time",       sksc_shader_var_float, 1, &scene->time);
-	skr_compute_set_param(current, "delta_time", sksc_shader_var_float, 1, &delta_time);
-	skr_compute_set_param(current, "strength",   sksc_shader_var_float, 1, &(float){4.0f});
-
-	// Execute compute shader to update particles on GPU
-	// Dispatch 500k particles / 256 threads per group = 1954 groups (rounded up)
-	skr_compute_execute(current, (PARTICLE_COUNT + 255) / 256, 1, 1);
-	scene->compute_iteration++;
+	scene->time            += delta_time;
+	scene->params.sim_time  = scene->time;
+	scene->params.delta_time = delta_time;
 }
 
 static void _scene_orbital_particles_render(scene_t* base, int32_t width, int32_t height, skr_render_list_t* ref_render_list, su_system_buffer_t* ref_system_buffer) {
 	scene_orbital_particles_t* scene = (scene_orbital_particles_t*)base;
 
-	// Bind particle params buffer (colors) to slot 0
-	skr_material_set_params(&scene->material, &scene->particle_params, sizeof(scene->particle_params));
+	// Bind params (colors + simulation uniforms)
+	skr_material_set_params(&scene->material, &scene->params, sizeof(scene->params));
 
-	// Use particle buffer directly - no CPU roundtrip needed!
-	// The shader reads directly from the GPU buffer at slot 3
-	skr_buffer_t* current_buffer = (scene->compute_iteration % 2 == 0) ? &scene->particle_buffer_a : &scene->particle_buffer_b;
-	skr_material_set_buffer(&scene->material, "particles", current_buffer);
+	// Ping-pong: read from one buffer, VS writes to the other
+	skr_buffer_t* read_buf  = (scene->frame % 2 == 0) ? &scene->particle_buffer_a : &scene->particle_buffer_b;
+	skr_buffer_t* write_buf = (scene->frame % 2 == 0) ? &scene->particle_buffer_b : &scene->particle_buffer_a;
+	skr_material_set_buffer(&scene->material, "particles",     read_buf);
+	skr_material_set_buffer(&scene->material, "particles_out", write_buf);
+	scene->frame++;
 
-	// Draw with no instance data - shader reads from buffer binding
-	skr_render_list_add(ref_render_list, &scene->pyramid_mesh, &scene->material, NULL, 0, PARTICLE_COUNT);
+	skr_render_list_add(ref_render_list, &scene->particle_mesh, &scene->material, NULL, 0, 1);
 }
 
 const scene_vtable_t scene_orbital_particles_vtable = {
