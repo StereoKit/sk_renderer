@@ -209,7 +209,6 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/cubemap_skybox.hlsl
 	assets/shaders/equirect_to_cubemap.hlsl
 	assets/shaders/mipgen_alpha_weighted_render.hlsl
-	assets/shaders/orbital_particles_compute.hlsl
 	assets/shaders/orbital_particles.hlsl
 	assets/shaders/pbr.hlsl
 	assets/shaders/shadow_caster.hlsl
