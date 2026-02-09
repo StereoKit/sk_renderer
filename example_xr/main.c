@@ -380,7 +380,7 @@ bool openxr_init(const char* app_name) {
 	xrCreateReferenceSpace(xr_session, &(XrReferenceSpaceCreateInfo){
 		.type                 = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
 		.poseInReferenceSpace = xr_pose_identity,
-		.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL
+		.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR
 	}, &xr_app_space);
 
 	// Enumerate views
@@ -804,6 +804,7 @@ int main(int argc, char* argv[]) {
 	(void)argv;
 
 	ska_init(NULL);
+	ska_set_cwd(NULL);
 
 	ska_log(ska_log_info, "sk_renderer OpenXR Example");
 	ska_log(ska_log_info, "==========================");

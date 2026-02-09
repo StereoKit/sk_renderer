@@ -377,19 +377,8 @@ static void _scene_yuv_destroy(scene_t* base) {
 }
 
 static void _scene_yuv_update(scene_t* base, float delta_time) {
-	scene_yuv_test_t* scene = (scene_yuv_test_t*)base;
+	(void)base;
 	(void)delta_time;
-
-	// Camera zoom
-	ImGuiIO* io = igGetIO();
-	if (!io->WantCaptureMouse) {
-		if (io->MouseWheel != 0.0f)
-			scene->cam_distance -= io->MouseWheel * 0.5f;
-		if (io->MouseDown[0])
-			scene->cam_distance += io->MouseDelta.y * 0.02f;
-		if (scene->cam_distance < 1.0f)  scene->cam_distance = 1.0f;
-		if (scene->cam_distance > 20.0f) scene->cam_distance = 20.0f;
-	}
 }
 
 static void _scene_yuv_render(scene_t* base, int32_t width, int32_t height,
@@ -438,6 +427,16 @@ static void _scene_yuv_render(scene_t* base, int32_t width, int32_t height,
 
 static bool _scene_yuv_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_yuv_test_t* scene = (scene_yuv_test_t*)base;
+
+	ImGuiIO* io = igGetIO();
+	if (!io->WantCaptureMouse) {
+		if (io->MouseWheel != 0.0f)
+			scene->cam_distance -= io->MouseWheel * 0.5f;
+		if (io->MouseDown[0])
+			scene->cam_distance += io->MouseDelta.y * 0.02f;
+		if (scene->cam_distance < 1.0f)  scene->cam_distance = 1.0f;
+		if (scene->cam_distance > 20.0f) scene->cam_distance = 20.0f;
+	}
 
 	out_camera->position = (float3){0, 0, scene->cam_distance};
 	out_camera->target   = (float3){0, 0, 0};

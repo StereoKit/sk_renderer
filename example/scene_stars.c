@@ -17,7 +17,7 @@
 // Star field scene - displays randomly distributed stars as single-pixel triangles
 // Stars are uniformly distributed on a sphere using proper spherical distribution
 
-#define STAR_COUNT     50000
+#define STAR_COUNT     8000
 #define STAR_DISTANCE  40.0f
 
 typedef struct {
@@ -26,6 +26,7 @@ typedef struct {
 	skr_shader_t   shader;
 	skr_material_t material;
 	float          time;
+	float          delta_time;
 
 	// Arc-ball camera state
 	float  cam_yaw;
@@ -174,70 +175,8 @@ static void _scene_stars_destroy(scene_t* base) {
 
 static void _scene_stars_update(scene_t* base, float delta_time) {
 	scene_stars_t* scene = (scene_stars_t*)base;
-	scene->time += delta_time;
-
-	// Camera control constants
-	const float rotate_sensitivity = 0.0002f;
-	const float pan_sensitivity    = 0.0001f;
-	const float zoom_sensitivity   = 0.2f;
-	const float velocity_damping   = 0.0001f;  // Per-second retention (lower = more damping)
-	const float pitch_limit        = 1.5f;
-	const float min_distance       = 1.0f;
-	const float max_distance       = 40.0f;
-
-	// Get ImGui IO for mouse input
-	ImGuiIO* io = igGetIO();
-
-	if (!io->WantCaptureMouse) {
-		// Left mouse drag: arc rotate
-		if (io->MouseDown[0]) {
-			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
-			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
-		}
-
-		// Right mouse drag: pan
-		if (io->MouseDown[1]) {
-			float cos_yaw = cosf(scene->cam_yaw);
-			float sin_yaw = sinf(scene->cam_yaw);
-
-			float3 right = { cos_yaw, 0.0f, -sin_yaw };
-
-			float pan_scale = scene->cam_distance * pan_sensitivity;
-			scene->cam_target_vel.x -= right.x * io->MouseDelta.x * pan_scale;
-			scene->cam_target_vel.z -= right.z * io->MouseDelta.x * pan_scale;
-			scene->cam_target_vel.y += io->MouseDelta.y * pan_scale;
-		}
-
-		// Mouse wheel: zoom
-		if (io->MouseWheel != 0.0f) {
-			scene->cam_distance_vel -= io->MouseWheel * zoom_sensitivity;
-		}
-	}
-
-	// Apply velocities
-	scene->cam_yaw      += scene->cam_yaw_vel;
-	scene->cam_pitch    += scene->cam_pitch_vel;
-	scene->cam_distance += scene->cam_distance_vel;
-	scene->cam_target.x += scene->cam_target_vel.x;
-	scene->cam_target.y += scene->cam_target_vel.y;
-	scene->cam_target.z += scene->cam_target_vel.z;
-
-	// Clamp pitch to avoid gimbal issues
-	if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
-	if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
-
-	// Clamp distance
-	if (scene->cam_distance < min_distance) scene->cam_distance = min_distance;
-	if (scene->cam_distance > max_distance) scene->cam_distance = max_distance;
-
-	// Apply damping (exponential decay, frame-rate independent)
-	float damping = powf(velocity_damping, delta_time);
-	scene->cam_yaw_vel      *= damping;
-	scene->cam_pitch_vel    *= damping;
-	scene->cam_distance_vel *= damping;
-	scene->cam_target_vel.x *= damping;
-	scene->cam_target_vel.y *= damping;
-	scene->cam_target_vel.z *= damping;
+	scene->time       += delta_time;
+	scene->delta_time  = delta_time;
 }
 
 static void _scene_stars_render(scene_t* base, int32_t width, int32_t height, skr_render_list_t* ref_render_list, su_system_buffer_t* ref_system_buffer) {
@@ -253,8 +192,57 @@ static void _scene_stars_render(scene_t* base, int32_t width, int32_t height, sk
 
 static bool _scene_stars_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_stars_t* scene = (scene_stars_t*)base;
+	float delta_time     = scene->delta_time;
 
-	// Compute camera position from spherical coordinates around target
+	const float rotate_sensitivity = 0.0002f;
+	const float pan_sensitivity    = 0.0001f;
+	const float zoom_sensitivity   = 0.2f;
+	const float velocity_damping   = 0.0001f;
+	const float pitch_limit        = 1.5f;
+	const float min_distance       = 1.0f;
+	const float max_distance       = 40.0f;
+
+	ImGuiIO* io = igGetIO();
+
+	if (!io->WantCaptureMouse) {
+		if (io->MouseDown[0]) {
+			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
+			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
+		}
+		if (io->MouseDown[1]) {
+			float cos_yaw = cosf(scene->cam_yaw);
+			float sin_yaw = sinf(scene->cam_yaw);
+			float3 right  = { cos_yaw, 0.0f, -sin_yaw };
+			float  pan_scale = scene->cam_distance * pan_sensitivity;
+			scene->cam_target_vel.x -= right.x * io->MouseDelta.x * pan_scale;
+			scene->cam_target_vel.z -= right.z * io->MouseDelta.x * pan_scale;
+			scene->cam_target_vel.y += io->MouseDelta.y * pan_scale;
+		}
+		if (io->MouseWheel != 0.0f) {
+			scene->cam_distance_vel -= io->MouseWheel * zoom_sensitivity;
+		}
+	}
+
+	scene->cam_yaw      += scene->cam_yaw_vel;
+	scene->cam_pitch    += scene->cam_pitch_vel;
+	scene->cam_distance += scene->cam_distance_vel;
+	scene->cam_target.x += scene->cam_target_vel.x;
+	scene->cam_target.y += scene->cam_target_vel.y;
+	scene->cam_target.z += scene->cam_target_vel.z;
+
+	if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
+	if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
+	if (scene->cam_distance < min_distance) scene->cam_distance = min_distance;
+	if (scene->cam_distance > max_distance) scene->cam_distance = max_distance;
+
+	float damping = powf(velocity_damping, delta_time);
+	scene->cam_yaw_vel      *= damping;
+	scene->cam_pitch_vel    *= damping;
+	scene->cam_distance_vel *= damping;
+	scene->cam_target_vel.x *= damping;
+	scene->cam_target_vel.y *= damping;
+	scene->cam_target_vel.z *= damping;
+
 	float cos_pitch = cosf(scene->cam_pitch);
 	float sin_pitch = sinf(scene->cam_pitch);
 	float cos_yaw   = cosf(scene->cam_yaw);

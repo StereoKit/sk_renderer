@@ -173,6 +173,7 @@ typedef struct {
 
 	// Camera state
 	float  time;
+	float  delta_time;
 #ifdef __ANDROID__
 	// Arc rotation camera (touch)
 	float  cam_yaw;
@@ -456,12 +457,13 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_intensity  = 1.0f;
 	scene->gi_volume_min = (float3){-10.0f, -10.0f, -10.0f};
 	scene->gi_volume_max = (float3){ 10.0f,  10.0f,  10.0f};
-	scene->gi_sh_decay      = 0.985f;
+	scene->gi_sh_decay      = 0.99f;
 	scene->gi_total_frames  = 0;
-	scene->gi_ray_count     = 2;
-	scene->gi_env_mip       = 5.0f;
+	scene->gi_ray_count     = 16;
+	scene->gi_env_mip       = 3.0f;
 	scene->gi_env_strength  = 1.0f;
 	scene->gi_frame         = 0;
+	scene->gi_mode          = 1;
 
 	// Create 3D SH textures (single buffer, continuous temporal accumulation)
 	skr_tex_sampler_t gi_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
@@ -600,7 +602,6 @@ static scene_t* _scene_gi_create(void) {
 	};
 	scene->model      = su_gltf_load_ex("LightingRoom.glb", model_infos, 4);
 	scene->model_path = strdup("LightingRoom.glb");
-	scene->model_scale = 4;
 	_load_skybox(scene, "cubemap.jpg");
 
 	return (scene_t*)scene;
@@ -682,95 +683,8 @@ static void _scene_gi_destroy(scene_t* base) {
 
 static void _scene_gi_update(scene_t* base, float delta_time) {
 	scene_gi_t* scene = (scene_gi_t*)base;
-	scene->time += delta_time;
-
-	ImGuiIO* io = igGetIO();
-
-#ifdef __ANDROID__
-	// Arc rotation camera (same as scene_stars)
-	const float rotate_sensitivity = 0.0002f;
-	const float pan_sensitivity    = 0.0001f;
-	const float zoom_sensitivity   = 0.2f;
-	const float velocity_damping   = 0.0001f;
-	const float pitch_limit        = 1.5f;
-	const float min_distance       = 1.0f;
-	const float max_distance       = 40.0f;
-
-	if (!io->WantCaptureMouse) {
-		// Skip first-frame delta to avoid jump from previous touch position
-		if (io->MouseDown[0] && io->MouseDownDuration[0] > 0.0f) {
-			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
-			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
-		}
-		if (io->MouseDown[1] && io->MouseDownDuration[1] > 0.0f) {
-			float cos_yaw = cosf(scene->cam_yaw);
-			float sin_yaw = sinf(scene->cam_yaw);
-			float3 right  = { cos_yaw, 0.0f, -sin_yaw };
-			float  pan_scale = scene->cam_distance * pan_sensitivity;
-			scene->cam_target_vel.x -= right.x * io->MouseDelta.x * pan_scale;
-			scene->cam_target_vel.z -= right.z * io->MouseDelta.x * pan_scale;
-			scene->cam_target_vel.y += io->MouseDelta.y * pan_scale;
-		}
-		if (io->MouseWheel != 0.0f) {
-			scene->cam_distance_vel -= io->MouseWheel * zoom_sensitivity;
-		}
-	}
-
-	scene->cam_yaw      += scene->cam_yaw_vel;
-	scene->cam_pitch    += scene->cam_pitch_vel;
-	scene->cam_distance += scene->cam_distance_vel;
-	scene->cam_target.x += scene->cam_target_vel.x;
-	scene->cam_target.y += scene->cam_target_vel.y;
-	scene->cam_target.z += scene->cam_target_vel.z;
-
-	if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
-	if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
-	if (scene->cam_distance < min_distance) scene->cam_distance = min_distance;
-	if (scene->cam_distance > max_distance) scene->cam_distance = max_distance;
-
-	float damping = powf(velocity_damping, delta_time);
-	scene->cam_yaw_vel      *= damping;
-	scene->cam_pitch_vel    *= damping;
-	scene->cam_distance_vel *= damping;
-	scene->cam_target_vel.x *= damping;
-	scene->cam_target_vel.y *= damping;
-	scene->cam_target_vel.z *= damping;
-
-#else
-	// WASD+QE fly camera
-	const float move_speed   = 5.0f;
-	const float look_speed   = 0.002f;
-
-	// Mouse look (right-click drag)
-	if (!io->WantCaptureMouse && io->MouseDown[1]) {
-		scene->cam_yaw   -= io->MouseDelta.x * look_speed;
-		scene->cam_pitch -= io->MouseDelta.y * look_speed;
-
-		const float pitch_limit = 1.5f;
-		if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
-		if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
-	}
-
-	// Compute forward/right/up from yaw/pitch
-	float cos_p = cosf(scene->cam_pitch);
-	float sin_p = sinf(scene->cam_pitch);
-	float cos_y = cosf(scene->cam_yaw);
-	float sin_y = sinf(scene->cam_yaw);
-
-	float3 forward = { -sin_y * cos_p, sin_p, -cos_y * cos_p };
-	float3 right   = {  cos_y, 0.0f, -sin_y };
-	float3 up      = {  0.0f,  1.0f,  0.0f  };
-
-	float speed = move_speed * delta_time;
-	if (!io->WantCaptureKeyboard) {
-		if (igIsKeyDown_Nil(ImGuiKey_W)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(forward,  speed)); }
-		if (igIsKeyDown_Nil(ImGuiKey_S)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(forward, -speed)); }
-		if (igIsKeyDown_Nil(ImGuiKey_D)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(right,    speed)); }
-		if (igIsKeyDown_Nil(ImGuiKey_A)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(right,   -speed)); }
-		if (igIsKeyDown_Nil(ImGuiKey_E)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(up,       speed)); }
-		if (igIsKeyDown_Nil(ImGuiKey_Q)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(up,      -speed)); }
-	}
-#endif
+	scene->time       += delta_time;
+	scene->delta_time  = delta_time;
 }
 
 ///////////////////////////////////////////
@@ -780,20 +694,19 @@ static void _scene_gi_update(scene_t* base, float delta_time) {
 // Compute GI volume bounds from the scaled model and optional floor.
 // Adds one voxel of padding on each side.
 static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds, float scale) {
-	float3 extents = {
-		model_bounds.max.x - model_bounds.min.x,
-		model_bounds.max.y - model_bounds.min.y,
-		model_bounds.max.z - model_bounds.min.z,
+	// Model is scaled from its own origin, no translation
+	float3 scene_min = {
+		model_bounds.min.x * scale,
+		model_bounds.min.y * scale,
+		model_bounds.min.z * scale,
 	};
-	float half_x = extents.x * 0.5f * scale;
-	float half_z = extents.z * 0.5f * scale;
-	float height = extents.y * scale;
+	float3 scene_max = {
+		model_bounds.max.x * scale,
+		model_bounds.max.y * scale,
+		model_bounds.max.z * scale,
+	};
 
-	// Model is centered XZ with bottom at y=0
-	float3 scene_min = { -half_x, 0.0f, -half_z };
-	float3 scene_max = {  half_x, height, half_z };
-
-	// Include floor (20x20 quad at y=0)
+	// Include floor (20x20 quad at model base)
 	if (scene->show_floor) {
 		scene_min.x = fminf(scene_min.x, -10.0f);
 		scene_min.z = fminf(scene_min.z, -10.0f);
@@ -1052,23 +965,13 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	// Compute model transform (needed by both GI captures and main pass)
 	su_gltf_state_ state           = su_gltf_get_state(scene->model);
 	float4x4       model_transform = float4x4_identity();
+	float          floor_y         = 0.0f;
 	if (state == su_gltf_state_ready) {
 		su_bounds_t bounds = su_gltf_get_bounds(scene->model);
-		float3 extents = {
-			bounds.max.x - bounds.min.x,
-			bounds.max.y - bounds.min.y,
-			bounds.max.z - bounds.min.z,
-		};
-		float max_extent = fmaxf(fmaxf(extents.x, extents.y), extents.z);
-		float scale = (max_extent > 0.0001f) ? (4.0f / max_extent) : 1.0f;
-		scale *= scene->model_scale;
+		float scale = scene->model_scale;
 
-		float center_x = (bounds.min.x + bounds.max.x) * 0.5f;
-		float center_z = (bounds.min.z + bounds.max.z) * 0.5f;
-
-		float4x4 scale_mat = float4x4_s((float3){scale, scale, scale});
-		float4x4 offset    = float4x4_t((float3){-center_x, -bounds.min.y, -center_z});
-		model_transform     = float4x4_mul(scale_mat, offset);
+		model_transform = float4x4_s((float3){scale, scale, scale});
+		floor_y         = bounds.min.y * scale;
 
 		// Recompute volume bounds when model first loads, scale changes, or floor toggles
 		if (!scene->gi_volume_computed ||
@@ -1077,7 +980,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			_gi_update_volume_bounds(scene, bounds, scale);
 		}
 	}
-	float4x4 floor_instance = float4x4_identity();
+	float4x4 floor_instance = float4x4_t((float3){0.0f, floor_y, 0.0f});
 
 	// --- Compute shadow data early (needed by GI capture draws and shadow pass) ---
 	float  texel_size       = SHADOW_MAP_SIZE / SHADOW_MAP_RESOLUTION;
@@ -1321,7 +1224,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	if (!scene->gi_show_voxels) {
 		if (state != su_gltf_state_ready) {
 			float4x4 world = float4x4_trs(
-				(float3){0.0f, 1.0f, 0.0f},
+				(float3){0.0f, 0.0f, 0.0f},
 				float4_quat_from_euler((float3){0.0f, scene->time * 2.0f, 0.0f}),
 				(float3){1.0f, 1.0f, 1.0f}
 			);
@@ -1432,8 +1335,59 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 
 static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_gi_t* scene = (scene_gi_t*)base;
+	float delta_time  = scene->delta_time;
+
+	ImGuiIO* io = igGetIO();
 
 #ifdef __ANDROID__
+	// Arc rotation camera (touch)
+	const float rotate_sensitivity = 0.0002f;
+	const float pan_sensitivity    = 0.0001f;
+	const float zoom_sensitivity   = 0.2f;
+	const float velocity_damping   = 0.0001f;
+	const float pitch_limit        = 1.5f;
+	const float min_distance       = 1.0f;
+	const float max_distance       = 40.0f;
+
+	if (!io->WantCaptureMouse) {
+		if (io->MouseDown[0] && io->MouseDownDuration[0] > 0.0f) {
+			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
+			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
+		}
+		if (io->MouseDown[1] && io->MouseDownDuration[1] > 0.0f) {
+			float cos_yaw = cosf(scene->cam_yaw);
+			float sin_yaw = sinf(scene->cam_yaw);
+			float3 right  = { cos_yaw, 0.0f, -sin_yaw };
+			float  pan_scale = scene->cam_distance * pan_sensitivity;
+			scene->cam_target_vel.x -= right.x * io->MouseDelta.x * pan_scale;
+			scene->cam_target_vel.z -= right.z * io->MouseDelta.x * pan_scale;
+			scene->cam_target_vel.y += io->MouseDelta.y * pan_scale;
+		}
+		if (io->MouseWheel != 0.0f) {
+			scene->cam_distance_vel -= io->MouseWheel * zoom_sensitivity;
+		}
+	}
+
+	scene->cam_yaw      += scene->cam_yaw_vel;
+	scene->cam_pitch    += scene->cam_pitch_vel;
+	scene->cam_distance += scene->cam_distance_vel;
+	scene->cam_target.x += scene->cam_target_vel.x;
+	scene->cam_target.y += scene->cam_target_vel.y;
+	scene->cam_target.z += scene->cam_target_vel.z;
+
+	if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
+	if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
+	if (scene->cam_distance < min_distance) scene->cam_distance = min_distance;
+	if (scene->cam_distance > max_distance) scene->cam_distance = max_distance;
+
+	float damping = powf(velocity_damping, delta_time);
+	scene->cam_yaw_vel      *= damping;
+	scene->cam_pitch_vel    *= damping;
+	scene->cam_distance_vel *= damping;
+	scene->cam_target_vel.x *= damping;
+	scene->cam_target_vel.y *= damping;
+	scene->cam_target_vel.z *= damping;
+
 	float cos_pitch = cosf(scene->cam_pitch);
 	float sin_pitch = sinf(scene->cam_pitch);
 	float cos_yaw   = cosf(scene->cam_yaw);
@@ -1447,12 +1401,37 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	out_camera->target = scene->cam_target;
 	out_camera->up     = (float3){0, 1, 0};
 #else
+	// WASD+QE fly camera
+	const float move_speed = 5.0f;
+	const float look_speed = 0.002f;
+
+	if (!io->WantCaptureMouse && io->MouseDown[1]) {
+		scene->cam_yaw   -= io->MouseDelta.x * look_speed;
+		scene->cam_pitch -= io->MouseDelta.y * look_speed;
+
+		const float pitch_limit = 1.5f;
+		if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
+		if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
+	}
+
 	float cos_p = cosf(scene->cam_pitch);
 	float sin_p = sinf(scene->cam_pitch);
 	float cos_y = cosf(scene->cam_yaw);
 	float sin_y = sinf(scene->cam_yaw);
 
 	float3 forward = { -sin_y * cos_p, sin_p, -cos_y * cos_p };
+	float3 right   = {  cos_y, 0.0f, -sin_y };
+	float3 up      = {  0.0f,  1.0f,  0.0f  };
+
+	float speed = move_speed * delta_time;
+	if (!io->WantCaptureKeyboard) {
+		if (igIsKeyDown_Nil(ImGuiKey_W)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(forward,  speed)); }
+		if (igIsKeyDown_Nil(ImGuiKey_S)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(forward, -speed)); }
+		if (igIsKeyDown_Nil(ImGuiKey_D)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(right,    speed)); }
+		if (igIsKeyDown_Nil(ImGuiKey_A)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(right,   -speed)); }
+		if (igIsKeyDown_Nil(ImGuiKey_E)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(up,       speed)); }
+		if (igIsKeyDown_Nil(ImGuiKey_Q)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(up,      -speed)); }
+	}
 
 	out_camera->position = scene->cam_pos;
 	out_camera->target   = float3_add(scene->cam_pos, forward);

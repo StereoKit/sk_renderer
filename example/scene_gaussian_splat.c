@@ -161,6 +161,7 @@ typedef struct {
 	float3          cam_target_vel;
 
 	float           time;
+	float           delta_time;
 } scene_gaussian_splat_t;
 
 // Load Gaussian splat data from PLY file
@@ -598,114 +599,11 @@ static void _scene_gaussian_splat_destroy(scene_t* base) {
 
 static void _scene_gaussian_splat_update(scene_t* base, float delta_time) {
 	scene_gaussian_splat_t* scene = (scene_gaussian_splat_t*)base;
-	scene->time += delta_time;
+	scene->time       += delta_time;
+	scene->delta_time  = delta_time;
 
 	// Run compute shader for sorting (must be outside render pass)
 	_run_sort_compute(scene);
-
-	// Camera control - hybrid orbit + fly camera
-	const float rotate_sensitivity = 0.003f;
-	const float zoom_sensitivity   = 0.2f;
-	const float velocity_damping   = 0.0001f;
-	const float pitch_limit        = 1.5f;
-	const float min_distance       = 0.1f;
-	const float max_distance       = 100.0f;
-	const float move_speed         = 5.0f;  // Units per second
-
-	ImGuiIO* io = igGetIO();
-
-	// Compute camera vectors for movement
-	float cos_pitch = cosf(scene->cam_pitch);
-	float sin_pitch = sinf(scene->cam_pitch);
-	float cos_yaw   = cosf(scene->cam_yaw);
-	float sin_yaw   = sinf(scene->cam_yaw);
-
-	// Forward is from camera toward target (opposite of orbit direction)
-	float3 forward = { -cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw };
-	float3 right   = {  cos_yaw, 0.0f, -sin_yaw };
-	// Camera up = cross(right, forward)
-	float3 up      = { -sin_yaw * sin_pitch, cos_pitch, -cos_yaw * sin_pitch };
-
-	// WASD + QE fly movement (always active when not typing in UI)
-	if (!io->WantCaptureKeyboard) {
-		float move_delta = move_speed * delta_time;
-
-		// Check for shift to move faster
-		if (igIsKeyDown_Nil(ImGuiKey_LeftShift) || igIsKeyDown_Nil(ImGuiKey_RightShift)) {
-			move_delta *= 3.0f;
-		}
-
-		if (igIsKeyDown_Nil(ImGuiKey_W)) {
-			scene->cam_target.x += forward.x * move_delta;
-			scene->cam_target.y += forward.y * move_delta;
-			scene->cam_target.z += forward.z * move_delta;
-		}
-		if (igIsKeyDown_Nil(ImGuiKey_S)) {
-			scene->cam_target.x -= forward.x * move_delta;
-			scene->cam_target.y -= forward.y * move_delta;
-			scene->cam_target.z -= forward.z * move_delta;
-		}
-		if (igIsKeyDown_Nil(ImGuiKey_A)) {
-			scene->cam_target.x -= right.x * move_delta;
-			scene->cam_target.z -= right.z * move_delta;
-		}
-		if (igIsKeyDown_Nil(ImGuiKey_D)) {
-			scene->cam_target.x += right.x * move_delta;
-			scene->cam_target.z += right.z * move_delta;
-		}
-		if (igIsKeyDown_Nil(ImGuiKey_E)) {
-			scene->cam_target.x += up.x * move_delta;
-			scene->cam_target.y += up.y * move_delta;
-			scene->cam_target.z += up.z * move_delta;
-		}
-		if (igIsKeyDown_Nil(ImGuiKey_Q)) {
-			scene->cam_target.x -= up.x * move_delta;
-			scene->cam_target.y -= up.y * move_delta;
-			scene->cam_target.z -= up.z * move_delta;
-		}
-	}
-
-	if (!io->WantCaptureMouse) {
-		// Left mouse: arc rotate (orbit around target)
-		if (io->MouseDown[0]) {
-			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
-			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
-		}
-
-		// Right mouse: mouse look (same rotation, feels like FPS when combined with WASD)
-		if (io->MouseDown[1]) {
-			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
-			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
-		}
-
-		// Scroll wheel: zoom
-		if (io->MouseWheel != 0.0f) {
-			scene->cam_distance_vel -= io->MouseWheel * zoom_sensitivity * scene->cam_distance * 0.1f;
-		}
-	}
-
-	// Apply velocities
-	scene->cam_yaw      += scene->cam_yaw_vel;
-	scene->cam_pitch    += scene->cam_pitch_vel;
-	scene->cam_distance += scene->cam_distance_vel;
-	scene->cam_target.x += scene->cam_target_vel.x;
-	scene->cam_target.y += scene->cam_target_vel.y;
-	scene->cam_target.z += scene->cam_target_vel.z;
-
-	// Clamp
-	if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
-	if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
-	if (scene->cam_distance < min_distance) scene->cam_distance = min_distance;
-	if (scene->cam_distance > max_distance) scene->cam_distance = max_distance;
-
-	// Damping
-	float damping = powf(velocity_damping, delta_time);
-	scene->cam_yaw_vel      *= damping;
-	scene->cam_pitch_vel    *= damping;
-	scene->cam_distance_vel *= damping;
-	scene->cam_target_vel.x *= damping;
-	scene->cam_target_vel.y *= damping;
-	scene->cam_target_vel.z *= damping;
 }
 
 // Check if two float3s are approximately equal
@@ -858,11 +756,97 @@ static void _scene_gaussian_splat_render(scene_t* base, int32_t width, int32_t h
 
 static bool _scene_gaussian_splat_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_gaussian_splat_t* scene = (scene_gaussian_splat_t*)base;
+	float delta_time = scene->delta_time;
+
+	const float rotate_sensitivity = 0.003f;
+	const float zoom_sensitivity   = 0.2f;
+	const float velocity_damping   = 0.0001f;
+	const float pitch_limit        = 1.5f;
+	const float min_distance       = 0.1f;
+	const float max_distance       = 100.0f;
+	const float move_speed         = 5.0f;
+
+	ImGuiIO* io = igGetIO();
 
 	float cos_pitch = cosf(scene->cam_pitch);
 	float sin_pitch = sinf(scene->cam_pitch);
 	float cos_yaw   = cosf(scene->cam_yaw);
 	float sin_yaw   = sinf(scene->cam_yaw);
+
+	float3 forward = { -cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw };
+	float3 right   = {  cos_yaw, 0.0f, -sin_yaw };
+	float3 up      = { -sin_yaw * sin_pitch, cos_pitch, -cos_yaw * sin_pitch };
+
+	if (!io->WantCaptureKeyboard) {
+		float move_delta = move_speed * delta_time;
+
+		if (igIsKeyDown_Nil(ImGuiKey_LeftShift) || igIsKeyDown_Nil(ImGuiKey_RightShift)) {
+			move_delta *= 3.0f;
+		}
+
+		if (igIsKeyDown_Nil(ImGuiKey_W)) {
+			scene->cam_target.x += forward.x * move_delta;
+			scene->cam_target.y += forward.y * move_delta;
+			scene->cam_target.z += forward.z * move_delta;
+		}
+		if (igIsKeyDown_Nil(ImGuiKey_S)) {
+			scene->cam_target.x -= forward.x * move_delta;
+			scene->cam_target.y -= forward.y * move_delta;
+			scene->cam_target.z -= forward.z * move_delta;
+		}
+		if (igIsKeyDown_Nil(ImGuiKey_A)) {
+			scene->cam_target.x -= right.x * move_delta;
+			scene->cam_target.z -= right.z * move_delta;
+		}
+		if (igIsKeyDown_Nil(ImGuiKey_D)) {
+			scene->cam_target.x += right.x * move_delta;
+			scene->cam_target.z += right.z * move_delta;
+		}
+		if (igIsKeyDown_Nil(ImGuiKey_E)) {
+			scene->cam_target.x += up.x * move_delta;
+			scene->cam_target.y += up.y * move_delta;
+			scene->cam_target.z += up.z * move_delta;
+		}
+		if (igIsKeyDown_Nil(ImGuiKey_Q)) {
+			scene->cam_target.x -= up.x * move_delta;
+			scene->cam_target.y -= up.y * move_delta;
+			scene->cam_target.z -= up.z * move_delta;
+		}
+	}
+
+	if (!io->WantCaptureMouse) {
+		if (io->MouseDown[0]) {
+			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
+			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
+		}
+		if (io->MouseDown[1]) {
+			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
+			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
+		}
+		if (io->MouseWheel != 0.0f) {
+			scene->cam_distance_vel -= io->MouseWheel * zoom_sensitivity * scene->cam_distance * 0.1f;
+		}
+	}
+
+	scene->cam_yaw      += scene->cam_yaw_vel;
+	scene->cam_pitch    += scene->cam_pitch_vel;
+	scene->cam_distance += scene->cam_distance_vel;
+	scene->cam_target.x += scene->cam_target_vel.x;
+	scene->cam_target.y += scene->cam_target_vel.y;
+	scene->cam_target.z += scene->cam_target_vel.z;
+
+	if (scene->cam_pitch >  pitch_limit) scene->cam_pitch =  pitch_limit;
+	if (scene->cam_pitch < -pitch_limit) scene->cam_pitch = -pitch_limit;
+	if (scene->cam_distance < min_distance) scene->cam_distance = min_distance;
+	if (scene->cam_distance > max_distance) scene->cam_distance = max_distance;
+
+	float damping = powf(velocity_damping, delta_time);
+	scene->cam_yaw_vel      *= damping;
+	scene->cam_pitch_vel    *= damping;
+	scene->cam_distance_vel *= damping;
+	scene->cam_target_vel.x *= damping;
+	scene->cam_target_vel.y *= damping;
+	scene->cam_target_vel.z *= damping;
 
 	out_camera->position = (float3){
 		scene->cam_target.x + scene->cam_distance * cos_pitch * sin_yaw,

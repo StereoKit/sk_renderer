@@ -230,24 +230,6 @@ static void _scene_bc1_update(scene_t* base, float delta_time) {
 		scene->load_requested = false;
 		_load_image(scene, scene->file_path);
 	}
-
-	// Camera input (only when not hovering UI)
-	ImGuiIO* io = igGetIO();
-	if (!io->WantCaptureMouse) {
-		// Scroll wheel: zoom
-		if (io->MouseWheel != 0.0f) {
-			scene->cam_distance -= io->MouseWheel * 0.5f;
-		}
-
-		// Mouse drag: zoom (left button + vertical drag)
-		if (io->MouseDown[0]) {
-			scene->cam_distance += io->MouseDelta.y * 0.02f;
-		}
-
-		// Clamp distance
-		if (scene->cam_distance < 1.0f)  scene->cam_distance = 1.0f;
-		if (scene->cam_distance > 20.0f) scene->cam_distance = 20.0f;
-	}
 }
 
 static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
@@ -284,7 +266,18 @@ static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
 static bool _scene_bc1_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_bc1_t* scene = (scene_bc1_t*)base;
 
-	// Camera with zoom control
+	ImGuiIO* io = igGetIO();
+	if (!io->WantCaptureMouse) {
+		if (io->MouseWheel != 0.0f) {
+			scene->cam_distance -= io->MouseWheel * 0.5f;
+		}
+		if (io->MouseDown[0]) {
+			scene->cam_distance += io->MouseDelta.y * 0.02f;
+		}
+		if (scene->cam_distance < 1.0f)  scene->cam_distance = 1.0f;
+		if (scene->cam_distance > 20.0f) scene->cam_distance = 20.0f;
+	}
+
 	out_camera->position = (float3){0, 0, scene->cam_distance};
 	out_camera->target   = (float3){0, 0, 0};
 	out_camera->up       = (float3){0, 1, 0};
