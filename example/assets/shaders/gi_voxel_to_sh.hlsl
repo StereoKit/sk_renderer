@@ -4,8 +4,8 @@
 // Each frame, casts low-discrepancy rays per probe through the voxel grid.
 // First opaque voxel hit provides radiance; rays exiting the grid sample the
 // environment cubemap at a low mip. Results project into SH via exponential
-// moving average. Hammersley-like sampling with per-probe Cranley-Patterson
-// rotation gives fast, uniform sphere coverage with minimal fireflies.
+// moving average. R2 sequence (plastic constant) with per-probe Cranley-Patterson
+// rotation gives fast, uniform sphere coverage with minimal banding.
 //
 // Backface culling uses a 6-bit face mask packed in voxel alpha (set during
 // voxelization from capture direction). Bit encoding:
@@ -29,9 +29,8 @@ float env_mip;     // cubemap mip level for environment fallback (higher = blurr
 float env_strength; // multiplier for environment cubemap contribution
 
 #define MAX_RADIANCE  4.0
-#define GOLDEN_RATIO  0.6180339887
 
-// Integer hash for per-probe random offset
+// Integer hash for per-probe random direction
 uint _hash(uint x) {
 	x ^= x >> 16;
 	x *= 0x45d9f3bu;
@@ -39,17 +38,6 @@ uint _hash(uint x) {
 	x *= 0x45d9f3bu;
 	x ^= x >> 16;
 	return x;
-}
-
-// Van der Corput radical inverse (bit reversal) for low-discrepancy sampling.
-// Pure bitwise ops — very cheap.
-float _radical_inverse(uint bits) {
-	bits = (bits << 16u) | (bits >> 16u);
-	bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-	bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-	bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-	bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-	return float(bits) * 2.3283064365386963e-10;
 }
 
 // Build a 6-bit mask of which voxel faces a ray would enter through,
@@ -69,10 +57,7 @@ uint _ray_entry_mask(float3 dir) {
 void cs(uint3 id : SV_DispatchThreadID) {
 	if (id.x >= grid_size || id.y >= grid_size || id.z >= grid_size) return;
 
-	// Per-probe random offset (Cranley-Patterson rotation for decorrelation)
-	uint  probe_hash = _hash(id.x + _hash(id.y + _hash(id.z)));
-	float offset1    = float(probe_hash) / 4294967295.0;
-	float offset2    = float(_hash(probe_hash)) / 4294967295.0;
+	uint probe_hash = _hash(id.x + _hash(id.y + _hash(id.z)));
 
 	float  inv_grid = 1.0 / (float)grid_size;
 	float3 origin   = (float3(id) + 0.5) * inv_grid;
@@ -88,11 +73,10 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	float4 total_b = float4(0, 0, 0, 0);
 
 	for (uint ray = 0; ray < ray_count; ray++) {
-		uint sample_idx = frame_seed * ray_count + ray;
-
-		// Low-discrepancy direction: radical inverse + golden ratio, per-probe rotated
-		float u1 = frac(_radical_inverse(sample_idx) + offset1);
-		float u2 = frac(float(sample_idx) * GOLDEN_RATIO + offset2);
+		// White noise: hash(probe, frame, ray) for fully random directions
+		uint h   = _hash(probe_hash + _hash(frame_seed * ray_count + ray));
+		float u1 = float(h) / 4294967295.0;
+		float u2 = float(_hash(h)) / 4294967295.0;
 
 		float z   = 1.0 - 2.0 * u1;
 		float r   = sqrt(max(0.0, 1.0 - z * z));
@@ -126,7 +110,11 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 			uint face_mask = uint(voxel.a + 0.5);
 			if (face_mask == 0) continue; // empty voxel
-			if ((face_mask & entry_mask) == 0) continue; // no face on ray's entry side
+
+			if ((face_mask & entry_mask) == 0) {
+				hit = true; // backface: geometry is opaque, but no radiance
+				break;
+			}
 
 			uint count = countbits(face_mask);
 			radiance   = voxel.rgb / (float)count;

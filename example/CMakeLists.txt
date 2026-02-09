@@ -237,6 +237,7 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gi_capture.hlsl
 	assets/shaders/gi_clear.hlsl
 	assets/shaders/gi_debug.hlsl
+	assets/shaders/gi_debug_voxel.hlsl
 	assets/shaders/gi_propagate.hlsl
 	assets/shaders/gi_voxelize.hlsl
 	assets/shaders/gi_fast_voxelize.hlsl

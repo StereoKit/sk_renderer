@@ -159,7 +159,11 @@ typedef struct {
 	skr_material_t     gi_debug_material;
 	skr_mesh_t         gi_debug_mesh;
 	bool               gi_show_probes;
+	bool               gi_show_voxels;
 	int32_t            gi_debug_mode;    // 0=SH, 1=UVW, 2=L0, 3=SH detail
+	skr_shader_t       gi_debug_voxel_shader;
+	skr_material_t     gi_debug_voxel_material;
+	skr_mesh_t         gi_debug_voxel_mesh;
 	bool               gi_stepping;     // Pause auto-advance, step manually
 	bool               gi_step_next;    // Advance one layer then pause
 	skr_shader_t       gi_slice_shader;
@@ -556,6 +560,18 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_debug_mesh = su_mesh_create_sphere(8, 6, 1.0f, (skr_vec4_t){1, 1, 1, 1});
 	skr_mesh_set_name(&scene->gi_debug_mesh, "gi_debug_probe_sphere");
 
+	// Voxel cube debug visualization
+	scene->gi_show_voxels = false;
+	scene->gi_debug_voxel_shader = su_shader_load("shaders/gi_debug_voxel.hlsl.sks", "gi_debug_voxel");
+	skr_material_create((skr_material_info_t){
+		.shader     = &scene->gi_debug_voxel_shader,
+		.cull       = skr_cull_back,
+		.write_mask = skr_write_default,
+		.depth_test = skr_compare_less,
+	}, &scene->gi_debug_voxel_material);
+	scene->gi_debug_voxel_mesh = su_mesh_create_cube(1.0f, NULL);
+	skr_mesh_set_name(&scene->gi_debug_voxel_mesh, "gi_debug_voxel_cube");
+
 	// Slice visualization cube (shows active capture slab when stepping)
 	scene->gi_slice_shader = su_shader_load("shaders/unlit.hlsl.sks", "gi_slice");
 	skr_material_create((skr_material_info_t){
@@ -650,6 +666,9 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_mesh_destroy    (&scene->gi_debug_mesh);
 	skr_material_destroy(&scene->gi_debug_material);
 	skr_shader_destroy  (&scene->gi_debug_shader);
+	skr_mesh_destroy    (&scene->gi_debug_voxel_mesh);
+	skr_material_destroy(&scene->gi_debug_voxel_material);
+	skr_shader_destroy  (&scene->gi_debug_voxel_shader);
 	skr_mesh_destroy    (&scene->gi_slice_mesh);
 	skr_material_destroy(&scene->gi_slice_material);
 	skr_shader_destroy  (&scene->gi_slice_shader);
@@ -1298,17 +1317,19 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		skr_render_list_add(ref_render_list, &scene->floor_mesh, floor_mats[scene->gi_mode], &floor_instance, sizeof(float4x4), 1);
 	}
 
-	// GLTF model (shader set 0=per-pixel, 2=per-vertex, 3=cubemap)
-	if (state != su_gltf_state_ready) {
-		float4x4 world = float4x4_trs(
-			(float3){0.0f, 1.0f, 0.0f},
-			float4_quat_from_euler((float3){0.0f, scene->time * 2.0f, 0.0f}),
-			(float3){1.0f, 1.0f, 1.0f}
-		);
-		skr_render_list_add(ref_render_list, &scene->placeholder_mesh, &scene->placeholder_material, &world, sizeof(float4x4), 1);
-	} else {
-		int32_t shader_sets[] = { 0, 2, 3 };
-		su_gltf_add_to_render_list_shader(scene->model, ref_render_list, &model_transform, shader_sets[scene->gi_mode]);
+	// GLTF model (hidden when showing voxels)
+	if (!scene->gi_show_voxels) {
+		if (state != su_gltf_state_ready) {
+			float4x4 world = float4x4_trs(
+				(float3){0.0f, 1.0f, 0.0f},
+				float4_quat_from_euler((float3){0.0f, scene->time * 2.0f, 0.0f}),
+				(float3){1.0f, 1.0f, 1.0f}
+			);
+			skr_render_list_add(ref_render_list, &scene->placeholder_mesh, &scene->placeholder_material, &world, sizeof(float4x4), 1);
+		} else {
+			int32_t shader_sets[] = { 0, 2, 3 };
+			su_gltf_add_to_render_list_shader(scene->model, ref_render_list, &model_transform, shader_sets[scene->gi_mode]);
+		}
 	}
 
 	// --- Slice visualization (shows active capture slab when stepping) ---
@@ -1373,6 +1394,35 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			}
 		}
 		skr_render_list_add(ref_render_list, &scene->gi_debug_mesh, &scene->gi_debug_material, probe_data, sizeof(float4), total_probes);
+	}
+
+	// --- Voxel cube visualization ---
+	if (scene->gi_show_voxels) {
+		float3 vol_size  = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
+		float3 cell_size = {
+			vol_size.x / GI_GRID_SIZE,
+			vol_size.y / GI_GRID_SIZE,
+			vol_size.z / GI_GRID_SIZE,
+		};
+		skr_material_set_param(&scene->gi_debug_voxel_material, "cell_size", sksc_shader_var_float, 3, &cell_size);
+
+		int32_t total = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
+		float4  voxel_data[GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE];
+		int32_t i = 0;
+
+		for (int32_t z = 0; z < GI_GRID_SIZE; z++) {
+			for (int32_t y = 0; y < GI_GRID_SIZE; y++) {
+				for (int32_t x = 0; x < GI_GRID_SIZE; x++) {
+					voxel_data[i++] = (float4){
+						scene->gi_volume_min.x + (x + 0.5f) * cell_size.x,
+						scene->gi_volume_min.y + (y + 0.5f) * cell_size.y,
+						scene->gi_volume_min.z + (z + 0.5f) * cell_size.z,
+						0,
+					};
+				}
+			}
+		}
+		skr_render_list_add(ref_render_list, &scene->gi_debug_voxel_mesh, &scene->gi_debug_voxel_material, voxel_data, sizeof(float4), total);
 	}
 }
 
@@ -1499,6 +1549,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 
 	if (igCollapsingHeader_TreeNodeFlags("Debug", 0)) {
 		igCheckbox("Show Probes", &scene->gi_show_probes);
+		igCheckbox("Show Voxels", &scene->gi_show_voxels);
 		{
 			const char* modes[] = { "SH Irradiance", "Face Mask", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
 			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
