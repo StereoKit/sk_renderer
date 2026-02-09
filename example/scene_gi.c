@@ -59,6 +59,12 @@ typedef struct {
 	float  _gi_pad;
 } gi_buffer_data_t;
 
+typedef enum {
+	gi_mode_per_pixel,
+	gi_mode_per_vertex,
+	gi_mode_cubemap,
+} gi_mode_;
+
 ///////////////////////////////////////////
 // Scene state
 ///////////////////////////////////////////
@@ -72,7 +78,7 @@ typedef struct {
 	skr_shader_t   shader;            // pbr_gi shader (per-pixel GI)
 	skr_shader_t   shader_vertex_gi;  // pbr_gi_vertex shader (per-vertex GI)
 	skr_shader_t   shader_cubemap;    // pbr_cubemap shader (cubemap irradiance, no GI)
-	int32_t        gi_mode;           // 0=per-pixel, 1=per-vertex, 2=none (cubemap)
+	gi_mode_       gi_mode;
 	float          model_scale;
 
 	// Placeholder while loading
@@ -148,7 +154,6 @@ typedef struct {
 	bool               gi_fast_init_done;        // Has fast voxelize run at least once?
 	bool               gi_volume_computed;       // Volume bounds computed from model?
 	float              gi_prev_model_scale;      // Track for recompute
-	bool               gi_prev_show_floor;       // Track for recompute
 
 	// Voxel-to-SH conversion (per-frame random ray march with EMA)
 	skr_shader_t       gi_voxel_to_sh_shader;
@@ -463,7 +468,7 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_env_mip       = 3.0f;
 	scene->gi_env_strength  = 1.0f;
 	scene->gi_frame         = 0;
-	scene->gi_mode          = 1;
+	scene->gi_mode          = gi_mode_per_pixel;
 
 	// Create 3D SH textures (single buffer, continuous temporal accumulation)
 	skr_tex_sampler_t gi_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
@@ -534,15 +539,21 @@ static scene_t* _scene_gi_create(void) {
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_b", &scene->gi_sh_b);
 	skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
-	// GI capture render list and simplified capture material
+	// GI capture render list and capture material
+	// Use gi_capture for fast/simple captures, or pbr_gi for full PBR during captures
 	skr_render_list_create(&scene->gi_capture_list);
 	scene->gi_capture_shader = su_shader_load("shaders/gi_capture.hlsl.sks", "gi_capture");
+	//scene->gi_capture_shader = su_shader_load("shaders/pbr_gi.hlsl.sks", "gi_capture_pbr");
 	skr_material_create((skr_material_info_t){
 		.shader     = &scene->gi_capture_shader,
 		.depth_test = skr_compare_less,
 		.cull       = skr_cull_back,
 	}, &scene->gi_capture_material);
-	skr_material_set_tex(&scene->gi_capture_material, "albedo_tex", &scene->floor_texture);
+	skr_material_set_tex  (&scene->gi_capture_material, "albedo_tex",      &scene->floor_texture);
+	skr_material_set_tex  (&scene->gi_capture_material, "emission_tex",    &scene->black_texture);
+	skr_material_set_param(&scene->gi_capture_material, "color",           sksc_shader_var_float, 4, &(skr_vec4_t){1, 1, 1, 1});
+	skr_material_set_param(&scene->gi_capture_material, "emission_factor", sksc_shader_var_float, 4, &(skr_vec4_t){0, 0, 0, 0});
+	skr_material_set_param(&scene->gi_capture_material, "tex_trans",       sksc_shader_var_float, 4, &(skr_vec4_t){0, 0, 1, 1});
 
 	// GI constant buffer
 	gi_buffer_data_t gi_data = {0};
@@ -691,7 +702,7 @@ static void _scene_gi_update(scene_t* base, float delta_time) {
 // GI capture helpers
 ///////////////////////////////////////////
 
-// Compute GI volume bounds from the scaled model and optional floor.
+// Compute GI volume bounds from the scaled model.
 // Adds one voxel of padding on each side.
 static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds, float scale) {
 	// Model is scaled from its own origin, no translation
@@ -706,25 +717,16 @@ static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds
 		model_bounds.max.z * scale,
 	};
 
-	// Include floor (20x20 quad at model base)
-	if (scene->show_floor) {
-		scene_min.x = fminf(scene_min.x, -10.0f);
-		scene_min.z = fminf(scene_min.z, -10.0f);
-		scene_max.x = fmaxf(scene_max.x,  10.0f);
-		scene_max.z = fmaxf(scene_max.z,  10.0f);
-	}
-
 	// Pad by ~1.137 voxels on each side to offset grid from unit-aligned geometry
 	float3 tight_size = float3_sub(scene_max, scene_min);
 	float3 padding    = float3_mul_s(tight_size, 1.137f / (float)(GI_GRID_SIZE - 2.0f * 1.137f));
 	scene->gi_volume_min = float3_sub(scene_min, padding);
 	scene->gi_volume_max = float3_add(scene_max, padding);
 
-	scene->gi_volume_computed   = true;
-	scene->gi_prev_model_scale  = scene->model_scale;
-	scene->gi_prev_show_floor   = scene->show_floor;
-	scene->gi_fast_init_done    = false;
-	scene->gi_frame             = 0;
+	scene->gi_volume_computed  = true;
+	scene->gi_prev_model_scale = scene->model_scale;
+	scene->gi_fast_init_done   = false;
+	scene->gi_frame            = 0;
 }
 
 // Build an orthographic view/proj for capturing one axis-aligned direction.
@@ -872,7 +874,7 @@ static void _gi_run_fast_voxelize(
 	// Set GI intensity to 0 during captures (prevent feedback)
 	gi_buffer_data_t gi_capture_data = {
 		.gi_volume_min = scene->gi_volume_min,
-		.gi_intensity  = 0.0f,
+		.gi_intensity  = 1.0f,
 		.gi_volume_inv = {
 			1.0f / vol_size.x,
 			1.0f / vol_size.y,
@@ -965,22 +967,29 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	// Compute model transform (needed by both GI captures and main pass)
 	su_gltf_state_ state           = su_gltf_get_state(scene->model);
 	float4x4       model_transform = float4x4_identity();
-	float          floor_y         = 0.0f;
+	float4x4       floor_instance  = float4x4_identity();
 	if (state == su_gltf_state_ready) {
 		su_bounds_t bounds = su_gltf_get_bounds(scene->model);
 		float scale = scene->model_scale;
 
 		model_transform = float4x4_s((float3){scale, scale, scale});
-		floor_y         = bounds.min.y * scale;
 
-		// Recompute volume bounds when model first loads, scale changes, or floor toggles
+		// Floor covers the model's XZ footprint at its base Y
+		float floor_cx = (bounds.min.x + bounds.max.x) * 0.5f * scale;
+		float floor_cz = (bounds.min.z + bounds.max.z) * 0.5f * scale;
+		float floor_sx = (bounds.max.x - bounds.min.x) * scale / 20.0f;
+		float floor_sz = (bounds.max.z - bounds.min.z) * scale / 20.0f;
+		floor_instance = float4x4_trs(
+			(float3){floor_cx, bounds.min.y * scale, floor_cz},
+			(float4){0, 0, 0, 1},
+			(float3){floor_sx, 1, floor_sz});
+
+		// Recompute volume bounds when model first loads or scale changes
 		if (!scene->gi_volume_computed ||
-		    scene->model_scale != scene->gi_prev_model_scale ||
-		    scene->show_floor  != scene->gi_prev_show_floor) {
+		    scene->model_scale != scene->gi_prev_model_scale) {
 			_gi_update_volume_bounds(scene, bounds, scale);
 		}
 	}
-	float4x4 floor_instance = float4x4_t((float3){0.0f, floor_y, 0.0f});
 
 	// --- Compute shadow data early (needed by GI capture draws and shadow pass) ---
 	float  texel_size       = SHADOW_MAP_SIZE / SHADOW_MAP_RESOLUTION;
@@ -1012,7 +1021,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	//   0 = Layer Scan: progressive 96-frame cycle (cheapest per-frame, most detailed)
 	//   1 = Fast: re-voxelize every frame (most responsive to scene changes)
 	//   2 = Fast Periodic: re-voxelize every 96 frames (same cadence as layer scan)
-	if (scene->gi_mode != 2) {
+	if (scene->gi_mode != gi_mode_cubemap) {
 		bool run_fast = !scene->gi_fast_init_done ||
 		                (scene->gi_voxel_mode == 1) ||
 		                (scene->gi_voxel_mode == 2 && scene->gi_frame == 0);
@@ -1045,7 +1054,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			// During captures: set gi_intensity=0 so pbr_gi shader doesn't sample GI (no feedback)
 			gi_buffer_data_t gi_capture_data = {
 				.gi_volume_min = scene->gi_volume_min,
-				.gi_intensity  = 0.0f,
+				.gi_intensity  = 1.0f,
 				.gi_volume_inv = {
 					1.0f / vol_size.x,
 					1.0f / vol_size.y,
@@ -1158,7 +1167,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
 		gi_buffer_data_t gi_data = {
 			.gi_volume_min = scene->gi_volume_min,
-			.gi_intensity  = scene->gi_mode != 2 ? scene->gi_intensity : 0.0f,
+			.gi_intensity  = scene->gi_mode != gi_mode_cubemap ? scene->gi_intensity : 0.0f,
 			.gi_volume_inv = {
 				1.0f / vol_size.x,
 				1.0f / vol_size.y,
@@ -1510,9 +1519,9 @@ static void _scene_gi_render_ui(scene_t* base) {
 	igText("GI Probes");
 	{
 		const char* gi_modes[] = { "Per-Pixel", "Per-Vertex", "None" };
-		igCombo_Str_arr("GI Mode", &scene->gi_mode, gi_modes, 3, 0);
+		igCombo_Str_arr("GI Mode", (int*)&scene->gi_mode, gi_modes, 3, 0);
 	}
-	if (scene->gi_mode != 2) {
+	if (scene->gi_mode != gi_mode_cubemap) {
 		const char* voxel_modes[] = { "Layer Scan", "Fast", "Fast Periodic" };
 		if (igCombo_Str_arr("Voxel Mode", &scene->gi_voxel_mode, voxel_modes, 3, 0)) {
 			scene->gi_frame    = 0;
@@ -1534,7 +1543,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
 		}
 
-		if (scene->gi_mode != 2 && scene->gi_voxel_mode == 0) {
+		if (scene->gi_mode != gi_mode_cubemap && scene->gi_voxel_mode == 0) {
 			const char *axis_names[] = {"X", "Y", "Z"};
 			int32_t show_frame = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
 			int32_t axis  = show_frame / GI_GRID_SIZE;
