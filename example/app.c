@@ -198,8 +198,6 @@ app_t* app_create(int32_t start_scene) {
 	app->scene_types[app->scene_count++] = &scene_video_vtable;
 #endif
 
-	start_scene = 17;
-
 	su_log(su_log_info, "Application created successfully!");
 	su_log(su_log_info, "Available scenes: %d (use arrow keys to switch)", app->scene_count);
 
