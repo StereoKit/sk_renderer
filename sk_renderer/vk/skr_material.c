@@ -545,6 +545,16 @@ void skr_material_get_param(const skr_material_t* material, const char* name, sk
 	memcpy(out_data, (uint8_t*)material->param_buffer + var->offset, copy_size);
 }
 
+bool skr_material_get_param_info(const skr_material_t* material, const char* param_name, skr_shader_param_info_t* opt_out_info) {
+	if (!material) return false;
+	return skr_shader_get_param_info(material->key.shader, param_name, opt_out_info);
+}
+
+bool skr_material_get_tex_info(const skr_material_t* material, const char* tex_name, skr_shader_tex_info_t* opt_out_info) {
+	if (!material) return false;
+	return skr_shader_get_tex_info(material->key.shader, tex_name, opt_out_info);
+}
+
 const char* _skr_material_bind_name(const sksc_shader_meta_t* meta, int32_t bind_idx) {
 	if (!meta || bind_idx < 0) return "unknown";
 	if ((uint32_t)bind_idx < meta->buffer_count) {

@@ -1178,20 +1178,22 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 
 			skr_material_create(mat_info, &gltf->materials[s][i]);
 
-			// Set default fallback textures (params that don't exist
-			// in the shader are silently ignored)
-			skr_material_set_tex(&gltf->materials[s][i], "albedo_tex",    &gltf->white_texture);
-			skr_material_set_tex(&gltf->materials[s][i], "emission_tex",  &gltf->black_texture);
-			skr_material_set_tex(&gltf->materials[s][i], "metal_tex",     &gltf->default_metal_texture);
-			skr_material_set_tex(&gltf->materials[s][i], "occlusion_tex", &gltf->white_texture);
+			// Set default fallback textures for bindings that exist in the shader
+			skr_material_t* mat = &gltf->materials[s][i];
+			if (skr_material_get_tex_info(mat, "albedo_tex",    NULL)) skr_material_set_tex(mat, "albedo_tex",    &gltf->white_texture);
+			if (skr_material_get_tex_info(mat, "emission_tex",  NULL)) skr_material_set_tex(mat, "emission_tex",  &gltf->black_texture);
+			if (skr_material_get_tex_info(mat, "metal_tex",     NULL)) skr_material_set_tex(mat, "metal_tex",     &gltf->default_metal_texture);
+			if (skr_material_get_tex_info(mat, "occlusion_tex", NULL)) skr_material_set_tex(mat, "occlusion_tex", &gltf->white_texture);
 
-			// Set material parameters
-			skr_material_set_param(&gltf->materials[s][i], "color",           sksc_shader_var_float, 4, &md->base_color_factor);
-			skr_vec4_t emission = {md->emissive_factor.x, md->emissive_factor.y, md->emissive_factor.z, 1.0f};
-			skr_material_set_param(&gltf->materials[s][i], "emission_factor", sksc_shader_var_float, 4, &emission);
-			skr_material_set_param(&gltf->materials[s][i], "tex_trans",       sksc_shader_var_float, 4, &md->tex_trans);
-			skr_material_set_param(&gltf->materials[s][i], "metallic",        sksc_shader_var_float, 1, &md->metallic_factor);
-			skr_material_set_param(&gltf->materials[s][i], "roughness",       sksc_shader_var_float, 1, &md->roughness_factor);
+			// Set material parameters for bindings that exist in the shader
+			if (skr_material_get_param_info(mat, "color",           NULL)) skr_material_set_param(mat, "color",           sksc_shader_var_float, 4, &md->base_color_factor);
+			if (skr_material_get_param_info(mat, "emission_factor", NULL)) {
+				skr_vec4_t emission = {md->emissive_factor.x, md->emissive_factor.y, md->emissive_factor.z, 1.0f};
+				skr_material_set_param(mat, "emission_factor", sksc_shader_var_float, 4, &emission);
+			}
+			if (skr_material_get_param_info(mat, "tex_trans",       NULL)) skr_material_set_param(mat, "tex_trans",       sksc_shader_var_float, 4, &md->tex_trans);
+			if (skr_material_get_param_info(mat, "metallic",        NULL)) skr_material_set_param(mat, "metallic",        sksc_shader_var_float, 1, &md->metallic_factor);
+			if (skr_material_get_param_info(mat, "roughness",       NULL)) skr_material_set_param(mat, "roughness",       sksc_shader_var_float, 1, &md->roughness_factor);
 		}
 	}
 
@@ -1239,8 +1241,10 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 				const char* bind_names[] = {"albedo_tex", "metal_tex", NULL, "occlusion_tex", "emission_tex"};
 				const char* bind_name    = bind_names[tex_type];
 				if (bind_name) {
-					for (int32_t s = 0; s < gltf->shader_count; s++)
-						skr_material_set_tex(&gltf->materials[s][m], bind_name, &gltf->textures[tex_idx]);
+					for (int32_t s = 0; s < gltf->shader_count; s++) {
+						if (skr_material_get_tex_info(&gltf->materials[s][m], bind_name, NULL))
+							skr_material_set_tex(&gltf->materials[s][m], bind_name, &gltf->textures[tex_idx]);
+					}
 				}
 			}
 		}

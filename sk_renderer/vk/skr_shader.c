@@ -141,6 +141,40 @@ skr_bind_t skr_shader_get_bind(const skr_shader_t* shader, const char* bind_name
 	return sksc_shader_meta_get_bind(shader->meta, bind_name);
 }
 
+bool skr_shader_get_param_info(const skr_shader_t* shader, const char* param_name, skr_shader_param_info_t* opt_out_info) {
+	if (!shader || !shader->meta) return false;
+
+	int32_t idx = sksc_shader_meta_get_var_index(shader->meta, param_name);
+	if (idx < 0) return false;
+
+	if (opt_out_info) {
+		const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(shader->meta, idx);
+		*opt_out_info = (skr_shader_param_info_t){
+			.type  = var->type,
+			.count = var->type_count,
+			.size  = var->size,
+		};
+	}
+	return true;
+}
+
+bool skr_shader_get_tex_info(const skr_shader_t* shader, const char* tex_name, skr_shader_tex_info_t* opt_out_info) {
+	if (!shader || !shader->meta) return false;
+
+	uint64_t hash = skr_hash(tex_name);
+	for (uint32_t i = 0; i < shader->meta->resource_count; i++) {
+		if (shader->meta->resources[i].name_hash == hash) {
+			if (opt_out_info) {
+				*opt_out_info = (skr_shader_tex_info_t){
+					.default_value = shader->meta->resources[i].value,
+				};
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 void skr_shader_set_name(skr_shader_t* ref_shader, const char* name) {
 	if (!ref_shader) return;
 

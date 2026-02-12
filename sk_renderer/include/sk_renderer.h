@@ -479,6 +479,16 @@ typedef struct skr_settings_t {
 
 typedef struct skr_shader_t skr_shader_t;
 
+typedef struct skr_shader_param_info_t {
+	sksc_shader_var_ type;
+	uint32_t         count;
+	uint32_t         size;
+} skr_shader_param_info_t;
+
+typedef struct skr_shader_tex_info_t {
+	const char* default_value;
+} skr_shader_tex_info_t;
+
 typedef struct skr_material_info_t {
 	const skr_shader_t*  shader;
 	skr_cull_            cull;
@@ -599,6 +609,8 @@ SKR_API skr_err_          skr_shader_create                (const void *shader_d
 SKR_API bool              skr_shader_is_valid              (const skr_shader_t*     shader);
 SKR_API void              skr_shader_destroy               (      skr_shader_t* ref_shader);
 SKR_API skr_bind_t        skr_shader_get_bind              (const skr_shader_t*     shader, const char* bind_name);
+SKR_API bool              skr_shader_get_param_info        (const skr_shader_t*     shader, const char* param_name, skr_shader_param_info_t* opt_out_info);
+SKR_API bool              skr_shader_get_tex_info          (const skr_shader_t*     shader, const char* tex_name,   skr_shader_tex_info_t*   opt_out_info);
 SKR_API void              skr_shader_set_name              (      skr_shader_t* ref_shader, const char* name);
 
 SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_t* out_compute);
@@ -621,6 +633,8 @@ SKR_API void              skr_material_set_params          (      skr_material_t
 SKR_API void              skr_material_destroy             (      skr_material_t* ref_material);
 SKR_API void              skr_material_set_param           (      skr_material_t* ref_material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data);
 SKR_API void              skr_material_get_param           (const skr_material_t*     material, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data);
+SKR_API bool              skr_material_get_param_info      (const skr_material_t*     material, const char* param_name, skr_shader_param_info_t* opt_out_info);
+SKR_API bool              skr_material_get_tex_info        (const skr_material_t*     material, const char* tex_name,   skr_shader_tex_info_t*   opt_out_info);
 
 SKR_API skr_err_          skr_render_list_create           (skr_render_list_t* out_list);
 SKR_API void              skr_render_list_destroy          (skr_render_list_t* ref_list);
