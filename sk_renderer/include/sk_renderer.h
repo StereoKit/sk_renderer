@@ -369,6 +369,12 @@ typedef struct skr_stencil_state_t {
 	uint32_t        reference;
 } skr_stencil_state_t;
 
+typedef enum skr_buffering_ {
+	skr_buffering_default = 0,
+	skr_buffering_double  = 2,
+	skr_buffering_triple  = 3,
+} skr_buffering_;
+
 // GPU selection flags - can be combined with bitwise OR
 typedef enum skr_gpu_ {
 	skr_gpu_none       = 0,
@@ -475,6 +481,8 @@ typedef struct skr_settings_t {
 
 	// Bind slot configuration (NULL = use defaults: material=0, system=1, instance=2)
 	const skr_bind_settings_t* bind_settings;
+
+	skr_buffering_ buffering; // Swapchain image count (default = triple)
 } skr_settings_t;
 
 typedef struct skr_shader_t skr_shader_t;

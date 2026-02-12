@@ -65,9 +65,23 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 	vkGetPhysicalDeviceSurfacePresentModesKHR(phys_device, ref_surface->surface, &present_mode_count, NULL);
 	vkGetPhysicalDeviceSurfacePresentModesKHR(phys_device, ref_surface->surface, &present_mode_count, present_modes);
 
-	// Choose present mode: IMMEDIATE for lowest latency (allows tearing), FIFO for vsync
+	// Choose present mode: prefer FIFO_RELAXED (vsync but tolerant of missed
+	// deadlines), fall back to FIFO. MAILBOX doesn't vsync on many Linux
+	// compositors, and FIFO cascades missed frames.
 	VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
-	//VkPresentModeKHR present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+	for (uint32_t i = 0; i < present_mode_count; i++) {
+		if (present_modes[i] == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
+			present_mode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+			break;
+		}
+	}
+
+	const char* mode_name =
+		present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO_RELAXED" :
+		present_mode == VK_PRESENT_MODE_FIFO_KHR         ? "FIFO"         :
+		present_mode == VK_PRESENT_MODE_MAILBOX_KHR      ? "MAILBOX"      :
+		present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR    ? "IMMEDIATE"    : "UNKNOWN";
+	skr_log(skr_log_info, "Present mode: %s", mode_name);
 
 	// Determine extent
 	VkExtent2D extent = capabilities.currentExtent;
@@ -82,11 +96,11 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		return false;
 	}
 
-	// Determine image count
-	uint32_t image_count = capabilities.minImageCount + 1;
-	if (capabilities.maxImageCount > 0 && image_count > capabilities.maxImageCount) {
+	// Determine image count based on buffering preference
+	uint32_t desired      = (uint32_t)_skr_vk.buffering;
+	uint32_t image_count  = capabilities.minImageCount > desired ? capabilities.minImageCount : desired;
+	if (capabilities.maxImageCount > 0 && image_count > capabilities.maxImageCount)
 		image_count = capabilities.maxImageCount;
-	}
 
 	// Create swapchain
 	VkSwapchainCreateInfoKHR swapchain_info = {

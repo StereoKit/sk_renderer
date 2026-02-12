@@ -140,6 +140,10 @@ bool skr_init(skr_settings_t settings) {
 		};
 	}
 
+	_skr_vk.buffering = settings.buffering == skr_buffering_default
+		? skr_buffering_triple
+		: settings.buffering;
+
 	// Initialize volk
 	VkResult vr = volkInitialize();
 	SKR_VK_CHECK_RET(vr, volkInitialize, false);

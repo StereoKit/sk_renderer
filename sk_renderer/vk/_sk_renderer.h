@@ -193,6 +193,7 @@ typedef struct {
 
 	// Bind slot configuration
 	skr_bind_settings_t      bind_settings;
+	skr_buffering_           buffering;
 	bool                     in_frame;  // True when between frame_begin and frame_end
 	thrd_t                   main_thread_id;  // Thread that calls skr_init
 	uint32_t                 frame;
