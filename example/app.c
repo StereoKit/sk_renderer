@@ -60,6 +60,9 @@ struct app_t {
 	float   gpu_time_history[512];
 	float   cpu_time_history[512];
 	int32_t history_index;
+	float   frame_ema;
+	float   gpu_ema;
+	float   cpu_ema;
 };
 
 static const char* _tex_fmt_name(skr_tex_fmt_ fmt) {
@@ -422,9 +425,15 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	app->cpu_time_history  [app->history_index] = cpu_ms > 0.0f ? cpu_ms : app->cpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE];
 	app->history_index = (app->history_index + 1) % FRAME_HISTORY_SIZE;
 
-	igText("Frame Time: %.2f ms (%.1f FPS)", frame_ms, 1000.0f / frame_ms);
-	igText("CPU Time: %.2f ms", cpu_ms);
-	igText("GPU Time: %.2f ms", gpu_ms);
+	// Exponential moving average for readable display (smoothing factor ~0.1)
+	const float ema_a = 0.02f;
+	app->frame_ema = app->frame_ema > 0.0f ? app->frame_ema + ema_a * (frame_ms - app->frame_ema) : frame_ms;
+	app->gpu_ema   = app->gpu_ema   > 0.0f ? app->gpu_ema   + ema_a * (app->gpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE] - app->gpu_ema) : gpu_ms;
+	app->cpu_ema   = app->cpu_ema   > 0.0f ? app->cpu_ema   + ema_a * (app->cpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE] - app->cpu_ema) : cpu_ms;
+
+	igText("Frame Time: %.3f ms (%.1f FPS)", app->frame_ema, 1000.0f / app->frame_ema);
+	igText("CPU Time: %.3f ms", app->cpu_ema);
+	igText("GPU Time: %.3f ms", app->gpu_ema);
 
 	// Graph display ranges
 	const float frame_graph_min = 6.0f;
@@ -440,9 +449,9 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	float plot_width = content_region.x;
 
 	char frame_overlay[32], cpu_overlay[32], gpu_overlay[32];
-	snprintf(frame_overlay, sizeof(frame_overlay), "Frame: %.1f ms", frame_ms);
-	snprintf(cpu_overlay,   sizeof(cpu_overlay),   "CPU: %.1f ms",   cpu_ms > 0.0f ? cpu_ms : 0.0f);
-	snprintf(gpu_overlay,   sizeof(gpu_overlay),   "GPU: %.1f ms",   gpu_ms > 0.0f ? gpu_ms : 0.0f);
+	snprintf(frame_overlay, sizeof(frame_overlay), "Frame: %.1f ms", app->frame_ema);
+	snprintf(cpu_overlay,   sizeof(cpu_overlay),   "CPU: %.1f ms",   app->cpu_ema);
+	snprintf(gpu_overlay,   sizeof(gpu_overlay),   "GPU: %.1f ms",   app->gpu_ema);
 
 	// Plot frame time - using values_offset for circular buffer
 	igPlotLines_FloatPtr("##frame_graph", app->frame_time_history, FRAME_HISTORY_SIZE,
