@@ -1,6 +1,7 @@
 //--name = pbr_gi
 
 #include "common.hlsli"
+#include "gi_voxel.hlsli"
 
 ///////////////////////////////////////////
 // Material Parameters
@@ -43,7 +44,7 @@ cbuffer GIBuffer : register(b12, space0) {
 	float3 gi_volume_min;
 	float  gi_intensity;
 	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	float  _gi_pad;
+	uint   gi_grid_size;
 };
 
 ///////////////////////////////////////////
@@ -56,15 +57,8 @@ SamplerState albedo_tex_s : register(s1);
 Texture2D    emission_tex   : register(t0);
 SamplerState emission_tex_s : register(s0);
 
-// GI SH probe textures (3D, one per color channel, 4 SH coefficients each)
-Texture3D<float4> gi_sh_r   : register(t6);
-SamplerState      gi_sh_r_s : register(s6);
-
-Texture3D<float4> gi_sh_g   : register(t7);
-SamplerState      gi_sh_g_s : register(s7);
-
-Texture3D<float4> gi_sh_b   : register(t8);
-SamplerState      gi_sh_b_s : register(s8);
+// GI SH probe buffer (one SHProbe per grid cell)
+StructuredBuffer<SHProbe> gi_sh_probes : register(t6);
 
 // Shadow map (t14/s14)
 Texture2D              shadow_map         : register(t14);
@@ -82,13 +76,13 @@ struct vsIn {
 };
 
 struct psIn {
-	float4 pos        : SV_POSITION;
-	float3 sh_norm    : NORMAL0;    // 1.02333 * normal.yzx (SH L1 basis, pre-scaled)
-	float2 uv         : TEXCOORD0;
-	float4 color      : COLOR0;
-	float3 gi_uvw     : TEXCOORD1;  // pre-computed GI probe UVW
-	float4 shadow_uv  : TEXCOORD2;  // .xyz = shadow coords, .w = ndotl
-	uint   layer      : SV_RenderTargetArrayIndex;
+	float4 pos            : SV_POSITION;
+	float3 normal         : NORMAL0;    // world-space normal
+	float2 uv             : TEXCOORD0;
+	float4 color          : COLOR0;
+	float3 gi_world_offset : TEXCOORD1;  // world_pos - volume_min
+	float4 shadow_uv      : TEXCOORD2;  // .xyz = shadow coords, .w = ndotl
+	uint   layer          : SV_RenderTargetArrayIndex;
 };
 
 ///////////////////////////////////////////
@@ -104,12 +98,12 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	float3 world_pos = mul(float4(input.pos, 1), inst[inst_idx].world).xyz;
 	float3 normal    = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
 	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
-	output.sh_norm   = 1.02333 * normal.yzx;
+	output.normal    = normal;
 	output.uv        = (input.uv * tex_trans.zw) + tex_trans.xy;
 	output.color     = input.color * color;
 
-	// GI probe UVW (linear transform of world_pos, interpolates correctly)
-	output.gi_uvw = (world_pos - gi_volume_min) * gi_volume_inv;
+	// GI world offset (linear, interpolates correctly; cheaper direction math in PS)
+	output.gi_world_offset = world_pos - gi_volume_min;
 
 	// Shadow map projection + ndotl (reused in PS for diffuse lighting)
 	float  ndotl = dot(normal, light_direction);
@@ -149,14 +143,71 @@ float4 ps(psIn input) : SV_TARGET {
 	float4 albedo   = albedo_tex  .Sample(albedo_tex_s,   input.uv) * input.color;
 	float3 emissive = emission_tex.Sample(emission_tex_s, input.uv).rgb * emission_factor.rgb;
 
-	// GI probe irradiance (UVW pre-computed in VS)
-	float3 uvw = saturate(input.gi_uvw);
-	float4 shr = gi_sh_r.SampleLevel(gi_sh_r_s, uvw, 0);
-	float4 shg = gi_sh_g.SampleLevel(gi_sh_g_s, uvw, 0);
-	float4 shb = gi_sh_b.SampleLevel(gi_sh_b_s, uvw, 0);
+	// GI probe irradiance with cosine-weighted probe blending
+	float3 world_offset = input.gi_world_offset;
+	float3 normal       = normalize(input.normal);
 
-	float4 sh_basis = float4(0.88623, input.sh_norm);
-	float3 irradiance = max(float3(0, 0, 0), float3(dot(shr, sh_basis), dot(shg, sh_basis), dot(shb, sh_basis))) * gi_intensity;
+	// Find the 8 neighboring probes
+	float3 uvw       = world_offset * gi_volume_inv;
+	float3 grid_pos  = uvw * (float)GI_GRID - 0.5;
+	float3 cell_size = 1.0 / (gi_volume_inv * (float)GI_GRID);
+	int3   base     = int3(floor(grid_pos));
+	float3 f        = grid_pos - float3(base);
+	int3   max_idx  = int3(GI_GRID - 1, GI_GRID - 1, GI_GRID - 1);
+
+	// Precompute clamped corner positions and linear index offsets (~6 ALU)
+	uint3 p0 = uint3(clamp(base,     int3(0, 0, 0), max_idx));
+	uint3 p1 = uint3(clamp(base + 1, int3(0, 0, 0), max_idx));
+	uint base_idx = p0.x + (p0.y << 5) + (p0.z << 10);
+	uint dx = p1.x - p0.x;
+	uint dy = (p1.y - p0.y) << 5;
+	uint dz = (p1.z - p0.z) << 10;
+
+	float4 sum_r = float4(0, 0, 0, 0);
+	float4 sum_g = float4(0, 0, 0, 0);
+	float4 sum_b = float4(0, 0, 0, 0);
+	float  sum_w = 0;
+
+	[unroll]
+	for (uint i = 0; i < 8; i++) {
+		int3 offset = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+
+		// Trilinear weight
+		float3 t        = lerp(1.0 - f, f, float3(offset));
+		float  trilinear = t.x * t.y * t.z;
+
+		// Probe position from precomputed corners (resolved statically by unroll)
+		uint3  probe = uint3((i & 1) ? p1.x : p0.x,
+		                     ((i >> 1) & 1) ? p1.y : p0.y,
+		                     ((i >> 2) & 1) ? p1.z : p0.z);
+
+		// Direction from surface to probe (world space)
+		float3 dir       = (float3(probe) + 0.5) * cell_size - world_offset;
+		float  dist2     = dot(dir, dir);
+		float  cosine    = dist2 > 0.0001
+			? max(0.0, dot(normal, dir * rsqrt(dist2)))
+			: 1.0;
+
+		// Linear index from precomputed base + offsets (1 v_add per probe)
+		uint    idx = base_idx + ((i & 1) ? dx : 0) + (((i >> 1) & 1) ? dy : 0) + (((i >> 2) & 1) ? dz : 0);
+		SHProbe p   = gi_sh_probes[idx];
+		float   w   = trilinear * max(cosine, 0.0001);
+		sum_r += sh_unpack(p.r) * w;
+		sum_g += sh_unpack(p.g) * w;
+		sum_b += sh_unpack(p.b) * w;
+		sum_w += w;
+	}
+
+	float4 shr = sum_r / sum_w;
+	float4 shg = sum_g / sum_w;
+	float4 shb = sum_b / sum_w;
+
+	float4 sh_basis   = float4(0.88623, 1.02333 * normal.yzx);
+	float3 irradiance = max(float3(0, 0, 0), float3(
+		dot(shr, sh_basis),
+		dot(shg, sh_basis),
+		dot(shb, sh_basis)
+	)) * gi_intensity;
 
 	// Shadow (ndotl from VS via shadow_uv.w)
 	float ndotl  = input.shadow_uv.w;

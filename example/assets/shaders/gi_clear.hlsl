@@ -1,14 +1,19 @@
 //--name = gi_clear
 
-// Compute shader to decay voxel radiance at cycle start.
-// decay=0 clears to zero, decay<1 applies temporal fade (e.g. 0.85).
-// SH decay is handled by the EMA in gi_voxel_to_sh instead.
+// Compute shader to clear the voxel color buffer.
 
-RWTexture3D<float4> voxel : register(u0);
+#include "gi_voxel.hlsli"
 
-float decay;
+RWStructuredBuffer<Voxel> voxel : register(u0);
+
+uint grid_size;
 
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
-	voxel[id] *= decay;
+	if (id.x >= GI_GRID || id.y >= GI_GRID || id.z >= GI_GRID) return;
+	uint idx = voxel_index(id);
+
+	voxel[idx].faces_x = 0;
+	voxel[idx].faces_y = 0;
+	voxel[idx].faces_z = 0;
 }

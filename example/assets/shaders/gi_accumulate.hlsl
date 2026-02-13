@@ -4,10 +4,10 @@
 // Each dispatch processes one 32x32 capture from one axis-aligned direction,
 // accumulating into the 3D SH textures.
 
-Texture2D<float4>   capture_tex : register(t0);
-RWTexture3D<float4> sh_r        : register(u0);
-RWTexture3D<float4> sh_g        : register(u1);
-RWTexture3D<float4> sh_b        : register(u2);
+#include "gi_voxel.hlsli"
+
+Texture2D<float4>          capture_tex : register(t0);
+RWStructuredBuffer<SHProbe> sh_probes  : register(u0);
 
 uint  axis;        // 0=X, 1=Y, 2=Z
 uint  layer_index; // 0-31
@@ -19,15 +19,15 @@ float hysteresis;  // decay factor for existing SH (1.0 = pure add, <1.0 = tempo
 
 [numthreads(8, 8, 1)]
 void cs(uint3 id : SV_DispatchThreadID) {
-	if (id.x >= grid_size || id.y >= grid_size) return;
+	if (id.x >= GI_GRID || id.y >= GI_GRID) return;
 
 	float3 color = capture_tex[id.xy].rgb;
 
 	// Correct for view-space axis flips caused by the lookat orientation.
 	// The lookat right/up vectors flip between + and - directions,
 	// so some pixel axes map in reverse. Flip them back here.
-	uint px = flip_x ? (grid_size - 1 - id.x) : id.x;
-	uint py = flip_y ? (grid_size - 1 - id.y) : id.y;
+	uint px = flip_x ? (GI_GRID - 1 - id.x) : id.x;
+	uint py = flip_y ? (GI_GRID - 1 - id.y) : id.y;
 
 	// Map (pixel_x, pixel_y, layer_index) -> 3D texel based on capture axis
 	uint3 texel;
@@ -55,7 +55,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	// Temporal accumulation: decay existing SH then add new contribution.
 	// hysteresis=1.0 is pure additive (second direction in same frame),
 	// hysteresis<1.0 decays old data (first direction, enables continuous updates).
-	sh_r[texel] = sh_r[texel] * hysteresis + sh_coeff * color.r;
-	sh_g[texel] = sh_g[texel] * hysteresis + sh_coeff * color.g;
-	sh_b[texel] = sh_b[texel] * hysteresis + sh_coeff * color.b;
+	uint idx = voxel_index(texel);
+	sh_probes[idx].r = sh_pack(sh_unpack(sh_probes[idx].r) * hysteresis + sh_coeff * color.r);
+	sh_probes[idx].g = sh_pack(sh_unpack(sh_probes[idx].g) * hysteresis + sh_coeff * color.g);
+	sh_probes[idx].b = sh_pack(sh_unpack(sh_probes[idx].b) * hysteresis + sh_coeff * color.b);
 }

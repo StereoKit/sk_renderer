@@ -4,23 +4,23 @@
 // neighbors, spreading captured radiance through the volume. Run multiple
 // iterations to propagate further. Ping-pongs between source/dest textures.
 
-Texture3D<float4>   sh_r_in  : register(t0);
-Texture3D<float4>   sh_g_in  : register(t1);
-Texture3D<float4>   sh_b_in  : register(t2);
-RWTexture3D<float4> sh_r_out : register(u0);
-RWTexture3D<float4> sh_g_out : register(u1);
-RWTexture3D<float4> sh_b_out : register(u2);
+#include "gi_voxel.hlsli"
+
+StructuredBuffer<SHProbe>   sh_probes_in  : register(t0);
+RWStructuredBuffer<SHProbe> sh_probes_out : register(u0);
 
 float damping;
 uint  grid_size;
 
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
-	if (id.x >= grid_size || id.y >= grid_size || id.z >= grid_size) return;
+	if (id.x >= GI_GRID || id.y >= GI_GRID || id.z >= GI_GRID) return;
 
-	float4 r = sh_r_in[id];
-	float4 g = sh_g_in[id];
-	float4 b = sh_b_in[id];
+	uint   idx = voxel_index(id);
+	SHProbe sp = sh_probes_in[idx];
+	float4 r   = sh_unpack(sp.r);
+	float4 g   = sh_unpack(sp.g);
+	float4 b   = sh_unpack(sp.b);
 
 	// 6 face-adjacent neighbor offsets and the direction from each neighbor to us
 	static const int3 offsets[6] = {
@@ -38,14 +38,15 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 	for (int i = 0; i < 6; i++) {
 		int3 npos = int3(id) + offsets[i];
-		if (npos.x < 0 || npos.x >= (int)grid_size ||
-			npos.y < 0 || npos.y >= (int)grid_size ||
-			npos.z < 0 || npos.z >= (int)grid_size)
+		if (npos.x < 0 || npos.x >= (int)GI_GRID ||
+			npos.y < 0 || npos.y >= (int)GI_GRID ||
+			npos.z < 0 || npos.z >= (int)GI_GRID)
 			continue;
 
-		float4 nr = sh_r_in[uint3(npos)];
-		float4 ng = sh_g_in[uint3(npos)];
-		float4 nb = sh_b_in[uint3(npos)];
+		SHProbe nsp = sh_probes_in[voxel_index(uint3(npos))];
+		float4  nr  = sh_unpack(nsp.r);
+		float4  ng  = sh_unpack(nsp.g);
+		float4  nb  = sh_unpack(nsp.b);
 
 		// SH basis for direction from neighbor toward us (raw, no cosine weights)
 		float3 d = from_neighbor[i];
@@ -65,7 +66,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		b += proj_basis * inc_b * W * damping;
 	}
 
-	sh_r_out[id] = r;
-	sh_g_out[id] = g;
-	sh_b_out[id] = b;
+	sh_probes_out[idx].r = sh_pack(r);
+	sh_probes_out[idx].g = sh_pack(g);
+	sh_probes_out[idx].b = sh_pack(b);
 }

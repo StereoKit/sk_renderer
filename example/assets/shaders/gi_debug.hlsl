@@ -7,6 +7,7 @@
 //             4=voxel radiance, 5=voxel opacity
 
 #include "common.hlsli"
+#include "gi_voxel.hlsli"
 
 uint debug_mode;
 
@@ -17,7 +18,7 @@ uint debug_mode;
 struct Inst {
 	float4 pos_scale; // xyz=position, w=uniform scale
 };
-StructuredBuffer<Inst> inst : register(t2, space0);
+ StructuredBuffer<Inst> inst : register(t2, space0);
 
 ///////////////////////////////////////////
 // GI Probe Buffer (b12)
@@ -27,24 +28,15 @@ cbuffer GIBuffer : register(b12, space0) {
 	float3 gi_volume_min;
 	float  gi_intensity;
 	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	float  _gi_pad;
+	uint   gi_grid_size;
 };
 
 ///////////////////////////////////////////
-// GI SH Textures
+// GI Buffers
 ///////////////////////////////////////////
 
-Texture3D<float4> gi_sh_r   : register(t6);
-SamplerState      gi_sh_r_s : register(s6);
-
-Texture3D<float4> gi_sh_g   : register(t7);
-SamplerState      gi_sh_g_s : register(s7);
-
-Texture3D<float4> gi_sh_b   : register(t8);
-SamplerState      gi_sh_b_s : register(s8);
-
-Texture3D<float4> gi_voxel      : register(t9);
-SamplerState      gi_voxel_s    : register(s9);
+StructuredBuffer<SHProbe> gi_sh_probes : register(t6);
+StructuredBuffer<Voxel>   gi_voxel_buf : register(t9);
 
 
 ///////////////////////////////////////////
@@ -93,15 +85,15 @@ float4 ps(psIn input) : SV_TARGET {
 	float3 uvw = (input.world_pos - gi_volume_min) * gi_volume_inv;
 	uvw = saturate(uvw);
 
-	// Snap to texel center for voxel modes — the sphere surface has physical
-	// extent so raw UVW varies across the sphere, causing linear filter blending
-	// at texel boundaries. Snapping ensures each sphere shows its exact texel.
-	float3 voxel_uvw = (floor(uvw * 32.0) + 0.5) / 32.0;
+	// Snap to voxel grid position for voxel modes
+	uint3 vpos = uint3(clamp(uvw * (float)GI_GRID, float3(0,0,0),
+	                          float3(GI_GRID-1, GI_GRID-1, GI_GRID-1)));
+	uint lidx = voxel_index(vpos);
 
 	// Mode 1: show face mask as RGB (+axis=bright 0.8, -axis=dim 0.2, both=1.0)
 	if (debug_mode == 1) {
-		float4 voxel_fm = gi_voxel.SampleLevel(gi_voxel_s, voxel_uvw, 0);
-		uint mask = uint(voxel_fm.a + 0.5);
+		Voxel v = gi_voxel_buf[lidx];
+		uint mask = voxel_face_mask(v);
 		if (mask == 0) discard;
 		float rx = ((mask &  1u) ? 0.8 : 0.0) + ((mask &  2u) ? 0.2 : 0.0);
 		float gy = ((mask &  4u) ? 0.8 : 0.0) + ((mask &  8u) ? 0.2 : 0.0);
@@ -109,25 +101,28 @@ float4 ps(psIn input) : SV_TARGET {
 		return float4(rx, gy, bz, 1.0);
 	}
 
-	// Mode 4: voxel radiance (normalized rgb)
+	// Mode 4: voxel radiance (average of occupied face colors)
 	if (debug_mode == 4) {
-		float4 voxel = gi_voxel.SampleLevel(gi_voxel_s, voxel_uvw, 0);
-		float3 col = voxel.a > 0.01 ? voxel.rgb / voxel.a : float3(0, 0, 0);
-		if (voxel.a < 0.01) discard;
+		Voxel v = gi_voxel_buf[lidx];
+		uint mask = voxel_face_mask(v);
+		if (mask == 0) discard;
+		float3 col = voxel_average_color(v);
 		return float4(col, 1.0);
 	}
 
-	// Mode 5: voxel opacity (alpha as grayscale)
+	// Mode 5: voxel opacity (occupied = white, empty = discarded)
 	if (debug_mode == 5) {
-		float4 voxel = gi_voxel.SampleLevel(gi_voxel_s, voxel_uvw, 0);
-		float  a = saturate(voxel.a);
-		return float4(a, a, a, 1.0);
+		Voxel v = gi_voxel_buf[lidx];
+		uint mask = voxel_face_mask(v);
+		if (mask == 0) discard;
+		return float4(1.0, 1.0, 1.0, 1.0);
 	}
 
-	// Sample SH coefficients
-	float4 shr = gi_sh_r.SampleLevel(gi_sh_r_s, uvw, 0);
-	float4 shg = gi_sh_g.SampleLevel(gi_sh_g_s, uvw, 0);
-	float4 shb = gi_sh_b.SampleLevel(gi_sh_b_s, uvw, 0);
+	// Sample SH coefficients (nearest probe, linear-indexed)
+	SHProbe sh  = gi_sh_probes[lidx];
+	float4  shr = sh_unpack(sh.r);
+	float4  shg = sh_unpack(sh.g);
+	float4  shb = sh_unpack(sh.b);
 
 	// Mode 2: show raw L0 coefficient (ambient, direction-independent)
 	if (debug_mode == 2) {
