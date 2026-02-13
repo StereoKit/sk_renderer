@@ -250,10 +250,10 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	if (framebuffer == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
 	// Transition depth texture to attachment layout if needed
-	// Automatic system handles the optimization:
-	// - Non-readable depth (transient_discard=true): Uses UNDEFINED oldLayout (tile GPU optimization)
-	// - Readable depth: Properly tracks previous layout
-	if (depth && (depth->flags & skr_tex_flags_writeable)) {
+	// Transient discard depth (non-readable) skips the explicit barrier — the render pass
+	// handles it via initialLayout=UNDEFINED with LOAD_OP_CLEAR. Readable depth (e.g. shadow
+	// maps reused as depth targets) still needs the explicit transition for synchronization.
+	if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
 		_skr_tex_transition(cmd, depth,
 			VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 			VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,

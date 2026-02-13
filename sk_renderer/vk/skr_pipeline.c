@@ -557,7 +557,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.storeOp        = key->depth_store_op,  // Use the store op from the key (based on readable flag)
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = has_stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,  // Expect already transitioned
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,  // Depth always clears, discard previous contents
 			.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 		};
 
@@ -576,11 +576,16 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 	};
 
 	// Subpass dependencies
+	// When clearing (LOAD_OP_CLEAR + initialLayout=UNDEFINED), use TOP_OF_PIPE to avoid
+	// unnecessary execution dependency on prior fragment/color work. The clear discards
+	// previous contents so there's no data hazard with earlier passes.
 	VkSubpassDependency dependencies[2] = {
 		{
 			.srcSubpass    = VK_SUBPASS_EXTERNAL,
 			.dstSubpass    = 0,
-			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
+				? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+				: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			.srcAccessMask = 0,
 			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -588,7 +593,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		{
 			.srcSubpass    = VK_SUBPASS_EXTERNAL,
 			.dstSubpass    = 0,
-			.srcStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // Depth always clears, no prior dependency needed
 			.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 			.srcAccessMask = 0,
 			.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
