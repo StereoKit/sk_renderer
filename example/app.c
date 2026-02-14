@@ -407,8 +407,8 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	igText("Resolution: %d x %d", width, height);
 	igText("MSAA: %dx", app->msaa);
 
-	float gpu_ms   = skr_renderer_get_gpu_time_ms();
-	float cpu_ms   = skr_renderer_get_cpu_time_ms();
+	float gpu_ms   = skr_renderer_get_gpu_time_us() / 1000.0f;
+	float cpu_ms   = skr_renderer_get_cpu_time_us() / 1000.0f;
 	float frame_ms = app->frame_time_ms;
 
 	// Track GPU performance stats
