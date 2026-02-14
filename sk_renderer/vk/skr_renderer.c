@@ -907,12 +907,12 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	_skr_cmd_release(cmd);
 }
 
-float skr_renderer_get_gpu_time_us() {
+uint64_t skr_renderer_get_gpu_time_us() {
 	// Return timing from most recently completed frame
 	uint32_t read_flight = (_skr_vk.flight_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
 
 	if (!_skr_vk.timestamps_valid[read_flight]) {
-		return 0.0f;
+		return 0;
 	}
 
 	uint64_t start = _skr_vk.frame_timestamps[read_flight][0];
@@ -920,15 +920,15 @@ float skr_renderer_get_gpu_time_us() {
 
 	// Convert ticks to microseconds: (ticks * ns_per_tick) / 1,000
 	float time_ns = (float)(end - start) * _skr_vk.timestamp_period;
-	return time_ns / 1000.0f;
+	return (uint64_t)(time_ns / 1000.0f);
 }
 
-float skr_renderer_get_cpu_time_us() {
+uint64_t skr_renderer_get_cpu_time_us() {
 	// Return CPU timing from most recently completed frame
 	uint32_t read_flight = (_skr_vk.flight_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
 
 	if (!_skr_vk.cpu_timestamps_valid[read_flight]) {
-		return 0.0f;
+		return 0;
 	}
 
 	uint64_t start = _skr_vk.cpu_frame_start_ns[read_flight];
@@ -937,7 +937,7 @@ float skr_renderer_get_cpu_time_us() {
 
 	// Guard against invalid data (end should be > start)
 	if (end <= start) {
-		return 0.0f;
+		return 0;
 	}
 
 	uint64_t total = end - start;
@@ -946,5 +946,5 @@ float skr_renderer_get_cpu_time_us() {
 	if (wait > total) wait = 0;
 
 	// Convert nanoseconds to microseconds, subtracting wait time
-	return (float)(total - wait) / 1000.0f;
+	return (total - wait) / 1000;
 }
