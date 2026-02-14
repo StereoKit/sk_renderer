@@ -178,7 +178,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				uint matching = face_mask & entry_mask;
 				face_idx = firstbitlow(matching);
 			}
-			radiance = unpack_rgb5a1_color(voxel_get_face(v, face_idx));
+			radiance = unpack_rgba8_color(voxel_get_face(v, face_idx));
 			hit = true;
 			break;
 		}
@@ -211,7 +211,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				uint matching = face_mask & entry_mask;
 				face_idx = firstbitlow(matching);
 			}
-			radiance = unpack_rgb5a1_color(voxel_get_face(v, face_idx));
+			radiance = unpack_rgba8_color(voxel_get_face(v, face_idx));
 			hit = true;
 			break;
 		}

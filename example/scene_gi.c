@@ -506,7 +506,7 @@ static scene_t* _scene_gi_create(void) {
 	// Voxel radiance buffer (single StructuredBuffer, 6 faces per voxel as RGB5A1)
 	{
 		uint32_t voxel_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
-		uint32_t voxel_stride = 3 * sizeof(uint32_t); // 3 uints per Voxel (12 bytes)
+		uint32_t voxel_stride = 6 * sizeof(uint32_t); // 6 uints per Voxel (24 bytes, RGBA8 per face)
 		uint32_t voxel_bytes  = voxel_count * voxel_stride;
 		void    *zero_data    = calloc(1, voxel_bytes);
 		skr_buffer_create(zero_data, voxel_count, voxel_stride,
@@ -1057,14 +1057,14 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		// Advance frame in non-scan modes always, in scan mode only when not paused
 		bool should_advance = (scene->gi_voxel_mode != 0) || run_scan;
 
-		//if (run_fast) {
+		if (run_fast) {
 			// Clear voxel buffer before full re-voxelization
 			int32_t clear_dispatch = (GI_GRID_SIZE + 3) / 4;
 			skr_compute_execute(&scene->gi_clear_compute, clear_dispatch, clear_dispatch, clear_dispatch);
 
 			//_gi_run_fast_voxelize(scene, floor_instance, model_transform, state);
-			//scene->gi_fast_init_done = true;
-		//}
+			scene->gi_fast_init_done = true;
+		}
 
 		if (run_scan) {
 			scene->gi_step_next = false;
@@ -1164,7 +1164,6 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			int32_t vts_dispatch = (GI_GRID_SIZE + 3) / 4;
 			skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch * 4);
 
-			if (scene->gi_total_frames % 200 == 0)
 			scene->gi_frame = (scene->gi_frame + 1) % GI_CYCLE_LENGTH;
 			scene->gi_total_frames++;
 		}

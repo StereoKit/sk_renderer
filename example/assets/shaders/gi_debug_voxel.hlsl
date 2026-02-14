@@ -108,5 +108,5 @@ float4 ps(psIn input) : SV_TARGET {
 	if (!(input.face_mask & (1u << face_idx))) discard;
 
 	Voxel v = gi_voxel_buf[input.vox_idx];
-	return float4(unpack_rgb5a1_color(voxel_get_face(v, face_idx)), 1.0);
+	return float4(unpack_rgba8_color(voxel_get_face(v, face_idx)), 1.0);
 }

@@ -61,7 +61,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	// Write both faces of the same voxel — single thread, no race
 	uint  idx = voxel_index(texel);
 	Voxel v   = voxel_buf[idx];
-	voxel_set_face(v, pos_face, pack_rgb5a1(color_pos.rgb, color_pos.a > 0));
-	voxel_set_face(v, neg_face, pack_rgb5a1(color_neg.rgb, color_neg.a > 0));
+	voxel_set_face(v, pos_face, pack_rgba8(color_pos.rgb, color_pos.a > 0));
+	voxel_set_face(v, neg_face, pack_rgba8(color_neg.rgb, color_neg.a > 0));
 	voxel_buf[idx] = v;
 }

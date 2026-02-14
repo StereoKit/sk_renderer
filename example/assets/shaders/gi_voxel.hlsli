@@ -1,14 +1,11 @@
 #ifndef GI_VOXEL_HLSLI
 #define GI_VOXEL_HLSLI
 
-// Per-voxel storage: 6 faces packed as 3 uint (two RGB5A1 per uint).
-// Face order: +X/-X in faces_x, +Y/-Y in faces_y, +Z/-Z in faces_z.
-// Lower 16 bits = positive axis face, upper 16 bits = negative axis face.
-// Each face: [R:5][G:5][B:5][A:1] where A=1 means occupied.
+// Per-voxel storage: 6 faces as RGBA8 (one uint per face, 24 bytes total).
+// Face order: faces[0]=+X, [1]=-X, [2]=+Y, [3]=-Y, [4]=+Z, [5]=-Z.
+// Each face: [R:8][G:8][B:8][A:8] where A>0 means occupied.
 struct Voxel {
-	uint faces_x; // lower 16 = +X (RGB5A1), upper 16 = -X (RGB5A1)
-	uint faces_y; // lower 16 = +Y, upper 16 = -Y
-	uint faces_z; // lower 16 = +Z, upper 16 = -Z
+	uint faces[6];
 };
 
 // Face index convention: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
@@ -30,80 +27,52 @@ uint voxel_index(uint3 pos) {
 }
 
 ///////////////////////////////////////////
-// RGB5A1 Packing
+// RGBA8 Packing
 ///////////////////////////////////////////
 
-// Pack color + occupancy into a 16-bit RGB5A1 value.
-// Layout: [R:5][G:5][B:5][A:1] = 16 bits. A=1 means face is occupied.
-uint pack_rgb5a1(float3 color, bool occupied) {
-	uint r = (uint)(saturate(color.r) * 31.0 + 0.5);
-	uint g = (uint)(saturate(color.g) * 31.0 + 0.5);
-	uint b = (uint)(saturate(color.b) * 31.0 + 0.5);
-	return (r << 11) | (g << 6) | (b << 1) | (occupied ? 1u : 0u);
+// Pack color + occupancy into a 32-bit RGBA8 value.
+// A=255 when occupied, A=0 when empty.
+uint pack_rgba8(float3 color, bool occupied) {
+	uint r = (uint)(saturate(color.r) * 255.0 + 0.5);
+	uint g = (uint)(saturate(color.g) * 255.0 + 0.5);
+	uint b = (uint)(saturate(color.b) * 255.0 + 0.5);
+	uint a = occupied ? 255u : 0u;
+	return (r << 24) | (g << 16) | (b << 8) | a;
 }
 
-float3 unpack_rgb5a1_color(uint packed) {
-	float r = (float)((packed >> 11) & 0x1F) / 31.0;
-	float g = (float)((packed >> 6)  & 0x1F) / 31.0;
-	float b = (float)((packed >> 1)  & 0x1F) / 31.0;
+float3 unpack_rgba8_color(uint packed) {
+	float r = (float)((packed >> 24) & 0xFF) / 255.0;
+	float g = (float)((packed >> 16) & 0xFF) / 255.0;
+	float b = (float)((packed >> 8)  & 0xFF) / 255.0;
 	return float3(r, g, b);
 }
 
-bool unpack_rgb5a1_occupied(uint packed) {
-	return (packed & 1u) != 0;
-}
-
-///////////////////////////////////////////
-// Face Pair Packing (two faces per uint)
-///////////////////////////////////////////
-
-uint unpack_positive_face(uint packed_pair) {
-	return packed_pair & 0xFFFF;
-}
-
-uint unpack_negative_face(uint packed_pair) {
-	return (packed_pair >> 16) & 0xFFFF;
+bool unpack_rgba8_occupied(uint packed) {
+	return (packed & 0xFF) != 0;
 }
 
 ///////////////////////////////////////////
 // Per-Face Accessors
 ///////////////////////////////////////////
 
-// Get a specific face's packed RGB5A1 uint16 by face index
 uint voxel_get_face(Voxel v, uint face_idx) {
-	uint pair;
-	if      (face_idx < 2) pair = v.faces_x;
-	else if (face_idx < 4) pair = v.faces_y;
-	else                   pair = v.faces_z;
-	return (face_idx & 1) == 0 ? (pair & 0xFFFF) : ((pair >> 16) & 0xFFFF);
+	return v.faces[face_idx];
 }
 
-// Set a specific face in a Voxel
-void voxel_set_face(inout Voxel v, uint face_idx, uint packed_rgb5a1) {
-	uint val_lo = packed_rgb5a1 & 0xFFFF;
-	uint val_hi = (packed_rgb5a1 & 0xFFFF) << 16;
-	if      (face_idx == 0) v.faces_x = (v.faces_x & 0xFFFF0000) | val_lo;
-	else if (face_idx == 1) v.faces_x = (v.faces_x & 0x0000FFFF) | val_hi;
-	else if (face_idx == 2) v.faces_y = (v.faces_y & 0xFFFF0000) | val_lo;
-	else if (face_idx == 3) v.faces_y = (v.faces_y & 0x0000FFFF) | val_hi;
-	else if (face_idx == 4) v.faces_z = (v.faces_z & 0xFFFF0000) | val_lo;
-	else                    v.faces_z = (v.faces_z & 0x0000FFFF) | val_hi;
+void voxel_set_face(inout Voxel v, uint face_idx, uint packed) {
+	v.faces[face_idx] = packed;
 }
 
 ///////////////////////////////////////////
 // Voxel Queries
 ///////////////////////////////////////////
 
-// Build 6-bit face mask from alpha bits of all 6 faces.
+// Build 6-bit face mask from alpha of all 6 faces.
 // Bit 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
 uint voxel_face_mask(Voxel v) {
 	uint mask = 0;
-	if (v.faces_x        & 1u) mask |=  1u; // +X
-	if ((v.faces_x >> 16) & 1u) mask |=  2u; // -X
-	if (v.faces_y        & 1u) mask |=  4u; // +Y
-	if ((v.faces_y >> 16) & 1u) mask |=  8u; // -Y
-	if (v.faces_z        & 1u) mask |= 16u; // +Z
-	if ((v.faces_z >> 16) & 1u) mask |= 32u; // -Z
+	[unroll] for (uint i = 0; i < 6; i++)
+		if (v.faces[i] & 0xFF) mask |= (1u << i);
 	return mask;
 }
 
@@ -114,7 +83,7 @@ float3 voxel_average_color(Voxel v) {
 	uint   count     = 0;
 	for (uint i = 0; i < 6; i++) {
 		if (face_mask & (1u << i)) {
-			total += unpack_rgb5a1_color(voxel_get_face(v, i));
+			total += unpack_rgba8_color(v.faces[i]);
 			count++;
 		}
 	}

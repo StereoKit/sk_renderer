@@ -68,7 +68,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	uint face_idx = face_indices[view_index];
 
 	uint idx    = voxel_index(texel);
-	uint packed = pack_rgb5a1(color.rgb, true);
+	uint packed = pack_rgba8(color.rgb, true);
 
 	Voxel v = voxel_buf[idx];
 	voxel_set_face(v, face_idx, packed);
