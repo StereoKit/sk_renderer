@@ -662,8 +662,8 @@ SKR_API void              skr_renderer_blit                (skr_material_t* mate
 
 SKR_API void              skr_renderer_draw                (skr_render_list_t* list, const void* system_data, uint32_t system_data_size, int32_t instance_multiplier);
 SKR_API void              skr_renderer_draw_mesh_immediate (skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, int32_t instance_count);
-SKR_API float             skr_renderer_get_gpu_time_ms     (void);
-SKR_API float             skr_renderer_get_cpu_time_ms     (void);
+SKR_API float             skr_renderer_get_gpu_time_us     (void);
+SKR_API float             skr_renderer_get_cpu_time_us     (void);
 
 #ifdef __cplusplus
 }
