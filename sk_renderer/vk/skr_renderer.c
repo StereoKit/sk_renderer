@@ -3,6 +3,10 @@
 // Copyright (c) 2025 Nick Klingensmith
 // Copyright (c) 2025 Qualcomm Technologies, Inc.
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include "_sk_renderer.h"
 #include "skr_pipeline.h"
 #include "skr_conversions.h"
