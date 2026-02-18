@@ -234,7 +234,7 @@ static VkPipelineStageFlags _layout_to_src_stage(VkImageLayout layout) {
 		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 			return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 		case VK_IMAGE_LAYOUT_GENERAL:
-			return VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+			return VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 		case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
 			return VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 		default:
@@ -318,7 +318,9 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 	VkImageLayout old_layout = ref_tex->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : ref_tex->current_layout;
 
 	// Skip if already in target layout (unless it's a transient discard texture)
-	if (!ref_tex->is_transient_discard && ref_tex->current_layout == new_layout) {
+	// Exception: GENERAL layout storage images still need memory barriers between
+	// different pipeline stages (e.g. fragment shader write → compute shader read)
+	if (!ref_tex->is_transient_discard && ref_tex->current_layout == new_layout && new_layout != VK_IMAGE_LAYOUT_GENERAL) {
 		return;
 	}
 

@@ -3,8 +3,8 @@
 
 // Debug visualization shader for GI light probes.
 // Renders instanced spheres colored by the SH irradiance at each probe position.
-// debug_mode: 0=SH irradiance, 1=face mask, 2=raw L0, 3=SH detail,
-//             4=voxel radiance, 5=voxel opacity
+// debug_mode: 0=SH irradiance, 1=voxel occupancy, 2=raw L0, 3=SH detail,
+//             4=voxel radiance
 
 #include "common.hlsli"
 #include "gi_voxel.hlsli"
@@ -36,8 +36,7 @@ cbuffer GIBuffer : register(b12, space0) {
 ///////////////////////////////////////////
 
 StructuredBuffer<SHProbe> gi_sh_probes : register(t6);
-StructuredBuffer<Voxel>   gi_voxel_buf : register(t9);
-
+Texture3D<float4>         gi_voxel_tex : register(t9);
 
 ///////////////////////////////////////////
 // Vertex/Pixel Shader I/O
@@ -85,37 +84,26 @@ float4 ps(psIn input) : SV_TARGET {
 	float3 uvw = (input.world_pos - gi_volume_min) * gi_volume_inv;
 	uvw = saturate(uvw);
 
-	// Snap to voxel grid position for voxel modes
-	uint3 vpos = uint3(clamp(uvw * (float)GI_GRID, float3(0,0,0),
-	                          float3(GI_GRID-1, GI_GRID-1, GI_GRID-1)));
-	uint lidx = voxel_index(vpos);
+	// Voxel grid position (higher res)
+	uint3 voxel_pos = uint3(clamp(uvw * (float)GI_VOXEL_RES, float3(0,0,0),
+	                               float3(GI_VOXEL_RES-1, GI_VOXEL_RES-1, GI_VOXEL_RES-1)));
+	// Probe grid position (lower res)
+	uint3 probe_pos = uint3(clamp(uvw * (float)GI_GRID, float3(0,0,0),
+	                               float3(GI_GRID-1, GI_GRID-1, GI_GRID-1)));
+	uint lidx = voxel_index(probe_pos);
 
-	// Mode 1: show face mask as RGB (+axis=bright 0.8, -axis=dim 0.2, both=1.0)
+	// Mode 1: voxel occupancy (occupied = white, empty = discarded)
 	if (debug_mode == 1) {
-		Voxel v = gi_voxel_buf[lidx];
-		uint mask = voxel_face_mask(v);
-		if (mask == 0) discard;
-		float rx = ((mask &  1u) ? 0.8 : 0.0) + ((mask &  2u) ? 0.2 : 0.0);
-		float gy = ((mask &  4u) ? 0.8 : 0.0) + ((mask &  8u) ? 0.2 : 0.0);
-		float bz = ((mask & 16u) ? 0.8 : 0.0) + ((mask & 32u) ? 0.2 : 0.0);
-		return float4(rx, gy, bz, 1.0);
-	}
-
-	// Mode 4: voxel radiance (average of occupied face colors)
-	if (debug_mode == 4) {
-		Voxel v = gi_voxel_buf[lidx];
-		uint mask = voxel_face_mask(v);
-		if (mask == 0) discard;
-		float3 col = voxel_average_color(v);
-		return float4(col, 1.0);
-	}
-
-	// Mode 5: voxel opacity (occupied = white, empty = discarded)
-	if (debug_mode == 5) {
-		Voxel v = gi_voxel_buf[lidx];
-		uint mask = voxel_face_mask(v);
-		if (mask == 0) discard;
+		float4 voxel = gi_voxel_tex.Load(int4(voxel_pos, 0));
+		if (voxel.a <= 0) discard;
 		return float4(1.0, 1.0, 1.0, 1.0);
+	}
+
+	// Mode 4: voxel radiance (color from 3D texture)
+	if (debug_mode == 4) {
+		float4 voxel = gi_voxel_tex.Load(int4(voxel_pos, 0));
+		if (voxel.a <= 0) discard;
+		return float4(voxel.rgb, 1.0);
 	}
 
 	// Sample SH coefficients (nearest probe, linear-indexed)

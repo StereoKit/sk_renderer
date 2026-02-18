@@ -649,6 +649,7 @@ bool skr_init(skr_settings_t settings) {
 		.fillModeNonSolid               = VK_FALSE, // Not using wireframe
 		.depthClamp                     = available_features.depthClamp,
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
+		.fragmentStoresAndAtomics       = available_features.fragmentStoresAndAtomics,
 	};
 
 	// YCbCr conversion is Vulkan 1.1 core - always enable for YUV texture support

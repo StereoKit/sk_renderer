@@ -118,19 +118,14 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 // Shadow Sampling
 ///////////////////////////////////////////
 
-float shadow_factor_pcf3(float3 uv, float scale) {
-	float radius = shadow_pixel_size * scale;
-	float shadow_factor = 0.0;
-
-	[unroll]
-	for (int x = -1; x <= 1; x++) {
-		[unroll]
-		for (int y = -1; y <= 1; y++) {
-			float2 offset = float2(x, y) * radius;
-			shadow_factor += shadow_map.SampleCmpLevelZero(shadow_map_sampler, uv.xy + offset, uv.z);
-		}
-	}
-	return shadow_factor / 9.0;
+float shadow_factor_pcf4(float3 uv, float scale) {
+	float r = shadow_pixel_size * scale * 0.5;
+	return (
+		shadow_map.SampleCmpLevelZero(shadow_map_sampler, uv.xy + float2(-r, -r), uv.z) +
+		shadow_map.SampleCmpLevelZero(shadow_map_sampler, uv.xy + float2( r, -r), uv.z) +
+		shadow_map.SampleCmpLevelZero(shadow_map_sampler, uv.xy + float2(-r,  r), uv.z) +
+		shadow_map.SampleCmpLevelZero(shadow_map_sampler, uv.xy + float2( r,  r), uv.z)
+	) * 0.25;
 }
 
 ///////////////////////////////////////////
@@ -139,9 +134,9 @@ float shadow_factor_pcf3(float3 uv, float scale) {
 
 float4 ps(psIn input) : SV_TARGET {
 	// Sample textures
+	float3 metal_sample    = metal_tex   .Sample(metal_tex_s,     input.uv).rgb;
 	float4 albedo_sample   = albedo_tex  .Sample(albedo_tex_s,    input.uv) * input.color;
 	float3 emissive_sample = emission_tex.Sample(emission_tex_s,  input.uv).rgb * emission_factor.rgb;
-	float3 metal_sample    = metal_tex   .Sample(metal_tex_s,     input.uv).rgb;
 	float  ao_sample       = occlusion_tex.Sample(occlusion_tex_s, input.uv).r;
 
 	float roughness_final = metal_sample.g * roughness;
@@ -155,7 +150,7 @@ float4 ps(psIn input) : SV_TARGET {
 	float ndotl  = dot(input.normal, light_direction);
 	float shadow = 1.0;
 	if (ndotl > 0.0) {
-		shadow = shadow_factor_pcf3(input.shadow_uv, 1.0);
+		shadow = shadow_factor_pcf4(input.shadow_uv, 1.0);
 	}
 
 	// Directional light contribution, modulated by shadow

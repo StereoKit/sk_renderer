@@ -173,6 +173,12 @@ skr_mesh_t su_mesh_create_quad(
 // UV coordinates go from (0,0) to (1,1)
 skr_mesh_t su_mesh_create_fullscreen_quad(void);
 
+// Creates a fullscreen triangle for post-processing effects
+// A single oversized triangle that covers the entire viewport (clipped by rasterizer)
+// More efficient than a quad: 1 triangle vs 2, no diagonal edge overlap
+// UV coordinates match the quad convention: (0,0) top-left to (1,1) bottom-right
+skr_mesh_t su_mesh_create_fullscreen_triangle(void);
+
 ///////////////////////////////////////////////////////////////////////////////
 // Texture Generation
 ///////////////////////////////////////////////////////////////////////////////

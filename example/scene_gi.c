@@ -31,13 +31,8 @@ static const float   SHADOW_MAP_FAR        = 50.0f;
 // GI probe configuration
 ///////////////////////////////////////////
 
-#define GI_GRID_SIZE       32
-#define GI_CAPTURE_RES     (GI_GRID_SIZE * 2) // 2x supersample capture
-#define GI_LAYERS_PER_FRAME 3
-#define GI_BATCHES_PER_AXIS ((GI_GRID_SIZE + GI_LAYERS_PER_FRAME - 1) / GI_LAYERS_PER_FRAME) // 11
-#define GI_CYCLE_LENGTH    (GI_BATCHES_PER_AXIS * 3) // 33 frames per full update
-#define GI_CAM_DISTANCE    50.0f
-#define GI_CAM_NEAR        0.000f
+#define GI_GRID_SIZE       16
+#define GI_VOXEL_SIZE      128
 
 ///////////////////////////////////////////
 // Shadow buffer (matches ShadowBuffer in pbr_shadow.hlsl / shadow_receiver.hlsl)
@@ -125,42 +120,30 @@ typedef struct {
 	skr_material_t floor_material_cubemap;  // cubemap irradiance variant
 	skr_tex_t      floor_texture;
 
-	// GI probe system (single buffer, continuous temporal accumulation)
-	skr_buffer_t       gi_sh;                // SH probes (32^3 x {float4 r, float4 g, float4 b})
-	skr_tex_t          gi_capture_color;     // 64x64 x6-layer color array RT (2x supersample)
-	skr_tex_t          gi_capture_depth;     // 64x64 x6-layer depth array RT
-	skr_render_list_t  gi_capture_list;
-	skr_shader_t       gi_capture_shader;    // Simplified diffuse for captures
-	skr_material_t     gi_capture_material;
+	// GI probe system
+	skr_buffer_t       gi_sh;                // SH probes (32^3 x SHProbe)
 	skr_buffer_t       gi_const_buffer;      // GI constant buffer (b12)
-	int32_t            gi_frame;             // 0 to GI_CYCLE_LENGTH-1
 	float              gi_intensity;
 	float              gi_sh_decay;          // SH EMA decay per frame (0.98 = ~50 frame window)
 	uint32_t           gi_total_frames;      // Monotonic frame counter for random seeds
-	int32_t            gi_ray_count;         // Rays per probe per frame (1-8)
+	int32_t            gi_ray_count;         // Rays per probe per frame (>= 4)
 	float              gi_env_mip;           // Cubemap mip for environment fallback
 	float              gi_env_strength;      // Multiplier for environment contribution
 	float3             gi_volume_min;
 	float3             gi_volume_max;
 	gi_fit_            gi_grid_fit;
 	float              gi_grid_scale;
+	bool               gi_volume_computed;   // Volume bounds computed from model?
+	float              gi_prev_model_scale;  // Track for recompute
 
-	// Voxel radiance (StructuredBuffer<Voxel>, 6 faces per voxel as RGB5A1)
-	skr_buffer_t       gi_voxel_buffer;       // 32^3 x 3 uints, per-face RGB5A1
+	// 3D voxel texture (RGB10A2, 32^3)
+	skr_tex_t          gi_voxel_tex;
+	skr_tex_t          gi_voxel_rt;          // Dummy render target (drives rasterization)
+	skr_render_list_t  gi_voxel_list;
+	skr_shader_t       gi_voxelize_shader;   // Fragment shader voxelization
+	skr_material_t     gi_voxelize_material;
 	skr_shader_t       gi_clear_shader;
 	skr_compute_t      gi_clear_compute;
-	skr_shader_t       gi_voxelize_shader;
-	skr_compute_t      gi_voxelize_compute;
-
-	// Fast voxelization (12-view depth-based)
-	skr_tex_t          gi_fast_color;            // 32x32 x6-layer rgba32 array RT
-	skr_tex_t          gi_fast_depth;            // 32x32 x6-layer depth16 array RT
-	skr_shader_t       gi_fast_voxelize_shader;
-	skr_compute_t      gi_fast_voxelize_compute;
-	int32_t            gi_voxel_mode;            // 0=Layer Scan, 1=Fast, 2=Fast Periodic
-	bool               gi_fast_init_done;        // Has fast voxelize run at least once?
-	bool               gi_volume_computed;       // Volume bounds computed from model?
-	float              gi_prev_model_scale;      // Track for recompute
 
 	// Voxel-to-SH conversion (per-frame random ray march with EMA)
 	skr_shader_t       gi_voxel_to_sh_shader;
@@ -172,15 +155,10 @@ typedef struct {
 	skr_mesh_t         gi_debug_mesh;
 	bool               gi_show_probes;
 	bool               gi_show_voxels;
-	int32_t            gi_debug_mode;    // 0=SH, 1=UVW, 2=L0, 3=SH detail
+	int32_t            gi_debug_mode;    // 0=SH, 1=occupancy, 2=L0, 3=SH detail, 4=radiance
 	skr_shader_t       gi_debug_voxel_shader;
 	skr_material_t     gi_debug_voxel_material;
 	skr_mesh_t         gi_debug_voxel_mesh;
-	bool               gi_stepping;     // Pause auto-advance, step manually
-	bool               gi_step_next;    // Advance one layer then pause
-	skr_shader_t       gi_slice_shader;
-	skr_material_t     gi_slice_material;
-	skr_mesh_t         gi_slice_mesh;
 	bool               show_floor;
 
 	// Camera state
@@ -318,7 +296,7 @@ static void _load_model(scene_gi_t* scene, const char* path) {
 
 	skr_material_info_t infos[] = {
 		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
-		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_back,                                  .depth_test = skr_compare_less },
+		{ .shader = &scene->gi_voxelize_shader, .cull = skr_cull_none, .write_mask = skr_write_none,   .depth_test = skr_compare_always },
 		{ .shader = &scene->shader_vertex_gi,  .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 		{ .shader = &scene->shader_cubemap,    .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 	};
@@ -466,18 +444,17 @@ static scene_t* _scene_gi_create(void) {
 	skr_material_set_param(&scene->floor_material_cubemap, "tex_trans",       sksc_shader_var_float, 4, &floor_tex_trans);
 
 	// GI probe system (volume bounds computed dynamically from model + floor)
-	scene->gi_intensity  = 1.0f;
-	scene->gi_volume_min = (float3){-10.0f, -10.0f, -10.0f};
-	scene->gi_volume_max = (float3){ 10.0f,  10.0f,  10.0f};
-	scene->gi_grid_fit   = gi_fit_tight;
-	scene->gi_grid_scale = 1.0f;
-	scene->gi_sh_decay      = 0.99f;
-	scene->gi_total_frames  = 0;
-	scene->gi_ray_count     = 16;
-	scene->gi_env_mip       = 3.0f;
-	scene->gi_env_strength  = 1.0f;
-	scene->gi_frame         = 0;
-	scene->gi_mode          = gi_mode_per_pixel;
+	scene->gi_intensity    = 1.0f;
+	scene->gi_volume_min   = (float3){-10.0f, -10.0f, -10.0f};
+	scene->gi_volume_max   = (float3){ 10.0f,  10.0f,  10.0f};
+	scene->gi_grid_fit     = gi_fit_tight;
+	scene->gi_grid_scale   = 1.0f;
+	scene->gi_sh_decay     = 0.99f;
+	scene->gi_total_frames = 0;
+	scene->gi_ray_count    = 16;
+	scene->gi_env_mip      = 3.0f;
+	scene->gi_env_strength = 1.0f;
+	scene->gi_mode         = gi_mode_per_pixel;
 
 	// Create SH probe StructuredBuffer (32^3 x SHProbe{uint2 r, g, b} = 24 bytes/probe)
 	{
@@ -490,85 +467,47 @@ static scene_t* _scene_gi_create(void) {
 	}
 	skr_buffer_set_name(&scene->gi_sh, "gi_sh");
 
-	// Capture render targets (64x64, 2x supersample → bilinear downsample in compute)
-	skr_tex_create(skr_tex_fmt_rgba32_linear,
-		skr_tex_flags_writeable | skr_tex_flags_readable | skr_tex_flags_array,
+	// 3D voxel texture (RGB10A2, 128^3)
+	skr_tex_create(skr_tex_fmt_rgb10a2,
+		skr_tex_flags_3d | skr_tex_flags_compute | skr_tex_flags_readable,
 		(skr_tex_sampler_t){ .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
-		(skr_vec3i_t){GI_CAPTURE_RES, GI_CAPTURE_RES, 6}, 1, 0, NULL, &scene->gi_capture_color);
-	skr_tex_set_name(&scene->gi_capture_color, "gi_capture_color");
+		(skr_vec3i_t){GI_VOXEL_SIZE, GI_VOXEL_SIZE, GI_VOXEL_SIZE},
+		1, 0, NULL, &scene->gi_voxel_tex);
+	skr_tex_set_name(&scene->gi_voxel_tex, "gi_voxel_3d");
 
-	skr_tex_create(skr_tex_fmt_depth16,
+	// Dummy render target (drives rasterization for voxelization, color writes disabled)
+	skr_tex_create(skr_tex_fmt_r8,
 		skr_tex_flags_writeable | skr_tex_flags_array,
 		(skr_tex_sampler_t){0},
-		(skr_vec3i_t){GI_CAPTURE_RES, GI_CAPTURE_RES, 6}, 1, 0, NULL, &scene->gi_capture_depth);
-	skr_tex_set_name(&scene->gi_capture_depth, "gi_capture_depth");
+		(skr_vec3i_t){GI_VOXEL_SIZE, GI_VOXEL_SIZE, 3},
+		1, 0, NULL, &scene->gi_voxel_rt);
+	skr_tex_set_name(&scene->gi_voxel_rt, "gi_voxel_rt");
 
-	// Voxel radiance buffer (single StructuredBuffer, 6 faces per voxel as RGB5A1)
-	{
-		uint32_t voxel_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
-		uint32_t voxel_stride = 6 * sizeof(uint32_t); // 6 uints per Voxel (24 bytes, RGBA8 per face)
-		uint32_t voxel_bytes  = voxel_count * voxel_stride;
-		void    *zero_data    = calloc(1, voxel_bytes);
-		skr_buffer_create(zero_data, voxel_count, voxel_stride,
-			skr_buffer_type_storage, skr_use_compute_readwrite,
-			&scene->gi_voxel_buffer);
-		free(zero_data);
-		skr_buffer_set_name(&scene->gi_voxel_buffer, "gi_voxel_buffer");
-	}
+	// Clear compute shader (clears 3D voxel texture)
+	scene->gi_clear_shader = su_shader_load("shaders/gi_clear.hlsl.sks", "gi_clear");
+	skr_compute_create(&scene->gi_clear_shader, &scene->gi_clear_compute);
+	skr_compute_set_tex(&scene->gi_clear_compute, "voxel_tex", &scene->gi_voxel_tex);
 
-	// Clear compute shader (clears voxel color buffer)
-	{
-		scene->gi_clear_shader = su_shader_load("shaders/gi_clear.hlsl.sks", "gi_clear");
-		skr_compute_create(&scene->gi_clear_shader, &scene->gi_clear_compute);
-		skr_compute_set_buffer(&scene->gi_clear_compute, "voxel",     &scene->gi_voxel_buffer);
-		skr_compute_set_param (&scene->gi_clear_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
-	}
+	// Voxelization shader + material (fragment shader writes to RWTexture3D)
+	scene->gi_voxelize_shader = su_shader_load("shaders/gi_voxelize_3d.hlsl.sks", "gi_voxelize_3d");
+	skr_material_create((skr_material_info_t){
+		.shader     = &scene->gi_voxelize_shader,
+		.depth_test = skr_compare_always,
+		.cull       = skr_cull_none,
+		.write_mask = skr_write_none,
+	}, &scene->gi_voxelize_material);
+	skr_material_set_tex  (&scene->gi_voxelize_material, "voxel_tex",  &scene->gi_voxel_tex);
+	skr_material_set_tex  (&scene->gi_voxelize_material, "albedo_tex", &scene->floor_texture);
+	skr_material_set_param(&scene->gi_voxelize_material, "color",      sksc_shader_var_float, 4, &(skr_vec4_t){1, 1, 1, 1});
+	skr_material_set_param(&scene->gi_voxelize_material, "tex_trans",  sksc_shader_var_float, 4, &(skr_vec4_t){0, 0, 1, 1});
 
-	// Voxelize compute shader
-	scene->gi_voxelize_shader = su_shader_load("shaders/gi_voxelize.hlsl.sks", "gi_voxelize");
-	skr_compute_create(&scene->gi_voxelize_shader, &scene->gi_voxelize_compute);
-	skr_compute_set_tex  (&scene->gi_voxelize_compute, "capture_tex", &scene->gi_capture_color);
-	skr_compute_set_param(&scene->gi_voxelize_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
+	skr_render_list_create(&scene->gi_voxel_list);
 
-	// Fast voxelization render targets (6-layer arrays, 2x supersample)
-	skr_tex_create(skr_tex_fmt_rgba32_linear,
-		skr_tex_flags_writeable | skr_tex_flags_readable | skr_tex_flags_array,
-		(skr_tex_sampler_t){ .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
-		(skr_vec3i_t){GI_CAPTURE_RES, GI_CAPTURE_RES, 6}, 1, 0, NULL, &scene->gi_fast_color);
-	skr_tex_set_name(&scene->gi_fast_color, "gi_fast_color");
-
-	skr_tex_create(skr_tex_fmt_depth16,
-		skr_tex_flags_writeable | skr_tex_flags_readable | skr_tex_flags_array,
-		(skr_tex_sampler_t){ .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp, .anisotropy = 1 },
-		(skr_vec3i_t){GI_CAPTURE_RES, GI_CAPTURE_RES, 6}, 1, 0, NULL, &scene->gi_fast_depth);
-	skr_tex_set_name(&scene->gi_fast_depth, "gi_fast_depth");
-
-	// Fast voxelize compute shader
-	scene->gi_fast_voxelize_shader = su_shader_load("shaders/gi_fast_voxelize.hlsl.sks", "gi_fast_voxelize");
-	skr_compute_create(&scene->gi_fast_voxelize_shader, &scene->gi_fast_voxelize_compute);
-	skr_compute_set_param(&scene->gi_fast_voxelize_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
-
-	// Voxel-to-SH conversion (ray march the completed voxel volume → SH)
+	// Voxel-to-SH conversion (ray march the completed voxel volume -> SH)
 	scene->gi_voxel_to_sh_shader = su_shader_load("shaders/gi_voxel_to_sh.hlsl.sks", "gi_voxel_to_sh");
 	skr_compute_create(&scene->gi_voxel_to_sh_shader, &scene->gi_voxel_to_sh_compute);
 	skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "sh_probes", &scene->gi_sh);
-	skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
-
-	// GI capture render list and capture material
-	// Use gi_capture for fast/simple captures, or pbr_gi for full PBR during captures
-	skr_render_list_create(&scene->gi_capture_list);
-	scene->gi_capture_shader = su_shader_load("shaders/gi_capture.hlsl.sks", "gi_capture");
-	//scene->gi_capture_shader = su_shader_load("shaders/pbr_gi.hlsl.sks", "gi_capture_pbr");
-	skr_material_create((skr_material_info_t){
-		.shader     = &scene->gi_capture_shader,
-		.depth_test = skr_compare_less,
-		.cull       = skr_cull_back,
-	}, &scene->gi_capture_material);
-	skr_material_set_tex  (&scene->gi_capture_material, "albedo_tex",      &scene->floor_texture);
-	skr_material_set_tex  (&scene->gi_capture_material, "emission_tex",    &scene->black_texture);
-	skr_material_set_param(&scene->gi_capture_material, "color",           sksc_shader_var_float, 4, &(skr_vec4_t){1, 1, 1, 1});
-	skr_material_set_param(&scene->gi_capture_material, "emission_factor", sksc_shader_var_float, 4, &(skr_vec4_t){0, 0, 0, 0});
-	skr_material_set_param(&scene->gi_capture_material, "tex_trans",       sksc_shader_var_float, 4, &(skr_vec4_t){0, 0, 1, 1});
+	skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
 	// GI constant buffer
 	gi_buffer_data_t gi_data = { .gi_grid_size = GI_GRID_SIZE };
@@ -600,29 +539,10 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_debug_voxel_mesh = su_mesh_create_cube(1.0f, NULL);
 	skr_mesh_set_name(&scene->gi_debug_voxel_mesh, "gi_debug_voxel_cube");
 
-	// Slice visualization cube (shows active capture slab when stepping)
-	scene->gi_slice_shader = su_shader_load("shaders/unlit.hlsl.sks", "gi_slice");
-	skr_material_create((skr_material_info_t){
-		.shader       = &scene->gi_slice_shader,
-		.cull         = skr_cull_none,
-		.write_mask   = skr_write_rgba,
-		.depth_test   = skr_compare_less,
-		.blend_state  = skr_blend_alpha,
-		.queue_offset = 100,
-	}, &scene->gi_slice_material);
-	skr_vec4_t slice_colors[6] = {
-		{0, 1, 1, 0.15f}, {0, 1, 1, 0.15f}, // cyan
-		{0, 1, 1, 0.15f}, {0, 1, 1, 0.15f},
-		{0, 1, 1, 0.15f}, {0, 1, 1, 0.15f},
-	};
-	scene->gi_slice_mesh = su_mesh_create_cube(1.0f, slice_colors);
-	skr_mesh_set_name(&scene->gi_slice_mesh, "gi_slice_cube");
-
-	// /home/koujaku/Art/Modeling/BounceRoom.glb
-	// Load default assets (shader 0=per-pixel, 1=capture, 2=per-vertex, 3=cubemap)
+	// Load default assets (shader 0=per-pixel, 1=voxelize, 2=per-vertex, 3=cubemap)
 	skr_material_info_t model_infos[] = {
 		{ .shader = &scene->shader,            .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
-		{ .shader = &scene->gi_capture_shader, .cull = skr_cull_back,                                  .depth_test = skr_compare_less },
+		{ .shader = &scene->gi_voxelize_shader, .cull = skr_cull_none, .write_mask = skr_write_none,   .depth_test = skr_compare_always },
 		{ .shader = &scene->shader_vertex_gi,  .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 		{ .shader = &scene->shader_cubemap,    .cull = skr_cull_back, .write_mask = skr_write_default, .depth_test = skr_compare_less },
 	};
@@ -666,23 +586,16 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_material_destroy(&scene->floor_material_cubemap);
 	skr_tex_destroy     (&scene->floor_texture);
 
-	// GI probes
+	// GI voxel system
 	skr_buffer_destroy     (&scene->gi_sh);
-	skr_tex_destroy        (&scene->gi_capture_color);
-	skr_tex_destroy        (&scene->gi_capture_depth);
-	skr_render_list_destroy(&scene->gi_capture_list);
-	skr_material_destroy   (&scene->gi_capture_material);
-	skr_shader_destroy     (&scene->gi_capture_shader);
 	skr_buffer_destroy     (&scene->gi_const_buffer);
-	skr_buffer_destroy     (&scene->gi_voxel_buffer);
+	skr_tex_destroy        (&scene->gi_voxel_tex);
+	skr_tex_destroy        (&scene->gi_voxel_rt);
+	skr_render_list_destroy(&scene->gi_voxel_list);
+	skr_material_destroy   (&scene->gi_voxelize_material);
+	skr_shader_destroy     (&scene->gi_voxelize_shader);
 	skr_compute_destroy    (&scene->gi_clear_compute);
 	skr_shader_destroy     (&scene->gi_clear_shader);
-	skr_compute_destroy    (&scene->gi_voxelize_compute);
-	skr_shader_destroy     (&scene->gi_voxelize_shader);
-	skr_tex_destroy        (&scene->gi_fast_color);
-	skr_tex_destroy        (&scene->gi_fast_depth);
-	skr_compute_destroy    (&scene->gi_fast_voxelize_compute);
-	skr_shader_destroy     (&scene->gi_fast_voxelize_shader);
 	skr_compute_destroy    (&scene->gi_voxel_to_sh_compute);
 	skr_shader_destroy     (&scene->gi_voxel_to_sh_shader);
 
@@ -693,9 +606,6 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_mesh_destroy    (&scene->gi_debug_voxel_mesh);
 	skr_material_destroy(&scene->gi_debug_voxel_material);
 	skr_shader_destroy  (&scene->gi_debug_voxel_shader);
-	skr_mesh_destroy    (&scene->gi_slice_mesh);
-	skr_material_destroy(&scene->gi_slice_material);
-	skr_shader_destroy  (&scene->gi_slice_shader);
 
 	free(scene);
 }
@@ -758,75 +668,13 @@ static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds
 
 	scene->gi_volume_computed  = true;
 	scene->gi_prev_model_scale = scene->model_scale;
-	scene->gi_fast_init_done   = false;
-	scene->gi_frame            = 0;
 }
 
-// Build an orthographic view/proj for capturing one axis-aligned direction.
-// axis: 0=X, 1=Y, 2=Z. dir_sign: +1 or -1.
-// layer_pos: world-space position at the cell EDGE along the capture axis.
-// Camera looks through the full cell depth (near=0, far=cell_size).
-static void _gi_build_capture_camera(
+// Build 3 orthographic cameras (X, Y, Z) covering the full volume for
+// fragment-shader voxelization.  Each camera looks along one axis from
+// the volume edge through the entire depth.
+static void _gi_build_voxelize_cameras(
 	float3 vol_min, float3 vol_max,
-	int32_t axis, float dir_sign, float layer_pos,
-	float4x4* out_view, float4x4* out_proj, float4x4* out_viewproj)
-{
-	float3 center = {
-		(vol_min.x + vol_max.x) * 0.5f,
-		(vol_min.y + vol_max.y) * 0.5f,
-		(vol_min.z + vol_max.z) * 0.5f,
-	};
-	float3 cam_pos = center;
-	float3 up      = {0, 1, 0};
-
-	// Place camera at the layer position along the capture axis.
-	if      (axis == 0) { cam_pos.x = layer_pos; }
-	else if (axis == 1) { cam_pos.y = layer_pos; up = (float3){0, 0, -1}; }
-	else                { cam_pos.z = layer_pos; }
-
-	// Look outward in the capture direction.
-	float3 forward = {0, 0, 0};
-	if      (axis == 0) forward = (float3){dir_sign, 0, 0};
-	else if (axis == 1) forward = (float3){0, dir_sign, 0};
-	else                forward = (float3){0, 0, dir_sign};
-
-	float3 cam_target = float3_add(cam_pos, forward);
-	*out_view = float4x4_lookat(cam_pos, cam_target, up);
-
-	// Orthographic half-extents cover the perpendicular axes of the volume.
-	float half_a, half_b;
-	if (axis == 0) {
-		half_a = (vol_max.z - vol_min.z) * 0.5f;
-		half_b = (vol_max.y - vol_min.y) * 0.5f;
-	} else if (axis == 1) {
-		half_a = (vol_max.x - vol_min.x) * 0.5f;
-		half_b = (vol_max.z - vol_min.z) * 0.5f;
-	} else {
-		half_a = (vol_max.x - vol_min.x) * 0.5f;
-		half_b = (vol_max.y - vol_min.y) * 0.5f;
-	}
-
-	// Camera is at cell edge, far plane covers full cell depth.
-	// Both +dir and -dir see the entire cell from opposite edges.
-	float cell_size;
-	if      (axis == 0) cell_size = (vol_max.x - vol_min.x) / GI_GRID_SIZE;
-	else if (axis == 1) cell_size = (vol_max.y - vol_min.y) / GI_GRID_SIZE;
-	else                cell_size = (vol_max.z - vol_min.z) / GI_GRID_SIZE;
-	float far_dist = cell_size;
-
-	*out_proj     = float4x4_orthographic(-half_a, half_a, -half_b, half_b, GI_CAM_NEAR, far_dist);
-	*out_viewproj = float4x4_mul(*out_proj, *out_view);
-}
-
-///////////////////////////////////////////
-// Fast voxelization (6-view depth-based)
-///////////////////////////////////////////
-
-// Build 6 orthographic cameras along major axes for fast voxelization.
-// from_center=true:  cameras at volume center, looking outward (far = half_size)
-// from_center=false: cameras at volume edges, looking inward (far = full_size)
-static void _gi_build_fast_cameras(
-	float3 vol_min, float3 vol_max, bool from_center,
 	su_system_buffer_t* out_sys)
 {
 	float3 center    = float3_mul_s(float3_add(vol_min, vol_max), 0.5f);
@@ -834,52 +682,29 @@ static void _gi_build_fast_cameras(
 	float3 half_size = float3_mul_s(vol_size, 0.5f);
 
 	memset(out_sys, 0, sizeof(*out_sys));
-	out_sys->view_count = 6;
+	out_sys->view_count = 3;
 
-	// Views: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
-	float3 forwards[6] = {
-		{ 1, 0, 0}, {-1, 0, 0},
-		{ 0, 1, 0}, { 0,-1, 0},
-		{ 0, 0, 1}, { 0, 0,-1},
-	};
-	float3 ups[6] = {
-		{0, 1, 0}, {0, 1, 0},
-		{0, 0,-1}, {0, 0,-1},
-		{0, 1, 0}, {0, 1, 0},
-	};
-	float axis_sizes[3]   = { vol_size.x,  vol_size.y,  vol_size.z  };
-	float half_sizes[3]   = { half_size.x, half_size.y, half_size.z };
-	float vol_min_arr[3]  = { vol_min.x,   vol_min.y,   vol_min.z   };
-	float vol_max_arr[3]  = { vol_max.x,   vol_max.y,   vol_max.z   };
+	// 0=+X, 1=+Y, 2=+Z
+	float3 forwards[3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+	float3 ups[3]      = { {0,1,0}, {0,0,-1}, {0,1,0} };
 
-	for (int32_t i = 0; i < 6; i++) {
-		int32_t axis        = i / 2;
-		bool    is_positive = (i % 2 == 0);
-
-		float3 cam_pos  = center;
-		float  far_dist;
-
-		if (from_center) {
-			far_dist = half_sizes[axis];
-		} else {
-			far_dist = axis_sizes[axis];
-			// Place camera at the near edge
-			float edge = is_positive ? vol_min_arr[axis] : vol_max_arr[axis];
-			if      (axis == 0) cam_pos.x = edge;
-			else if (axis == 1) cam_pos.y = edge;
-			else                cam_pos.z = edge;
-		}
+	for (int32_t i = 0; i < 3; i++) {
+		// Place camera at the near edge of the volume along this axis
+		float3 cam_pos = center;
+		if      (i == 0) cam_pos.x = vol_min.x;
+		else if (i == 1) cam_pos.y = vol_min.y;
+		else             cam_pos.z = vol_min.z;
 
 		float3   target = float3_add(cam_pos, forwards[i]);
 		float4x4 view   = float4x4_lookat(cam_pos, target, ups[i]);
 
-		// Orthographic bounds (perpendicular axes)
-		float half_a, half_b;
-		if      (axis == 0) { half_a = half_size.z; half_b = half_size.y; }
-		else if (axis == 1) { half_a = half_size.x; half_b = half_size.z; }
-		else                { half_a = half_size.x; half_b = half_size.y; }
+		// Orthographic bounds cover perpendicular axes
+		float half_a, half_b, far_dist;
+		if      (i == 0) { half_a = half_size.z; half_b = half_size.y; far_dist = vol_size.x; }
+		else if (i == 1) { half_a = half_size.x; half_b = half_size.z; far_dist = vol_size.y; }
+		else             { half_a = half_size.x; half_b = half_size.y; far_dist = vol_size.z; }
 
-		float4x4 proj = float4x4_orthographic(-half_a, half_a, -half_b, half_b, GI_CAM_NEAR, far_dist);
+		float4x4 proj = float4x4_orthographic(-half_a, half_a, -half_b, half_b, 0.0f, far_dist);
 
 		out_sys->view      [i] = view;
 		out_sys->projection[i] = proj;
@@ -887,83 +712,6 @@ static void _gi_build_fast_cameras(
 		out_sys->cam_pos   [i] = (float4){cam_pos.x, cam_pos.y, cam_pos.z, 0};
 		out_sys->cam_dir   [i] = (float4){forwards[i].x, forwards[i].y, forwards[i].z, 0};
 	}
-}
-
-// Run complete fast voxelization: 2 passes (center-out + edges-in), then swap buffers.
-static void _gi_run_fast_voxelize(
-	scene_gi_t*        scene,
-	float4x4           floor_instance,
-	float4x4           model_transform,
-	su_gltf_state_     model_state)
-{
-	float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
-
-	// Per-face writes overwrite directly, no clear needed
-
-	// Set GI intensity to 0 during captures (prevent feedback)
-	gi_buffer_data_t gi_capture_data = {
-		.gi_volume_min = scene->gi_volume_min,
-		.gi_intensity  = 1.0f,
-		.gi_volume_inv = {
-			1.0f / vol_size.x,
-			1.0f / vol_size.y,
-			1.0f / vol_size.z,
-		},
-		.gi_grid_size = GI_GRID_SIZE,
-	};
-	skr_buffer_set(&scene->gi_const_buffer, &gi_capture_data, sizeof(gi_buffer_data_t));
-	skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
-
-	// Bind SH textures globally (shader sees zeros since gi_intensity=0)
-	skr_renderer_set_global_constants(6, &scene->gi_sh);
-
-	// Shadow data needs to be bound for the capture shader
-	skr_renderer_set_global_constants(13, &scene->shadow_buffer);
-	skr_renderer_set_global_texture  (14, &scene->shadow_map);
-
-	// Two passes: center outward, then edges inward
-	bool passes[2] = { true, false };
-	for (int32_t pass = 0; pass < 2; pass++) {
-		bool from_center = passes[pass];
-
-		su_system_buffer_t cap_sys;
-		_gi_build_fast_cameras(scene->gi_volume_min, scene->gi_volume_max, from_center, &cap_sys);
-		cap_sys.time = scene->time;
-		if (scene->cubemap_ready) {
-			cap_sys.cubemap_info = (float4){
-				(float)scene->cubemap_texture.size.x,
-				(float)scene->cubemap_texture.size.y,
-				(float)scene->cubemap_texture.mip_levels,
-				0.0f
-			};
-		}
-
-		// Render scene into 6-layer capture RT
-		skr_renderer_begin_pass(&scene->gi_fast_color, &scene->gi_fast_depth, NULL,
-			skr_clear_all, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-		skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_CAPTURE_RES, (float)GI_CAPTURE_RES});
-		skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_CAPTURE_RES, GI_CAPTURE_RES});
-
-		if (scene->show_floor)
-			skr_render_list_add(&scene->gi_capture_list, &scene->floor_mesh, &scene->gi_capture_material, &floor_instance, sizeof(float4x4), 1);
-		if (model_state == su_gltf_state_ready) {
-			su_gltf_add_to_render_list_shader(scene->model, &scene->gi_capture_list, &model_transform, 1);
-		}
-
-		skr_renderer_draw    (&scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), 6);
-		skr_render_list_clear(&scene->gi_capture_list);
-		skr_renderer_end_pass();
-
-		// Dispatch fast voxelize compute at 2x resolution: each sub-pixel finds its voxel via depth
-		uint32_t from_center_val = from_center ? 1 : 0;
-		skr_compute_set_tex   (&scene->gi_fast_voxelize_compute, "capture_color",  &scene->gi_fast_color);
-		skr_compute_set_tex   (&scene->gi_fast_voxelize_compute, "capture_depth",  &scene->gi_fast_depth);
-		skr_compute_set_buffer(&scene->gi_fast_voxelize_compute, "voxel_buf",      &scene->gi_voxel_buffer);
-		skr_compute_set_param (&scene->gi_fast_voxelize_compute, "from_center",    sksc_shader_var_uint, 1, &from_center_val);
-		skr_compute_execute(&scene->gi_fast_voxelize_compute, (GI_CAPTURE_RES + 7) / 8, (GI_CAPTURE_RES + 7) / 8, 6);
-	}
-
-	// No swap needed — single buffer
 }
 
 ///////////////////////////////////////////
@@ -1042,131 +790,75 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	};
 	skr_buffer_set(&scene->shadow_buffer, &shadow_data, sizeof(shadow_buffer_data_t));
 
-	// --- GI voxelization (mode-based dispatch) ---
-	// Fast voxelize always runs once at startup for immediate data.
-	// After that, behavior depends on gi_voxel_mode:
-	//   0 = Layer Scan: progressive 33-frame cycle (1 axis × 3 layers per frame)
-	//   1 = Fast: re-voxelize every frame (most responsive to scene changes)
-	//   2 = Fast Periodic: re-voxelize every 33 frames (same cadence as layer scan)
+	// --- GI voxelization (3-view fragment shader, every frame) ---
 	if (scene->gi_mode != gi_mode_cubemap) {
-		bool run_fast = !scene->gi_fast_init_done ||
-		                (scene->gi_voxel_mode == 1) ||
-		                (scene->gi_voxel_mode == 2 && scene->gi_frame == 0);
-		// Layer scan only runs in mode 0, respects stepping
-		bool run_scan = (scene->gi_voxel_mode == 0) && (!scene->gi_stepping || scene->gi_step_next);
-		// Advance frame in non-scan modes always, in scan mode only when not paused
-		bool should_advance = (scene->gi_voxel_mode != 0) || run_scan;
+		float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
 
-		if (run_fast) {
-			// Clear voxel buffer before full re-voxelization
-			int32_t clear_dispatch = (GI_GRID_SIZE + 3) / 4;
-			skr_compute_execute(&scene->gi_clear_compute, clear_dispatch, clear_dispatch, clear_dispatch);
+		// Set GI constants for voxelization pass
+		gi_buffer_data_t gi_vox_data = {
+			.gi_volume_min = scene->gi_volume_min,
+			.gi_intensity  = 1.0f,
+			.gi_volume_inv = {
+				1.0f / vol_size.x,
+				1.0f / vol_size.y,
+				1.0f / vol_size.z,
+			},
+			.gi_grid_size = GI_GRID_SIZE,
+		};
+		skr_buffer_set(&scene->gi_const_buffer, &gi_vox_data, sizeof(gi_buffer_data_t));
+		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
+		skr_renderer_set_global_constants(6,  &scene->gi_sh);
+		skr_renderer_set_global_constants(13, &scene->shadow_buffer);
+		skr_renderer_set_global_texture  (14, &scene->shadow_map);
 
-			//_gi_run_fast_voxelize(scene, floor_instance, model_transform, state);
-			scene->gi_fast_init_done = true;
-		}
+		// 1) Clear 3D voxel texture
+		int32_t clear_dispatch = (GI_VOXEL_SIZE + 3) / 4;
+		skr_compute_execute(&scene->gi_clear_compute, clear_dispatch, clear_dispatch, clear_dispatch);
 
-		if (run_scan) {
-			scene->gi_step_next = false;
-
-			float3  vol_size    = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
-			int32_t batch       = scene->gi_frame / 3;
-			int32_t axis        =  scene->gi_frame % 3;
-			int32_t layer_start =  batch * GI_LAYERS_PER_FRAME;
-			int32_t layer_count = GI_LAYERS_PER_FRAME;
-			if (layer_start + layer_count > GI_GRID_SIZE)
-				layer_count = GI_GRID_SIZE - layer_start;
-
-			// Set GI constants for capture
-			gi_buffer_data_t gi_capture_data = {
-				.gi_volume_min = scene->gi_volume_min,
-				.gi_intensity  = 1.0f,
-				.gi_volume_inv = {
-					1.0f / vol_size.x,
-					1.0f / vol_size.y,
-					1.0f / vol_size.z,
-				},
+		// 2) Build 3 orthographic cameras (X, Y, Z)
+		su_system_buffer_t vox_sys = {0};
+		_gi_build_voxelize_cameras(scene->gi_volume_min, scene->gi_volume_max, &vox_sys);
+		vox_sys.time = scene->time;
+		if (scene->cubemap_ready) {
+			vox_sys.cubemap_info = (float4){
+				(float)scene->cubemap_texture.size.x,
+				(float)scene->cubemap_texture.size.y,
+				(float)scene->cubemap_texture.mip_levels,
+				0.0f
 			};
-			skr_buffer_set(&scene->gi_const_buffer, &gi_capture_data, sizeof(gi_buffer_data_t));
-			skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
-			skr_renderer_set_global_constants(6,  &scene->gi_sh);
-			skr_renderer_set_global_constants(13, &scene->shadow_buffer);
-			skr_renderer_set_global_texture  (14, &scene->shadow_map);
-
-			// Build camera views: layer_count layers × 2 directions = up to 6 views
-			// Texture layout: [0,1]=layer+0 (pos,neg), [2,3]=layer+1, [4,5]=layer+2
-			int32_t view_count = layer_count * 2;
-			su_system_buffer_t cap_sys = {0};
-			cap_sys.view_count = view_count;
-			cap_sys.time       = scene->time;
-			if (scene->cubemap_ready) {
-				cap_sys.cubemap_info = (float4){
-					(float)scene->cubemap_texture.size.x,
-					(float)scene->cubemap_texture.size.y,
-					(float)scene->cubemap_texture.mip_levels,
-					0.0f
-				};
-			}
-			for (int32_t l = 0; l < layer_count; l++) {
-				int32_t current_layer = layer_start + l;
-				for (int32_t dir = 0; dir < 2; dir++) {
-					int32_t d        = l * 2 + dir;
-					float   dir_sign = (dir == 0) ? 1.0f : -1.0f;
-					float   edge_off = (dir_sign > 0) ? (float)current_layer : (float)(current_layer + 1);
-
-					float layer_pos;
-					if      (axis == 0) { layer_pos = scene->gi_volume_min.x + edge_off * vol_size.x / GI_GRID_SIZE; }
-					else if (axis == 1) { layer_pos = scene->gi_volume_min.y + edge_off * vol_size.y / GI_GRID_SIZE; }
-					else                { layer_pos = scene->gi_volume_min.z + edge_off * vol_size.z / GI_GRID_SIZE; }
-
-					float4x4 v, p, vp;
-					_gi_build_capture_camera(scene->gi_volume_min, scene->gi_volume_max,
-						axis, dir_sign, layer_pos, &v, &p, &vp);
-					cap_sys.view      [d] = v;
-					cap_sys.projection[d] = p;
-					cap_sys.viewproj  [d] = vp;
-				}
-			}
-
-			// Render into capture RT (no MSAA for timing comparison)
-			skr_renderer_begin_pass(&scene->gi_capture_color, &scene->gi_capture_depth, NULL,
-				skr_clear_all, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-			skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_CAPTURE_RES, (float)GI_CAPTURE_RES});
-			skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_CAPTURE_RES, GI_CAPTURE_RES});
-
-			if (scene->show_floor)
-				skr_render_list_add(&scene->gi_capture_list, &scene->floor_mesh, &scene->gi_capture_material, &floor_instance, sizeof(float4x4), 1);
-			if (state == su_gltf_state_ready)
-				su_gltf_add_to_render_list_shader(scene->model, &scene->gi_capture_list, &model_transform, 1);
-
-			skr_renderer_draw    (&scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), view_count);
-			skr_render_list_clear(&scene->gi_capture_list);
-			skr_renderer_end_pass();
-
-			// Voxelize: each thread handles one voxel, both +/- directions
-			skr_compute_set_tex   (&scene->gi_voxelize_compute, "capture_tex", &scene->gi_capture_color);
-			skr_compute_set_buffer(&scene->gi_voxelize_compute, "voxel_buf",   &scene->gi_voxel_buffer);
-			skr_compute_set_param (&scene->gi_voxelize_compute, "axis",        sksc_shader_var_uint, 1, &(uint32_t){axis});
-			skr_compute_set_param (&scene->gi_voxelize_compute, "layer_start", sksc_shader_var_uint, 1, &(uint32_t){layer_start});
-			skr_compute_set_param (&scene->gi_voxelize_compute, "layer_count", sksc_shader_var_uint, 1, &(uint32_t){layer_count});
-			skr_compute_execute(&scene->gi_voxelize_compute, (GI_GRID_SIZE + 7) / 8, (GI_GRID_SIZE + 7) / 8, layer_count);
 		}
 
-		if (should_advance) {
-			// Voxel-to-SH runs every advancing frame (EMA accumulation)
-			skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "voxel_buf",      &scene->gi_voxel_buffer);
-			skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "frame_seed",   sksc_shader_var_uint,  1, &scene->gi_total_frames);
-			skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "sh_decay",     sksc_shader_var_float, 1, &scene->gi_sh_decay);
-			skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "ray_count",    sksc_shader_var_uint,  1, &scene->gi_ray_count);
-			skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "env_cubemap",  &scene->cubemap_texture);
-			skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "env_mip",      sksc_shader_var_float, 1, &scene->gi_env_mip);
-			skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "env_strength", sksc_shader_var_float, 1, &scene->gi_env_strength);
-			int32_t vts_dispatch = (GI_GRID_SIZE + 3) / 4;
-			skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch * 4);
+		// 3) Render into dummy RT — fragment shader writes to RWTexture3D
+		// Bind voxel_tex globally at slot 0 so GLTF model's voxelize materials (shader set 1)
+		// pick it up as RWTexture3D at register(u0) without needing per-material binding.
+		skr_renderer_set_global_texture(0, &scene->gi_voxel_tex);
+		skr_renderer_begin_pass(&scene->gi_voxel_rt, NULL, NULL,
+			skr_clear_color, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
+		skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_VOXEL_SIZE, (float)GI_VOXEL_SIZE});
+		skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_VOXEL_SIZE, GI_VOXEL_SIZE});
 
-			scene->gi_frame = (scene->gi_frame + 1) % GI_CYCLE_LENGTH;
-			scene->gi_total_frames++;
-		}
+		if (scene->show_floor)
+			skr_render_list_add(&scene->gi_voxel_list, &scene->floor_mesh, &scene->gi_voxelize_material, &floor_instance, sizeof(float4x4), 1);
+		if (state == su_gltf_state_ready)
+			su_gltf_add_to_render_list_shader(scene->model, &scene->gi_voxel_list, &model_transform, 1);
+
+		skr_renderer_draw    (&scene->gi_voxel_list, &vox_sys, sizeof(su_system_buffer_t), 3);
+		skr_render_list_clear(&scene->gi_voxel_list);
+		skr_renderer_end_pass();
+		skr_renderer_set_global_texture(0, NULL);
+
+		// 4) Voxel-to-SH ray march (EMA accumulation)
+		skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "voxel_tex",    &scene->gi_voxel_tex);
+		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "frame_seed",   sksc_shader_var_uint,  1, &scene->gi_total_frames);
+		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "sh_decay",     sksc_shader_var_float, 1, &scene->gi_sh_decay);
+		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "ray_count",    sksc_shader_var_uint,  1, &scene->gi_ray_count);
+		skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "env_cubemap",  &scene->cubemap_texture);
+		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "env_mip",      sksc_shader_var_float, 1, &scene->gi_env_mip);
+		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "env_strength", sksc_shader_var_float, 1, &scene->gi_env_strength);
+		int32_t vts_dispatch = (GI_GRID_SIZE + 3) / 4;
+		skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch * 4);
+
+		scene->gi_total_frames++;
 	}
 
 	// --- Bind GI for main pass ---
@@ -1185,7 +877,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
 		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
 		skr_renderer_set_global_constants(6, &scene->gi_sh);
-		skr_renderer_set_global_constants(9,  &scene->gi_voxel_buffer);     // voxel StructuredBuffer at t9
+		skr_renderer_set_global_texture  (9, &scene->gi_voxel_tex);
 	}
 
 	// Bind cubemap globally for cubemap irradiance shader (t5)
@@ -1250,46 +942,6 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		}
 	}
 
-	// --- Slice visualization (shows active capture slabs when stepping) ---
-	// Shows slabs for the current axis's layers (up to 3 slabs).
-	if (scene->gi_stepping) {
-		float3 vol_size  = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
-		float3 cell_size = {
-			vol_size.x / GI_GRID_SIZE,
-			vol_size.y / GI_GRID_SIZE,
-			vol_size.z / GI_GRID_SIZE,
-		};
-		// gi_frame was already incremented after the capture, so use -1
-		int32_t prev_frame   = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
-		int32_t batch        = prev_frame / 3;
-		int32_t axis         = prev_frame % 3;
-		int32_t layer_start  = batch * GI_LAYERS_PER_FRAME;
-		int32_t layer_count  = GI_LAYERS_PER_FRAME;
-		if (layer_start + layer_count > GI_GRID_SIZE)
-			layer_count = GI_GRID_SIZE - layer_start;
-
-		for (int32_t l = 0; l < layer_count; l++) {
-			int32_t layer = layer_start + l;
-			float3 center = {
-				scene->gi_volume_min.x + vol_size.x * 0.5f,
-				scene->gi_volume_min.y + vol_size.y * 0.5f,
-				scene->gi_volume_min.z + vol_size.z * 0.5f,
-			};
-			float3 scale = vol_size;
-
-			if      (axis == 0) { center.x = scene->gi_volume_min.x + (layer + 0.5f) * cell_size.x; scale.x = cell_size.x; }
-			else if (axis == 1) { center.y = scene->gi_volume_min.y + (layer + 0.5f) * cell_size.y; scale.y = cell_size.y; }
-			else                { center.z = scene->gi_volume_min.z + (layer + 0.5f) * cell_size.z; scale.z = cell_size.z; }
-
-			float4x4 slice_world = float4x4_trs(
-				center,
-				float4_quat_from_euler((float3){0, 0, 0}),
-				scale
-			);
-			skr_render_list_add(ref_render_list, &scene->gi_slice_mesh, &scene->gi_slice_material, &slice_world, sizeof(float4x4), 1);
-		}
-	}
-
 	// --- Debug probe visualization ---
 	if (scene->gi_show_probes) {
 		uint32_t dm = (uint32_t)scene->gi_debug_mode;
@@ -1323,31 +975,8 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 
 	// --- Voxel cube visualization ---
 	if (scene->gi_show_voxels) {
-		float3 vol_size  = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
-		float3 cell_size = {
-			vol_size.x / GI_GRID_SIZE,
-			vol_size.y / GI_GRID_SIZE,
-			vol_size.z / GI_GRID_SIZE,
-		};
-		skr_material_set_param(&scene->gi_debug_voxel_material, "cell_size", sksc_shader_var_float, 3, &cell_size);
-
-		int32_t total = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
-		float4  voxel_data[GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE];
-		int32_t i = 0;
-
-		for (int32_t z = 0; z < GI_GRID_SIZE; z++) {
-			for (int32_t y = 0; y < GI_GRID_SIZE; y++) {
-				for (int32_t x = 0; x < GI_GRID_SIZE; x++) {
-					voxel_data[i++] = (float4){
-						scene->gi_volume_min.x + (x + 0.5f) * cell_size.x,
-						scene->gi_volume_min.y + (y + 0.5f) * cell_size.y,
-						scene->gi_volume_min.z + (z + 0.5f) * cell_size.z,
-						0,
-					};
-				}
-			}
-		}
-		skr_render_list_add(ref_render_list, &scene->gi_debug_voxel_mesh, &scene->gi_debug_voxel_material, voxel_data, sizeof(float4), total);
+		int32_t total = GI_VOXEL_SIZE * GI_VOXEL_SIZE * GI_VOXEL_SIZE;
+		skr_render_list_add(ref_render_list, &scene->gi_debug_voxel_mesh, &scene->gi_debug_voxel_material, NULL, 0, total);
 	}
 }
 
@@ -1535,12 +1164,6 @@ static void _scene_gi_render_ui(scene_t* base) {
 		igCombo_Str_arr("GI Mode", (int*)&scene->gi_mode, gi_modes, 3, 0);
 	}
 	if (scene->gi_mode != gi_mode_cubemap) {
-		const char* voxel_modes[] = { "Layer Scan", "Fast", "Fast Periodic" };
-		if (igCombo_Str_arr("Voxel Mode", &scene->gi_voxel_mode, voxel_modes, 3, 0)) {
-			scene->gi_frame    = 0;
-			scene->gi_stepping = false;
-			scene->gi_step_next = false;
-		}
 		igSliderFloat("Intensity", &scene->gi_intensity, 0.0f, 5.0f, "%.2f", 0);
 		igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
 		igSliderInt("Rays/Probe", &scene->gi_ray_count, 4, 32, "%d", 0);
@@ -1559,35 +1182,8 @@ static void _scene_gi_render_ui(scene_t* base) {
 		igCheckbox("Show Probes", &scene->gi_show_probes);
 		igCheckbox("Show Voxels", &scene->gi_show_voxels);
 		{
-			const char* modes[] = { "SH Irradiance", "Face Mask", "Raw L0", "SH Detail", "Voxel Radiance", "Voxel Opacity" };
-			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 6, 0);
-		}
-
-		if (scene->gi_mode != gi_mode_cubemap && scene->gi_voxel_mode == 0) {
-			int32_t prev_frame  = (scene->gi_frame - 1 + GI_CYCLE_LENGTH) % GI_CYCLE_LENGTH;
-			int32_t dbg_batch   = prev_frame / 3;
-			int32_t dbg_axis    = prev_frame % 3;
-			int32_t dbg_lstart  = dbg_batch * GI_LAYERS_PER_FRAME;
-			int32_t dbg_lcount  = GI_LAYERS_PER_FRAME;
-			if (dbg_lstart + dbg_lcount > GI_GRID_SIZE) dbg_lcount = GI_GRID_SIZE - dbg_lstart;
-			const char* axis_names[] = { "X", "Y", "Z" };
-			igText("Capture: %s layers %d-%d", axis_names[dbg_axis], dbg_lstart, dbg_lstart + dbg_lcount - 1);
-
-			if (scene->gi_stepping) {
-				if (igButton("Next", (ImVec2){0, 0})) scene->gi_step_next = true;
-				igSameLine(0, 4);
-				if (igButton("Resume", (ImVec2){0, 0})) scene->gi_stepping = false;
-			} else {
-				if (igButton("Pause", (ImVec2){0, 0})) scene->gi_stepping = true;
-			}
-
-			ImVec2 avail;
-			igGetContentRegionAvail(&avail);
-			float  img_size = avail.x > 0 ? avail.x : 128;
-			igImage((ImTextureID)(uintptr_t)&scene->gi_capture_color,
-				(ImVec2){img_size, img_size},
-				(ImVec2){0, 0}, (ImVec2){1, 1},
-				(ImVec4){1, 1, 1, 1}, (ImVec4){0.5f, 0.5f, 0.5f, 0.5f});
+			const char* modes[] = { "SH Irradiance", "Occupancy", "Raw L0", "SH Detail", "Voxel Radiance" };
+			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 5, 0);
 		}
 	}
 

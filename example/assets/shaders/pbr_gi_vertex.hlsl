@@ -112,10 +112,10 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	// Precompute clamped corner positions and linear index offsets (~6 ALU)
 	uint3 p0  = uint3(clamp(bp,     int3(0, 0, 0), max_idx));
 	uint3 p1  = uint3(clamp(bp + 1, int3(0, 0, 0), max_idx));
-	uint base_idx = p0.x + (p0.y << 5) + (p0.z << 10);
+	uint base_idx = voxel_index(p0);
 	uint dx = p1.x - p0.x;
-	uint dy = (p1.y - p0.y) << 5;
-	uint dz = (p1.z - p0.z) << 10;
+	uint dy = (p1.y - p0.y) * GI_GRID;
+	uint dz = (p1.z - p0.z) * GI_GRID2;
 
 	float4 sum_r = float4(0, 0, 0, 0);
 	float4 sum_g = float4(0, 0, 0, 0);

@@ -157,6 +157,7 @@ target_sources(sk_renderer_test PRIVATE
 	scene_stars.c
 	scene_yuv_test.c
 	scene_gi.c
+	scene_skybox_compare.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c
@@ -232,15 +233,13 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/pbr_gi.hlsl
 	assets/shaders/pbr_gi_vertex.hlsl
 	assets/shaders/pbr_cubemap.hlsl
-	assets/shaders/gi_accumulate.hlsl
-	assets/shaders/gi_capture.hlsl
 	assets/shaders/gi_clear.hlsl
 	assets/shaders/gi_debug.hlsl
 	assets/shaders/gi_debug_voxel.hlsl
-	assets/shaders/gi_propagate.hlsl
-	assets/shaders/gi_voxelize.hlsl
-	assets/shaders/gi_fast_voxelize.hlsl
+	assets/shaders/gi_voxelize_3d.hlsl
 	assets/shaders/gi_voxel_to_sh.hlsl
+	assets/shaders/octahedral_skybox.hlsl
+	assets/shaders/equirect_to_octahedral.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

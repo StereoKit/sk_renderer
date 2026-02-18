@@ -338,6 +338,18 @@ skr_mesh_t su_mesh_create_fullscreen_quad(void) {
 	return mesh;
 }
 
+skr_mesh_t su_mesh_create_fullscreen_triangle(void) {
+	su_vertex_t tri_vertices[] = {
+		{ .position = {-1.0f,  3.0f, 0.0f}, .normal = {0.0f, 0.0f, 1.0f}, .uv = {0.0f, -1.0f}, .color = 0xFFFFFFFF },
+		{ .position = {-1.0f, -1.0f, 0.0f}, .normal = {0.0f, 0.0f, 1.0f}, .uv = {0.0f,  1.0f}, .color = 0xFFFFFFFF },
+		{ .position = { 3.0f, -1.0f, 0.0f}, .normal = {0.0f, 0.0f, 1.0f}, .uv = {2.0f,  1.0f}, .color = 0xFFFFFFFF },
+	};
+	uint16_t tri_indices[] = { 0, 1, 2 };
+	skr_mesh_t mesh;
+	skr_mesh_create(&su_vertex_type, skr_index_fmt_u16, tri_vertices, 3, tri_indices, 3, &mesh);
+	return mesh;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Texture Generation
 ///////////////////////////////////////////////////////////////////////////////

@@ -1,22 +1,18 @@
 //--name = gi_voxel_to_sh
 
 // Compute shader to accumulate SH probes from voxel radiance via ray marching.
-// Each frame, casts low-discrepancy rays per probe through the voxel grid.
-// First opaque voxel hit provides radiance from the specific face the ray enters;
-// rays exiting the grid sample the environment cubemap at a low mip. Results
-// project into SH via exponential moving average. White noise with per-probe
-// hash gives uniform sphere coverage.
+// Each frame, casts random rays per probe through the 3D voxel texture.
+// First opaque voxel hit provides radiance; rays exiting the grid sample the
+// environment cubemap. Results project into SH via exponential moving average.
 //
-// Per-face color stored as RGB5A1 in a StructuredBuffer<Voxel> (6 faces per voxel).
-// Occupancy derived from alpha bits (A=1 means occupied).
-// A ray samples the color of the face it enters through (dominant axis).
+// Voxel data stored as RGB10A2 in a 3D texture. Occupancy: alpha > 0.
 
 #include "gi_voxel.hlsli"
 
-StructuredBuffer<Voxel>      voxel_buf     : register(t0);
-TextureCube<float4>          env_cubemap   : register(t1);
-SamplerState                 env_cubemap_s : register(s1);
-RWStructuredBuffer<SHProbe>  sh_probes     : register(u0);
+Texture3D<float4>               voxel_tex     : register(t0);
+TextureCube<float4>              env_cubemap   : register(t1);
+SamplerState                     env_cubemap_s : register(s1);
+RWStructuredBuffer<SHProbe>      sh_probes     : register(u0);
 
 uint  grid_size;
 uint  frame_seed;
@@ -27,11 +23,20 @@ float env_strength; // multiplier for environment cubemap contribution
 
 #define MAX_RADIANCE  4.0
 
-// Uncomment to use DDA traversal instead of fixed-step ray march.
-// DDA visits every voxel the ray passes through (no skipping), using linear
-// index stride adds (~2 ALU per step). Fixed-step recomputes voxel_index each
-// step (~5 ALU) but takes fewer steps on diagonal rays.
 #define RAY_MARCH_DDA
+
+// Single DDA step: advances voxel_pos and t_max along the nearest axis.
+void _dda_step(inout int3 voxel_pos, inout float3 t_max, float3 t_delta, int3 step_dir) {
+	bool sel_x = (t_max.x <= t_max.y) && (t_max.x <= t_max.z);
+	bool sel_y = !sel_x && (t_max.y <= t_max.z);
+
+	voxel_pos += int3(sel_x ? step_dir.x : 0,
+	                  sel_y ? step_dir.y : 0,
+	                  (!sel_x && !sel_y) ? step_dir.z : 0);
+	t_max += float3(sel_x ? t_delta.x : 0.0,
+	                sel_y ? t_delta.y : 0.0,
+	                (!sel_x && !sel_y) ? t_delta.z : 0.0);
+}
 
 // Integer hash for per-probe random direction
 uint _hash(uint x) {
@@ -43,46 +48,20 @@ uint _hash(uint x) {
 	return x;
 }
 
-// Build a 6-bit mask of which voxel faces a ray would enter through,
-// based on ray direction. Computed once per ray, used for all steps.
-uint _ray_entry_mask(float3 dir) {
-	uint m = 0;
-	if (dir.x > 0) m |= 2u;  // ray going +X enters through -X face
-	if (dir.x < 0) m |= 1u;  // ray going -X enters through +X face
-	if (dir.y > 0) m |= 8u;  // ray going +Y enters through -Y face
-	if (dir.y < 0) m |= 4u;  // ray going -Y enters through +Y face
-	if (dir.z > 0) m |= 32u; // ray going +Z enters through -Z face
-	if (dir.z < 0) m |= 16u; // ray going -Z enters through +Z face
-	return m;
-}
-
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
 	// Multi-pass dispatch: Z dimension is 4x grid size. Each pass touches every
 	// probe with ray_count/4 rays. Pass 0 applies EMA decay + accumulates;
-	// passes 1-3 just accumulate. Thread group scheduling ensures each pass
-	// completes before the next starts (512 groups of separation per pass).
-	uint  pass = id.z >> 5;                          // 0-3
-	uint3 pid  = uint3(id.x, id.y, id.z & (GI_GRID - 1)); // probe coordinates
+	// passes 1-3 just accumulate.
+	uint  pass = id.z / GI_GRID;
+	uint3 pid  = uint3(id.x, id.y, id.z % GI_GRID);
 
 	uint probe_hash = _hash(pid.x + _hash(pid.y + _hash(pid.z)));
 
 	float3 origin = (float3(pid) + 0.5) * GI_INV_GRID;
 
-	// Load origin voxel and derive face mask from alpha bits
-	uint  origin_lidx      = voxel_index(pid);
-	Voxel origin_voxel     = voxel_buf[origin_lidx];
-	uint  origin_face_mask = voxel_face_mask(origin_voxel);
-
-	// If the origin voxel has a clear outward normal, sample only that
-	// hemisphere. Otherwise (empty or opposing faces), sample full sphere.
-	float3 face_normal     = voxel_face_normal(origin_face_mask);
-	float  normal_len2     = dot(face_normal, face_normal);
-	bool   use_hemisphere  = normal_len2 > 0.01;
-	if (use_hemisphere) face_normal *= rsqrt(normal_len2);
-
-	// Weight per ray: uses full ray_count so both passes sum to correct total
-	float solid_angle = use_hemisphere ? 6.28318 : 12.56637; // 2*pi or 4*pi
+	// Weight per ray: full sphere sampling (4*pi)
+	float solid_angle = 12.56637; // 4*pi
 	float w           = solid_angle * (1.0 - sh_decay) / (float)ray_count;
 
 	// Each pass does a quarter of the rays
@@ -105,13 +84,6 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		float phi = 6.28318530718 * u2;
 		float3 dir = float3(r * cos(phi), r * sin(phi), z);
 
-		// Flip ray into outward hemisphere if origin has a clear surface normal
-		if (use_hemisphere && dot(dir, face_normal) < 0)
-			dir = -dir;
-
-		// Precompute which faces this ray would enter through
-		uint entry_mask = _ray_entry_mask(dir);
-
 		// Ray march through voxel volume: first hit wins
 		float3 radiance = float3(0, 0, 0);
 		bool   hit      = false;
@@ -124,96 +96,57 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		bool pos_z = dir.z >= 0;
 		int3 step_dir = int3(pos_x ? 1 : -1, pos_y ? 1 : -1, pos_z ? 1 : -1);
 
-		// Linear index strides per axis (constant for grid=32)
-		int stride_x = pos_x ? 1 : -1;
-		int stride_y = pos_y ? GI_GRID : -GI_GRID;
-		int stride_z = pos_z ? GI_GRID2 : -GI_GRID2;
-
-		int3 voxel_pos = int3(pid);
-		uint lidx      = origin_lidx;
+		int3 voxel_pos = int3(origin * (float)GI_VOXEL_RES);
 
 		// Distance to next voxel boundary along each axis (in t units)
 		float3 t_max;
-		t_max.x = abs_dir.x > 0.0001 ? ((pos_x ? (voxel_pos.x + 1) : voxel_pos.x) * GI_INV_GRID - origin.x) / dir.x : 1e30;
-		t_max.y = abs_dir.y > 0.0001 ? ((pos_y ? (voxel_pos.y + 1) : voxel_pos.y) * GI_INV_GRID - origin.y) / dir.y : 1e30;
-		t_max.z = abs_dir.z > 0.0001 ? ((pos_z ? (voxel_pos.z + 1) : voxel_pos.z) * GI_INV_GRID - origin.z) / dir.z : 1e30;
+		t_max.x = abs_dir.x > 0.0001 ? ((pos_x ? (voxel_pos.x + 1) : voxel_pos.x) * GI_INV_VOXEL_RES - origin.x) / dir.x : 1e30;
+		t_max.y = abs_dir.y > 0.0001 ? ((pos_y ? (voxel_pos.y + 1) : voxel_pos.y) * GI_INV_VOXEL_RES - origin.y) / dir.y : 1e30;
+		t_max.z = abs_dir.z > 0.0001 ? ((pos_z ? (voxel_pos.z + 1) : voxel_pos.z) * GI_INV_VOXEL_RES - origin.z) / dir.z : 1e30;
 
 		float3 t_delta;
-		t_delta.x = abs_dir.x > 0.0001 ? GI_INV_GRID / abs_dir.x : 1e30;
-		t_delta.y = abs_dir.y > 0.0001 ? GI_INV_GRID / abs_dir.y : 1e30;
-		t_delta.z = abs_dir.z > 0.0001 ? GI_INV_GRID / abs_dir.z : 1e30;
+		t_delta.x = abs_dir.x > 0.0001 ? GI_INV_VOXEL_RES / abs_dir.x : 1e30;
+		t_delta.y = abs_dir.y > 0.0001 ? GI_INV_VOXEL_RES / abs_dir.y : 1e30;
+		t_delta.z = abs_dir.z > 0.0001 ? GI_INV_VOXEL_RES / abs_dir.z : 1e30;
 
-		for (uint dda_step = 0; dda_step < GI_GRID * 3u; dda_step++) {
-			// Axis selection (branchless -> v_cmp + v_cndmask)
-			bool sel_x = (t_max.x <= t_max.y) && (t_max.x <= t_max.z);
-			bool sel_y = !sel_x && (t_max.y <= t_max.z);
+		for (uint dda_step = 0; dda_step < GI_VOXEL_RES * 3u; dda_step += 4) {
+			// Advance 4 DDA steps (pure ALU, no memory access)
+			_dda_step(voxel_pos, t_max, t_delta, step_dir); int3 p0 = voxel_pos;
+			_dda_step(voxel_pos, t_max, t_delta, step_dir); int3 p1 = voxel_pos;
+			_dda_step(voxel_pos, t_max, t_delta, step_dir); int3 p2 = voxel_pos;
+			_dda_step(voxel_pos, t_max, t_delta, step_dir); int3 p3 = voxel_pos;
 
-			// Linear index step: one v_cndmask + one v_add
-			lidx += (uint)(sel_x ? stride_x : (sel_y ? stride_y : stride_z));
+			// Issue 4 loads back-to-back (texture unit can prefetch)
+			float4 v0 = voxel_tex.Load(int4(p0, 0));
+			float4 v1 = voxel_tex.Load(int4(p1, 0));
+			float4 v2 = voxel_tex.Load(int4(p2, 0));
+			float4 v3 = voxel_tex.Load(int4(p3, 0));
 
-			// Branchless position + t_max update
-			voxel_pos += int3(sel_x ? step_dir.x : 0,
-			                  sel_y ? step_dir.y : 0,
-			                  (!sel_x && !sel_y) ? step_dir.z : 0);
-			t_max += float3(sel_x ? t_delta.x : 0.0,
-			                sel_y ? t_delta.y : 0.0,
-			                (!sel_x && !sel_y) ? t_delta.z : 0.0);
+			// First hit wins (OOB loads return 0, so alpha check handles bounds)
+			if (v0.a > 0) { radiance = v0.rgb; hit = true; break; }
+			if (v1.a > 0) { radiance = v1.rgb; hit = true; break; }
+			if (v2.a > 0) { radiance = v2.rgb; hit = true; break; }
+			if (v3.a > 0) { radiance = v3.rgb; hit = true; break; }
 
-			// Bounds check: negative ints cast to huge uints (bit 31), values
-			// >= 32 have bit 5+. OR combines, one compare catches all 6 cases.
-			if (((uint)voxel_pos.x | (uint)voxel_pos.y | (uint)voxel_pos.z) >= GI_GRID) break;
-
-			// Load voxel and derive face mask from alpha bits
-			Voxel v = voxel_buf[lidx];
-			uint face_mask = voxel_face_mask(v);
-			if (face_mask == 0) continue;
-
-			if ((face_mask & entry_mask) == 0) {
-				hit = true;
-				break;
-			}
-
-			uint face_idx = entry_mask_to_face(entry_mask, dir);
-			if (!(face_mask & (1u << face_idx))) {
-				uint matching = face_mask & entry_mask;
-				face_idx = firstbitlow(matching);
-			}
-			radiance = unpack_rgba8_color(voxel_get_face(v, face_idx));
-			hit = true;
-			break;
+			if (((uint)p3.x | (uint)p3.y | (uint)p3.z) >= GI_VOXEL_RES) break;
 		}
 #else
-		// Fixed-step march: step one voxel-width along the ray direction.
-		// Recomputes voxel_index each step (~5 ALU) but takes at most
-		// grid_size steps even on diagonal rays.
-		for (int s = 1; s < GI_GRID; s++) {
-			float3 pos = origin + dir * (s * GI_INV_GRID);
+		for (int s = 1; s < GI_VOXEL_RES; s++) {
+			float3 pos = origin + dir * (s * GI_INV_VOXEL_RES);
 
 			if (pos.x < 0 || pos.x >= 1.0 ||
 			    pos.y < 0 || pos.y >= 1.0 ||
 			    pos.z < 0 || pos.z >= 1.0) break;
 
-			int3 texel_pos = clamp(int3(pos * (float)GI_GRID), int3(0,0,0),
-			                       int3(GI_GRID-1, GI_GRID-1, GI_GRID-1));
-			uint idx = voxel_index(uint3(texel_pos));
+			int3 texel_pos = clamp(int3(pos * (float)GI_VOXEL_RES), int3(0,0,0),
+			                       int3(GI_VOXEL_RES-1, GI_VOXEL_RES-1, GI_VOXEL_RES-1));
 
-			Voxel v = voxel_buf[idx];
-			uint face_mask = voxel_face_mask(v);
-			if (face_mask == 0) continue;
-
-			if ((face_mask & entry_mask) == 0) {
+			float4 voxel = voxel_tex.Load(int4(texel_pos, 0));
+			if (voxel.a > 0) {
+				radiance = voxel.rgb;
 				hit = true;
 				break;
 			}
-
-			uint face_idx = entry_mask_to_face(entry_mask, dir);
-			if (!(face_mask & (1u << face_idx))) {
-				uint matching = face_mask & entry_mask;
-				face_idx = firstbitlow(matching);
-			}
-			radiance = unpack_rgba8_color(voxel_get_face(v, face_idx));
-			hit = true;
-			break;
 		}
 #endif
 
@@ -237,7 +170,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		total_b += sh * radiance.b;
 	}
 
-	// Write SH: pass 0 applies EMA decay + accumulates, pass 1 just accumulates
+	// Write SH: pass 0 applies EMA decay + accumulates, passes 1-3 just accumulate
 	uint idx = voxel_index(pid);
 	if (pass == 0) {
 		sh_probes[idx].r = sh_pack(sh_unpack(sh_probes[idx].r) * sh_decay + total_r);

@@ -163,14 +163,10 @@ skshaderc_compile_assets(sk_renderer_xr_test ${CMAKE_CURRENT_BINARY_DIR}/generat
 	../example/assets/shaders/pbr_gi.hlsl
 	../example/assets/shaders/pbr_gi_vertex.hlsl
 	../example/assets/shaders/pbr_cubemap.hlsl
-	../example/assets/shaders/gi_accumulate.hlsl
-	../example/assets/shaders/gi_capture.hlsl
 	../example/assets/shaders/gi_clear.hlsl
 	../example/assets/shaders/gi_debug.hlsl
 	../example/assets/shaders/gi_debug_voxel.hlsl
-	../example/assets/shaders/gi_propagate.hlsl
-	../example/assets/shaders/gi_voxelize.hlsl
-	../example/assets/shaders/gi_fast_voxelize.hlsl
+	../example/assets/shaders/gi_voxelize_3d.hlsl
 	../example/assets/shaders/gi_voxel_to_sh.hlsl
 )
 target_skapp_assets(sk_renderer_xr_test ${CMAKE_CURRENT_BINARY_DIR}/generated)

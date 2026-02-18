@@ -57,6 +57,7 @@ extern const scene_vtable_t scene_tex_compress_vtable;
 extern const scene_vtable_t scene_stars_vtable;
 extern const scene_vtable_t scene_yuv_test_vtable;
 extern const scene_vtable_t scene_gi_vtable;
+extern const scene_vtable_t scene_skybox_compare_vtable;
 #ifdef SKR_HAS_VIDEO
 extern const scene_vtable_t scene_video_vtable;
 #endif

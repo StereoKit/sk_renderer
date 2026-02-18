@@ -1,18 +1,13 @@
 //--name = gi_clear
 
-// Compute shader to clear the voxel color buffer.
+// Compute shader to clear the 3D voxel texture.
 
 #include "gi_voxel.hlsli"
 
-RWStructuredBuffer<Voxel> voxel : register(u0);
-
-uint grid_size;
+RWTexture3D<float4> voxel_tex : register(u0);
 
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
-	if (id.x >= GI_GRID || id.y >= GI_GRID || id.z >= GI_GRID) return;
-	uint idx = voxel_index(id);
-
-	[unroll] for (uint i = 0; i < 6; i++)
-		voxel[idx].faces[i] = 0;
+	if (id.x >= GI_VOXEL_RES || id.y >= GI_VOXEL_RES || id.z >= GI_VOXEL_RES) return;
+	voxel_tex[id] = float4(0, 0, 0, 0);
 }
