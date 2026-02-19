@@ -220,7 +220,7 @@ static void _skr_transition_image_layout(VkCommandBuffer cmd, VkImage image, VkI
 }
 
 // Helper: Convert layout to typical source stage flags
-static VkPipelineStageFlags _layout_to_src_stage(VkImageLayout layout) {
+VkPipelineStageFlags _layout_to_src_stage(VkImageLayout layout) {
 	switch (layout) {
 		case VK_IMAGE_LAYOUT_UNDEFINED:
 			return VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -243,7 +243,7 @@ static VkPipelineStageFlags _layout_to_src_stage(VkImageLayout layout) {
 }
 
 // Helper: Convert layout to typical access flags
-static VkAccessFlags _layout_to_access_flags(VkImageLayout layout) {
+VkAccessFlags _layout_to_access_flags(VkImageLayout layout) {
 	switch (layout) {
 		case VK_IMAGE_LAYOUT_UNDEFINED:
 			return 0;
@@ -335,16 +335,29 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 	VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
 	VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
 
-	// Perform transition
-	_skr_transition_image_layout(cmd, ref_tex->image, ref_tex->aspect_mask,
-		0, ref_tex->mip_levels, ref_tex->layer_count,
-		old_layout, new_layout,
-		src_stage,  dst_stage,
-		src_access, dst_access);
+	// Same-layout case (e.g. GENERAL→GENERAL for storage images): only an
+	// execution + memory dependency is needed, no image layout work. A
+	// VkMemoryBarrier is cheaper than VkImageMemoryBarrier here because the
+	// driver can skip per-image cache management.
+	if (old_layout == new_layout) {
+		vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0,
+			1, &(VkMemoryBarrier){
+				.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+				.srcAccessMask = src_access,
+				.dstAccessMask = dst_access,
+			}, 0, NULL, 0, NULL);
+	} else {
+		// Layout transition — needs a full image memory barrier
+		_skr_transition_image_layout(cmd, ref_tex->image, ref_tex->aspect_mask,
+			0, ref_tex->mip_levels, ref_tex->layer_count,
+			old_layout, new_layout,
+			src_stage,  dst_stage,
+			src_access, dst_access);
 
-	// Update tracked state (unless it's transient discard - always stays UNDEFINED conceptually)
-	if (!ref_tex->is_transient_discard) {
-		ref_tex->current_layout = new_layout;
+		// Update tracked state (unless it's transient discard - always stays UNDEFINED conceptually)
+		if (!ref_tex->is_transient_discard) {
+			ref_tex->current_layout = new_layout;
+		}
 	}
 	ref_tex->first_use = false;
 }
@@ -974,8 +987,10 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	out_tex->current_layout       = VK_IMAGE_LAYOUT_UNDEFINED;
 	out_tex->current_queue_family = _skr_vk.graphics_queue_family;
 	out_tex->first_use            = true;
-	// Transient discard optimization for non-readable depth/MSAA (tile GPU optimization)
-	out_tex->is_transient_discard = (is_msaa_attachment || (is_depth && !(flags & skr_tex_flags_readable)));
+	// All attachments track layout so render passes can use non-UNDEFINED
+	// initialLayouts, avoiding DCC/HTILE metadata re-initialization.
+	// Tiled GPU optimization is driven by loadOp/storeOp, not initialLayout.
+	out_tex->is_transient_discard = false;
 
 	// Upload texture data if provided (or just transition to shader read layout)
 	if (opt_data && opt_data->data) {

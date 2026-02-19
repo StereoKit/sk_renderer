@@ -102,20 +102,169 @@ void _skr_tex_transition_enqueue(skr_tex_t* ref_tex, uint8_t type) {
 	_skr_vk.pending_transition_count++;
 }
 
-// Flush all pending texture transitions (called before render pass begins)
-static void _skr_flush_texture_transitions(VkCommandBuffer cmd) {
-	for (uint32_t i = 0; i < _skr_vk.pending_transition_count; i++) {
+// Flush all pending texture transitions as a single batched barrier.
+// opt_depth/opt_color: if non-NULL, attachment transitions are included in
+// the same vkCmdPipelineBarrier call (saves extra barriers in begin_pass).
+static void _skr_flush_texture_transitions(VkCommandBuffer cmd, skr_tex_t* opt_depth, skr_tex_t* opt_color) {
+	uint32_t pending = _skr_vk.pending_transition_count;
+	bool     depth   = opt_depth != NULL;
+	bool     color   = opt_color != NULL;
+
+	if (pending == 0 && !depth && !color) return;
+
+	// Collect barriers — image barriers for layout changes, memory barriers
+	// for same-layout (GENERAL→GENERAL) synchronization. Extra slots for
+	// the optional depth and color transitions.
+	VkImageMemoryBarrier image_barriers[18]; // 16 max globals + depth + color
+	VkMemoryBarrier      mem_barrier = {
+		.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = 0,
+		.dstAccessMask = 0,
+	};
+	uint32_t             image_count      = 0;
+	bool                 need_mem_barrier = false;
+	VkPipelineStageFlags combined_src     = 0;
+	VkPipelineStageFlags combined_dst     = 0;
+
+	for (uint32_t i = 0; i < pending; i++) {
 		skr_tex_t* tex  = _skr_vk.pending_transitions[i];
 		uint8_t    type = _skr_vk.pending_transition_types[i];
+		if (!tex || !tex->image) continue;
 
-		if (type == 1) {  // storage
-			_skr_tex_transition_for_storage(cmd, tex);
-		} else {  // shader_read
-			_skr_tex_transition_for_shader_read(cmd, tex, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		// Determine target layout and dst stage/access
+		VkImageLayout        new_layout;
+		VkPipelineStageFlags dst_stage;
+		VkAccessFlags        dst_access;
+		if (type == 1) { // storage
+			new_layout = VK_IMAGE_LAYOUT_GENERAL;
+			dst_stage  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+			dst_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		} else { // shader_read
+			new_layout = (tex->flags & skr_tex_flags_compute) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			dst_stage  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+			dst_access = VK_ACCESS_SHADER_READ_BIT;
 		}
+
+		VkImageLayout old_layout = tex->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : tex->current_layout;
+
+		// Skip if already in target layout and not a same-layout GENERAL case
+		if (!tex->is_transient_discard && old_layout == new_layout && new_layout != VK_IMAGE_LAYOUT_GENERAL) continue;
+
+		VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+		VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
+
+		combined_src |= src_stage;
+		combined_dst |= dst_stage;
+
+		if (old_layout == new_layout) {
+			// Same layout — accumulate into a single VkMemoryBarrier
+			need_mem_barrier        = true;
+			mem_barrier.srcAccessMask |= src_access;
+			mem_barrier.dstAccessMask |= dst_access;
+		} else {
+			// Layout change — needs an image barrier
+			image_barriers[image_count++] = (VkImageMemoryBarrier){
+				.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.oldLayout           = old_layout,
+				.newLayout           = new_layout,
+				.srcAccessMask       = src_access,
+				.dstAccessMask       = dst_access,
+				.image               = tex->image,
+				.subresourceRange    = {
+					.aspectMask     = tex->aspect_mask,
+					.baseMipLevel   = 0,
+					.levelCount     = tex->mip_levels,
+					.baseArrayLayer = 0,
+					.layerCount     = tex->layer_count,
+				},
+			};
+		}
+
+		// Update tracked state
+		if (!tex->is_transient_discard) tex->current_layout = new_layout;
+		tex->first_use = false;
 	}
 
-	// Clear the queue
+	// Include depth attachment transition in the same barrier call
+	if (depth) {
+		VkImageLayout old_layout = opt_depth->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : opt_depth->current_layout;
+		VkImageLayout new_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+		VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+		VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
+		VkPipelineStageFlags dst_stage  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+		VkAccessFlags        dst_access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+
+		combined_src |= src_stage;
+		combined_dst |= dst_stage;
+
+		image_barriers[image_count++] = (VkImageMemoryBarrier){
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.oldLayout           = old_layout,
+			.newLayout           = new_layout,
+			.srcAccessMask       = src_access,
+			.dstAccessMask       = dst_access,
+			.image               = opt_depth->image,
+			.subresourceRange    = {
+				.aspectMask     = opt_depth->aspect_mask,
+				.baseMipLevel   = 0,
+				.levelCount     = opt_depth->mip_levels,
+				.baseArrayLayer = 0,
+				.layerCount     = opt_depth->layer_count,
+			},
+		};
+
+		opt_depth->current_layout = new_layout;
+		opt_depth->first_use = false;
+	}
+
+	// Include MSAA color attachment transition in the same barrier call
+	if (color) {
+		VkImageLayout old_layout = opt_color->current_layout;
+		VkImageLayout new_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+		VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
+		VkPipelineStageFlags dst_stage  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		VkAccessFlags        dst_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+		combined_src |= src_stage;
+		combined_dst |= dst_stage;
+
+		image_barriers[image_count++] = (VkImageMemoryBarrier){
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.oldLayout           = old_layout,
+			.newLayout           = new_layout,
+			.srcAccessMask       = src_access,
+			.dstAccessMask       = dst_access,
+			.image               = opt_color->image,
+			.subresourceRange    = {
+				.aspectMask     = opt_color->aspect_mask,
+				.baseMipLevel   = 0,
+				.levelCount     = opt_color->mip_levels,
+				.baseArrayLayer = 0,
+				.layerCount     = opt_color->layer_count,
+			},
+		};
+
+		opt_color->current_layout = new_layout;
+		opt_color->first_use = false;
+	}
+
+	// Issue a single batched barrier
+	if (image_count > 0 || need_mem_barrier) {
+		vkCmdPipelineBarrier(cmd, combined_src, combined_dst, 0,
+			need_mem_barrier ? 1 : 0, need_mem_barrier ? &mem_barrier : NULL,
+			0, NULL,
+			image_count, image_count > 0 ? image_barriers : NULL);
+	}
+
 	_skr_vk.pending_transition_count = 0;
 }
 
@@ -216,9 +365,18 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 
-	// Flush all pending texture transitions BEFORE starting render pass
-	// This prevents barriers inside render pass which require self-dependencies
-	_skr_flush_texture_transitions(cmd);
+	// Flush all pending texture transitions BEFORE starting render pass.
+	// Attachment transitions (depth, MSAA color) are included in the same
+	// batched vkCmdPipelineBarrier call to reduce barrier overhead.
+	// First frame transitions from UNDEFINED; subsequent frames skip since
+	// finalLayout keeps attachments in the right layout.
+	// Resolve target keeps initialLayout=UNDEFINED (loadOp=DONT_CARE skips DCC init).
+	bool use_msaa              = color && color->samples > VK_SAMPLE_COUNT_1_BIT;
+	bool need_depth_transition = depth && (depth->flags & skr_tex_flags_writeable) && depth->current_layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	bool need_color_transition = use_msaa && color->current_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	_skr_flush_texture_transitions(cmd,
+		need_depth_transition  ? depth : NULL,
+		need_color_transition  ? color : NULL);
 
 	// Register render pass format with pipeline system
 	skr_pipeline_renderpass_key_t rp_key = {
@@ -248,17 +406,6 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	VkFramebuffer framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, fb_cache_target, render_pass, color, depth, opt_resolve, depth != NULL);
 
 	if (framebuffer == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
-
-	// Transition depth texture to attachment layout if needed
-	// Transient discard depth (non-readable) skips the explicit barrier — the render pass
-	// handles it via initialLayout=UNDEFINED with LOAD_OP_CLEAR. Readable depth (e.g. shadow
-	// maps reused as depth targets) still needs the explicit transition for synchronization.
-	if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
-		_skr_tex_transition(cmd, depth,
-			VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-			VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-			VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
-	}
 
 	// Note: Color attachments use render pass implicit transitions (initialLayout/finalLayout)
 	// We'll notify the system after vkCmdBeginRenderPass about the layout change

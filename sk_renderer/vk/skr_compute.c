@@ -350,11 +350,84 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ref_compute->pipeline);
 
-	// Transition all bound textures to appropriate layouts before dispatch
-	for (uint32_t i = 0; i < ref_compute->bind_count; i++) {
-		skr_material_bind_t *res = &ref_compute->binds[i];
-		if      (res->bind.register_type == skr_register_readwrite_tex && res->texture) {_skr_tex_transition_for_storage    (cmd, res->texture); }
-		else if (res->bind.register_type == skr_register_texture       && res->texture) {_skr_tex_transition_for_shader_read(cmd, res->texture, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); }
+	// Transition all bound textures to appropriate layouts before dispatch.
+	// Batched into a single vkCmdPipelineBarrier to reduce barrier overhead.
+	{
+		VkImageMemoryBarrier image_barriers[32];
+		VkMemoryBarrier      mem_barrier = {
+			.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = 0,
+			.dstAccessMask = 0,
+		};
+		uint32_t             image_count      = 0;
+		bool                 need_mem_barrier = false;
+		VkPipelineStageFlags combined_src     = 0;
+		VkPipelineStageFlags combined_dst     = 0;
+
+		for (uint32_t i = 0; i < ref_compute->bind_count; i++) {
+			skr_material_bind_t *res = &ref_compute->binds[i];
+			if (!res->texture) continue;
+
+			VkImageLayout        new_layout;
+			VkAccessFlags        dst_access;
+			if (res->bind.register_type == skr_register_readwrite_tex) {
+				new_layout = VK_IMAGE_LAYOUT_GENERAL;
+				dst_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			} else if (res->bind.register_type == skr_register_texture) {
+				new_layout = (res->texture->flags & skr_tex_flags_compute)
+					? VK_IMAGE_LAYOUT_GENERAL
+					: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				dst_access = VK_ACCESS_SHADER_READ_BIT;
+			} else {
+				continue;
+			}
+
+			skr_tex_t    *tex        = res->texture;
+			VkImageLayout old_layout = tex->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : tex->current_layout;
+
+			// Skip if already in target layout and not a same-layout GENERAL case
+			if (!tex->is_transient_discard && old_layout == new_layout && new_layout != VK_IMAGE_LAYOUT_GENERAL) continue;
+
+			VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+			VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
+
+			combined_src |= src_stage;
+			combined_dst |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+			if (old_layout == new_layout) {
+				need_mem_barrier           = true;
+				mem_barrier.srcAccessMask |= src_access;
+				mem_barrier.dstAccessMask |= dst_access;
+			} else {
+				image_barriers[image_count++] = (VkImageMemoryBarrier){
+					.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					.oldLayout           = old_layout,
+					.newLayout           = new_layout,
+					.srcAccessMask       = src_access,
+					.dstAccessMask       = dst_access,
+					.image               = tex->image,
+					.subresourceRange    = {
+						.aspectMask     = tex->aspect_mask,
+						.baseMipLevel   = 0,
+						.levelCount     = tex->mip_levels,
+						.baseArrayLayer = 0,
+						.layerCount     = tex->layer_count,
+					},
+				};
+			}
+
+			if (!tex->is_transient_discard) tex->current_layout = new_layout;
+			tex->first_use = false;
+		}
+
+		if (image_count > 0 || need_mem_barrier) {
+			vkCmdPipelineBarrier(cmd, combined_src, combined_dst, 0,
+				need_mem_barrier ? 1 : 0, need_mem_barrier ? &mem_barrier : NULL,
+				0, NULL,
+				image_count, image_count > 0 ? image_barriers : NULL);
+		}
 	}
 
 	VkWriteDescriptorSet   writes      [32];

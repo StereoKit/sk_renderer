@@ -10,9 +10,35 @@
 #define GI_GRID2     256       // GI_GRID * GI_GRID
 #define GI_INV_GRID  0.0625    // 1.0 / GI_GRID
 
-// Voxel 3D texture (128^3)
+// Voxel 3D texture (64^3 per cascade)
 #define GI_VOXEL_RES     64
 #define GI_INV_VOXEL_RES 0.015625 // 1.0 / GI_VOXEL_RES
+
+// Cascade configuration
+#define GI_CASCADE_COUNT 3
+
+///////////////////////////////////////////
+// Per-Cascade Data
+///////////////////////////////////////////
+
+struct GICascade {
+	float3 volume_min;
+	float  cell_size;     // world-space size of one voxel
+	float3 volume_inv;    // 1.0 / (volume_max - volume_min)
+	uint   _pad;
+};
+
+///////////////////////////////////////////
+// GI Buffer (shared across all GI shaders)
+///////////////////////////////////////////
+
+cbuffer GIBuffer : register(b12, space0) {
+	GICascade gi_cascades[GI_CASCADE_COUNT];
+	float  gi_intensity;
+	uint   gi_grid_size;
+	uint   gi_cascade_count;
+	uint   gi_active_cascade;
+};
 
 ///////////////////////////////////////////
 // Linear Indexing (used for SH probes)

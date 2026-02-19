@@ -37,17 +37,6 @@ cbuffer ShadowBuffer : register(b13, space0) {
 };
 
 ///////////////////////////////////////////
-// GI Probe Buffer (b12)
-///////////////////////////////////////////
-
-cbuffer GIBuffer : register(b12, space0) {
-	float3 gi_volume_min;
-	float  gi_intensity;
-	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	uint   gi_grid_size;
-};
-
-///////////////////////////////////////////
 // Textures
 ///////////////////////////////////////////
 
@@ -141,7 +130,7 @@ float4 ps(psIn input) : SV_TARGET {
 	}
 
 	// GI probe irradiance (tetrahedral interpolation, 4 probes)
-	float3 uvw      = (world_pos - gi_volume_min) * gi_volume_inv;
+	float3 uvw      = (world_pos - gi_cascades[0].volume_min) * gi_cascades[0].volume_inv;
 	float3 grid_pos = uvw * (float)GI_GRID - 0.5;
 	int3   base     = int3(floor(grid_pos));
 	float3 f        = grid_pos - float3(base);

@@ -21,17 +21,6 @@ struct Inst {
  StructuredBuffer<Inst> inst : register(t2, space0);
 
 ///////////////////////////////////////////
-// GI Probe Buffer (b12)
-///////////////////////////////////////////
-
-cbuffer GIBuffer : register(b12, space0) {
-	float3 gi_volume_min;
-	float  gi_intensity;
-	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	uint   gi_grid_size;
-};
-
-///////////////////////////////////////////
 // GI Buffers
 ///////////////////////////////////////////
 
@@ -81,7 +70,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 
 float4 ps(psIn input) : SV_TARGET {
 	// World position -> probe volume UVW [0,1]
-	float3 uvw = (input.world_pos - gi_volume_min) * gi_volume_inv;
+	float3 uvw = (input.world_pos - gi_cascades[0].volume_min) * gi_cascades[0].volume_inv;
 	uvw = saturate(uvw);
 
 	// Voxel grid position (higher res)

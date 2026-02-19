@@ -37,17 +37,6 @@ cbuffer ShadowBuffer : register(b13, space0) {
 };
 
 ///////////////////////////////////////////
-// GI Probe Buffer (b12)
-///////////////////////////////////////////
-
-cbuffer GIBuffer : register(b12, space0) {
-	float3 gi_volume_min;
-	float  gi_intensity;
-	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	uint   gi_grid_size;
-};
-
-///////////////////////////////////////////
 // Textures
 ///////////////////////////////////////////
 
@@ -101,10 +90,10 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	output.color     = input.color * color;
 
 	// GI probe sampling (per-vertex, cosine-weighted 8-probe blend)
-	float3 world_offset = world_pos - gi_volume_min;
-	float3 uvw       = saturate(world_offset * gi_volume_inv);
+	float3 world_offset = world_pos - gi_cascades[0].volume_min;
+	float3 uvw       = saturate(world_offset * gi_cascades[0].volume_inv);
 	float3 gp        = uvw * (float)GI_GRID - 0.5;
-	float3 cell_size = 1.0 / (gi_volume_inv * (float)GI_GRID);
+	float3 cell_size = 1.0 / (gi_cascades[0].volume_inv * (float)GI_GRID);
 	int3   bp      = int3(floor(gp));
 	float3 f       = gp - float3(bp);
 	int3   max_idx = int3(GI_GRID - 1, GI_GRID - 1, GI_GRID - 1);

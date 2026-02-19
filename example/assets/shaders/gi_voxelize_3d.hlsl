@@ -25,17 +25,6 @@ struct Inst {
 StructuredBuffer<Inst> inst : register(t2);
 
 ///////////////////////////////////////////
-// GI Volume Constants (b12)
-///////////////////////////////////////////
-
-cbuffer GIBuffer : register(b12, space0) {
-	float3 gi_volume_min;
-	float  gi_intensity;
-	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	uint   gi_grid_size;
-};
-
-///////////////////////////////////////////
 // Shadow Buffer (b13)
 ///////////////////////////////////////////
 
@@ -134,12 +123,13 @@ float4 ps(psIn input) : SV_TARGET {
 
 	if (dominant != input.view_axis) discard;
 
-	// Compute 3D voxel coordinate
-	float3 uvw   = (input.world_pos - gi_volume_min) * gi_volume_inv;
+	// Compute 3D voxel coordinate in active cascade
+	float3 uvw   = (input.world_pos - gi_cascades[gi_active_cascade].volume_min) * gi_cascades[gi_active_cascade].volume_inv;
 	int3   texel = int3(uvw * (float)GI_VOXEL_RES);
+	texel.z += gi_active_cascade * GI_VOXEL_RES; // offset into stacked texture
 
 	// Bounds check
-	if (any(texel < 0) || any(texel >= (int)GI_VOXEL_RES)) discard;
+	if (any(texel < 0) || any(texel >= int3(GI_VOXEL_RES, GI_VOXEL_RES, GI_VOXEL_RES * GI_CASCADE_COUNT))) discard;
 
 	// Albedo
 	float4 albedo = albedo_tex.Sample(albedo_tex_s, input.uv) * input.color;

@@ -87,7 +87,7 @@ typedef struct skr_tex_t {
 	VkImageLayout          current_layout;       // Current image layout (tracked automatically)
 	uint32_t               current_queue_family; // Current queue family owner
 	bool                   first_use;            // True until first transition (allows UNDEFINED optimization)
-	bool                   is_transient_discard; // True for non-readable depth/MSAA (always use UNDEFINED)
+	bool                   is_transient_discard; // True for MSAA attachments (always use UNDEFINED)
 	bool                   is_external;          // True if image/memory are externally owned (don't destroy)
 
 	// YCbCr conversion (Vulkan 1.1) for opaque YUV textures (e.g. AHB video frames)

@@ -32,7 +32,8 @@ static const float   SHADOW_MAP_FAR        = 50.0f;
 ///////////////////////////////////////////
 
 #define GI_GRID_SIZE       16
-#define GI_VOXEL_SIZE      128
+#define GI_VOXEL_SIZE      64
+#define GI_CASCADE_COUNT   3
 
 ///////////////////////////////////////////
 // Shadow buffer (matches ShadowBuffer in pbr_shadow.hlsl / shadow_receiver.hlsl)
@@ -51,10 +52,18 @@ typedef struct {
 ///////////////////////////////////////////
 
 typedef struct {
-	float3   gi_volume_min;
+	float3   volume_min;
+	float    cell_size;
+	float3   volume_inv;
+	uint32_t _pad;
+} gi_cascade_data_t;
+
+typedef struct {
+	gi_cascade_data_t cascades[GI_CASCADE_COUNT];
 	float    gi_intensity;
-	float3   gi_volume_inv; // 1.0 / (volume_max - volume_min)
 	uint32_t gi_grid_size;
+	uint32_t gi_cascade_count;
+	uint32_t gi_active_cascade;
 } gi_buffer_data_t;
 
 typedef enum {
@@ -156,6 +165,8 @@ typedef struct {
 	bool               gi_show_probes;
 	bool               gi_show_voxels;
 	int32_t            gi_debug_mode;    // 0=SH, 1=occupancy, 2=L0, 3=SH detail, 4=radiance
+	int32_t            gi_voxel_cascade; // Current cascade being voxelized (cycles 0..GI_CASCADE_COUNT-1)
+	int32_t            gi_debug_cascade; // Which cascade to visualize (0..GI_CASCADE_COUNT-1)
 	skr_shader_t       gi_debug_voxel_shader;
 	skr_material_t     gi_debug_voxel_material;
 	skr_mesh_t         gi_debug_voxel_mesh;
@@ -467,11 +478,11 @@ static scene_t* _scene_gi_create(void) {
 	}
 	skr_buffer_set_name(&scene->gi_sh, "gi_sh");
 
-	// 3D voxel texture (RGB10A2, 128^3)
+	// 3D voxel texture (RGB10A2, 64^3 per cascade, stacked in Z)
 	skr_tex_create(skr_tex_fmt_rgb10a2,
 		skr_tex_flags_3d | skr_tex_flags_compute | skr_tex_flags_readable,
 		(skr_tex_sampler_t){ .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
-		(skr_vec3i_t){GI_VOXEL_SIZE, GI_VOXEL_SIZE, GI_VOXEL_SIZE},
+		(skr_vec3i_t){GI_VOXEL_SIZE, GI_VOXEL_SIZE, GI_VOXEL_SIZE * GI_CASCADE_COUNT},
 		1, 0, NULL, &scene->gi_voxel_tex);
 	skr_tex_set_name(&scene->gi_voxel_tex, "gi_voxel_3d");
 
@@ -509,8 +520,8 @@ static scene_t* _scene_gi_create(void) {
 	skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "sh_probes", &scene->gi_sh);
 	skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
-	// GI constant buffer
-	gi_buffer_data_t gi_data = { .gi_grid_size = GI_GRID_SIZE };
+	// GI constant buffer (cascade data filled per-frame)
+	gi_buffer_data_t gi_data = { .gi_grid_size = GI_GRID_SIZE, .gi_cascade_count = GI_CASCADE_COUNT };
 	skr_buffer_create(&gi_data, sizeof(gi_buffer_data_t), 1, skr_buffer_type_constant, skr_use_dynamic, &scene->gi_const_buffer);
 	skr_buffer_set_name(&scene->gi_const_buffer, "gi_constants");
 
@@ -714,6 +725,30 @@ static void _gi_build_voxelize_cameras(
 	}
 }
 
+// Fill gi_buffer_data_t with cascade volumes centered on the base volume.
+// Each cascade doubles the linear extent of the previous one.
+static void _gi_fill_cascade_data(gi_buffer_data_t *out, float3 vol_min, float3 vol_max, float intensity) {
+	float3 center    = float3_mul_s(float3_add(vol_min, vol_max), 0.5f);
+	float3 half_size = float3_mul_s(float3_sub(vol_max, vol_min), 0.5f);
+
+	for (int32_t i = 0; i < GI_CASCADE_COUNT; i++) {
+		float  scale  = (float)(1 << i); // 1, 2, 4
+		float3 c_half = float3_mul_s(half_size, scale);
+		float3 c_min  = float3_sub(center, c_half);
+		float3 c_size = float3_mul_s(c_half, 2.0f);
+
+		out->cascades[i].volume_min = c_min;
+		out->cascades[i].volume_inv = (float3){ 1.0f/c_size.x, 1.0f/c_size.y, 1.0f/c_size.z };
+		out->cascades[i].cell_size  = c_size.x / GI_VOXEL_SIZE;
+		out->cascades[i]._pad       = 0;
+	}
+
+	out->gi_intensity      = intensity;
+	out->gi_grid_size      = GI_GRID_SIZE;
+	out->gi_cascade_count  = GI_CASCADE_COUNT;
+	out->gi_active_cascade = 0;
+}
+
 ///////////////////////////////////////////
 // Render
 ///////////////////////////////////////////
@@ -790,71 +825,73 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	};
 	skr_buffer_set(&scene->shadow_buffer, &shadow_data, sizeof(shadow_buffer_data_t));
 
-	// --- GI voxelization (3-view fragment shader, every frame) ---
+	// --- GI voxelization (one cascade per frame, cycling 0→1→2→0→...) ---
 	if (scene->gi_mode != gi_mode_cubemap) {
-		float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
+		int32_t ci = scene->gi_voxel_cascade;
 
-		// Set GI constants for voxelization pass
-		gi_buffer_data_t gi_vox_data = {
-			.gi_volume_min = scene->gi_volume_min,
-			.gi_intensity  = 1.0f,
-			.gi_volume_inv = {
-				1.0f / vol_size.x,
-				1.0f / vol_size.y,
-				1.0f / vol_size.z,
-			},
-			.gi_grid_size = GI_GRID_SIZE,
-		};
-		skr_buffer_set(&scene->gi_const_buffer, &gi_vox_data, sizeof(gi_buffer_data_t));
+		// Fill cascade data for all cascades (ray march reads all of them)
+		gi_buffer_data_t gi_data = {0};
+		_gi_fill_cascade_data(&gi_data, scene->gi_volume_min, scene->gi_volume_max, 1.0f);
+		gi_data.gi_active_cascade = ci;
+		skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
 		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
 		skr_renderer_set_global_constants(6,  &scene->gi_sh);
 		skr_renderer_set_global_constants(13, &scene->shadow_buffer);
 		skr_renderer_set_global_texture  (14, &scene->shadow_map);
 
-		// 1) Clear 3D voxel texture
+		// 1) Clear only the active cascade's slice
+		uint32_t cascade_offset = ci * GI_VOXEL_SIZE;
+		skr_compute_set_param(&scene->gi_clear_compute, "cascade_offset", sksc_shader_var_uint, 1, &cascade_offset);
 		int32_t clear_dispatch = (GI_VOXEL_SIZE + 3) / 4;
 		skr_compute_execute(&scene->gi_clear_compute, clear_dispatch, clear_dispatch, clear_dispatch);
 
-		// 2) Build 3 orthographic cameras (X, Y, Z)
-		su_system_buffer_t vox_sys = {0};
-		_gi_build_voxelize_cameras(scene->gi_volume_min, scene->gi_volume_max, &vox_sys);
-		vox_sys.time = scene->time;
-		if (scene->cubemap_ready) {
-			vox_sys.cubemap_info = (float4){
-				(float)scene->cubemap_texture.size.x,
-				(float)scene->cubemap_texture.size.y,
-				(float)scene->cubemap_texture.mip_levels,
-				0.0f
-			};
-		}
-
-		// 3) Render into dummy RT — fragment shader writes to RWTexture3D
-		// Bind voxel_tex globally at slot 0 so GLTF model's voxelize materials (shader set 1)
-		// pick it up as RWTexture3D at register(u0) without needing per-material binding.
+		// 2) Voxelize the active cascade
 		skr_renderer_set_global_texture(0, &scene->gi_voxel_tex);
-		skr_renderer_begin_pass(&scene->gi_voxel_rt, NULL, NULL,
-			skr_clear_color, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-		skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_VOXEL_SIZE, (float)GI_VOXEL_SIZE});
-		skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_VOXEL_SIZE, GI_VOXEL_SIZE});
+		{
+			float3 cas_min = gi_data.cascades[ci].volume_min;
+			float3 cas_inv = gi_data.cascades[ci].volume_inv;
+			float3 cas_max = float3_add(cas_min, (float3){1.0f/cas_inv.x, 1.0f/cas_inv.y, 1.0f/cas_inv.z});
 
-		if (scene->show_floor)
-			skr_render_list_add(&scene->gi_voxel_list, &scene->floor_mesh, &scene->gi_voxelize_material, &floor_instance, sizeof(float4x4), 1);
-		if (state == su_gltf_state_ready)
-			su_gltf_add_to_render_list_shader(scene->model, &scene->gi_voxel_list, &model_transform, 1);
+			su_system_buffer_t vox_sys = {0};
+			_gi_build_voxelize_cameras(cas_min, cas_max, &vox_sys);
+			vox_sys.time = scene->time;
+			if (scene->cubemap_ready) {
+				vox_sys.cubemap_info = (float4){
+					(float)scene->cubemap_texture.size.x,
+					(float)scene->cubemap_texture.size.y,
+					(float)scene->cubemap_texture.mip_levels,
+					0.0f
+				};
+			}
 
-		skr_renderer_draw    (&scene->gi_voxel_list, &vox_sys, sizeof(su_system_buffer_t), 3);
-		skr_render_list_clear(&scene->gi_voxel_list);
-		skr_renderer_end_pass();
+			skr_renderer_begin_pass(&scene->gi_voxel_rt, NULL, NULL,
+				skr_clear_color, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
+			skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_VOXEL_SIZE, (float)GI_VOXEL_SIZE});
+			skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_VOXEL_SIZE, GI_VOXEL_SIZE});
+
+			if (scene->show_floor)
+				skr_render_list_add(&scene->gi_voxel_list, &scene->floor_mesh, &scene->gi_voxelize_material, &floor_instance, sizeof(float4x4), 1);
+			if (state == su_gltf_state_ready)
+				su_gltf_add_to_render_list_shader(scene->model, &scene->gi_voxel_list, &model_transform, 1);
+
+			skr_renderer_draw    (&scene->gi_voxel_list, &vox_sys, sizeof(su_system_buffer_t), 3);
+			skr_render_list_clear(&scene->gi_voxel_list);
+			skr_renderer_end_pass();
+		}
 		skr_renderer_set_global_texture(0, NULL);
 
-		// 4) Voxel-to-SH ray march (EMA accumulation)
-		skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "voxel_tex",    &scene->gi_voxel_tex);
-		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "frame_seed",   sksc_shader_var_uint,  1, &scene->gi_total_frames);
-		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "sh_decay",     sksc_shader_var_float, 1, &scene->gi_sh_decay);
-		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "ray_count",    sksc_shader_var_uint,  1, &scene->gi_ray_count);
-		skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "env_cubemap",  &scene->cubemap_texture);
-		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "env_mip",      sksc_shader_var_float, 1, &scene->gi_env_mip);
-		skr_compute_set_param(&scene->gi_voxel_to_sh_compute, "env_strength", sksc_shader_var_float, 1, &scene->gi_env_strength);
+		// Advance to next cascade for next frame
+		scene->gi_voxel_cascade = (ci + 1) % GI_CASCADE_COUNT;
+
+		// 3) Voxel-to-SH ray march (EMA accumulation, reads all cascades)
+		skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "GIBuffer",    &scene->gi_const_buffer);
+		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "voxel_tex",   &scene->gi_voxel_tex);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "frame_seed",  sksc_shader_var_uint,  1, &scene->gi_total_frames);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "sh_decay",    sksc_shader_var_float, 1, &scene->gi_sh_decay);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "ray_count",   sksc_shader_var_uint,  1, &scene->gi_ray_count);
+		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "env_cubemap", &scene->cubemap_texture);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_mip",     sksc_shader_var_float, 1, &scene->gi_env_mip);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_strength",sksc_shader_var_float, 1, &scene->gi_env_strength);
 		int32_t vts_dispatch = (GI_GRID_SIZE + 3) / 4;
 		skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch * 4);
 
@@ -863,17 +900,10 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 
 	// --- Bind GI for main pass ---
 	{
-		float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
-		gi_buffer_data_t gi_data = {
-			.gi_volume_min = scene->gi_volume_min,
-			.gi_intensity  = scene->gi_mode != gi_mode_cubemap ? scene->gi_intensity : 0.0f,
-			.gi_volume_inv = {
-				1.0f / vol_size.x,
-				1.0f / vol_size.y,
-				1.0f / vol_size.z,
-			},
-			.gi_grid_size = GI_GRID_SIZE,
-		};
+		gi_buffer_data_t gi_data = {0};
+		_gi_fill_cascade_data(&gi_data, scene->gi_volume_min, scene->gi_volume_max,
+			scene->gi_mode != gi_mode_cubemap ? scene->gi_intensity : 0.0f);
+		gi_data.gi_active_cascade = scene->gi_debug_cascade;
 		skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
 		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
 		skr_renderer_set_global_constants(6, &scene->gi_sh);
@@ -1185,6 +1215,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 			const char* modes[] = { "SH Irradiance", "Occupancy", "Raw L0", "SH Detail", "Voxel Radiance" };
 			igCombo_Str_arr("Debug Mode", &scene->gi_debug_mode, modes, 5, 0);
 		}
+		igSliderInt("Debug Cascade", &scene->gi_debug_cascade, 0, GI_CASCADE_COUNT - 1, "%d", 0);
 	}
 
 	igSeparator();

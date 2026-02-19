@@ -517,7 +517,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.storeOp        = use_msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.initialLayout  = use_msaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
 			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 
@@ -536,7 +536,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED, // loadOp=DONT_CARE, no DCC init cost from UNDEFINED
 			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 		resolve_ref.attachment = attachment_count;
@@ -556,8 +556,8 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
 			.storeOp        = key->depth_store_op,  // Use the store op from the key (based on readable flag)
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = has_stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,  // Depth always clears, discard previous contents
+			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, // Preserves HTILE for fast clears
 			.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 		};
 
@@ -576,9 +576,9 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 	};
 
 	// Subpass dependencies
-	// When clearing (LOAD_OP_CLEAR + initialLayout=UNDEFINED), use TOP_OF_PIPE to avoid
-	// unnecessary execution dependency on prior fragment/color work. The clear discards
-	// previous contents so there's no data hazard with earlier passes.
+	// Use TOP_OF_PIPE for clears to avoid unnecessary execution dependency on
+	// prior fragment/color work. loadOp=CLEAR discards previous contents so
+	// there's no data hazard with earlier passes.
 	VkSubpassDependency dependencies[2] = {
 		{
 			.srcSubpass    = VK_SUBPASS_EXTERNAL,

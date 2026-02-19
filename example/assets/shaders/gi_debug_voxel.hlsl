@@ -8,17 +8,6 @@
 #include "gi_voxel.hlsli"
 
 ///////////////////////////////////////////
-// GI Probe Buffer (b12)
-///////////////////////////////////////////
-
-cbuffer GIBuffer : register(b12, space0) {
-	float3 gi_volume_min;
-	float  gi_intensity;
-	float3 gi_volume_inv; // 1.0 / (volume_max - volume_min)
-	uint   gi_grid_size;
-};
-
-///////////////////////////////////////////
 // Voxel Texture
 ///////////////////////////////////////////
 
@@ -58,7 +47,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 		(inst_idx / GI_VOXEL_RES) % GI_VOXEL_RES,
 		inst_idx / (GI_VOXEL_RES * GI_VOXEL_RES));
 
-	float4 voxel = gi_voxel_tex.Load(int4(vpos, 0));
+	float4 voxel = gi_voxel_tex.Load(int4(vpos.x, vpos.y, vpos.z + gi_active_cascade * GI_VOXEL_RES, 0));
 
 	if (voxel.a <= 0) {
 		output.pos     = asfloat(0x7FC00000); // NaN kills the primitive
@@ -70,10 +59,10 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 
 	output.vox_col = voxel.rgb;
 
-	// Compute world position from voxel coordinate
-	float3 vol_size = 1.0 / gi_volume_inv;
+	// Compute world position from voxel coordinate (using active cascade)
+	float3 vol_size = 1.0 / gi_cascades[gi_active_cascade].volume_inv;
 	float3 cell     = vol_size / (float)GI_VOXEL_RES;
-	float3 center   = gi_volume_min + (float3(vpos) + 0.5) * cell;
+	float3 center   = gi_cascades[gi_active_cascade].volume_min + (float3(vpos) + 0.5) * cell;
 
 	float3 world_pos = input.pos * cell + center;
 	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
