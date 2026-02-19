@@ -3,11 +3,16 @@
 // Compute shader to accumulate SH probes from voxel radiance via ray marching.
 // Each frame, casts Fibonacci sphere rays per probe through the 3D voxel texture.
 // First opaque voxel hit provides radiance; rays exiting the grid sample the
-// environment cubemap. Results project into SH via exponential moving average.
+// environment cubemap. Results project into SH via sliding window average.
 //
-// Directions: Fibonacci spiral (low-discrepancy) with per-frame random rotation
-// (Rodrigues). All probes share the same directions each frame (DDGI-style) for
-// better cache coherence. Much less temporal flickering than white noise.
+// Accumulation: ring buffer of per-frame SH snapshots. Each frame writes one
+// slot and recomputes the average from all history entries. Each frame has
+// equal 1/N weight with bounded error (no EMA tail).
+//
+// Directions: Fibonacci sphere with temporal stratification. Total pool =
+// history_size * ray_count directions. Each frame samples a different stratum
+// so over one full window every direction is sampled exactly once. Per-probe
+// angular offset decorrelates neighboring probes.
 //
 // Voxel data stored as RGB10A2 in a 3D texture. Occupancy: alpha > 0.
 // Cascaded: rays march through cascade 0 first, then 1, then 2 (fine-to-coarse).
@@ -18,13 +23,15 @@ Texture3D<float4>               voxel_tex     : register(t0);
 TextureCube<float4>              env_cubemap   : register(t1);
 SamplerState                     env_cubemap_s : register(s1);
 RWStructuredBuffer<SHProbe>      sh_probes     : register(u0);
+RWStructuredBuffer<SHProbe>      sh_history    : register(u1);
 
 uint  grid_size;
 uint  frame_seed;
-float sh_decay;    // EMA decay (0.98 = ~50 frame window, 0.99 = ~100)
-uint  ray_count;   // total rays per probe per frame
-float env_mip;     // cubemap mip level for environment fallback (higher = blurrier)
-float env_strength; // multiplier for environment cubemap contribution
+uint  history_index; // = frame_seed % history_size
+uint  history_size;  // sliding window size (default 32)
+uint  ray_count;     // total rays per probe per frame
+float env_mip;       // cubemap mip level for environment fallback (higher = blurrier)
+float env_strength;  // multiplier for environment cubemap contribution
 
 #define MAX_RADIANCE  4.0
 
@@ -61,72 +68,55 @@ uint _hash(uint x) {
 	return x;
 }
 
-// Fibonacci sphere: low-discrepancy direction sampling (DDGI-style).
-// Golden ratio spacing ensures near-uniform sphere coverage with N points.
-// Much less temporal flickering than white noise because directions are
-// well-distributed rather than random. Per-frame rotation (Rodrigues)
-// ensures each frame samples different directions while keeping the
-// uniform distribution property.
+// Fibonacci sphere with temporal stratification and per-probe offset.
+//
+// Total direction pool = history_size * ray_count. Each frame samples a
+// different stratum (stride = history_size), so over one full window every
+// direction is sampled exactly once. Per-probe angular offset decorrelates
+// neighboring probes so they don't flicker in unison.
 #define GOLDEN_RATIO 1.6180339887
 
-float3 _fibonacci_dir(uint index, uint total) {
+float3 _fibonacci_dir(uint index, uint total, float offset) {
 	float i = (float)index + 0.5;
 	float n = (float)total;
 
-	// Cylindrical equal-area: z linearly spaced, phi by golden ratio
+	// Cylindrical equal-area: z linearly spaced, phi by golden ratio + offset
 	float z   = 1.0 - 2.0 * i / n;
 	float r   = sqrt(max(0.0, 1.0 - z * z));
-	float phi = 6.28318530718 * frac(i * (1.0 / GOLDEN_RATIO));
+	float phi = 6.28318530718 * frac(i * (1.0 / GOLDEN_RATIO) + offset);
 	return float3(r * cos(phi), r * sin(phi), z);
-}
-
-// Rodrigues rotation: rotate vector v around unit axis k by angle theta.
-float3 _rodrigues(float3 v, float3 k, float s, float c) {
-	return v * c + cross(k, v) * s + k * dot(k, v) * (1.0 - c);
 }
 
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
-	// Multi-pass dispatch: Z dimension is 4x grid size. Each pass touches every
-	// probe with ray_count/4 rays. Pass 0 applies EMA decay + accumulates;
-	// passes 1-3 just accumulate.
-	uint  pass = id.z / GI_GRID;
-	uint3 pid  = uint3(id.x, id.y, id.z % GI_GRID);
+	// One thread per probe. All rays computed in registers, single history write.
+	uint3 pid = id;
 
 	// Probe world position (computed from cascade 0)
 	float3 vol_size_0  = 1.0 / gi_cascades[0].volume_inv;
 	float3 probe_world = gi_cascades[0].volume_min + (float3(pid) + 0.5) * GI_INV_GRID * vol_size_0;
 
-	// Weight per ray: full sphere sampling (4*pi)
-	float solid_angle = 12.56637; // 4*pi
-	float w           = solid_angle * (1.0 - sh_decay) / (float)ray_count;
+	// Weight per ray: full sphere sampling (4*pi), equal weight per frame
+	float w = 12.56637 / (float)ray_count;
 
-	// Per-frame rotation via Rodrigues: random axis + angle from frame_seed.
-	// Computed once per wavefront (scalar ALU), applied to every Fibonacci direction.
-	// All probes share the same rotated directions each frame (DDGI-style),
-	// improving texture cache coherence since nearby probes march similar paths.
-	uint   rot_h = _hash(frame_seed);
-	float  rot_a = 6.28318530718 * float(rot_h) / 4294967295.0;
-	float  rot_z = 1.0 - 2.0 * float(_hash(rot_h)) / 4294967295.0;
-	float  rot_r = sqrt(max(0.0, 1.0 - rot_z * rot_z));
-	float  rot_p = 6.28318530718 * float(_hash(rot_h + 1u)) / 4294967295.0;
-	float3 rot_axis = float3(rot_r * cos(rot_p), rot_r * sin(rot_p), rot_z);
-	float  rot_sin, rot_cos;
-	sincos(rot_a, rot_sin, rot_cos);
+	// Per-probe angular offset: hash probe position to rotate the Fibonacci
+	// spiral uniquely per probe. Decorrelates neighboring probes so they don't
+	// flicker in unison. Deterministic — same probe always gets the same offset.
+	uint  probe_hash  = _hash(pid.x + _hash(pid.y + _hash(pid.z)));
+	float probe_offset = float(probe_hash) / 4294967295.0;
 
-	// Each pass does a quarter of the rays
-	uint rays_per_pass = ray_count >> 2;
+	// Temporal stratification: total pool = history_size * ray_count directions.
+	// This frame samples indices {history_index, history_index + history_size, ...}
+	// so over one full window, every direction in the pool is sampled exactly once.
+	uint ray_total = history_size * ray_count;
 
 	float4 total_r = float4(0, 0, 0, 0);
 	float4 total_g = float4(0, 0, 0, 0);
 	float4 total_b = float4(0, 0, 0, 0);
 
-	for (uint ray = 0; ray < rays_per_pass; ray++) {
-		// Fibonacci sphere: low-discrepancy directions with per-frame rotation.
-		// Interleave across passes (ray*4+pass) so each pass covers the full
-		// sphere uniformly, rather than clustering rays in one hemisphere.
-		uint ray_idx = ray * 4 + pass;
-		float3 dir = _rodrigues(_fibonacci_dir(ray_idx, ray_count), rot_axis, rot_sin, rot_cos);
+	for (uint ray = 0; ray < ray_count; ray++) {
+		uint ray_idx = history_index + ray * history_size;
+		float3 dir = _fibonacci_dir(ray_idx, ray_total, probe_offset);
 
 		// Ray march through cascaded voxel volumes: fine-to-coarse
 		float3 radiance = float3(0, 0, 0);
@@ -277,15 +267,28 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		total_b += sh * radiance.b;
 	}
 
-	// Write SH: pass 0 applies EMA decay + accumulates, passes 1-3 just accumulate
-	uint idx = voxel_index(pid);
-	if (pass == 0) {
-		sh_probes[idx].r = sh_pack(sh_unpack(sh_probes[idx].r) * sh_decay + total_r);
-		sh_probes[idx].g = sh_pack(sh_unpack(sh_probes[idx].g) * sh_decay + total_g);
-		sh_probes[idx].b = sh_pack(sh_unpack(sh_probes[idx].b) * sh_decay + total_b);
-	} else {
-		sh_probes[idx].r = sh_pack(sh_unpack(sh_probes[idx].r) + total_r);
-		sh_probes[idx].g = sh_pack(sh_unpack(sh_probes[idx].g) + total_g);
-		sh_probes[idx].b = sh_pack(sh_unpack(sh_probes[idx].b) + total_b);
+	// Write this frame's SH to the ring buffer
+	uint idx       = voxel_index(pid);
+	uint hist_slot = idx * history_size + history_index;
+	SHProbe new_entry;
+	new_entry.r = sh_pack(total_r);
+	new_entry.g = sh_pack(total_g);
+	new_entry.b = sh_pack(total_b);
+	sh_history[hist_slot] = new_entry;
+
+	// Recompute average from all history entries
+	float4 sum_r = float4(0, 0, 0, 0);
+	float4 sum_g = float4(0, 0, 0, 0);
+	float4 sum_b = float4(0, 0, 0, 0);
+	uint base = idx * history_size;
+	for (uint i = 0; i < history_size; i++) {
+		SHProbe entry = sh_history[base + i];
+		sum_r += sh_unpack(entry.r);
+		sum_g += sh_unpack(entry.g);
+		sum_b += sh_unpack(entry.b);
 	}
+	float inv_n = 1.0 / (float)history_size;
+	sh_probes[idx].r = sh_pack(sum_r * inv_n);
+	sh_probes[idx].g = sh_pack(sum_g * inv_n);
+	sh_probes[idx].b = sh_pack(sum_b * inv_n);
 }

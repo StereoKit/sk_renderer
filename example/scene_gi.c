@@ -130,12 +130,13 @@ typedef struct {
 	skr_tex_t      floor_texture;
 
 	// GI probe system
-	skr_buffer_t       gi_sh;                // SH probes (32^3 x SHProbe)
+	skr_buffer_t       gi_sh;                // SH probes (16^3 x SHProbe)
+	skr_buffer_t       gi_sh_history;        // Ring buffer (16^3 x history_size x SHProbe)
 	skr_buffer_t       gi_const_buffer;      // GI constant buffer (b12)
 	float              gi_intensity;
-	float              gi_sh_decay;          // SH EMA decay per frame (0.98 = ~50 frame window)
+	int32_t            gi_history_size;      // Sliding window size (default 32)
 	uint32_t           gi_total_frames;      // Monotonic frame counter for random seeds
-	int32_t            gi_ray_count;         // Rays per probe per frame (>= 4)
+	int32_t            gi_ray_count;         // Rays per probe per frame
 	float              gi_env_mip;           // Cubemap mip for environment fallback
 	float              gi_env_strength;      // Multiplier for environment contribution
 	float3             gi_volume_min;
@@ -145,7 +146,7 @@ typedef struct {
 	bool               gi_volume_computed;   // Volume bounds computed from model?
 	float              gi_prev_model_scale;  // Track for recompute
 
-	// 3D voxel texture (RGB10A2, 32^3)
+	// 3D voxel texture (RGBA8, 64^3)
 	skr_tex_t          gi_voxel_tex;
 	skr_tex_t          gi_voxel_rt;          // Dummy render target (drives rasterization)
 	skr_render_list_t  gi_voxel_list;
@@ -154,7 +155,7 @@ typedef struct {
 	skr_shader_t       gi_clear_shader;
 	skr_compute_t      gi_clear_compute;
 
-	// Voxel-to-SH conversion (per-frame random ray march with EMA)
+	// Voxel-to-SH conversion (ray march with sliding window accumulation)
 	skr_shader_t       gi_voxel_to_sh_shader;
 	skr_compute_t      gi_voxel_to_sh_compute;
 
@@ -460,14 +461,14 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_volume_max   = (float3){ 10.0f,  10.0f,  10.0f};
 	scene->gi_grid_fit     = gi_fit_tight;
 	scene->gi_grid_scale   = 1.0f;
-	scene->gi_sh_decay     = 0.99f;
+	scene->gi_history_size = 32;
 	scene->gi_total_frames = 0;
 	scene->gi_ray_count    = 16;
 	scene->gi_env_mip      = 3.0f;
 	scene->gi_env_strength = 1.0f;
 	scene->gi_mode         = gi_mode_per_pixel;
 
-	// Create SH probe StructuredBuffer (32^3 x SHProbe{uint2 r, g, b} = 24 bytes/probe)
+	// Create SH probe StructuredBuffer (16^3 x SHProbe{uint2 r, g, b} = 24 bytes/probe)
 	{
 		uint32_t sh_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
 		uint32_t sh_stride = 3 * 2 * sizeof(uint32_t); // SHProbe = 3 x uint2 (half-precision)
@@ -478,8 +479,19 @@ static scene_t* _scene_gi_create(void) {
 	}
 	skr_buffer_set_name(&scene->gi_sh, "gi_sh");
 
-	// 3D voxel texture (RGB10A2, 64^3 per cascade, stacked in Z)
-	skr_tex_create(skr_tex_fmt_rgb10a2,
+	// Create SH history ring buffer (16^3 x history_size x SHProbe = ~3 MB at history=32)
+	{
+		uint32_t hist_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE * scene->gi_history_size;
+		uint32_t hist_stride = 3 * 2 * sizeof(uint32_t); // SHProbe = 24 bytes
+		uint32_t hist_bytes  = hist_count * hist_stride;
+		void    *zero_data   = calloc(1, hist_bytes);
+		skr_buffer_create(zero_data, hist_count, hist_stride, skr_buffer_type_storage, skr_use_compute_readwrite, &scene->gi_sh_history);
+		free(zero_data);
+	}
+	skr_buffer_set_name(&scene->gi_sh_history, "gi_sh_history");
+
+	// 3D voxel texture (RGBA8, 64^3 per cascade, stacked in Z)
+	skr_tex_create(skr_tex_fmt_rgba32_linear,
 		skr_tex_flags_3d | skr_tex_flags_compute | skr_tex_flags_readable,
 		(skr_tex_sampler_t){ .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
 		(skr_vec3i_t){GI_VOXEL_SIZE, GI_VOXEL_SIZE, GI_VOXEL_SIZE * GI_CASCADE_COUNT},
@@ -517,8 +529,9 @@ static scene_t* _scene_gi_create(void) {
 	// Voxel-to-SH conversion (ray march the completed voxel volume -> SH)
 	scene->gi_voxel_to_sh_shader = su_shader_load("shaders/gi_voxel_to_sh.hlsl.sks", "gi_voxel_to_sh");
 	skr_compute_create(&scene->gi_voxel_to_sh_shader, &scene->gi_voxel_to_sh_compute);
-	skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "sh_probes", &scene->gi_sh);
-	skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
+	skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "sh_probes",  &scene->gi_sh);
+	skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "sh_history", &scene->gi_sh_history);
+	skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "grid_size",  sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
 	// GI constant buffer (cascade data filled per-frame)
 	gi_buffer_data_t gi_data = { .gi_grid_size = GI_GRID_SIZE, .gi_cascade_count = GI_CASCADE_COUNT };
@@ -599,6 +612,7 @@ static void _scene_gi_destroy(scene_t* base) {
 
 	// GI voxel system
 	skr_buffer_destroy     (&scene->gi_sh);
+	skr_buffer_destroy     (&scene->gi_sh_history);
 	skr_buffer_destroy     (&scene->gi_const_buffer);
 	skr_tex_destroy        (&scene->gi_voxel_tex);
 	skr_tex_destroy        (&scene->gi_voxel_rt);
@@ -883,17 +897,19 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		// Advance to next cascade for next frame
 		scene->gi_voxel_cascade = (ci + 1) % GI_CASCADE_COUNT;
 
-		// 3) Voxel-to-SH ray march (EMA accumulation, reads all cascades)
-		skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "GIBuffer",    &scene->gi_const_buffer);
-		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "voxel_tex",   &scene->gi_voxel_tex);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "frame_seed",  sksc_shader_var_uint,  1, &scene->gi_total_frames);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "sh_decay",    sksc_shader_var_float, 1, &scene->gi_sh_decay);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "ray_count",   sksc_shader_var_uint,  1, &scene->gi_ray_count);
-		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "env_cubemap", &scene->cubemap_texture);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_mip",     sksc_shader_var_float, 1, &scene->gi_env_mip);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_strength",sksc_shader_var_float, 1, &scene->gi_env_strength);
+		// 3) Voxel-to-SH ray march (sliding window accumulation, reads all cascades)
+		uint32_t history_index = scene->gi_total_frames % scene->gi_history_size;
+		skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "GIBuffer",      &scene->gi_const_buffer);
+		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "voxel_tex",     &scene->gi_voxel_tex);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "frame_seed",    sksc_shader_var_uint,  1, &scene->gi_total_frames);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "history_index", sksc_shader_var_uint,  1, &history_index);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "history_size",  sksc_shader_var_uint,  1, &scene->gi_history_size);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "ray_count",     sksc_shader_var_uint,  1, &scene->gi_ray_count);
+		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "env_cubemap",   &scene->cubemap_texture);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_mip",       sksc_shader_var_float, 1, &scene->gi_env_mip);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_strength",  sksc_shader_var_float, 1, &scene->gi_env_strength);
 		int32_t vts_dispatch = (GI_GRID_SIZE + 3) / 4;
-		skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch * 4);
+		skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch);
 
 		scene->gi_total_frames++;
 	}
@@ -1195,7 +1211,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 	}
 	if (scene->gi_mode != gi_mode_cubemap) {
 		igSliderFloat("Intensity", &scene->gi_intensity, 0.0f, 5.0f, "%.2f", 0);
-		igSliderFloat("SH Decay", &scene->gi_sh_decay, 0.9f, 0.999f, "%.3f", 0);
+		igSliderInt("History Size", &scene->gi_history_size, 4, 64, "%d", 0);
 		igSliderInt("Rays/Probe", &scene->gi_ray_count, 4, 32, "%d", 0);
 		igSliderFloat("Env Mip", &scene->gi_env_mip, 0.0f, 10.0f, "%.1f", 0);
 		igSliderFloat("Env Strength", &scene->gi_env_strength, 0.0f, 5.0f, "%.2f", 0);

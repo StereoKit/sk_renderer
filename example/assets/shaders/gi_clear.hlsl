@@ -8,7 +8,7 @@
 
 uint cascade_offset;
 
-RWTexture3D<float4> voxel_tex : register(u0);
+RWTexture3D<unorm float4> voxel_tex : register(u0);
 
 [numthreads(4, 4, 4)]
 void cs(uint3 id : SV_DispatchThreadID) {
