@@ -106,6 +106,9 @@ if(ANDROID)
 	target_compile_definitions(volk         PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
 	target_compile_definitions(sk_renderer  PUBLIC  VK_USE_PLATFORM_ANDROID_KHR)
 	target_link_libraries(sk_renderer PRIVATE log)  # Android logging library
+elseif(WIN32)
+	target_compile_definitions(volk         PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+	target_compile_definitions(sk_renderer  PUBLIC  VK_USE_PLATFORM_WIN32_KHR)
 endif()
 
 # Set symbol visibility to hidden by default, only export what's marked with SKR_API/SKSC_API
