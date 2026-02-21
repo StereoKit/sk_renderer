@@ -129,8 +129,15 @@ float4 ps(psIn input) : SV_TARGET {
 		shadow = shadow_factor_pcf4(float3(spos.xy * float2(0.5, -0.5) + 0.5, spos.z / spos.w), 1.0);
 	}
 
+	// GI probe cascade selection: find finest cascade containing this fragment
+	uint gi_cascade = GI_CASCADE_COUNT - 1;
+	for (uint c = 0; c < GI_CASCADE_COUNT - 1; c++) {
+		float3 test_uvw = (world_pos - gi_cascades[c].volume_min) * gi_cascades[c].volume_inv;
+		if (all(test_uvw >= 0) && all(test_uvw <= 1)) { gi_cascade = c; break; }
+	}
+
 	// GI probe irradiance (tetrahedral interpolation, 4 probes)
-	float3 uvw      = (world_pos - gi_cascades[0].volume_min) * gi_cascades[0].volume_inv;
+	float3 uvw      = saturate((world_pos - gi_cascades[gi_cascade].volume_min) * gi_cascades[gi_cascade].volume_inv);
 	float3 grid_pos = uvw * (float)GI_GRID - 0.5;
 	int3   base     = int3(floor(grid_pos));
 	float3 f        = grid_pos - float3(base);
@@ -140,37 +147,37 @@ float4 ps(psIn input) : SV_TARGET {
 	uint3 p1 = uint3(clamp(base + 1, int3(0, 0, 0), max_idx));
 
 	// Sort fractional coords to select tetrahedron (4 of 8 corners)
-	uint  idx0 = voxel_index(p0);
-	uint  idx3 = voxel_index(p1);
+	uint  idx0 = probe_index_scrolled(p0, gi_cascade);
+	uint  idx3 = probe_index_scrolled(p1, gi_cascade);
 	uint  idx1, idx2;
 	float tw0, tw1, tw2, tw3;
 
 	if (f.x >= f.y) {
 		if (f.y >= f.z) {
-			idx1 = voxel_index(uint3(p1.x, p0.y, p0.z));
-			idx2 = voxel_index(uint3(p1.x, p1.y, p0.z));
+			idx1 = probe_index_scrolled(uint3(p1.x, p0.y, p0.z), gi_cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p1.y, p0.z), gi_cascade);
 			tw0 = 1-f.x; tw1 = f.x-f.y; tw2 = f.y-f.z; tw3 = f.z;
 		} else if (f.x >= f.z) {
-			idx1 = voxel_index(uint3(p1.x, p0.y, p0.z));
-			idx2 = voxel_index(uint3(p1.x, p0.y, p1.z));
+			idx1 = probe_index_scrolled(uint3(p1.x, p0.y, p0.z), gi_cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p0.y, p1.z), gi_cascade);
 			tw0 = 1-f.x; tw1 = f.x-f.z; tw2 = f.z-f.y; tw3 = f.y;
 		} else {
-			idx1 = voxel_index(uint3(p0.x, p0.y, p1.z));
-			idx2 = voxel_index(uint3(p1.x, p0.y, p1.z));
+			idx1 = probe_index_scrolled(uint3(p0.x, p0.y, p1.z), gi_cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p0.y, p1.z), gi_cascade);
 			tw0 = 1-f.z; tw1 = f.z-f.x; tw2 = f.x-f.y; tw3 = f.y;
 		}
 	} else {
 		if (f.x >= f.z) {
-			idx1 = voxel_index(uint3(p0.x, p1.y, p0.z));
-			idx2 = voxel_index(uint3(p1.x, p1.y, p0.z));
+			idx1 = probe_index_scrolled(uint3(p0.x, p1.y, p0.z), gi_cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p1.y, p0.z), gi_cascade);
 			tw0 = 1-f.y; tw1 = f.y-f.x; tw2 = f.x-f.z; tw3 = f.z;
 		} else if (f.y >= f.z) {
-			idx1 = voxel_index(uint3(p0.x, p1.y, p0.z));
-			idx2 = voxel_index(uint3(p0.x, p1.y, p1.z));
+			idx1 = probe_index_scrolled(uint3(p0.x, p1.y, p0.z), gi_cascade);
+			idx2 = probe_index_scrolled(uint3(p0.x, p1.y, p1.z), gi_cascade);
 			tw0 = 1-f.y; tw1 = f.y-f.z; tw2 = f.z-f.x; tw3 = f.x;
 		} else {
-			idx1 = voxel_index(uint3(p0.x, p0.y, p1.z));
-			idx2 = voxel_index(uint3(p0.x, p1.y, p1.z));
+			idx1 = probe_index_scrolled(uint3(p0.x, p0.y, p1.z), gi_cascade);
+			idx2 = probe_index_scrolled(uint3(p0.x, p1.y, p1.z), gi_cascade);
 			tw0 = 1-f.z; tw1 = f.z-f.y; tw2 = f.y-f.x; tw3 = f.x;
 		}
 	}

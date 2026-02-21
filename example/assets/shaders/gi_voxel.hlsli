@@ -8,6 +8,7 @@
 // SH probe grid (16^3)
 #define GI_GRID      16
 #define GI_GRID2     256       // GI_GRID * GI_GRID
+#define GI_GRID3     4096      // GI_GRID * GI_GRID * GI_GRID
 #define GI_INV_GRID  0.0625    // 1.0 / GI_GRID
 
 // Voxel 3D texture (64^3 per cascade)
@@ -25,7 +26,11 @@ struct GICascade {
 	float3 volume_min;
 	float  cell_size;     // world-space size of one voxel
 	float3 volume_inv;    // 1.0 / (volume_max - volume_min)
-	uint   _pad;
+	int    scroll_x;      // toroidal scroll offset per axis
+	int    scroll_y;
+	int    scroll_z;
+	uint   _pad0;
+	uint   _pad1;
 };
 
 ///////////////////////////////////////////
@@ -46,6 +51,16 @@ cbuffer GIBuffer : register(b12, space0) {
 
 uint voxel_index(uint3 pos) {
 	return pos.x + pos.y * GI_GRID + pos.z * GI_GRID2;
+}
+
+uint probe_index(uint3 pos, uint cascade) {
+	return cascade * GI_GRID3 + voxel_index(pos);
+}
+
+uint probe_index_scrolled(uint3 grid_pos, uint cascade) {
+	int3 scroll = int3(gi_cascades[cascade].scroll_x, gi_cascades[cascade].scroll_y, gi_cascades[cascade].scroll_z);
+	uint3 buf   = uint3((int3(grid_pos) + scroll + GI_GRID * 256) % GI_GRID);
+	return cascade * GI_GRID3 + voxel_index(buf);
 }
 
 ///////////////////////////////////////////

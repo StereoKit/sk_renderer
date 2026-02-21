@@ -55,7 +55,11 @@ typedef struct {
 	float3   volume_min;
 	float    cell_size;
 	float3   volume_inv;
-	uint32_t _pad;
+	int32_t  scroll_x;
+	int32_t  scroll_y;
+	int32_t  scroll_z;
+	uint32_t _pad0;
+	uint32_t _pad1;
 } gi_cascade_data_t;
 
 typedef struct {
@@ -71,11 +75,6 @@ typedef enum {
 	gi_mode_per_vertex,
 	gi_mode_cubemap,
 } gi_mode_;
-
-typedef enum {
-	gi_fit_tight,
-	gi_fit_uniform,
-} gi_fit_;
 
 ///////////////////////////////////////////
 // Scene state
@@ -141,8 +140,7 @@ typedef struct {
 	float              gi_env_strength;      // Multiplier for environment contribution
 	float3             gi_volume_min;
 	float3             gi_volume_max;
-	gi_fit_            gi_grid_fit;
-	float              gi_grid_scale;
+	float              gi_probe_spacing;     // World-space distance between probes
 	bool               gi_volume_computed;   // Volume bounds computed from model?
 	float              gi_prev_model_scale;  // Track for recompute
 
@@ -158,6 +156,13 @@ typedef struct {
 	// Voxel-to-SH conversion (ray march with sliding window accumulation)
 	skr_shader_t       gi_voxel_to_sh_shader;
 	skr_compute_t      gi_voxel_to_sh_compute;
+
+	// Probe scroll (toroidal shift on camera movement)
+	skr_shader_t       gi_scroll_shader;
+	skr_compute_t      gi_scroll_compute;
+	float3             gi_snapped_center;    // Last camera-snapped volume center
+	int32_t            gi_scroll[GI_CASCADE_COUNT][3]; // Per-cascade scroll offsets
+	bool               gi_scroll_initialized; // First frame needs full init
 
 	// GI debug visualization
 	skr_shader_t       gi_debug_shader;
@@ -314,7 +319,9 @@ static void _load_model(scene_gi_t* scene, const char* path) {
 	};
 	scene->model      = su_gltf_load_ex(path, infos, 4);
 	scene->model_path = strdup(path);
-	scene->gi_volume_computed = false;
+	scene->gi_volume_computed    = false;
+	scene->gi_scroll_initialized = false;
+	scene->gi_probe_spacing      = 0.0f; // reset to auto-fit
 
 	su_log(su_log_info, "GI: Loading model: %s", path);
 }
@@ -459,8 +466,7 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_intensity    = 1.0f;
 	scene->gi_volume_min   = (float3){-10.0f, -10.0f, -10.0f};
 	scene->gi_volume_max   = (float3){ 10.0f,  10.0f,  10.0f};
-	scene->gi_grid_fit     = gi_fit_tight;
-	scene->gi_grid_scale   = 1.0f;
+	scene->gi_probe_spacing = 0.0f; // 0 = auto-fit from model bounds
 	scene->gi_history_size = 32;
 	scene->gi_total_frames = 0;
 	scene->gi_ray_count    = 16;
@@ -468,9 +474,9 @@ static scene_t* _scene_gi_create(void) {
 	scene->gi_env_strength = 1.0f;
 	scene->gi_mode         = gi_mode_per_pixel;
 
-	// Create SH probe StructuredBuffer (16^3 x SHProbe{uint2 r, g, b} = 24 bytes/probe)
+	// Create SH probe StructuredBuffer (16^3 x 3 cascades x SHProbe{uint2 r, g, b} = 24 bytes/probe)
 	{
-		uint32_t sh_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
+		uint32_t sh_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE * GI_CASCADE_COUNT;
 		uint32_t sh_stride = 3 * 2 * sizeof(uint32_t); // SHProbe = 3 x uint2 (half-precision)
 		uint32_t sh_bytes  = sh_count * sh_stride;
 		void    *zero_data = calloc(1, sh_bytes);
@@ -479,9 +485,9 @@ static scene_t* _scene_gi_create(void) {
 	}
 	skr_buffer_set_name(&scene->gi_sh, "gi_sh");
 
-	// Create SH history ring buffer (16^3 x history_size x SHProbe = ~3 MB at history=32)
+	// Create SH history ring buffer (16^3 x 3 cascades x history_size x SHProbe = ~9 MB at history=32)
 	{
-		uint32_t hist_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE * scene->gi_history_size;
+		uint32_t hist_count  = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE * GI_CASCADE_COUNT * scene->gi_history_size;
 		uint32_t hist_stride = 3 * 2 * sizeof(uint32_t); // SHProbe = 24 bytes
 		uint32_t hist_bytes  = hist_count * hist_stride;
 		void    *zero_data   = calloc(1, hist_bytes);
@@ -533,8 +539,20 @@ static scene_t* _scene_gi_create(void) {
 	skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "sh_history", &scene->gi_sh_history);
 	skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "grid_size",  sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
+	// Probe scroll compute shader (toroidal shift on camera movement)
+	scene->gi_scroll_shader = su_shader_load("shaders/gi_probe_scroll.hlsl.sks", "gi_probe_scroll");
+	skr_compute_create(&scene->gi_scroll_shader, &scene->gi_scroll_compute);
+	skr_compute_set_buffer(&scene->gi_scroll_compute, "sh_probes",  &scene->gi_sh);
+	skr_compute_set_buffer(&scene->gi_scroll_compute, "sh_history", &scene->gi_sh_history);
+
+	// Scroll state initialized from camera on first render frame
+	scene->gi_scroll_initialized = false;
+	memset(scene->gi_scroll, 0, sizeof(scene->gi_scroll));
+
 	// GI constant buffer (cascade data filled per-frame)
-	gi_buffer_data_t gi_data = { .gi_grid_size = GI_GRID_SIZE, .gi_cascade_count = GI_CASCADE_COUNT };
+	gi_buffer_data_t gi_data = {0};
+	gi_data.gi_grid_size     = GI_GRID_SIZE;
+	gi_data.gi_cascade_count = GI_CASCADE_COUNT;
 	skr_buffer_create(&gi_data, sizeof(gi_buffer_data_t), 1, skr_buffer_type_constant, skr_use_dynamic, &scene->gi_const_buffer);
 	skr_buffer_set_name(&scene->gi_const_buffer, "gi_constants");
 
@@ -623,6 +641,8 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_shader_destroy     (&scene->gi_clear_shader);
 	skr_compute_destroy    (&scene->gi_voxel_to_sh_compute);
 	skr_shader_destroy     (&scene->gi_voxel_to_sh_shader);
+	skr_compute_destroy    (&scene->gi_scroll_compute);
+	skr_shader_destroy     (&scene->gi_scroll_shader);
 
 	// GI debug
 	skr_mesh_destroy    (&scene->gi_debug_mesh);
@@ -649,10 +669,16 @@ static void _scene_gi_update(scene_t* base, float delta_time) {
 // GI capture helpers
 ///////////////////////////////////////////
 
-// Compute GI volume bounds from the scaled model.
-// Adds one voxel of padding on each side.
-static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds, float scale) {
-	// Model is scaled from its own origin, no translation
+// Compute probe spacing from model bounds (auto-fit mode).
+// If probe_spacing is already set (> 0), this is a no-op.
+// Volume center is now driven by camera, not model center.
+static void _gi_update_probe_spacing(scene_gi_t* scene, su_bounds_t model_bounds, float scale) {
+	if (scene->gi_probe_spacing > 0.0f) {
+		scene->gi_volume_computed  = true;
+		scene->gi_prev_model_scale = scene->model_scale;
+		return;
+	}
+
 	float3 scene_min = {
 		model_bounds.min.x * scale,
 		model_bounds.min.y * scale,
@@ -663,33 +689,9 @@ static void _gi_update_volume_bounds(scene_gi_t* scene, su_bounds_t model_bounds
 		model_bounds.max.y * scale,
 		model_bounds.max.z * scale,
 	};
-
-	// Pad by ~1.137 voxels on each side to offset grid from unit-aligned geometry
-	float3 tight_size = float3_sub(scene_max, scene_min);
-	float3 padding    = float3_mul_s(tight_size, 1.137f / (float)(GI_GRID_SIZE - 2.0f * 1.137f));
-	float3 vol_min    = float3_sub(scene_min, padding);
-	float3 vol_max    = float3_add(scene_max, padding);
-
-	// Uniform mode: expand to the largest axis so the grid is a cube
-	if (scene->gi_grid_fit == gi_fit_uniform) {
-		float3 size    = float3_sub(vol_max, vol_min);
-		float  max_dim = fmaxf(fmaxf(size.x, size.y), size.z);
-		float3 center  = float3_mul_s(float3_add(vol_min, vol_max), 0.5f);
-		float  half    = max_dim * 0.5f;
-		vol_min = (float3){ center.x - half, center.y - half, center.z - half };
-		vol_max = (float3){ center.x + half, center.y + half, center.z + half };
-	}
-
-	// Grid scale: expand volume around center
-	if (scene->gi_grid_scale != 1.0f) {
-		float3 center = float3_mul_s(float3_add(vol_min, vol_max), 0.5f);
-		float3 half   = float3_mul_s(float3_sub(vol_max, vol_min), 0.5f * scene->gi_grid_scale);
-		vol_min = float3_sub(center, half);
-		vol_max = float3_add(center, half);
-	}
-
-	scene->gi_volume_min = vol_min;
-	scene->gi_volume_max = vol_max;
+	float3 size    = float3_sub(scene_max, scene_min);
+	float  max_dim = fmaxf(fmaxf(size.x, size.y), size.z);
+	scene->gi_probe_spacing = max_dim / (float)(GI_GRID_SIZE - 2);
 
 	scene->gi_volume_computed  = true;
 	scene->gi_prev_model_scale = scene->model_scale;
@@ -739,22 +741,24 @@ static void _gi_build_voxelize_cameras(
 	}
 }
 
-// Fill gi_buffer_data_t with cascade volumes centered on the base volume.
+// Fill gi_buffer_data_t with cascade volumes centered on the given center.
 // Each cascade doubles the linear extent of the previous one.
-static void _gi_fill_cascade_data(gi_buffer_data_t *out, float3 vol_min, float3 vol_max, float intensity) {
-	float3 center    = float3_mul_s(float3_add(vol_min, vol_max), 0.5f);
-	float3 half_size = float3_mul_s(float3_sub(vol_max, vol_min), 0.5f);
-
+// base_half_extent = probe_spacing * GI_GRID_SIZE * 0.5 (half-extent of cascade 0).
+static void _gi_fill_cascade_data(gi_buffer_data_t *out, float3 center, float base_half_extent, float intensity, const int32_t scroll[][3]) {
 	for (int32_t i = 0; i < GI_CASCADE_COUNT; i++) {
 		float  scale  = (float)(1 << i); // 1, 2, 4
-		float3 c_half = float3_mul_s(half_size, scale);
-		float3 c_min  = float3_sub(center, c_half);
-		float3 c_size = float3_mul_s(c_half, 2.0f);
+		float  he     = base_half_extent * scale;
+		float3 c_min  = float3_sub(center, (float3){he, he, he});
+		float  c_size = he * 2.0f;
 
 		out->cascades[i].volume_min = c_min;
-		out->cascades[i].volume_inv = (float3){ 1.0f/c_size.x, 1.0f/c_size.y, 1.0f/c_size.z };
-		out->cascades[i].cell_size  = c_size.x / GI_VOXEL_SIZE;
-		out->cascades[i]._pad       = 0;
+		out->cascades[i].volume_inv = (float3){ 1.0f/c_size, 1.0f/c_size, 1.0f/c_size };
+		out->cascades[i].cell_size  = c_size / GI_VOXEL_SIZE;
+		out->cascades[i].scroll_x   = scroll[i][0];
+		out->cascades[i].scroll_y   = scroll[i][1];
+		out->cascades[i].scroll_z   = scroll[i][2];
+		out->cascades[i]._pad0      = 0;
+		out->cascades[i]._pad1      = 0;
 	}
 
 	out->gi_intensity      = intensity;
@@ -808,10 +812,10 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			(float4){0, 0, 0, 1},
 			(float3){floor_sx, 1, floor_sz});
 
-		// Recompute volume bounds when model first loads or scale changes
+		// Recompute probe spacing when model first loads or scale changes (auto mode)
 		if (!scene->gi_volume_computed ||
-		    scene->model_scale != scene->gi_prev_model_scale) {
-			_gi_update_volume_bounds(scene, bounds, scale);
+		    (scene->gi_probe_spacing <= 0.0f && scene->model_scale != scene->gi_prev_model_scale)) {
+			_gi_update_probe_spacing(scene, bounds, scale);
 		}
 	}
 
@@ -839,13 +843,98 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	};
 	skr_buffer_set(&scene->shadow_buffer, &shadow_data, sizeof(shadow_buffer_data_t));
 
+	// --- Camera-following GI volume ---
+	// Snap camera to cascade 2 probe cell grid so all cascades shift together.
+	// Probe spacing must be known (auto-computed from model or user-set).
+	{
+		float spacing = scene->gi_probe_spacing > 0.0f ? scene->gi_probe_spacing : 1.0f;
+		float base_half_extent = spacing * (float)GI_GRID_SIZE * 0.5f;
+
+		// Snap unit = cascade 2 probe cell size = spacing * 2^(CASCADE_COUNT-1)
+		float snap_unit = spacing * (float)(1 << (GI_CASCADE_COUNT - 1));
+
+#ifdef __ANDROID__
+		float3 cam = scene->cam_target;
+#else
+		float3 cam = scene->cam_pos;
+#endif
+
+		float3 snapped = {
+			roundf(cam.x / snap_unit) * snap_unit,
+			roundf(cam.y / snap_unit) * snap_unit,
+			roundf(cam.z / snap_unit) * snap_unit,
+		};
+
+		if (!scene->gi_scroll_initialized) {
+			scene->gi_snapped_center     = snapped;
+			scene->gi_scroll_initialized = true;
+			memset(scene->gi_scroll, 0, sizeof(scene->gi_scroll));
+		}
+
+		// Detect shift in cascade 2 cells
+		float3 delta = float3_sub(snapped, scene->gi_snapped_center);
+		int32_t shift_c2[3] = {
+			(int32_t)roundf(delta.x / snap_unit),
+			(int32_t)roundf(delta.y / snap_unit),
+			(int32_t)roundf(delta.z / snap_unit),
+		};
+		bool shifted = shift_c2[0] != 0 || shift_c2[1] != 0 || shift_c2[2] != 0;
+
+		if (shifted) {
+			scene->gi_snapped_center = snapped;
+
+			// Compute per-cascade shifts and update scroll offsets
+			int32_t per_cascade_shift[GI_CASCADE_COUNT][3];
+			for (int32_t c = 0; c < GI_CASCADE_COUNT; c++) {
+				int32_t scale = 1 << (GI_CASCADE_COUNT - 1 - c); // 4, 2, 1
+				for (int32_t a = 0; a < 3; a++) {
+					per_cascade_shift[c][a] = shift_c2[a] * scale;
+					scene->gi_scroll[c][a] = ((scene->gi_scroll[c][a] + per_cascade_shift[c][a]) % GI_GRID_SIZE + GI_GRID_SIZE) % GI_GRID_SIZE;
+				}
+			}
+
+			// Fill cascade data with NEW scroll offsets and volume bounds
+			// (scroll shader needs the updated GIBuffer to compute world positions)
+			gi_buffer_data_t gi_data = {0};
+			_gi_fill_cascade_data(&gi_data, scene->gi_snapped_center, base_half_extent, 1.0f, scene->gi_scroll);
+			skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
+			skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
+
+			// Dispatch scroll compute shader for each cascade
+			int32_t scroll_dispatch = (GI_GRID_SIZE + 3) / 4;
+			for (int32_t c = 0; c < GI_CASCADE_COUNT; c++) {
+				skr_compute_set_buffer(&scene->gi_scroll_compute, "GIBuffer",      &scene->gi_const_buffer);
+				skr_compute_set_param (&scene->gi_scroll_compute, "shift_x",       sksc_shader_var_int, 1, &per_cascade_shift[c][0]);
+				skr_compute_set_param (&scene->gi_scroll_compute, "shift_y",       sksc_shader_var_int, 1, &per_cascade_shift[c][1]);
+				skr_compute_set_param (&scene->gi_scroll_compute, "shift_z",       sksc_shader_var_int, 1, &per_cascade_shift[c][2]);
+				skr_compute_set_param (&scene->gi_scroll_compute, "cascade",       sksc_shader_var_uint, 1, &(uint32_t){c});
+				skr_compute_set_param (&scene->gi_scroll_compute, "history_size",  sksc_shader_var_uint, 1, &scene->gi_history_size);
+				skr_compute_execute(&scene->gi_scroll_compute, scroll_dispatch, scroll_dispatch, scroll_dispatch);
+			}
+		}
+
+		// Update volume bounds for rendering (always use current snapped center)
+		scene->gi_volume_min = (float3){
+			scene->gi_snapped_center.x - base_half_extent,
+			scene->gi_snapped_center.y - base_half_extent,
+			scene->gi_snapped_center.z - base_half_extent,
+		};
+		scene->gi_volume_max = (float3){
+			scene->gi_snapped_center.x + base_half_extent,
+			scene->gi_snapped_center.y + base_half_extent,
+			scene->gi_snapped_center.z + base_half_extent,
+		};
+	}
+
 	// --- GI voxelization (one cascade per frame, cycling 0→1→2→0→...) ---
 	if (scene->gi_mode != gi_mode_cubemap) {
 		int32_t ci = scene->gi_voxel_cascade;
+		float spacing = scene->gi_probe_spacing > 0.0f ? scene->gi_probe_spacing : 1.0f;
+		float base_half_extent = spacing * (float)GI_GRID_SIZE * 0.5f;
 
 		// Fill cascade data for all cascades (ray march reads all of them)
 		gi_buffer_data_t gi_data = {0};
-		_gi_fill_cascade_data(&gi_data, scene->gi_volume_min, scene->gi_volume_max, 1.0f);
+		_gi_fill_cascade_data(&gi_data, scene->gi_snapped_center, base_half_extent, 1.0f, scene->gi_scroll);
 		gi_data.gi_active_cascade = ci;
 		skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
 		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
@@ -898,16 +987,20 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 		scene->gi_voxel_cascade = (ci + 1) % GI_CASCADE_COUNT;
 
 		// 3) Voxel-to-SH ray march (sliding window accumulation, reads all cascades)
-		uint32_t history_index = scene->gi_total_frames % scene->gi_history_size;
-		skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "GIBuffer",      &scene->gi_const_buffer);
-		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "voxel_tex",     &scene->gi_voxel_tex);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "frame_seed",    sksc_shader_var_uint,  1, &scene->gi_total_frames);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "history_index", sksc_shader_var_uint,  1, &history_index);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "history_size",  sksc_shader_var_uint,  1, &scene->gi_history_size);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "ray_count",     sksc_shader_var_uint,  1, &scene->gi_ray_count);
-		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "env_cubemap",   &scene->cubemap_texture);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_mip",       sksc_shader_var_float, 1, &scene->gi_env_mip);
-		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_strength",  sksc_shader_var_float, 1, &scene->gi_env_strength);
+		//    Computes probes for the same cascade that was just voxelized.
+		//    Each cascade sees sequential history indices across its updates.
+		uint32_t probe_cascade = (uint32_t)ci;
+		uint32_t history_index = (scene->gi_total_frames / GI_CASCADE_COUNT) % scene->gi_history_size;
+		skr_compute_set_buffer(&scene->gi_voxel_to_sh_compute, "GIBuffer",       &scene->gi_const_buffer);
+		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "voxel_tex",      &scene->gi_voxel_tex);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "frame_seed",     sksc_shader_var_uint,  1, &scene->gi_total_frames);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "probe_cascade",  sksc_shader_var_uint,  1, &probe_cascade);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "history_index",  sksc_shader_var_uint,  1, &history_index);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "history_size",   sksc_shader_var_uint,  1, &scene->gi_history_size);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "ray_count",      sksc_shader_var_uint,  1, &scene->gi_ray_count);
+		skr_compute_set_tex   (&scene->gi_voxel_to_sh_compute, "env_cubemap",    &scene->cubemap_texture);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_mip",        sksc_shader_var_float, 1, &scene->gi_env_mip);
+		skr_compute_set_param (&scene->gi_voxel_to_sh_compute, "env_strength",   sksc_shader_var_float, 1, &scene->gi_env_strength);
 		int32_t vts_dispatch = (GI_GRID_SIZE + 3) / 4;
 		skr_compute_execute(&scene->gi_voxel_to_sh_compute, vts_dispatch, vts_dispatch, vts_dispatch);
 
@@ -916,9 +1009,11 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 
 	// --- Bind GI for main pass ---
 	{
+		float spacing = scene->gi_probe_spacing > 0.0f ? scene->gi_probe_spacing : 1.0f;
+		float base_half_extent = spacing * (float)GI_GRID_SIZE * 0.5f;
 		gi_buffer_data_t gi_data = {0};
-		_gi_fill_cascade_data(&gi_data, scene->gi_volume_min, scene->gi_volume_max,
-			scene->gi_mode != gi_mode_cubemap ? scene->gi_intensity : 0.0f);
+		_gi_fill_cascade_data(&gi_data, scene->gi_snapped_center, base_half_extent,
+			scene->gi_mode != gi_mode_cubemap ? scene->gi_intensity : 0.0f, scene->gi_scroll);
 		gi_data.gi_active_cascade = scene->gi_debug_cascade;
 		skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
 		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
@@ -992,11 +1087,19 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	if (scene->gi_show_probes) {
 		uint32_t dm = (uint32_t)scene->gi_debug_mode;
 		skr_material_set_param(&scene->gi_debug_material, "debug_mode", sksc_shader_var_uint, 1, &dm);
-		float3 vol_size  = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
+
+		// Compute debug cascade's volume bounds (2^cascade scale)
+		float3 base_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
+		float3 center    = float3_mul_s(float3_add(scene->gi_volume_min, scene->gi_volume_max), 0.5f);
+		float  cas_scale = (float)(1 << scene->gi_debug_cascade);
+		float3 cas_half  = float3_mul_s(base_size, cas_scale * 0.5f);
+		float3 cas_min   = float3_sub(center, cas_half);
+		float3 cas_size  = float3_mul_s(cas_half, 2.0f);
+
 		float3 cell_size = {
-			vol_size.x / GI_GRID_SIZE,
-			vol_size.y / GI_GRID_SIZE,
-			vol_size.z / GI_GRID_SIZE,
+			cas_size.x / GI_GRID_SIZE,
+			cas_size.y / GI_GRID_SIZE,
+			cas_size.z / GI_GRID_SIZE,
 		};
 		float probe_radius = fminf(fminf(cell_size.x, cell_size.y), cell_size.z) * 0.07f;
 
@@ -1008,9 +1111,9 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			for (int32_t y = 0; y < GI_GRID_SIZE; y++) {
 				for (int32_t x = 0; x < GI_GRID_SIZE; x++) {
 					probe_data[i++] = (float4){
-						scene->gi_volume_min.x + (x + 0.5f) * cell_size.x,
-						scene->gi_volume_min.y + (y + 0.5f) * cell_size.y,
-						scene->gi_volume_min.z + (z + 0.5f) * cell_size.z,
+						cas_min.x + (x + 0.5f) * cell_size.x,
+						cas_min.y + (y + 0.5f) * cell_size.y,
+						cas_min.z + (z + 0.5f) * cell_size.z,
 						probe_radius,
 					};
 				}
@@ -1215,13 +1318,15 @@ static void _scene_gi_render_ui(scene_t* base) {
 		igSliderInt("Rays/Probe", &scene->gi_ray_count, 4, 32, "%d", 0);
 		igSliderFloat("Env Mip", &scene->gi_env_mip, 0.0f, 10.0f, "%.1f", 0);
 		igSliderFloat("Env Strength", &scene->gi_env_strength, 0.0f, 5.0f, "%.2f", 0);
-		{
-			const char* fit_modes[] = { "Tight", "Uniform" };
-			if (igCombo_Str_arr("Grid Fit", (int*)&scene->gi_grid_fit, fit_modes, 2, 0))
-				scene->gi_volume_computed = false;
+		if (igSliderFloat("Probe Spacing", &scene->gi_probe_spacing, 0.0f, 5.0f, "%.2f", 0)) {
+			scene->gi_volume_computed    = false;
+			scene->gi_scroll_initialized = false; // reset scroll on spacing change
 		}
-		if (igSliderFloat("Grid Scale", &scene->gi_grid_scale, 0.5f, 3.0f, "%.2f", 0))
-			scene->gi_volume_computed = false;
+		if (scene->gi_probe_spacing <= 0.0f) {
+			float3 vol_size = float3_sub(scene->gi_volume_max, scene->gi_volume_min);
+			igSameLine(0, 0);
+			igTextDisabled("(auto: %.2fm)", vol_size.x / (float)GI_GRID_SIZE);
+		}
 	}
 
 	if (igCollapsingHeader_TreeNodeFlags("Debug", 0)) {

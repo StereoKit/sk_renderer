@@ -238,6 +238,7 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gi_debug_voxel.hlsl
 	assets/shaders/gi_voxelize_3d.hlsl
 	assets/shaders/gi_voxel_to_sh.hlsl
+	assets/shaders/gi_probe_scroll.hlsl
 	assets/shaders/octahedral_skybox.hlsl
 	assets/shaders/equirect_to_octahedral.hlsl
 )

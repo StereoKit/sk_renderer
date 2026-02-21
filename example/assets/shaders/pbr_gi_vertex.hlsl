@@ -89,22 +89,24 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	output.uv        = (input.uv * tex_trans.zw) + tex_trans.xy;
 	output.color     = input.color * color;
 
+	// GI probe cascade selection: find finest cascade containing this vertex
+	uint gi_cascade = GI_CASCADE_COUNT - 1;
+	for (uint c = 0; c < GI_CASCADE_COUNT - 1; c++) {
+		float3 test_uvw = (world_pos - gi_cascades[c].volume_min) * gi_cascades[c].volume_inv;
+		if (all(test_uvw >= 0) && all(test_uvw <= 1)) { gi_cascade = c; break; }
+	}
+
 	// GI probe sampling (per-vertex, cosine-weighted 8-probe blend)
-	float3 world_offset = world_pos - gi_cascades[0].volume_min;
-	float3 uvw       = saturate(world_offset * gi_cascades[0].volume_inv);
+	float3 world_offset = world_pos - gi_cascades[gi_cascade].volume_min;
+	float3 uvw       = saturate(world_offset * gi_cascades[gi_cascade].volume_inv);
 	float3 gp        = uvw * (float)GI_GRID - 0.5;
-	float3 cell_size = 1.0 / (gi_cascades[0].volume_inv * (float)GI_GRID);
+	float3 cell_size = 1.0 / (gi_cascades[gi_cascade].volume_inv * (float)GI_GRID);
 	int3   bp      = int3(floor(gp));
 	float3 f       = gp - float3(bp);
 	int3   max_idx = int3(GI_GRID - 1, GI_GRID - 1, GI_GRID - 1);
 
-	// Precompute clamped corner positions and linear index offsets (~6 ALU)
 	uint3 p0  = uint3(clamp(bp,     int3(0, 0, 0), max_idx));
 	uint3 p1  = uint3(clamp(bp + 1, int3(0, 0, 0), max_idx));
-	uint base_idx = voxel_index(p0);
-	uint dx = p1.x - p0.x;
-	uint dy = (p1.y - p0.y) * GI_GRID;
-	uint dz = (p1.z - p0.z) * GI_GRID2;
 
 	float4 sum_r = float4(0, 0, 0, 0);
 	float4 sum_g = float4(0, 0, 0, 0);
@@ -117,7 +119,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 		float3 t     = lerp(1.0 - f, f, float3(off));
 		float  tri   = t.x * t.y * t.z;
 
-		// Probe position from precomputed corners (resolved statically by unroll)
+		// Probe grid position from precomputed corners (resolved statically by unroll)
 		uint3  probe = uint3((i & 1) ? p1.x : p0.x,
 		                     ((i >> 1) & 1) ? p1.y : p0.y,
 		                     ((i >> 2) & 1) ? p1.z : p0.z);
@@ -126,8 +128,8 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 		float  d2    = dot(dir, dir);
 		float  cosw  = d2 > 0.0001 ? max(0.0, dot(normal, dir * rsqrt(d2))) : 1.0;
 
-		// Linear index from precomputed base + offsets (1 v_add per probe)
-		uint    idx = base_idx + ((i & 1) ? dx : 0) + (((i >> 1) & 1) ? dy : 0) + (((i >> 2) & 1) ? dz : 0);
+		// Scrolled probe lookup (wrapping handles toroidal indexing)
+		uint    idx = probe_index_scrolled(probe, gi_cascade);
 		SHProbe p   = gi_sh_probes[idx];
 		float   w   = tri * max(cosw, 0.0001);
 		sum_r += sh_unpack(p.r) * w;

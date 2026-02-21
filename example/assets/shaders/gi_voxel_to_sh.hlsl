@@ -27,7 +27,8 @@ RWStructuredBuffer<SHProbe>      sh_history    : register(u1);
 
 uint  grid_size;
 uint  frame_seed;
-uint  history_index; // = frame_seed % history_size
+uint  probe_cascade; // which cascade's probes to compute this frame
+uint  history_index; // = (frame_seed / CASCADE_COUNT) % history_size
 uint  history_size;  // sliding window size (default 32)
 uint  ray_count;     // total rays per probe per frame
 float env_mip;       // cubemap mip level for environment fallback (higher = blurrier)
@@ -92,9 +93,9 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	// One thread per probe. All rays computed in registers, single history write.
 	uint3 pid = id;
 
-	// Probe world position (computed from cascade 0)
-	float3 vol_size_0  = 1.0 / gi_cascades[0].volume_inv;
-	float3 probe_world = gi_cascades[0].volume_min + (float3(pid) + 0.5) * GI_INV_GRID * vol_size_0;
+	// Probe world position (computed from this probe's cascade)
+	float3 vol_size_c  = 1.0 / gi_cascades[probe_cascade].volume_inv;
+	float3 probe_world = gi_cascades[probe_cascade].volume_min + (float3(pid) + 0.5) * GI_INV_GRID * vol_size_c;
 
 	// Weight per ray: full sphere sampling (4*pi), equal weight per frame
 	float w = 12.56637 / (float)ray_count;
@@ -267,8 +268,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		total_b += sh * radiance.b;
 	}
 
-	// Write this frame's SH to the ring buffer
-	uint idx       = voxel_index(pid);
+	// Write this frame's SH to the ring buffer (scrolled index)
+	uint idx       = probe_index_scrolled(pid, probe_cascade);
 	uint hist_slot = idx * history_size + history_index;
 	SHProbe new_entry;
 	new_entry.r = sh_pack(total_r);

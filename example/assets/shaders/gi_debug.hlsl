@@ -69,8 +69,8 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 ///////////////////////////////////////////
 
 float4 ps(psIn input) : SV_TARGET {
-	// World position -> probe volume UVW [0,1]
-	float3 uvw = (input.world_pos - gi_cascades[0].volume_min) * gi_cascades[0].volume_inv;
+	// World position -> probe volume UVW [0,1] (using active cascade)
+	float3 uvw = (input.world_pos - gi_cascades[gi_active_cascade].volume_min) * gi_cascades[gi_active_cascade].volume_inv;
 	uvw = saturate(uvw);
 
 	// Voxel grid position (higher res)
@@ -79,18 +79,18 @@ float4 ps(psIn input) : SV_TARGET {
 	// Probe grid position (lower res)
 	uint3 probe_pos = uint3(clamp(uvw * (float)GI_GRID, float3(0,0,0),
 	                               float3(GI_GRID-1, GI_GRID-1, GI_GRID-1)));
-	uint lidx = voxel_index(probe_pos);
+	uint lidx = probe_index_scrolled(probe_pos, gi_active_cascade);
 
 	// Mode 1: voxel occupancy (occupied = white, empty = discarded)
 	if (debug_mode == 1) {
-		float4 voxel = gi_voxel_tex.Load(int4(voxel_pos, 0));
+		float4 voxel = gi_voxel_tex.Load(int4(voxel_pos.x, voxel_pos.y, voxel_pos.z + gi_active_cascade * GI_VOXEL_RES, 0));
 		if (voxel.a <= 0) discard;
 		return float4(1.0, 1.0, 1.0, 1.0);
 	}
 
 	// Mode 4: voxel radiance (color from 3D texture)
 	if (debug_mode == 4) {
-		float4 voxel = gi_voxel_tex.Load(int4(voxel_pos, 0));
+		float4 voxel = gi_voxel_tex.Load(int4(voxel_pos.x, voxel_pos.y, voxel_pos.z + gi_active_cascade * GI_VOXEL_RES, 0));
 		if (voxel.a <= 0) discard;
 		return float4(voxel.rgb, 1.0);
 	}
