@@ -76,13 +76,6 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		}
 	}
 
-	const char* mode_name =
-		present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO_RELAXED" :
-		present_mode == VK_PRESENT_MODE_FIFO_KHR         ? "FIFO"         :
-		present_mode == VK_PRESENT_MODE_MAILBOX_KHR      ? "MAILBOX"      :
-		present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR    ? "IMMEDIATE"    : "UNKNOWN";
-	skr_log(skr_log_info, "Present mode: %s", mode_name);
-
 	// Determine extent
 	VkExtent2D extent = capabilities.currentExtent;
 	if (extent.width == UINT32_MAX) {
