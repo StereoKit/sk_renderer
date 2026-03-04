@@ -8,6 +8,7 @@
 #include <sk_renderer.h>
 #include "float_math.h"
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -45,8 +46,8 @@ static inline void su_log(su_log_ level, const char* text, ...) {
 	__android_log_write(priority, "sk_example", buffer);
 #else
 	const char* prefix = 
-		level == su_log_info     ? "[app:info] "     :
-		level == su_log_warning  ? "[app:warn] "  :
+		level == su_log_info     ? "[app:info] " :
+		level == su_log_warning  ? "[app:warn] " :
 		level == su_log_critical ? "[app:crit] " : "[app:unkn] ";
 	printf("%s%s\n", prefix, buffer);
 #endif
@@ -72,8 +73,26 @@ typedef struct {
 	float4   screen_size;                   // .xy = width/height, .zw = 1/width, 1/height
 	float    time;                          // Time in seconds
 	uint32_t view_count;                    // Number of active views (1-6)
-	uint32_t _pad[2];
+	uint32_t view_offset;                   // Base view index (set by pass system in fallback)
+	uint32_t _pad;
 } su_system_buffer_t;
+
+// View descriptor for su_system_buffer_t — describes which arrays are indexed
+// by view. Pass to skr_pass_add_draw for multi-view remapping.
+static const skr_pass_view_array_t su_view_arrays[] = {
+	{offsetof(su_system_buffer_t, view),            sizeof(float4x4)},
+	{offsetof(su_system_buffer_t, view_inv),        sizeof(float4x4)},
+	{offsetof(su_system_buffer_t, projection),      sizeof(float4x4)},
+	{offsetof(su_system_buffer_t, projection_inv),  sizeof(float4x4)},
+	{offsetof(su_system_buffer_t, viewproj),        sizeof(float4x4)},
+	{offsetof(su_system_buffer_t, cam_pos),         sizeof(float4)},
+	{offsetof(su_system_buffer_t, cam_dir),         sizeof(float4)},
+};
+static const skr_pass_view_desc_t su_view_desc = {
+	.view_count_byte_offset = offsetof(su_system_buffer_t, view_count),
+	.view_arrays            = su_view_arrays,
+	.view_array_count       = sizeof(su_view_arrays) / sizeof(su_view_arrays[0]),
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Common Vertex Format
@@ -345,3 +364,4 @@ void su_gltf_add_to_render_list_override(su_gltf_t* gltf, skr_render_list_t* lis
 #ifdef __cplusplus
 }
 #endif
+

@@ -180,6 +180,7 @@ typedef struct {
 	bool                     has_external_memory_dma_buf; // VK_EXT_external_memory_dma_buf
 	bool                     has_drm_format_modifier;     // VK_EXT_image_drm_format_modifier
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
+	bool                     has_viewport_layer;          // VK_EXT_shader_viewport_index_layer
 	bool                     initialized;
 
 	// Capability system (runtime-queried feature support)
@@ -303,6 +304,7 @@ void                  _skr_log_descriptor_writes            (const VkWriteDescri
 
 // Automatic layout transition system
 void                  _skr_tex_transition                   (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
+void                  _skr_tex_barrier                      (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
 void                  _skr_tex_transition_for_shader_read   (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage);
 void                  _skr_tex_transition_for_storage       (VkCommandBuffer cmd, skr_tex_t* ref_tex);
 void                  _skr_tex_transition_queue_family      (VkCommandBuffer cmd, skr_tex_t* ref_tex, uint32_t src_queue_family, uint32_t dst_queue_family, VkImageLayout layout);

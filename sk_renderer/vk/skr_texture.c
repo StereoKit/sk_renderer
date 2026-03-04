@@ -315,9 +315,19 @@ bool _skr_tex_needs_transition(const skr_tex_t* tex, uint8_t type) {
 	return tex->current_layout != target_layout;
 }
 
+// Notify the system that a render pass has performed an implicit layout transition
+// This updates tracked state without issuing a barrier
+void _skr_tex_transition_notify_layout(skr_tex_t* ref_tex, VkImageLayout new_layout) {
+	// Don't update transient discard textures - they conceptually stay in UNDEFINED
+	if (!ref_tex->is_transient_discard) {
+		ref_tex->current_layout = new_layout;
+	}
+	ref_tex->first_use = false;
+}
+
 // General-purpose automatic transition - tracks state and inserts barrier if needed
 void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
-	if (!ref_tex || !ref_tex->image) return;
+	if (!ref_tex->image) return;
 
 	// For transient discard textures (non-readable depth/MSAA), always use UNDEFINED as old layout
 	VkImageLayout old_layout = ref_tex->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : ref_tex->current_layout;
@@ -345,17 +355,30 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 		src_stage,  dst_stage,
 		src_access, dst_access);
 
-	// Update tracked state (unless it's transient discard - always stays UNDEFINED conceptually)
-	if (!ref_tex->is_transient_discard) {
-		ref_tex->current_layout = new_layout;
-	}
-	ref_tex->first_use = false;
+	_skr_tex_transition_notify_layout(ref_tex, new_layout);
+}
+
+// Memory barrier without layout change. Ensures ALL prior writes to this
+// texture are visible for the given destination stage/access. Unlike
+// _skr_tex_transition, this always emits a barrier even when the tracked
+// layout already matches — needed for cross-submission synchronization
+// where the layout is correct but the data may not yet be visible.
+void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+	if (!ref_tex->image) return;
+
+	VkImageLayout layout = ref_tex->is_transient_discard
+		? VK_IMAGE_LAYOUT_UNDEFINED
+		: ref_tex->current_layout;
+
+	_skr_transition_image_layout(cmd, ref_tex->image, ref_tex->aspect_mask,
+		0, ref_tex->mip_levels, ref_tex->layer_count,
+		layout, layout,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst_stage,
+		VK_ACCESS_MEMORY_WRITE_BIT,         dst_access);
 }
 
 // Specialized: Transition for shader read (most common case)
 void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage) {
-	if (!ref_tex) return;
-
 	// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
 	VkImageLayout target_layout = (ref_tex->flags & skr_tex_flags_compute)
 		? VK_IMAGE_LAYOUT_GENERAL
@@ -366,22 +389,9 @@ void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex
 
 // Specialized: Transition for storage image (compute RWTexture)
 void _skr_tex_transition_for_storage(VkCommandBuffer cmd, skr_tex_t* ref_tex) {
-	if (!ref_tex) return;
 	_skr_tex_transition(cmd, ref_tex, VK_IMAGE_LAYOUT_GENERAL,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-}
-
-// Notify the system that a render pass has performed an implicit layout transition
-// This updates tracked state without issuing a barrier
-void _skr_tex_transition_notify_layout(skr_tex_t* ref_tex, VkImageLayout new_layout) {
-	if (!ref_tex) return;
-
-	// Don't update transient discard textures - they conceptually stay in UNDEFINED
-	if (!ref_tex->is_transient_discard) {
-		ref_tex->current_layout = new_layout;
-	}
-	ref_tex->first_use = false;
 }
 
 // Queue family ownership transfer (for future async upload)
@@ -418,11 +428,8 @@ void _skr_tex_transition_queue_family(VkCommandBuffer cmd, skr_tex_t* ref_tex,
 	vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &barrier);
 
 	// Update tracked state
-	if (!ref_tex->is_transient_discard) {
-		ref_tex->current_layout = layout;
-	}
+	_skr_tex_transition_notify_layout(ref_tex, layout);
 	ref_tex->current_queue_family = dst_queue_family;
-	ref_tex->first_use = false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1033,6 +1040,32 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	// Store texture properties
 	out_tex->sampler = _skr_sampler_cache_acquire(sampler);
 
+	// Create per-layer 2D views for multi-view fallback rendering.
+	// Only needed for writeable array textures when the viewport layer
+	// extension is absent — the fallback renders one layer at a time.
+	if (!_skr_vk.has_viewport_layer && out_tex->layer_count > 1 && (flags & skr_tex_flags_writeable)) {
+		out_tex->layer_views = (VkImageView*)_skr_calloc(out_tex->layer_count, sizeof(VkImageView));
+		for (uint32_t i = 0; i < out_tex->layer_count; i++) {
+			vr = vkCreateImageView(_skr_vk.device, &(VkImageViewCreateInfo){
+				.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+				.image    = out_tex->image,
+				.viewType = VK_IMAGE_VIEW_TYPE_2D,
+				.format   = vk_format,
+				.subresourceRange = {
+					.aspectMask     = out_tex->aspect_mask,
+					.baseMipLevel   = 0,
+					.levelCount     = 1,
+					.baseArrayLayer = i,
+					.layerCount     = 1,
+				},
+			}, NULL, &out_tex->layer_views[i]);
+			if (vr != VK_SUCCESS) {
+				skr_log(skr_log_warning, "Failed to create per-layer view %u", i);
+				out_tex->layer_views[i] = VK_NULL_HANDLE;
+			}
+		}
+	}
+
 	return skr_err_success;
 }
 
@@ -1041,6 +1074,19 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
+
+	// Destroy per-layer views and framebuffers (multi-view fallback cache)
+	if (ref_tex->layer_views) {
+		for (uint32_t i = 0; i < ref_tex->layer_count; i++)
+			_skr_cmd_destroy_image_view(NULL, ref_tex->layer_views[i]);
+		_skr_free(ref_tex->layer_views);
+	}
+	if (ref_tex->layer_framebuffers) {
+		for (uint32_t i = 0; i < ref_tex->layer_count; i++)
+			_skr_cmd_destroy_framebuffer(NULL, ref_tex->layer_framebuffers[i]);
+		_skr_free(ref_tex->layer_framebuffers);
+	}
+
 	// Only release from sampler cache if we acquired from it (not YCbCr immutable samplers)
 	if (ref_tex->ycbcr_sampler == VK_NULL_HANDLE) {
 		_skr_sampler_cache_release(ref_tex->sampler_settings);
@@ -1180,9 +1226,16 @@ static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t*
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
-	// Transition mip 0 to TRANSFER_SRC_OPTIMAL (automatic system tracks current layout)
-	_skr_tex_transition(ctx.cmd, ref_tex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	// Transition to TRANSFER_SRC with broad source scope — the upload may
+	// have been in a prior submission, and _skr_tex_transition alone would
+	// derive srcStage from the tracked layout (SHADER_READ → FRAGMENT_SHADER)
+	// which doesn't cover the upload's TRANSFER_WRITE.
+	_skr_transition_image_layout(ctx.cmd, ref_tex->image, ref_tex->aspect_mask,
+		0, ref_tex->mip_levels, ref_tex->layer_count,
+		ref_tex->current_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_MEMORY_WRITE_BIT,         VK_ACCESS_TRANSFER_READ_BIT);
+	ref_tex->current_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
 	// Generate each mip level by blitting from the previous level
 	int32_t mip_width  = ref_tex->size.x;
@@ -1354,60 +1407,25 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_free(all_params);
 	}
 
+	// Does this texture need per-layer fallback?
+	bool needs_layer_fallback = !_skr_vk.has_viewport_layer && ref_tex->layer_count > 1;
+
+	// Ensure mip 0 data is visible — the upload may have been in a prior
+	// command buffer submission, and layout tracking alone doesn't guarantee
+	// cross-submission memory visibility.
+	_skr_tex_barrier(ctx.cmd, ref_tex,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
 	// Generate each mip level by rendering from previous mip
 	for (int32_t mip = 1; mip < mip_levels; mip++) {
 		skr_vec3i_t mip_dims   = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
 		uint32_t    mip_width  = mip_dims.x;
 		uint32_t    mip_height = mip_dims.y;
 
-		// Create image view for this mip level (target)
-		VkImageView mip_view = VK_NULL_HANDLE;
-		{
-			VkImageViewCreateInfo view_info = {
-				.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-				.image      = ref_tex->image,
-				.viewType   = view_type,
-				.format     = format,
-				.subresourceRange = {
-					.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-					.baseMipLevel   = mip,
-					.levelCount     = 1,
-					.baseArrayLayer = 0,
-					.layerCount     = ref_tex->layer_count,
-				},
-			};
-			VkResult vr = vkCreateImageView(device, &view_info, NULL, &mip_view);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateImageView");
-				continue;
-			}
-			_skr_cmd_destroy_image_view(ctx.destroy_list, mip_view);
-		}
-
-		// Create framebuffer for this mip level
-		VkFramebuffer framebuffer = VK_NULL_HANDLE;
-		{
-			VkFramebufferCreateInfo fb_info = {
-				.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				.renderPass      = render_pass,
-				.attachmentCount = 1,
-				.pAttachments    = &mip_view,
-				.width           = mip_width,
-				.height          = mip_height,
-				.layers          = ref_tex->layer_count,
-			};
-			VkResult vr = vkCreateFramebuffer(device, &fb_info, NULL, &framebuffer);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer");
-				continue;
-			}
-			_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
-		}
-
-		// Create image view for the previous mip level (source)
+		// Create source view for sampling the previous mip (always full layer count)
 		VkImageView src_view = VK_NULL_HANDLE;
 		{
-			VkImageViewCreateInfo src_view_info = {
+			VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
 				.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 				.image      = ref_tex->image,
 				.viewType   = view_type,
@@ -1419,55 +1437,13 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 					.baseArrayLayer = 0,
 					.layerCount     = ref_tex->layer_count,
 				},
-			};
-			VkResult vr = vkCreateImageView(device, &src_view_info, NULL, &src_view);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateImageView");
-				continue;
-			}
+			}, NULL, &src_view);
+			if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip src)"); continue; }
 			_skr_cmd_destroy_image_view(ctx.destroy_list, src_view);
 		}
 
-		// Transition current mip to color attachment (automatic tracking handles UNDEFINED vs previous layout)
-		VkImageMemoryBarrier barrier = {
-			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			.srcAccessMask       = 0,
-			.dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-			.newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image               = ref_tex->image,
-			.subresourceRange    = {
-				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel   = mip,
-				.levelCount     = 1,
-				.baseArrayLayer = 0,
-				.layerCount     = ref_tex->layer_count,
-			},
-		};
-		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                     0, 0, NULL, 0, NULL, 1, &barrier);
 
-		// Begin render pass
-		vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
-			.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-			.renderPass      = render_pass,
-			.framebuffer     = framebuffer,
-			.renderArea      = {{0, 0}, {mip_width, mip_height}},
-			.clearValueCount = 0,
-		}, VK_SUBPASS_CONTENTS_INLINE);
-
-		// Bind pipeline
-		vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-		// Set viewport and scissor
-		VkViewport viewport = {0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f};
-		VkRect2D   scissor  = {{0, 0}, {mip_width, mip_height}};
-		vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
-		vkCmdSetScissor (ctx.cmd, 0, 1, &scissor);
-
-		// Build descriptor writes using material system
+		// Build descriptor writes (shared across layers)
 		VkWriteDescriptorSet   writes      [32];
 		VkDescriptorBufferInfo buffer_infos[16];
 		VkDescriptorImageInfo  image_infos [16];
@@ -1525,29 +1501,150 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		if (fail_idx >= 0) {
 			const sksc_shader_meta_t* meta = material.key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
-			vkCmdEndRenderPass(ctx.cmd);
 			continue;
 		}
 
-		// Push descriptors and draw
-		_skr_bind_descriptors(
-			ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			_skr_pipeline_get_layout           (material.pipeline_material_idx),
-			_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
-			writes, write_ct);
+		if (needs_layer_fallback) {
+			// Per-layer fallback: render each face/layer separately
+			for (uint32_t layer = 0; layer < ref_tex->layer_count; layer++) {
+				VkImageView layer_view = VK_NULL_HANDLE;
+				VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
+					.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+					.image      = ref_tex->image,
+					.viewType   = VK_IMAGE_VIEW_TYPE_2D,
+					.format     = format,
+					.subresourceRange = {
+						.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel   = mip,
+						.levelCount     = 1,
+						.baseArrayLayer = layer,
+						.layerCount     = 1,
+					},
+				}, NULL, &layer_view);
+				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip layer)"); continue; }
 
-		// Draw fullscreen triangle (with instances for each layer/face)
-		vkCmdDraw(ctx.cmd, 3, ref_tex->layer_count, 0, 0);
+				VkFramebuffer layer_fb = VK_NULL_HANDLE;
+				vr = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
+					.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+					.renderPass      = render_pass,
+					.attachmentCount = 1,
+					.pAttachments    = &layer_view,
+					.width           = mip_width,
+					.height          = mip_height,
+					.layers          = 1,
+				}, NULL, &layer_fb);
+				if (vr != VK_SUCCESS) {
+					SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (mip layer)");
+					vkDestroyImageView(device, layer_view, NULL);
+					continue;
+				}
 
-		// End render pass
-		vkCmdEndRenderPass(ctx.cmd);
+				vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
+					.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+					.renderPass      = render_pass,
+					.framebuffer     = layer_fb,
+					.renderArea      = {{0, 0}, {mip_width, mip_height}},
+					.clearValueCount = 0,
+				}, VK_SUBPASS_CONTENTS_INLINE);
+
+				vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f});
+				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
+
+				_skr_bind_descriptors(
+					ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
+					_skr_pipeline_get_layout           (material.pipeline_material_idx),
+					_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
+					writes, write_ct);
+
+				// firstInstance = layer so SV_InstanceID == layer in the shader
+				vkCmdDraw(ctx.cmd, 3, 1, 0, layer);
+				vkCmdEndRenderPass(ctx.cmd);
+
+				_skr_cmd_destroy_framebuffer(ctx.destroy_list, layer_fb);
+				_skr_cmd_destroy_image_view (ctx.destroy_list, layer_view);
+			}
+		} else {
+			// Fast path: multi-layer framebuffer with SV_RenderTargetArrayIndex
+			VkImageView mip_view = VK_NULL_HANDLE;
+			{
+				// For framebuffer attachments, use 2D_ARRAY even for cubemaps
+				VkImageViewType fb_view_type = (ref_tex->layer_count > 1)
+					? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+					: VK_IMAGE_VIEW_TYPE_2D;
+				VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
+					.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+					.image      = ref_tex->image,
+					.viewType   = fb_view_type,
+					.format     = format,
+					.subresourceRange = {
+						.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel   = mip,
+						.levelCount     = 1,
+						.baseArrayLayer = 0,
+						.layerCount     = ref_tex->layer_count,
+					},
+				}, NULL, &mip_view);
+				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip target)"); continue; }
+				_skr_cmd_destroy_image_view(ctx.destroy_list, mip_view);
+			}
+
+			VkFramebuffer framebuffer = VK_NULL_HANDLE;
+			{
+				VkResult vr = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
+					.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+					.renderPass      = render_pass,
+					.attachmentCount = 1,
+					.pAttachments    = &mip_view,
+					.width           = mip_width,
+					.height          = mip_height,
+					.layers          = ref_tex->layer_count,
+				}, NULL, &framebuffer);
+				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (mip)"); continue; }
+				_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
+			}
+
+			vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
+				.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+				.renderPass      = render_pass,
+				.framebuffer     = framebuffer,
+				.renderArea      = {{0, 0}, {mip_width, mip_height}},
+				.clearValueCount = 0,
+			}, VK_SUBPASS_CONTENTS_INLINE);
+
+			vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f});
+			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
+
+			_skr_bind_descriptors(
+				ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
+				_skr_pipeline_get_layout           (material.pipeline_material_idx),
+				_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
+				writes, write_ct);
+
+			vkCmdDraw(ctx.cmd, 3, ref_tex->layer_count, 0, 0);
+			vkCmdEndRenderPass(ctx.cmd);
+		}
 
 		// Transition current mip to shader read for next iteration
-		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		barrier.oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		vkCmdPipelineBarrier( ctx.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+		VkImageMemoryBarrier barrier = {
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image               = ref_tex->image,
+			.subresourceRange    = {
+				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel   = mip,
+				.levelCount     = 1,
+				.baseArrayLayer = 0,
+				.layerCount     = ref_tex->layer_count,
+			},
+		};
+		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
 	}
 
 	_skr_cmd_release(ctx.cmd);

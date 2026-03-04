@@ -510,6 +510,10 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 	// Color attachment (MSAA if samples > 1) - only if we have a color format
 	VkAttachmentReference color_ref = {0};
 	if (has_color) {
+		// When loading previous contents, initialLayout must match the current layout
+		VkImageLayout color_initial = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD)
+			? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			: VK_IMAGE_LAYOUT_UNDEFINED;
 		attachments[attachment_count] = (VkAttachmentDescription){
 			.format         = key->color_format,
 			.samples        = key->samples,
@@ -517,7 +521,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.storeOp        = use_msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.initialLayout  = color_initial,
 			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 

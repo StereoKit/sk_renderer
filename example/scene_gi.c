@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
@@ -910,21 +911,26 @@ static void _gi_run_fast_voxelize(
 			};
 		}
 
-		// Render scene into 6-layer capture RT
-		skr_renderer_begin_pass(&scene->gi_fast_color, &scene->gi_fast_depth, NULL,
-			skr_clear_all, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-		skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE});
-		skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_GRID_SIZE, GI_GRID_SIZE});
-
+		// Render scene into 6-layer capture RT (uses pass system for multi-view fallback)
 		if (scene->show_floor)
 			skr_render_list_add(&scene->gi_capture_list, &scene->floor_mesh, &scene->gi_capture_material, &floor_instance, sizeof(float4x4), 1);
 		if (model_state == su_gltf_state_ready) {
 			su_gltf_add_to_render_list_shader(scene->model, &scene->gi_capture_list, &model_transform, 1);
 		}
 
-		skr_renderer_draw    (&scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), 6);
+		skr_pass_t gi_pass = {
+			.color       = &scene->gi_fast_color,
+			.depth       = &scene->gi_fast_depth,
+			.clear       = skr_clear_all,
+			.clear_color = {0, 0, 0, 0},
+			.clear_depth = 1.0f,
+			.viewport    = {0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE},
+			.scissor     = {0, 0, GI_GRID_SIZE, GI_GRID_SIZE},
+			.view_count  = cap_sys.view_count,
+		};
+		skr_pass_add_draw(&gi_pass, &scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), &su_view_desc);
+		skr_pass_submit(&gi_pass);
 		skr_render_list_clear(&scene->gi_capture_list);
-		skr_renderer_end_pass();
 
 		// Dispatch fast voxelize compute: map depth captures to 3D voxels
 		uint32_t from_center_val = from_center ? 1 : 0;
@@ -1103,20 +1109,24 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 				skr_renderer_set_global_texture  (14, &scene->shadow_map);
 
 				// Render scene into capture RT
-				skr_renderer_begin_pass(&scene->gi_capture_color, &scene->gi_capture_depth, NULL,
-					skr_clear_all, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-				skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE});
-				skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_GRID_SIZE, GI_GRID_SIZE});
-
 				if (scene->show_floor)
 					skr_render_list_add(&scene->gi_capture_list, &scene->floor_mesh, &scene->gi_capture_material, &floor_instance, sizeof(float4x4), 1);
 				if (state == su_gltf_state_ready) {
 					su_gltf_add_to_render_list_shader(scene->model, &scene->gi_capture_list, &model_transform, 1);
 				}
 
-				skr_renderer_draw    (&scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), 1);
+				skr_pass_t cap_pass = {
+					.color       = &scene->gi_capture_color,
+					.depth       = &scene->gi_capture_depth,
+					.clear       = skr_clear_all,
+					.clear_color = {0, 0, 0, 0},
+					.clear_depth = 1.0f,
+					.viewport    = {0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE},
+					.scissor     = {0, 0, GI_GRID_SIZE, GI_GRID_SIZE},
+				};
+				skr_pass_add_draw(&cap_pass, &scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t), NULL);
+				skr_pass_submit  (&cap_pass);
 				skr_render_list_clear(&scene->gi_capture_list);
-				skr_renderer_end_pass();
 
 				// Voxelize: write captured radiance into the voxel build buffer
 				uint32_t flip_x_val = 0, flip_y_val = (axis != 1) ? 1 : 0;
@@ -1200,19 +1210,22 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	// bound as a texture while being used as the depth render target.
 	skr_renderer_set_global_texture(14, &scene->white_texture);
 
-	skr_renderer_begin_pass(NULL, &scene->shadow_map, NULL, skr_clear_depth, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION});
-	skr_renderer_set_scissor ((skr_recti_t){0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION});
-
 	if (scene->show_floor)
 		skr_render_list_add(&scene->shadow_list, &scene->floor_mesh, &scene->shadow_caster_material, &floor_instance, sizeof(float4x4), 1);
 	if (state == su_gltf_state_ready) {
 		su_gltf_add_to_render_list_override(scene->model, &scene->shadow_list, &model_transform, &scene->shadow_caster_material);
 	}
 
-	skr_renderer_draw    (&scene->shadow_list, &shadow_sys, sizeof(su_system_buffer_t), 1);
+	skr_pass_t shadow_pass = {
+		.depth       = &scene->shadow_map,
+		.clear       = skr_clear_depth,
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
+		.scissor     = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
+	};
+	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys, sizeof(su_system_buffer_t), NULL);
+	skr_pass_submit  (&shadow_pass);
 	skr_render_list_clear(&scene->shadow_list);
-	skr_renderer_end_pass();
 
 	// --- Main pass setup ---
 	skr_renderer_set_global_constants(13, &scene->shadow_buffer);

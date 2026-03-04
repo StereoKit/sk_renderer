@@ -305,6 +305,7 @@ typedef enum skr_capability_ {
 	skr_capability_external_ahb,          // Android Hardware Buffer
 	skr_capability_external_dma,          // DMA-BUF via VK_EXT_external_memory_dma_buf
 	skr_capability_vk_video,              // Vulkan video decode (VK_KHR_video_decode_queue)
+	skr_capability_viewport_layer,        // VK_EXT_shader_viewport_index_layer
 	skr_capability_count_                 // Must be last - array size
 } skr_capability_;
 
@@ -510,6 +511,57 @@ typedef struct skr_material_info_t {
 	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)
 } skr_material_info_t;
 
+///////////////////////////////////////////////////////////////////////////////
+// Deferred pass assembly
+
+#define SKR_PASS_MAX_DRAWS  4
+#define SKR_PASS_MAX_POSTFX 2
+
+typedef struct skr_tex_t         skr_tex_t;
+typedef struct skr_render_list_t skr_render_list_t;
+typedef struct skr_material_t    skr_material_t;
+
+typedef struct skr_pass_view_array_t {
+	int32_t byte_offset;  // Byte offset of array[0] in system_data
+	int32_t stride;       // Size of each element in bytes
+} skr_pass_view_array_t;
+
+typedef struct skr_pass_view_desc_t {
+	int32_t                      view_count_byte_offset;  // Where to write view_count in system_data (-1 if none)
+	const skr_pass_view_array_t* view_arrays;             // View-indexed arrays to remap (NULL if none)
+	int32_t                      view_array_count;
+} skr_pass_view_desc_t;
+
+typedef struct skr_pass_draw_t {
+	skr_render_list_t*   list;
+	const void*          system_data;
+	uint32_t             system_data_size;
+	skr_pass_view_desc_t view_desc;
+} skr_pass_draw_t;
+
+typedef struct skr_pass_t {
+	skr_tex_t*  color;
+	skr_tex_t*  depth;
+	skr_tex_t*  resolve;
+	skr_tex_t*  postfx_output;      // Final output for postfx chain (NULL = write back to resolve/color)
+	skr_clear_  clear;
+	skr_vec4_t  clear_color;
+	float       clear_depth;
+	uint32_t    clear_stencil;
+	skr_rect_t  viewport;
+	skr_recti_t scissor;
+	int32_t     view_count;         // Number of views to render (1 = single, 2 = stereo, etc.)
+
+	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
+	uint32_t        draw_count;
+
+	// Populated by skr_pass_add_postfx()
+	skr_material_t* postfx[SKR_PASS_MAX_POSTFX];
+	uint32_t        postfx_count;
+} skr_pass_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
 // While this project is primarily Vulkan, the option to add backends in the
 // future would be nice. WebGPU or D3D12 could be targets. However, we don't
 // want to introduce pointer indirection to core graphics assets! We risk a bit
@@ -664,6 +716,10 @@ SKR_API void              skr_renderer_draw                (skr_render_list_t* l
 SKR_API void              skr_renderer_draw_mesh_immediate (skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, int32_t instance_count);
 SKR_API uint64_t          skr_renderer_get_gpu_time_us     (void);
 SKR_API uint64_t          skr_renderer_get_cpu_time_us     (void);
+
+SKR_API void              skr_pass_add_draw                (skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size, const skr_pass_view_desc_t* opt_view_desc);
+SKR_API void              skr_pass_add_postfx              (skr_pass_t* pass, skr_material_t* postfx_material);
+SKR_API void              skr_pass_submit                  (skr_pass_t* pass);
 
 #ifdef __cplusplus
 }

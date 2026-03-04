@@ -115,9 +115,11 @@ endif()
 if(NOT MSVC)
 	target_compile_options    (sk_renderer PRIVATE -fvisibility=hidden)
 endif()
-if (MINGW OR APPLE)
-	# MinGW and macOS do not support C11 threads, use pthread fallback
-	target_link_libraries     (sk_renderer PRIVATE pthread)
+if (MINGW OR APPLE OR ANDROID)
+	# MinGW, macOS, and Android may not support C11 threads, use pthread fallback
+	if (NOT ANDROID)
+		target_link_libraries(sk_renderer PRIVATE pthread)
+	endif()
 	target_include_directories(sk_renderer PRIVATE sk_renderer/threads)
 endif()
 

@@ -10,6 +10,62 @@
 #include <string.h>
 
 ///////////////////////////////////////////////////////////////////////////////
+// SPIRV patching
+///////////////////////////////////////////////////////////////////////////////
+
+// Strip instructions related to ShaderViewportIndexLayerEXT so shaders can
+// still load on devices that lack the extension. The Layer built-in is
+// replaced with Location 10 so vertex→pixel interface stays matched.
+// Returns the new word count after compaction (stripped instructions are
+// removed entirely rather than replaced with OpNop, since OpNop is not
+// permitted before OpMemoryModel in the SPIRV layout).
+static uint32_t _skr_spirv_strip_viewport_layer(uint32_t* code, uint32_t word_count) {
+	// SPIRV header is 5 words, instructions start at word 5
+	uint32_t src = 5;
+	uint32_t dst = 5;
+	while (src < word_count) {
+		uint32_t opcode   = code[src] & 0xFFFF;
+		uint32_t word_len = code[src] >> 16;
+		if (word_len == 0) break;
+
+		bool strip = false;
+
+		// OpCapability (17) with operand ShaderViewportIndexLayerEXT (5254)
+		if (opcode == 17 && word_len >= 2 && code[src + 1] == 5254) {
+			strip = true;
+		}
+		// OpExtension (10) with string "SPV_EXT_shader_viewport_index_layer"
+		else if (opcode == 10 && word_len >= 2) {
+			const char* ext_name = (const char*)&code[src + 1];
+			if (strncmp(ext_name, "SPV_EXT_shader_viewport_index_layer", (word_len - 1) * 4) == 0) {
+				strip = true;
+			}
+		}
+		// OpDecorate (71) with BuiltIn (11) decoration and Layer (9) value
+		// Replace with OpDecorate Location 10 instead of stripping — the
+		// output variable still exists and SPIRV requires all Output vars
+		// to have either a BuiltIn or Location decoration.
+		else if (opcode == 71 && word_len >= 4 && code[src + 2] == 11 && code[src + 3] == 9) {
+			code[src + 2] = 30; // Decoration: Location
+			code[src + 3] = 10; // Location index (above typical shader outputs)
+		}
+
+		if (strip) {
+			src += word_len;
+			continue;
+		}
+
+		if (dst != src) {
+			memmove(&code[dst], &code[src], word_len * sizeof(uint32_t));
+		}
+		dst += word_len;
+		src += word_len;
+	}
+
+	return dst;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Shader stage creation
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -17,13 +73,31 @@ skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_
 	skr_shader_stage_t stage = {0};
 	stage.type               = type;
 
+	const void* final_data = shader_data;
+	uint32_t*   patched    = NULL;
+
+	// Strip viewport layer capability when extension is not available.
+	// Vertex shaders: Layer output becomes Location 10 (dead variable).
+	// Pixel shaders:  Layer input becomes Location 10 (reads face index
+	//                 from the vertex shader's patched output).
+	uint32_t final_size = shader_size;
+	if (!_skr_vk.has_viewport_layer && (type == skr_stage_vertex || type == skr_stage_pixel)) {
+		uint32_t word_count = shader_size / sizeof(uint32_t);
+		patched = (uint32_t*)_skr_malloc(shader_size);
+		memcpy(patched, shader_data, shader_size);
+		uint32_t new_word_count = _skr_spirv_strip_viewport_layer(patched, word_count);
+		final_size = new_word_count * sizeof(uint32_t);
+		final_data = patched;
+	}
+
 	VkShaderModuleCreateInfo create_info = {
 		.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-		.codeSize = shader_size,
-		.pCode    = (const uint32_t*)shader_data,
+		.codeSize = final_size,
+		.pCode    = (const uint32_t*)final_data,
 	};
 
 	VkResult vr = vkCreateShaderModule(device, &create_info, NULL, &stage.shader);
+	_skr_free(patched);
 	SKR_VK_CHECK_RET(vr, "vkCreateShaderModule", stage);
 
 	return stage;

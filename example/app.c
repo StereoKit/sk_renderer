@@ -348,24 +348,32 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// Prepare ImGui mesh data OUTSIDE render pass (uploads via vkCmdCopyBuffer)
 	ImGui_ImplSkRenderer_PrepareDrawData();
 
-	// Begin main render pass
-	skr_vec4_t clear_color = {0, 0, 0, 0};
+	// Determine render targets
 	skr_tex_t* color_target   = (app->msaa > 1) ? &app->color_msaa : (enable_offscreen ? &app->scene_color : render_target);
 	skr_tex_t* resolve_target = (app->msaa > 1) ? (enable_offscreen ? &app->scene_color : render_target) : NULL;
-	skr_renderer_begin_pass(color_target, &app->depth_buffer, resolve_target, skr_clear_all, clear_color, 1.0f, 0);
 
-	// Set viewport and scissor
-	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
-	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
-
-	// Draw the render list that the scene populated
-	skr_renderer_draw    (&app->render_list, &sys_buffer, sizeof(su_system_buffer_t), sys_buffer.view_count);
+	// Scene geometry via deferred pass (handles multi-view transparently)
+	skr_pass_t pass = {
+		.color       = color_target,
+		.depth       = &app->depth_buffer,
+		.resolve     = resolve_target,
+		.clear       = skr_clear_all,
+		.clear_color = {0, 0, 0, 0},
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)width, (float)height},
+		.scissor     = {0, 0, width, height},
+		.view_count  = sys_buffer.view_count,
+	};
+	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t), &su_view_desc);
+	skr_pass_submit(&pass);
 	skr_render_list_clear(&app->render_list);
 
-	// Draw ImGui INSIDE the same render pass
+	// ImGui in separate immediate-mode pass
+	skr_tex_t* imgui_target = resolve_target ? resolve_target : color_target;
+	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0);
+	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
+	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
 	ImGui_ImplSkRenderer_RenderDrawData(width, height);
-
-	// End render pass
 	skr_renderer_end_pass();
 
 	// Post-processing
