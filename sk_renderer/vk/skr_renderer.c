@@ -1068,7 +1068,8 @@ void skr_pass_add_postfx(skr_pass_t* pass, skr_material_t* postfx_material) {
 
 // Internal: get or create a cached per-layer framebuffer for the multi-view fallback.
 // Uses color->layer_framebuffers[layer] for caching (similar to _skr_get_or_create_framebuffer).
-static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_tex_t* color, skr_tex_t* depth, uint32_t layer, VkRenderPass render_pass) {
+// Attachment order matches _skr_create_framebuffer: color, resolve, depth.
+static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_tex_t* color, skr_tex_t* resolve, skr_tex_t* depth, uint32_t layer, VkRenderPass render_pass) {
 	skr_tex_t* cache_target = color ? color : depth;
 	if (!cache_target || !cache_target->layer_views) return VK_NULL_HANDLE;
 
@@ -1094,7 +1095,8 @@ static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_t
 	}
 
 	// Build attachment list from single-layer views
-	VkImageView attachments[2];
+	// Order: color, resolve, depth (matches _skr_create_framebuffer)
+	VkImageView attachments[3];
 	uint32_t    attachment_count = 0;
 	uint32_t    width  = 1, height = 1;
 
@@ -1102,6 +1104,9 @@ static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_t
 		attachments[attachment_count++] = color->layer_views[layer];
 		width  = color->size.x;
 		height = color->size.y;
+	}
+	if (resolve && resolve->layer_views) {
+		attachments[attachment_count++] = resolve->layer_views[layer];
 	}
 	if (depth && depth->layer_views) {
 		attachments[attachment_count++] = depth->layer_views[layer];
@@ -1129,8 +1134,9 @@ static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_t
 
 // Internal: begin a render pass targeting a single layer of an array texture.
 // Mirrors skr_renderer_begin_pass but uses per-layer cached views/framebuffers.
-// Paired with skr_renderer_end_pass().
-static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* depth, uint32_t layer, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil) {
+// Supports renderpass-integrated MSAA resolve when opt_resolve is provided.
+// Paired with _skr_renderer_end_pass_layer().
+static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* opt_resolve, skr_tex_t* depth, uint32_t layer, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil) {
 	if (!color && !depth) return;
 
 	_skr_pipeline_lock();
@@ -1138,11 +1144,13 @@ static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* depth, u
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 	_skr_flush_texture_transitions(cmd);
 
-	// Register renderpass (single-layer, no resolve, no MSAA)
+	bool use_resolve = opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT;
+
+	// Register renderpass (single-layer, with resolve if MSAA)
 	skr_pipeline_renderpass_key_t rp_key = {
-		.color_format   = color ? skr_tex_fmt_to_native(color->format) : VK_FORMAT_UNDEFINED,
-		.depth_format   = depth ? skr_tex_fmt_to_native(depth->format) : VK_FORMAT_UNDEFINED,
-		.resolve_format = VK_FORMAT_UNDEFINED,
+		.color_format   = color       ? skr_tex_fmt_to_native(color->format)       : VK_FORMAT_UNDEFINED,
+		.depth_format   = depth       ? skr_tex_fmt_to_native(depth->format)       : VK_FORMAT_UNDEFINED,
+		.resolve_format = use_resolve ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
 		.samples        = color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
 		.depth_store_op = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op  = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -1152,7 +1160,7 @@ static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* depth, u
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(_skr_vk.current_renderpass_idx);
 	if (render_pass == VK_NULL_HANDLE) { _skr_cmd_release(cmd); _skr_pipeline_unlock(); return; }
 
-	VkFramebuffer framebuffer = _skr_get_or_create_layer_framebuffer(_skr_vk.device, color, depth, layer, render_pass);
+	VkFramebuffer framebuffer = _skr_get_or_create_layer_framebuffer(_skr_vk.device, color, use_resolve ? opt_resolve : NULL, depth, layer, render_pass);
 	if (framebuffer == VK_NULL_HANDLE) { _skr_cmd_release(cmd); _skr_pipeline_unlock(); return; }
 
 	// Depth transition (same as skr_renderer_begin_pass)
@@ -1169,14 +1177,19 @@ static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* depth, u
 			VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 	}
 
-	// Clear values
-	VkClearValue clear_values[2];
+	// Clear values — order: color, [resolve], depth
+	VkClearValue clear_values[3];
 	uint32_t     clear_value_count = 0;
 	if (color) {
 		if (clear & skr_clear_color) {
 			clear_values[clear_value_count] = (VkClearValue){ .color = {.float32 = {clear_color.x, clear_color.y, clear_color.z, clear_color.w}} };
 		}
 		clear_value_count++;
+
+		if (use_resolve) {
+			// Resolve has loadOp = DONT_CARE, but still needs an entry
+			clear_value_count++;
+		}
 	}
 	if (depth) {
 		if (clear & (skr_clear_depth | skr_clear_stencil)) {
@@ -1197,8 +1210,9 @@ static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* depth, u
 		.renderArea      = { .extent = {render_width, render_height} },
 	}, VK_SUBPASS_CONTENTS_INLINE);
 
-	if (color) _skr_tex_transition_notify_layout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	if (depth) _skr_tex_transition_notify_layout(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	if (color)      _skr_tex_transition_notify_layout(color,       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	if (use_resolve) _skr_tex_transition_notify_layout(opt_resolve, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	if (depth)      _skr_tex_transition_notify_layout(depth,       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
 	_skr_vk.current_color_texture = color;
 	_skr_vk.current_depth_texture = depth;
@@ -1258,7 +1272,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 		uint8_t* sys_copy = (uint8_t*)_skr_malloc(max_sys_size);
 
 		for (int32_t v = 0; v < view_count; v++) {
-			_skr_renderer_begin_pass_layer(pass->color, pass->depth, (uint32_t)v,
+			_skr_renderer_begin_pass_layer(pass->color, pass->resolve, pass->depth, (uint32_t)v,
 				pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil);
 			skr_renderer_set_viewport(pass->viewport);
 			skr_renderer_set_scissor (pass->scissor);
@@ -1290,6 +1304,10 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 		// Transition readable textures to shader-read after all layers are done
 		VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
+		if (pass->resolve && (pass->resolve->flags & skr_tex_flags_readable)) {
+			_skr_tex_transition_for_shader_read(cmd, pass->resolve,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		}
 		if (pass->color && (pass->color->flags & skr_tex_flags_readable)) {
 			_skr_tex_transition_for_shader_read(cmd, pass->color,
 				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
