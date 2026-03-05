@@ -204,6 +204,7 @@ bool openxr_init(const char* app_name) {
 		XR_EXT_DEBUG_UTILS_EXTENSION_NAME,
 #ifdef __ANDROID__
 		XR_KHR_LOADER_INIT_ANDROID_EXTENSION_NAME,
+		XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 #endif
 	};
 	const char* use_extensions[16];
@@ -238,6 +239,15 @@ bool openxr_init(const char* app_name) {
 		.enabledExtensionNames      = use_extensions,
 		.applicationInfo.apiVersion = XR_CURRENT_API_VERSION  };
 	strncpy(create_info.applicationInfo.applicationName, app_name, XR_MAX_APPLICATION_NAME_SIZE - 1);
+
+#ifdef __ANDROID__
+	XrInstanceCreateInfoAndroidKHR android_create_info = {
+		.type                = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR,
+		.applicationVM       = ska_android_get_vm(),
+		.applicationActivity = ska_android_get_activity() };
+	create_info.next = &android_create_info;
+#endif
+
 	XrResult result = xrCreateInstance(&create_info, &xr_instance);
 	if (XR_FAILED(result) || xr_instance == XR_NULL_HANDLE) {
 		ska_log(ska_log_error, "Failed to create OpenXR instance (result=%d)", result);
@@ -380,7 +390,7 @@ bool openxr_init(const char* app_name) {
 	xrCreateReferenceSpace(xr_session, &(XrReferenceSpaceCreateInfo){
 		.type                 = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
 		.poseInReferenceSpace = xr_pose_identity,
-		.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR
+		.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL
 	}, &xr_app_space);
 
 	// Enumerate views
@@ -720,8 +730,17 @@ void openxr_poll_predicted(XrTime predicted_time) {
 
 void openxr_render_frame(void) {
 	XrFrameState frame_state = { XR_TYPE_FRAME_STATE };
-	XR_CHECK(xrWaitFrame(xr_session, NULL, &frame_state));
-	XR_CHECK(xrBeginFrame(xr_session, NULL));
+	XrResult wait_result = xrWaitFrame(xr_session, &(XrFrameWaitInfo){ .type = XR_TYPE_FRAME_WAIT_INFO }, &frame_state);
+	if (XR_FAILED(wait_result)) {
+		ska_log(ska_log_error, "[OpenXR] xrWaitFrame failed: %s (%d)", xr_result_to_string(wait_result), wait_result);
+		return;
+	}
+
+	XrResult begin_result = xrBeginFrame(xr_session, &(XrFrameBeginInfo){ .type = XR_TYPE_FRAME_BEGIN_INFO });
+	if (XR_FAILED(begin_result)) {
+		ska_log(ska_log_error, "[OpenXR] xrBeginFrame failed: %s (%d)", xr_result_to_string(begin_result), begin_result);
+		return;
+	}
 
 	openxr_poll_predicted(frame_state.predictedDisplayTime);
 	app_xr_update_predicted();
@@ -730,10 +749,11 @@ void openxr_render_frame(void) {
 	XrCompositionLayerProjection      layer_proj = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerProjectionView* views      = calloc(xr_view_count, sizeof(XrCompositionLayerProjectionView));
 
-	bool session_active = xr_session_state == XR_SESSION_STATE_VISIBLE ||
-	                      xr_session_state == XR_SESSION_STATE_FOCUSED;
+	bool should_render = frame_state.shouldRender &&
+	                     (xr_session_state == XR_SESSION_STATE_VISIBLE ||
+	                      xr_session_state == XR_SESSION_STATE_FOCUSED);
 
-	if (session_active && openxr_render_layer(frame_state.predictedDisplayTime, views, xr_view_count, &layer_proj)) {
+	if (should_render && openxr_render_layer(frame_state.predictedDisplayTime, views, xr_view_count, &layer_proj)) {
 		layer = (XrCompositionLayerBaseHeader*)&layer_proj;
 	}
 

@@ -99,6 +99,7 @@ endif()
 add_skapp(sk_renderer_test
 	PACKAGE_NAME net.stereokit.renderer_test
 	APP_NAME "sk_renderer_test"
+	MIN_SDK 29
 	${SKR_MANIFEST}
 )
 
