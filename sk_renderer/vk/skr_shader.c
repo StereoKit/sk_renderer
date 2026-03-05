@@ -13,53 +13,205 @@
 // SPIRV patching
 ///////////////////////////////////////////////////////////////////////////////
 
-// Strip instructions related to ShaderViewportIndexLayerEXT so shaders can
-// still load on devices that lack the extension. The Layer built-in is
-// replaced with Location 10 so vertex→pixel interface stays matched.
-// Returns the new word count after compaction (stripped instructions are
-// removed entirely rather than replaced with OpNop, since OpNop is not
-// permitted before OpMemoryModel in the SPIRV layout).
+// SPIRV opcodes
+#define SPIRV_OP_EXTENSION  10
+#define SPIRV_OP_CAPABILITY 17
+#define SPIRV_OP_VARIABLE   59
+#define SPIRV_OP_DECORATE   71
+
+// SPIRV capabilities
+#define SPIRV_CAPABILITY_GEOMETRY        2
+#define SPIRV_CAPABILITY_VIEWPORT_LAYER  5254
+
+// SPIRV decorations
+#define SPIRV_DECORATION_BUILTIN  11
+#define SPIRV_DECORATION_FLAT     14
+#define SPIRV_DECORATION_LOCATION 30
+
+// SPIRV built-ins
+#define SPIRV_BUILTIN_PRIMITIVE_ID 7
+#define SPIRV_BUILTIN_LAYER        9
+
+// SPIRV storage classes
+#define SPIRV_STORAGE_INPUT  1
+#define SPIRV_STORAGE_OUTPUT 3
+
+// Convert the Layer built-in to a regular Location-decorated flat
+// interpolant when VK_EXT_shader_viewport_index_layer is absent. The
+// variable, its stores, loads, and entry-point reference all remain
+// intact — only the decoration changes so the value passes between
+// stages as a flat varying. The buffer must have room for up to 3 extra
+// words (one Flat decoration instruction). Returns the new word count.
 static uint32_t _skr_spirv_strip_viewport_layer(uint32_t* code, uint32_t word_count) {
-	// SPIRV header is 5 words, instructions start at word 5
+	// --- Phase 1: Analyze ---
+
+	// Scan capabilities
+	bool has_vl_cap   = false;
+	bool has_geom_cap = false;
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t opcode   = code[i] & 0xFFFF;
+		uint32_t word_len = code[i] >> 16;
+		if (word_len == 0 || opcode != SPIRV_OP_CAPABILITY) break;
+		if (word_len >= 2) {
+			if (code[i + 1] == SPIRV_CAPABILITY_VIEWPORT_LAYER) has_vl_cap   = true;
+			if (code[i + 1] == SPIRV_CAPABILITY_GEOMETRY)        has_geom_cap = true;
+		}
+		i += word_len;
+	}
+
+	// Find layer variable ID from OpDecorate BuiltIn Layer
+	uint32_t layer_id = 0;
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t opcode   = code[i] & 0xFFFF;
+		uint32_t word_len = code[i] >> 16;
+		if (word_len == 0) break;
+		if (opcode == SPIRV_OP_DECORATE && word_len >= 4 &&
+		    code[i + 2] == SPIRV_DECORATION_BUILTIN &&
+		    code[i + 3] == SPIRV_BUILTIN_LAYER) {
+			layer_id = code[i + 1];
+			break;
+		}
+		i += word_len;
+	}
+	if (layer_id == 0) return word_count;
+
+	// Find layer variable's storage class, collect interface variable IDs
+	// (same storage class), and check for PrimitiveId / existing Flat.
+	uint32_t layer_storage    = 0;
+	bool     has_prim_id      = false;
+	bool     has_flat          = false;
+	uint32_t iface_vars[32];
+	uint32_t iface_count      = 0;
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t opcode   = code[i] & 0xFFFF;
+		uint32_t word_len = code[i] >> 16;
+		if (word_len == 0) break;
+		if (opcode == SPIRV_OP_VARIABLE && word_len >= 4) {
+			if (code[i + 2] == layer_id)
+				layer_storage = code[i + 3];
+		}
+		if (opcode == SPIRV_OP_DECORATE && word_len >= 3 &&
+		    code[i + 1] == layer_id &&
+		    code[i + 2] == SPIRV_DECORATION_FLAT)
+			has_flat = true;
+		if (opcode == SPIRV_OP_DECORATE && word_len >= 4 &&
+		    code[i + 2] == SPIRV_DECORATION_BUILTIN &&
+		    code[i + 3] == SPIRV_BUILTIN_PRIMITIVE_ID)
+			has_prim_id = true;
+		i += word_len;
+	}
+
+	// VS: has viewport layer cap + Output layer variable
+	// PS: Input layer variable (reading it back)
+	bool is_output = has_vl_cap && layer_storage == SPIRV_STORAGE_OUTPUT;
+	bool is_input  = layer_storage == SPIRV_STORAGE_INPUT;
+	if (!is_output && !is_input) return word_count;
+
+	// Collect interface variable IDs (same storage class as layer).
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t opcode   = code[i] & 0xFFFF;
+		uint32_t word_len = code[i] >> 16;
+		if (word_len == 0) break;
+		if (opcode == SPIRV_OP_VARIABLE && word_len >= 4 &&
+		    code[i + 3] == layer_storage &&
+		    code[i + 2] != layer_id &&
+		    iface_count < 32)
+			iface_vars[iface_count++] = code[i + 2];
+		i += word_len;
+	}
+
+	// Find max Location among interface variables so the patched layer
+	// gets a non-conflicting slot. Both VS and PS will compute the same
+	// value because HLSL compilers assign matching locations to VS
+	// outputs and PS inputs.
+	uint32_t max_loc   = 0;
+	bool     found_loc = false;
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t opcode   = code[i] & 0xFFFF;
+		uint32_t word_len = code[i] >> 16;
+		if (word_len == 0) break;
+		if (opcode == SPIRV_OP_DECORATE && word_len >= 4 &&
+		    code[i + 2] == SPIRV_DECORATION_LOCATION) {
+			uint32_t var_id = code[i + 1];
+			for (uint32_t j = 0; j < iface_count; j++) {
+				if (iface_vars[j] == var_id) {
+					if (!found_loc || code[i + 3] > max_loc)
+						max_loc = code[i + 3];
+					found_loc = true;
+					break;
+				}
+			}
+		}
+		i += word_len;
+	}
+	uint32_t new_loc = found_loc ? max_loc + 1 : 0;
+
+	// --- Phase 2: Patch ---
+	// Convert BuiltIn Layer → Location + Flat. For VS, also strip the
+	// extension and capability. For PS, strip Geometry capability if it
+	// was only there for Layer reading.
+
+	bool strip_geom = is_input && has_geom_cap && !has_prim_id;
+	bool need_flat  = !has_flat; // emit Flat if the shader doesn't have it
+
 	uint32_t src = 5;
 	uint32_t dst = 5;
 	while (src < word_count) {
-		uint32_t opcode   = code[src] & 0xFFFF;
-		uint32_t word_len = code[src] >> 16;
+		uint32_t opcode       = code[src] & 0xFFFF;
+		uint32_t word_len     = code[src] >> 16;
+		uint32_t word_len_src = word_len;
 		if (word_len == 0) break;
 
 		bool strip = false;
 
-		// OpCapability (17) with operand ShaderViewportIndexLayerEXT (5254)
-		if (opcode == 17 && word_len >= 2 && code[src + 1] == 5254) {
+		// VS: strip ShaderViewportIndexLayerEXT capability
+		if (is_output && opcode == SPIRV_OP_CAPABILITY && word_len >= 2 &&
+		    code[src + 1] == SPIRV_CAPABILITY_VIEWPORT_LAYER) {
 			strip = true;
 		}
-		// OpExtension (10) with string "SPV_EXT_shader_viewport_index_layer"
-		else if (opcode == 10 && word_len >= 2) {
-			const char* ext_name = (const char*)&code[src + 1];
-			if (strncmp(ext_name, "SPV_EXT_shader_viewport_index_layer", (word_len - 1) * 4) == 0) {
+		// VS: strip the extension string
+		else if (is_output && opcode == SPIRV_OP_EXTENSION && word_len >= 2) {
+			const char* name = (const char*)&code[src + 1];
+			if (strncmp(name, "SPV_EXT_shader_viewport_index_layer", (word_len - 1) * 4) == 0)
 				strip = true;
+		}
+		// PS: strip Geometry capability if only used for Layer reading
+		else if (strip_geom && opcode == SPIRV_OP_CAPABILITY && word_len >= 2 &&
+		         code[src + 1] == SPIRV_CAPABILITY_GEOMETRY) {
+			strip = true;
+		}
+		// Convert BuiltIn Layer → Location + Flat
+		else if (opcode == SPIRV_OP_DECORATE && word_len >= 4 &&
+		         code[src + 1] == layer_id &&
+		         code[src + 2] == SPIRV_DECORATION_BUILTIN &&
+		         code[src + 3] == SPIRV_BUILTIN_LAYER) {
+			// Replace BuiltIn decoration with Location (same 4-word size)
+			code[dst + 0] = (4 << 16) | SPIRV_OP_DECORATE;
+			code[dst + 1] = layer_id;
+			code[dst + 2] = SPIRV_DECORATION_LOCATION;
+			code[dst + 3] = new_loc;
+			dst += 4;
+			// Emit Flat decoration if not already present. The buffer
+			// was allocated with 3 extra words of headroom for this.
+			if (need_flat) {
+				code[dst + 0] = (3 << 16) | SPIRV_OP_DECORATE;
+				code[dst + 1] = layer_id;
+				code[dst + 2] = SPIRV_DECORATION_FLAT;
+				dst += 3;
 			}
-		}
-		// OpDecorate (71) with BuiltIn (11) decoration and Layer (9) value
-		// Replace with OpDecorate Location 10 instead of stripping — the
-		// output variable still exists and SPIRV requires all Output vars
-		// to have either a BuiltIn or Location decoration.
-		else if (opcode == 71 && word_len >= 4 && code[src + 2] == 11 && code[src + 3] == 9) {
-			code[src + 2] = 30; // Decoration: Location
-			code[src + 3] = 10; // Location index (above typical shader outputs)
-		}
-
-		if (strip) {
-			src += word_len;
+			src += word_len_src;
 			continue;
 		}
 
-		if (dst != src) {
-			memmove(&code[dst], &code[src], word_len * sizeof(uint32_t));
+		if (strip) {
+			src += word_len_src;
+			continue;
 		}
+
+		if (dst != src)
+			memmove(&code[dst], &code[src], word_len * sizeof(uint32_t));
 		dst += word_len;
-		src += word_len;
+		src += word_len_src;
 	}
 
 	return dst;
@@ -76,14 +228,14 @@ skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_
 	const void* final_data = shader_data;
 	uint32_t*   patched    = NULL;
 
-	// Strip viewport layer capability when extension is not available.
-	// Vertex shaders: Layer output becomes Location 10 (dead variable).
-	// Pixel shaders:  Layer input becomes Location 10 (reads face index
-	//                 from the vertex shader's patched output).
+	// Convert the Layer built-in to a regular interpolant when the
+	// viewport layer extension is not available. The variable stays
+	// intact — only the decoration changes from BuiltIn to Location.
 	uint32_t final_size = shader_size;
 	if (!_skr_vk.has_viewport_layer && (type == skr_stage_vertex || type == skr_stage_pixel)) {
 		uint32_t word_count = shader_size / sizeof(uint32_t);
-		patched = (uint32_t*)_skr_malloc(shader_size);
+		// Extra 3 words of headroom for a potential Flat decoration insert
+		patched = (uint32_t*)_skr_malloc(shader_size + 3 * sizeof(uint32_t));
 		memcpy(patched, shader_data, shader_size);
 		uint32_t new_word_count = _skr_spirv_strip_viewport_layer(patched, word_count);
 		final_size = new_word_count * sizeof(uint32_t);
