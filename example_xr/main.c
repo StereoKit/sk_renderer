@@ -60,11 +60,11 @@ static const int32_t     xr_msaa_samples  = 4;    // MSAA sample count
 XrFormFactor             xr_config_form   = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 XrViewConfigurationType  xr_config_view   = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
-// Function pointers for OpenXR extensions
-PFN_xrGetVulkanInstanceExtensionsKHR   ext_xrGetVulkanInstanceExtensionsKHR   = NULL;
-PFN_xrGetVulkanDeviceExtensionsKHR     ext_xrGetVulkanDeviceExtensionsKHR     = NULL;
-PFN_xrGetVulkanGraphicsDeviceKHR       ext_xrGetVulkanGraphicsDeviceKHR       = NULL;
-PFN_xrGetVulkanGraphicsRequirementsKHR ext_xrGetVulkanGraphicsRequirementsKHR = NULL;
+// Function pointers for OpenXR extensions (vulkan_enable2)
+PFN_xrCreateVulkanInstanceKHR          ext_xrCreateVulkanInstanceKHR          = NULL;
+PFN_xrCreateVulkanDeviceKHR            ext_xrCreateVulkanDeviceKHR            = NULL;
+PFN_xrGetVulkanGraphicsDevice2KHR      ext_xrGetVulkanGraphicsDevice2KHR      = NULL;
+PFN_xrGetVulkanGraphicsRequirements2KHR ext_xrGetVulkanGraphicsRequirements2KHR = NULL;
 PFN_xrCreateDebugUtilsMessengerEXT     ext_xrCreateDebugUtilsMessengerEXT     = NULL;
 PFN_xrDestroyDebugUtilsMessengerEXT    ext_xrDestroyDebugUtilsMessengerEXT    = NULL;
 
@@ -95,62 +95,75 @@ static XrBool32 XRAPI_CALL xr_debug_callback(XrDebugUtilsMessageSeverityFlagsEXT
 }
 
 ///////////////////////////////////////////
-// Device extensions storage (populated by callback, freed after skr_init)
+// sk_renderer callbacks for XR_KHR_vulkan_enable2
 ///////////////////////////////////////////
 
-static char*        s_vk_device_ext_str   = NULL;
-static const char** s_vk_device_exts      = NULL;
-static uint32_t     s_vk_device_ext_count = 0;
+// HTC Wave runtime workaround: it calls vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateDevice")
+// which is invalid per the Vulkan spec. We wrap the proc addr to retry with the real instance.
+static VkInstance                s_vk_instance          = VK_NULL_HANDLE;
+static PFN_vkGetInstanceProcAddr s_real_get_proc_addr   = NULL;
 
-///////////////////////////////////////////
-// sk_renderer device init callback
-// Called after VkInstance is created, before VkDevice is created.
-// Queries OpenXR for physical device and device extensions.
-///////////////////////////////////////////
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL xr_vkGetInstanceProcAddr(VkInstance instance, const char* name) {
+	return s_real_get_proc_addr(s_vk_instance != VK_NULL_HANDLE ? s_vk_instance : instance, name);
+}
 
+// Instance creation callback: lets OpenXR create the VkInstance
+static void* xr_instance_create_callback(skr_instance_create_info_t* info, void* user_data) {
+	(void)user_data;
+	s_real_get_proc_addr = (PFN_vkGetInstanceProcAddr)info->get_instance_proc_addr;
+
+	VkInstance instance  = VK_NULL_HANDLE;
+	VkResult   vk_result = VK_SUCCESS;
+	XrResult   xr_result = ext_xrCreateVulkanInstanceKHR(xr_instance, &(XrVulkanInstanceCreateInfoKHR){
+		.type               = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR,
+		.systemId           = xr_system_id,
+		.pfnGetInstanceProcAddr = xr_vkGetInstanceProcAddr,
+		.vulkanCreateInfo   = info->instance_create_info,
+	}, &instance, &vk_result);
+
+	if (XR_FAILED(xr_result) || vk_result != VK_SUCCESS) {
+		ska_log(ska_log_error, "xrCreateVulkanInstanceKHR failed (xr=%d, vk=%d)", xr_result, vk_result);
+		return NULL;
+	}
+	s_vk_instance = instance;
+	return instance;
+}
+
+// Device init callback: gets the physical device OpenXR wants (no extension querying needed with enable2)
 static skr_device_request_t xr_device_init_callback(void* vk_instance, void* user_data) {
 	(void)user_data;
-	VkInstance instance = (VkInstance)vk_instance;
 
-	// Get the physical device OpenXR wants us to use
-	VkPhysicalDevice xr_physical_device = VK_NULL_HANDLE;
-	ext_xrGetVulkanGraphicsDeviceKHR(xr_instance, xr_system_id, instance, &xr_physical_device);
-
-	// Get required Vulkan device extensions from OpenXR
-	uint32_t vk_dev_ext_size = 0;
-	ext_xrGetVulkanDeviceExtensionsKHR(xr_instance, xr_system_id, 0, &vk_dev_ext_size, NULL);
-	s_vk_device_ext_str = malloc(vk_dev_ext_size);
-	ext_xrGetVulkanDeviceExtensionsKHR(xr_instance, xr_system_id, vk_dev_ext_size, &vk_dev_ext_size, s_vk_device_ext_str);
-
-	// Parse space-separated extension names
-	s_vk_device_exts      = malloc(64 * sizeof(char*));
-	s_vk_device_ext_count = 0;
-
-	// Use a copy for strtok since it modifies the string
-	char* str_copy = strdup(s_vk_device_ext_str);
-	char* token    = strtok(str_copy, " ");
-	while (token && s_vk_device_ext_count < 64) {
-		// Find the token in the original string and use that pointer
-		s_vk_device_exts[s_vk_device_ext_count++] = s_vk_device_ext_str + (token - str_copy);
-		token = strtok(NULL, " ");
-	}
-	free(str_copy);
-
-	// Null-terminate the tokens in the original string
-	for (uint32_t i = 0; i < vk_dev_ext_size; i++) {
-		if (s_vk_device_ext_str[i] == ' ') s_vk_device_ext_str[i] = '\0';
-	}
-
-	ska_log(ska_log_info, "OpenXR requires %u Vulkan device extensions:", s_vk_device_ext_count);
-	for (uint32_t i = 0; i < s_vk_device_ext_count; i++) {
-		ska_log(ska_log_info, "  - %s", s_vk_device_exts[i]);
-	}
+	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+	ext_xrGetVulkanGraphicsDevice2KHR(xr_instance, &(XrVulkanGraphicsDeviceGetInfoKHR){
+		.type           = XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR,
+		.systemId       = xr_system_id,
+		.vulkanInstance = (VkInstance)vk_instance,
+	}, &physical_device);
 
 	return (skr_device_request_t){
-		.physical_device                 = xr_physical_device,
-		.required_device_extensions      = s_vk_device_exts,
-		.required_device_extension_count = s_vk_device_ext_count,
+		.physical_device = physical_device,
 	};
+}
+
+// Device creation callback: lets OpenXR create the VkDevice
+static void* xr_device_create_callback(skr_device_create_info_t* info, void* user_data) {
+	(void)user_data;
+
+	VkDevice device    = VK_NULL_HANDLE;
+	VkResult vk_result = VK_SUCCESS;
+	XrResult xr_result = ext_xrCreateVulkanDeviceKHR(xr_instance, &(XrVulkanDeviceCreateInfoKHR){
+		.type               = XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR,
+		.systemId           = xr_system_id,
+		.pfnGetInstanceProcAddr = xr_vkGetInstanceProcAddr,
+		.vulkanPhysicalDevice = (VkPhysicalDevice)info->vk_physical_device,
+		.vulkanCreateInfo   = info->device_create_info,
+	}, &device, &vk_result);
+
+	if (XR_FAILED(xr_result) || vk_result != VK_SUCCESS) {
+		ska_log(ska_log_error, "xrCreateVulkanDeviceKHR failed (xr=%d, vk=%d)", xr_result, vk_result);
+		return NULL;
+	}
+	return device;
 }
 
 ///////////////////////////////////////////
@@ -200,7 +213,7 @@ bool openxr_init(const char* app_name) {
 
 	// Build list of extensions to use
 	const char* ask_extensions[] = {
-		XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
+		XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 		XR_EXT_DEBUG_UTILS_EXTENSION_NAME,
 #ifdef __ANDROID__
 		XR_KHR_LOADER_INIT_ANDROID_EXTENSION_NAME,
@@ -218,7 +231,7 @@ bool openxr_init(const char* app_name) {
 		for (uint32_t ask = 0; ask < sizeof(ask_extensions)/sizeof(ask_extensions[0]); ask++) {
 			if (strcmp(ask_extensions[ask], xr_exts[i].extensionName) == 0) {
 				use_extensions[use_count++] = ask_extensions[ask];
-				if (strcmp(ask_extensions[ask], XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
+				if (strcmp(ask_extensions[ask], XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
 					has_vulkan = true;
 				}
 				break;
@@ -255,13 +268,13 @@ bool openxr_init(const char* app_name) {
 		return false;
 	}
 
-	// Load extension function pointers
-	xrGetInstanceProcAddr(xr_instance, "xrGetVulkanInstanceExtensionsKHR",  (PFN_xrVoidFunction*)&ext_xrGetVulkanInstanceExtensionsKHR);
-	xrGetInstanceProcAddr(xr_instance, "xrGetVulkanDeviceExtensionsKHR",    (PFN_xrVoidFunction*)&ext_xrGetVulkanDeviceExtensionsKHR);
-	xrGetInstanceProcAddr(xr_instance, "xrGetVulkanGraphicsDeviceKHR",      (PFN_xrVoidFunction*)&ext_xrGetVulkanGraphicsDeviceKHR);
-	xrGetInstanceProcAddr(xr_instance, "xrGetVulkanGraphicsRequirementsKHR",(PFN_xrVoidFunction*)&ext_xrGetVulkanGraphicsRequirementsKHR);
-	xrGetInstanceProcAddr(xr_instance, "xrCreateDebugUtilsMessengerEXT",    (PFN_xrVoidFunction*)&ext_xrCreateDebugUtilsMessengerEXT);
-	xrGetInstanceProcAddr(xr_instance, "xrDestroyDebugUtilsMessengerEXT",   (PFN_xrVoidFunction*)&ext_xrDestroyDebugUtilsMessengerEXT);
+	// Load extension function pointers (vulkan_enable2)
+	xrGetInstanceProcAddr(xr_instance, "xrCreateVulkanInstanceKHR",           (PFN_xrVoidFunction*)&ext_xrCreateVulkanInstanceKHR);
+	xrGetInstanceProcAddr(xr_instance, "xrCreateVulkanDeviceKHR",             (PFN_xrVoidFunction*)&ext_xrCreateVulkanDeviceKHR);
+	xrGetInstanceProcAddr(xr_instance, "xrGetVulkanGraphicsDevice2KHR",       (PFN_xrVoidFunction*)&ext_xrGetVulkanGraphicsDevice2KHR);
+	xrGetInstanceProcAddr(xr_instance, "xrGetVulkanGraphicsRequirements2KHR", (PFN_xrVoidFunction*)&ext_xrGetVulkanGraphicsRequirements2KHR);
+	xrGetInstanceProcAddr(xr_instance, "xrCreateDebugUtilsMessengerEXT",      (PFN_xrVoidFunction*)&ext_xrCreateDebugUtilsMessengerEXT);
+	xrGetInstanceProcAddr(xr_instance, "xrDestroyDebugUtilsMessengerEXT",     (PFN_xrVoidFunction*)&ext_xrDestroyDebugUtilsMessengerEXT);
 
 	// Set up debug messenger (optional)
 	if (ext_xrCreateDebugUtilsMessengerEXT) {
@@ -308,29 +321,9 @@ bool openxr_init(const char* app_name) {
 	                         (xr_blend == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE)    ? "ADDITIVE" : "OPAQUE";
 	ska_log(ska_log_info, "Using blend mode: %s", blend_name);
 
-	// Get required Vulkan instance extensions from OpenXR
-	uint32_t vk_ext_size = 0;
-	ext_xrGetVulkanInstanceExtensionsKHR(xr_instance, xr_system_id, 0, &vk_ext_size, NULL);
-	char* vk_ext_str = malloc(vk_ext_size);
-	ext_xrGetVulkanInstanceExtensionsKHR(xr_instance, xr_system_id, vk_ext_size, &vk_ext_size, vk_ext_str);
-
-	// Parse space-separated extension names
-	const char** vk_extensions = malloc(64 * sizeof(char*));
-	uint32_t     vk_ext_count  = 0;
-	char*        token         = strtok(vk_ext_str, " ");
-	while (token && vk_ext_count < 64) {
-		vk_extensions[vk_ext_count++] = token;
-		token                         = strtok(NULL, " ");
-	}
-
-	ska_log(ska_log_info, "OpenXR requires %u Vulkan instance extensions:", vk_ext_count);
-	for (uint32_t i = 0; i < vk_ext_count; i++) {
-		ska_log(ska_log_info, "  - %s", vk_extensions[i]);
-	}
-
 	// Get graphics requirements (must call before creating session)
-	XrGraphicsRequirementsVulkanKHR gfx_requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR };
-	ext_xrGetVulkanGraphicsRequirementsKHR(xr_instance, xr_system_id, &gfx_requirements);
+	XrGraphicsRequirementsVulkan2KHR gfx_requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR };
+	ext_xrGetVulkanGraphicsRequirements2KHR(xr_instance, xr_system_id, &gfx_requirements);
 	ska_log(ska_log_info, "OpenXR Vulkan requirements: API %u.%u.%u - %u.%u.%u",
 		XR_VERSION_MAJOR(gfx_requirements.minApiVersionSupported),
 		XR_VERSION_MINOR(gfx_requirements.minApiVersionSupported),
@@ -339,37 +332,23 @@ bool openxr_init(const char* app_name) {
 		XR_VERSION_MINOR(gfx_requirements.maxApiVersionSupported),
 		XR_VERSION_PATCH(gfx_requirements.maxApiVersionSupported));
 
-	// Initialize sk_renderer with OpenXR's required extensions
-	// The callback will be invoked after VkInstance creation to get physical device
-	// and device extensions from OpenXR.
+	// Initialize sk_renderer with enable2 callbacks.
+	// OpenXR creates VkInstance and VkDevice on our behalf, handling extensions internally.
 	if (!skr_init((skr_settings_t){
-		.app_name                 = app_name,
-		.app_version              = 1,
-		.enable_validation        = true,
-		.required_extensions      = vk_extensions,
-		.required_extension_count = vk_ext_count,
-		.device_init_callback     = xr_device_init_callback,
-		.device_init_user_data    = NULL,
+		.app_name                  = app_name,
+		.app_version               = 1,
+		.enable_validation         = true,
+		.instance_create_callback  = xr_instance_create_callback,
+		.device_init_callback      = xr_device_init_callback,
+		.device_create_callback    = xr_device_create_callback,
 	})) {
 		ska_log(ska_log_error, "Failed to initialize sk_renderer");
-		free(vk_ext_str);
-		free(vk_extensions);
-		free(s_vk_device_ext_str);
-		free(s_vk_device_exts);
 		return false;
 	}
 
-	// Clean up extension string storage (sk_renderer has copied what it needs)
-	free(vk_ext_str);
-	free(vk_extensions);
-	free(s_vk_device_ext_str);
-	free(s_vk_device_exts);
-	s_vk_device_ext_str = NULL;
-	s_vk_device_exts    = NULL;
-
 	// Create OpenXR session with our Vulkan device
-	XrGraphicsBindingVulkanKHR binding = {
-		.type             = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR,
+	XrGraphicsBindingVulkan2KHR binding = {
+		.type             = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
 		.instance         = skr_get_vk_instance             (),
 		.physicalDevice   = skr_get_vk_physical_device      (),
 		.device           = skr_get_vk_device               (),
