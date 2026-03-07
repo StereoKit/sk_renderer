@@ -50,20 +50,19 @@ struct psIn {
 	float4 pos       : SV_POSITION;
 	float3 normal    : NORMAL0;
 	float3 color     : TEXCOORD0;
-	uint   layer     : SV_RenderTargetArrayIndex;
+	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
+
 	psIn output;
 
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
-
-	float3 center = inst[inst_idx].pos;
+	float3 center = inst[ids.inst].pos;
 
 	// Sample voxel from instance center position
 	float3 uvw       = (center - gi_volume_min) * gi_volume_inv;
@@ -75,7 +74,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 		output.pos    = asfloat(0x7FC00000); // NaN kills the primitive
 		output.normal = float3(0, 0, 0);
 		output.color  = float3(0, 0, 0);
-		output.layer  = view_idx;
+		SKR_SET_LAYER(output, ids.view);
 		return output;
 	}
 
@@ -83,9 +82,9 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	output.color = voxel.rgb / (float)count;
 
 	float3 world_pos = input.pos * cell_size + center;
-	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
+	output.pos       = mul(float4(world_pos, 1), viewproj[ids.view]);
 	output.normal    = input.norm;
-	output.layer     = view_idx;
+	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

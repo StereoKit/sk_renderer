@@ -521,15 +521,9 @@ typedef struct skr_tex_t         skr_tex_t;
 typedef struct skr_render_list_t skr_render_list_t;
 typedef struct skr_material_t    skr_material_t;
 
-typedef struct skr_pass_view_array_t {
-	int32_t byte_offset;  // Byte offset of array[0] in system_data
-	int32_t stride;       // Size of each element in bytes
-} skr_pass_view_array_t;
-
 typedef struct skr_pass_view_desc_t {
-	int32_t                      view_count_byte_offset;  // Where to write view_count in system_data (-1 if none)
-	const skr_pass_view_array_t* view_arrays;             // View-indexed arrays to remap (NULL if none)
-	int32_t                      view_array_count;
+	int32_t view_count_byte_offset;   // Where to write view_count in system_data (-1 to skip)
+	int32_t view_offset_byte_offset;  // Where to write view_offset in system_data (-1 to skip)
 } skr_pass_view_desc_t;
 
 typedef struct skr_pass_draw_t {

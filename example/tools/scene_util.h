@@ -77,21 +77,11 @@ typedef struct {
 	uint32_t _pad;
 } su_system_buffer_t;
 
-// View descriptor for su_system_buffer_t — describes which arrays are indexed
-// by view. Pass to skr_pass_add_draw for multi-view remapping.
-static const skr_pass_view_array_t su_view_arrays[] = {
-	{offsetof(su_system_buffer_t, view),            sizeof(float4x4)},
-	{offsetof(su_system_buffer_t, view_inv),        sizeof(float4x4)},
-	{offsetof(su_system_buffer_t, projection),      sizeof(float4x4)},
-	{offsetof(su_system_buffer_t, projection_inv),  sizeof(float4x4)},
-	{offsetof(su_system_buffer_t, viewproj),        sizeof(float4x4)},
-	{offsetof(su_system_buffer_t, cam_pos),         sizeof(float4)},
-	{offsetof(su_system_buffer_t, cam_dir),         sizeof(float4)},
-};
+// View descriptor for su_system_buffer_t — tells the pass system where to
+// write view_count and view_offset for multi-view fallback rendering.
 static const skr_pass_view_desc_t su_view_desc = {
-	.view_count_byte_offset = offsetof(su_system_buffer_t, view_count),
-	.view_arrays            = su_view_arrays,
-	.view_array_count       = sizeof(su_view_arrays) / sizeof(su_view_arrays[0]),
+	.view_count_byte_offset  = offsetof(su_system_buffer_t, view_count),
+	.view_offset_byte_offset = offsetof(su_system_buffer_t, view_offset),
 };
 
 ///////////////////////////////////////////////////////////////////////////////

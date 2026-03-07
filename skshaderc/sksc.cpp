@@ -33,6 +33,27 @@ void sksc_shutdown() {
 
 ///////////////////////////////////////////
 
+// Find or add a stage to the deduplicated pool. Returns the index.
+static int16_t _sksc_dedup_stage(array_t<sksc_shader_file_stage_t> *pool, sksc_shader_file_stage_t *stage) {
+	// Check for duplicate SPIRV bytecode
+	for (int32_t i = 0; i < pool->count; i++) {
+		sksc_shader_file_stage_t *existing = &pool->data[i];
+		if (existing->language  == stage->language  &&
+		    existing->stage     == stage->stage     &&
+		    existing->code_size == stage->code_size &&
+		    memcmp(existing->code, stage->code, stage->code_size) == 0) {
+			// Duplicate — free the new code and return existing index
+			free(stage->code);
+			*stage = {};
+			return (int16_t)i;
+		}
+	}
+	// New unique stage
+	int16_t idx = (int16_t)pool->count;
+	pool->add(*stage);
+	return idx;
+}
+
 bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *settings, sksc_shader_file_t *out_file) {
 	*out_file = {};
 	 out_file->meta = (sksc_shader_meta_t*)malloc(sizeof(sksc_shader_meta_t));
@@ -40,42 +61,72 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 	 out_file->meta->global_buffer_id = -1;
 	 out_file->meta->references = 1;
 
-	array_t<sksc_shader_file_stage_t> stages       = {};
-	array_t<sksc_meta_item_t>         var_meta     = sksc_meta_find_defaults(hlsl_text);
-	array_t<sksc_ast_default_t>       ast_defaults = sksc_hlsl_find_initializers(hlsl_text);
+	array_t<sksc_shader_file_stage_t>    stage_pool = {};
+	array_t<sksc_shader_file_variant_t>  variants   = {};
+	array_t<sksc_meta_item_t>            var_meta     = sksc_meta_find_defaults(hlsl_text);
+	array_t<sksc_ast_default_t>          ast_defaults = sksc_hlsl_find_initializers(hlsl_text);
+
+	// Variant definitions: each has an ID and optional #defines
+	struct variant_def_t {
+		sksc_variant_ id;
+		const char*   defines[1]; // NULL-terminated
+		int32_t       define_count;
+	};
+	variant_def_t variant_defs[] = {
+		{ sksc_variant_default,         { NULL },                    0 },
+		{ sksc_variant_no_layer_select, { "SKR_NO_LAYER_SELECT 1" }, 1 },
+	};
+	int32_t variant_def_count = sizeof(variant_defs) / sizeof(variant_defs[0]);
 
 	skr_stage_ compile_stages[3] = { skr_stage_vertex, skr_stage_pixel, skr_stage_compute };
 	char*      entrypoints   [3] = { settings->vs_entrypoint, settings->ps_entrypoint, settings->cs_entrypoint };
-	for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
-		if (entrypoints[i][0] == 0)
-			continue;
 
-		// Build SPIRV
-		sksc_shader_file_stage_t spirv_stage  = {};
-		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], NULL, 0, &spirv_stage);
-		if (spirv_result == compile_result_fail) {
-			sksc_log(sksc_log_level_err, "SPIRV compile failed");
-			return false;
-		} else if (spirv_result == compile_result_skip)
-			continue;
-			
-		// Extract metadata from the SPIRV
-		sksc_spirv_to_meta(&spirv_stage, out_file->meta);
+	for (int32_t v = 0; v < variant_def_count; v++) {
+		variant_def_t *vdef = &variant_defs[v];
+		sksc_shader_file_variant_t variant = {};
+		variant.variant_id    = (uint16_t)vdef->id;
+		variant.vertex_stage  = -1;
+		variant.pixel_stage   = -1;
+		variant.compute_stage = -1;
 
-		// Add it as a stage in our sks file
-		if (settings->target_langs[skr_shader_lang_spirv]) {
-			stages.add(spirv_stage);
+		for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
+			if (entrypoints[i][0] == 0)
+				continue;
+
+			sksc_shader_file_stage_t spirv_stage  = {};
+			compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], vdef->defines, vdef->define_count, &spirv_stage);
+			if (spirv_result == compile_result_fail) {
+				sksc_log(sksc_log_level_err, "SPIRV compile failed for variant %d", vdef->id);
+				return false;
+			} else if (spirv_result == compile_result_skip)
+				continue;
+
+			// Extract metadata from the default variant only
+			if (v == 0)
+				sksc_spirv_to_meta(&spirv_stage, out_file->meta);
+
+			if (settings->target_langs[skr_shader_lang_spirv]) {
+				int16_t idx = _sksc_dedup_stage(&stage_pool, &spirv_stage);
+				switch (compile_stages[i]) {
+				case skr_stage_vertex:  variant.vertex_stage  = idx; break;
+				case skr_stage_pixel:   variant.pixel_stage   = idx; break;
+				case skr_stage_compute: variant.compute_stage = idx; break;
+				}
+			} else {
+				free(spirv_stage.code);
+			}
 		}
 
-		if (!settings->target_langs[skr_shader_lang_spirv])
-			free(spirv_stage.code);
+		variants.add(variant);
 	}
 
 	sksc_meta_assign_defaults(ast_defaults, var_meta, out_file->meta);
 	var_meta.free();
 	ast_defaults.free();
-	out_file->stage_count = (uint32_t)stages.count;
-	out_file->stages      = stages.data;
+	out_file->stage_count   = (uint32_t)stage_pool.count;
+	out_file->stages        = stage_pool.data;
+	out_file->variant_count = (uint32_t)variants.count;
+	out_file->variants      = variants.data;
 
 	if (!settings->silent_info) {
 		sksc_log_shader_info(out_file);
@@ -91,6 +142,18 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 	if (!sksc_meta_check_dup_resources(out_file->meta, &dup_name1, &dup_name2, &dup_slot)) {
 		sksc_log(sksc_log_level_err, "Resources '%s' and '%s' are both bound to the same slot (t%u)", dup_name1, dup_name2, dup_slot);
 		return false;
+	}
+
+	// Log dedup stats
+	int32_t total_stages = 0;
+	for (uint32_t i = 0; i < out_file->variant_count; i++) {
+		sksc_shader_file_variant_t *var = &out_file->variants[i];
+		if (var->vertex_stage  >= 0) total_stages++;
+		if (var->pixel_stage   >= 0) total_stages++;
+		if (var->compute_stage >= 0) total_stages++;
+	}
+	if (!settings->silent_info && out_file->variant_count > 1) {
+		sksc_log(sksc_log_level_info, "%d variant(s), %d unique stage(s) (%d shared)", out_file->variant_count, out_file->stage_count, total_stages - out_file->stage_count);
 	}
 
 	return true;
@@ -236,13 +299,19 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 		}
 	}
 
-	// Only log buffer binds for the stages of a single language
-	skr_shader_lang_ stage_lang = file->stage_count > 0 ? file->stages[0].language : skr_shader_lang_hlsl;
-	for (uint32_t s = 0; s < file->stage_count; s++) {
-		const sksc_shader_file_stage_t* stage = &file->stages[s];
+	// Gather stage indices from the default variant for display
+	const sksc_shader_file_variant_t *default_var = sksc_shader_file_get_variant(file, sksc_variant_default);
+	int16_t display_indices[3] = { -1, -1, -1 };
+	if (default_var) {
+		display_indices[0] = default_var->vertex_stage;
+		display_indices[1] = default_var->pixel_stage;
+		display_indices[2] = default_var->compute_stage;
+	}
 
-		if (stage->language != stage_lang)
+	for (int32_t s = 0; s < 3; s++) {
+		if (display_indices[s] < 0 || display_indices[s] >= (int16_t)file->stage_count)
 			continue;
+		const sksc_shader_file_stage_t* stage = &file->stages[display_indices[s]];
 
 		const char *stage_name = "";
 		switch (stage->stage) {
@@ -324,11 +393,17 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 5;
+	uint16_t version = 6;
 	data.write(tag);
 	data.write(version);
 
-	data.write(file->stage_count);
+	// Header: stage_count(u16) + variant_count(u16) — keeps name at offset 14
+	uint16_t stage_count_16   = (uint16_t)file->stage_count;
+	uint16_t variant_count_16 = (uint16_t)file->variant_count;
+	data.write(stage_count_16);
+	data.write(variant_count_16);
+
+	// Meta (shared)
 	data.write_fixed_str(file->meta->name, sizeof(file->meta->name));
 	data.write(file->meta->buffer_count);
 	data.write(file->meta->resource_count);
@@ -385,6 +460,16 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write(res->element_size);
 	}
 
+	// Variants
+	for (uint32_t i = 0; i < file->variant_count; i++) {
+		const sksc_shader_file_variant_t *v = &file->variants[i];
+		data.write(v->variant_id);
+		data.write(v->vertex_stage);
+		data.write(v->pixel_stage);
+		data.write(v->compute_stage);
+	}
+
+	// Stages (deduplicated pool)
 	for (uint32_t i = 0; i < file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &file->stages[i];
 		data.write(stage->language);

@@ -20,25 +20,23 @@ struct psIn {
 	float3 normal    : TEXCOORD1;
 	float  roughness : TEXCOORD2;
 	float3 cam_pos   : TEXCOORD3;
-	uint   layer     : SV_RenderTargetArrayIndex;
+	SKR_LAYER_OUTPUT
 };
 
 TextureCube  cubemap         : register(t0);
 SamplerState cubemap_sampler : register(s0);
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	// Multi-view instancing: extract instance index and view index
-	uint inst_idx = id / view_count;
-	uint view_idx = id % view_count;
+psIn vs(vsIn input, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
 
 	psIn output;
-	float4 world_pos = mul(float4(input.pos, 1), inst[inst_idx].world);
+	float4 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world);
 	output.world_pos = world_pos.xyz;
-	output.pos = mul(world_pos, viewproj[view_idx]);
-	output.normal = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
-	output.roughness = inst[inst_idx].roughness;
-	output.cam_pos = cam_pos[view_idx].xyz;
-	output.layer = view_idx;
+	output.pos = mul(world_pos, viewproj[ids.view]);
+	output.normal = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
+	output.roughness = inst[ids.inst].roughness;
+	output.cam_pos = cam_pos[ids.view].xyz;
+	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

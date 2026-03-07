@@ -67,7 +67,7 @@ struct psIn {
 	float2 glyph_pos : TEXCOORD1;   // Position in glyph space
 	nointerpolation uint glyph_idx : TEXCOORD2;
 	float3 color     : COLOR0;
-	uint   layer     : SV_RenderTargetArrayIndex;  // Multi-view output layer
+	SKR_LAYER_OUTPUT
 };
 
 // Unpack RGBA8 color from uint (0xAABBGGRR format)
@@ -78,12 +78,10 @@ float3 unpack_color(uint packed) {
 	return float3(r, g, b);
 }
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	// Multi-view instancing
-	uint inst_idx = id / view_count;
-	uint view_idx = id % view_count;
+psIn vs(vsIn input, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
 
-	Instance instance = inst[inst_idx];
+	Instance instance = inst[ids.inst];
 	Glyph glyph = glyphs[instance.glyph_index];
 
 	// Transform quad vertex to glyph bounds with small expansion for edge pixels
@@ -99,12 +97,12 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	                 + local_pos.y * instance.up;
 
 	psIn output;
-	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
+	output.pos       = mul(float4(world_pos, 1), viewproj[ids.view]);
 	output.glyph_uv  = input.uv;
 	output.glyph_pos = local_pos;
 	output.glyph_idx = instance.glyph_index;
 	output.color     = unpack_color(instance.color);
-	output.layer     = view_idx;  // Route to correct render target layer
+	SKR_SET_LAYER(output, ids.view);
 
 	return output;
 }

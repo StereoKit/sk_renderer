@@ -21,4 +21,48 @@ cbuffer SystemBuffer : register(b1, space0) {
 	uint     _pad;
 };
 
+///////////////////////////////////////////
+// Multi-view variant abstractions
+///////////////////////////////////////////
+
+// Resolved instance and view indices from SV_InstanceID
+struct skr_ids_t {
+	uint inst;
+	uint view;
+};
+
+// System vertex input — contains SV_InstanceID and (future) SV_ViewID
+struct skr_input_t {
+	uint instance_id : SV_InstanceID;
+};
+
+// Resolve instance and view indices from system input.
+//
+// Default variant: instances are multiplied by view_count, view index is
+// packed into the instance ID via id % view_count.
+//
+// SKR_NO_LAYER_SELECT variant: renderer draws one pass per view, setting
+// view_offset each pass. Instance ID is used directly.
+skr_ids_t skr_resolve_ids(skr_input_t input) {
+	skr_ids_t r;
+#ifdef SKR_NO_LAYER_SELECT
+	r.inst = input.instance_id;
+	r.view = view_offset;
+#else
+	r.inst = input.instance_id / view_count;
+	r.view = input.instance_id % view_count;
+#endif
+	return r;
+}
+
+// Vertex output layer declaration — include in your psIn struct.
+// Expands to nothing when layer selection is unavailable.
+#ifdef SKR_NO_LAYER_SELECT
+	#define SKR_LAYER_OUTPUT
+	#define SKR_SET_LAYER(output, val)
+#else
+	#define SKR_LAYER_OUTPUT  uint layer : SV_RenderTargetArrayIndex;
+	#define SKR_SET_LAYER(output, val)  output.layer = val
+#endif
+
 #endif // COMMON_HLSLI

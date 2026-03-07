@@ -2097,6 +2097,23 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 		_skr_cmd_destroy_image_view(NULL, old_view);
 	}
 
+	// Invalidate per-layer views and framebuffers — they reference the old image
+	if (ref_tex->layer_views) {
+		for (uint32_t i = 0; i < (uint32_t)ref_tex->layer_count; i++)
+			_skr_cmd_destroy_image_view(NULL, ref_tex->layer_views[i]);
+		_skr_free(ref_tex->layer_views);
+		ref_tex->layer_views = NULL;
+	}
+	if (ref_tex->layer_framebuffers) {
+		for (uint32_t i = 0; i < (uint32_t)ref_tex->layer_count; i++) {
+			if (ref_tex->layer_framebuffers[i] != VK_NULL_HANDLE)
+				_skr_cmd_destroy_framebuffer(NULL, ref_tex->layer_framebuffers[i]);
+		}
+		_skr_free(ref_tex->layer_framebuffers);
+		ref_tex->layer_framebuffers     = NULL;
+		ref_tex->layer_framebuffer_pass = VK_NULL_HANDLE;
+	}
+
 	// Update layout tracking
 	ref_tex->current_layout = update.current_layout;
 	ref_tex->first_use      = false;

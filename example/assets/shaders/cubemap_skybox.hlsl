@@ -11,25 +11,24 @@ struct vsIn {
 struct psIn {
 	float4 pos   : SV_POSITION;
 	float3 dir   : TEXCOORD0;
-	uint   layer : SV_RenderTargetArrayIndex;
+	SKR_LAYER_OUTPUT
 };
 
 TextureCube  cubemap         : register(t0);
 SamplerState cubemap_sampler : register(s0);
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	// Multi-view instancing: extract view index
-	uint view_idx = id % view_count;
+psIn vs(vsIn input, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
 
 	psIn output;
 	output.pos   = float4(input.pos, 1.0);
 	output.pos.z = 1; // Force Z to the back
 
 	// Calculate view direction from inverse projection and view matrices
-	float4 proj_inv = mul(output.pos, projection_inv[view_idx]);
-	output.dir = mul(float4(proj_inv.xyz, 0), transpose(view[view_idx])).xyz;
+	float4 proj_inv = mul(output.pos, projection_inv[ids.view]);
+	output.dir = mul(float4(proj_inv.xyz, 0), transpose(view[ids.view])).xyz;
 
-	output.layer = view_idx;
+	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

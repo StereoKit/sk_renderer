@@ -22,10 +22,12 @@ RWStructuredBuffer<Particle> particles_out : register(u2, space0);
 struct psIn {
 	float4 pos   : SV_POSITION;
 	float3 color : COLOR0;
-	uint   layer : SV_RenderTargetArrayIndex;
+	SKR_LAYER_OUTPUT
 };
 
-psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
+psIn vs(uint vertex_id : SV_VertexID, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
+
 	const float size = 0.002;
 
 	uint particle_idx = vertex_id / 6;
@@ -44,7 +46,7 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 	};
 
 	// Render from input buffer position - all 6 corners agree
-	float4 view_pos = mul(float4(p.position, 1), view[view_idx]);
+	float4 view_pos = mul(float4(p.position, 1), view[ids.view]);
 	view_pos.xy += offsets[corner] * size;
 
 	// Color based on particle speed
@@ -53,7 +55,7 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 	float3 base_color = lerp(color_slow, color_fast, speed_t);
 
 	// Simulate on first vertex of first view only, write to output buffer
-	if (corner == 0 && view_idx == 0) {
+	if (corner == 0 && ids.view == 0) {
 		float3 attractors[3];
 		attractors[0] = float3(cos(sim_time * 0.5) * 2.0, sin(sim_time * 0.7) * 1.5, sin(sim_time * 0.5) * 2.0);
 		attractors[1] = float3(sin(sim_time * 0.6) * 2.5, cos(sim_time * 0.4) * 2.0, cos(sim_time * 0.6) * 1.5);
@@ -97,9 +99,9 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 	}
 
 	psIn output;
-	output.pos   = mul(view_pos, projection[view_idx]);
+	output.pos   = mul(view_pos, projection[ids.view]);
 	output.color = base_color;
-	output.layer = view_idx;
+	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

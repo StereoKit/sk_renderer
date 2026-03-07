@@ -83,25 +83,24 @@ struct psIn {
 	float3 world_pos  : TEXCOORD1;
 	float3 view_dir   : TEXCOORD2;
 	float3 shadow_uv  : TEXCOORD3;
-	uint   layer      : SV_RenderTargetArrayIndex;
+	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
+
 	psIn output;
 
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
-
-	output.world_pos = mul(float4(input.pos, 1), inst[inst_idx].world).xyz;
-	output.pos       = mul(float4(output.world_pos, 1), viewproj[view_idx]);
-	output.normal    = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
+	output.world_pos = mul(float4(input.pos, 1), inst[ids.inst].world).xyz;
+	output.pos       = mul(float4(output.world_pos, 1), viewproj[ids.view]);
+	output.normal    = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
 	output.uv        = (input.uv * tex_trans.zw) + tex_trans.xy;
 	output.color     = input.color * color;
-	output.view_dir  = cam_pos[view_idx].xyz - output.world_pos;
+	output.view_dir  = cam_pos[ids.view].xyz - output.world_pos;
 
 	// Shadow map projection
 	float  ndotl = dot(output.normal, light_direction);
@@ -110,7 +109,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	float4 shadow_pos = mul(float4(output.world_pos + bias, 1), shadow_transform);
 	output.shadow_uv  = float3(shadow_pos.xy * float2(0.5, -0.5) + 0.5, shadow_pos.z / shadow_pos.w);
 
-	output.layer = view_idx;
+	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

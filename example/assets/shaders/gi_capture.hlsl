@@ -59,22 +59,21 @@ struct psIn {
 	float2 uv         : TEXCOORD0;
 	float4 color      : COLOR0;
 	float3 shadow_uv  : TEXCOORD1;
-	uint   layer      : SV_RenderTargetArrayIndex;
+	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_input_t sys) {
+	skr_ids_t ids = skr_resolve_ids(sys);
+
 	psIn output;
 
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
-
-	float3 world_pos = mul(float4(input.pos, 1), inst[inst_idx].world).xyz;
-	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
-	output.normal    = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
+	float3 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world).xyz;
+	output.pos       = mul(float4(world_pos, 1), viewproj[ids.view]);
+	output.normal    = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
 	output.uv        = (input.uv * tex_trans.zw) + tex_trans.xy;
 	output.color     = input.color * color;
 
@@ -85,7 +84,7 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	float4 shadow_pos = mul(float4(world_pos + bias, 1), shadow_transform);
 	output.shadow_uv  = float3(shadow_pos.xy * float2(0.5, -0.5) + 0.5, shadow_pos.z / shadow_pos.w);
 
-	output.layer = view_idx;
+	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

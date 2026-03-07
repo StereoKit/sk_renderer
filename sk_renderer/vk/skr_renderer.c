@@ -1057,7 +1057,7 @@ void skr_pass_add_draw(skr_pass_t* pass, skr_render_list_t* list, const void* sy
 	if (opt_view_desc) {
 		pass->draws[idx].view_desc = *opt_view_desc;
 	} else {
-		pass->draws[idx].view_desc = (skr_pass_view_desc_t){ .view_count_byte_offset = -1 };
+		pass->draws[idx].view_desc = (skr_pass_view_desc_t){ .view_count_byte_offset = -1, .view_offset_byte_offset = -1 };
 	}
 }
 
@@ -1066,11 +1066,47 @@ void skr_pass_add_postfx(skr_pass_t* pass, skr_material_t* postfx_material) {
 	pass->postfx[pass->postfx_count++] = postfx_material;
 }
 
+// Internal: ensure per-layer 2D views exist for a multi-layer texture.
+// Called lazily when the multi-view fallback needs per-layer framebuffers
+// for textures that weren't created with layer_views (e.g. external/swapchain).
+static void _skr_ensure_layer_views(skr_tex_t* tex) {
+	if (!tex || tex->layer_views || tex->layer_count <= 1) return;
+
+	VkFormat vk_format = skr_tex_fmt_to_native(tex->format);
+	tex->layer_views = (VkImageView*)_skr_calloc(tex->layer_count, sizeof(VkImageView));
+	for (uint32_t i = 0; i < (uint32_t)tex->layer_count; i++) {
+		VkResult vr = vkCreateImageView(_skr_vk.device, &(VkImageViewCreateInfo){
+			.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image    = tex->image,
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format   = vk_format,
+			.subresourceRange = {
+				.aspectMask     = tex->aspect_mask,
+				.baseMipLevel   = 0,
+				.levelCount     = 1,
+				.baseArrayLayer = i,
+				.layerCount     = 1,
+			},
+		}, NULL, &tex->layer_views[i]);
+		if (vr != VK_SUCCESS) {
+			skr_log(skr_log_warning, "Failed to create per-layer view %u for resolve target", i);
+			tex->layer_views[i] = VK_NULL_HANDLE;
+		}
+	}
+}
+
 // Internal: get or create a cached per-layer framebuffer for the multi-view fallback.
 // Uses color->layer_framebuffers[layer] for caching (similar to _skr_get_or_create_framebuffer).
 // Attachment order matches _skr_create_framebuffer: color, resolve, depth.
 static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_tex_t* color, skr_tex_t* resolve, skr_tex_t* depth, uint32_t layer, VkRenderPass render_pass) {
-	skr_tex_t* cache_target = color ? color : depth;
+	// Ensure layer views exist for all textures that need them
+	_skr_ensure_layer_views(color);
+	_skr_ensure_layer_views(resolve);
+	_skr_ensure_layer_views(depth);
+
+	// Cache on resolve target when present (matches fast path fb_cache_target logic).
+	// This ensures framebuffers are invalidated when the swapchain image changes.
+	skr_tex_t* cache_target = resolve ? resolve : (color ? color : depth);
 	if (!cache_target || !cache_target->layer_views) return VK_NULL_HANDLE;
 
 	// Allocate framebuffer cache array if needed
@@ -1263,7 +1299,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 		_skr_pass_render_fast(pass);
 	} else {
 		// Fallback path: one render pass per view layer.
-		// Copy system data and remap view-indexed arrays so index 0 = current view.
+		// Set view_offset so shaders index into the correct view slot directly.
 		uint32_t max_sys_size = 0;
 		for (uint32_t d = 0; d < pass->draw_count; d++) {
 			if (pass->draws[d].system_data_size > max_sys_size)
@@ -1281,21 +1317,12 @@ void skr_pass_submit(skr_pass_t* pass) {
 				skr_pass_draw_t*      draw = &pass->draws[d];
 				skr_pass_view_desc_t* vd   = &draw->view_desc;
 
-				if (vd->view_array_count > 0 && vd->view_arrays) {
-					// Copy and remap: view[v] -> view[0] for each view-indexed array
-					memcpy(sys_copy, draw->system_data, draw->system_data_size);
-					for (int32_t a = 0; a < vd->view_array_count; a++) {
-						memcpy(sys_copy + vd->view_arrays[a].byte_offset,
-						       (const uint8_t*)draw->system_data + vd->view_arrays[a].byte_offset + v * vd->view_arrays[a].stride,
-						       vd->view_arrays[a].stride);
-					}
-					if (vd->view_count_byte_offset >= 0)
-						*(uint32_t*)(sys_copy + vd->view_count_byte_offset) = 1;
-					skr_renderer_draw(draw->list, sys_copy, draw->system_data_size, 1);
-				} else {
-					// Single-view draw, no remapping needed
-					skr_renderer_draw(draw->list, draw->system_data, draw->system_data_size, 1);
-				}
+				memcpy(sys_copy, draw->system_data, draw->system_data_size);
+				if (vd->view_offset_byte_offset >= 0)
+					*(uint32_t*)(sys_copy + vd->view_offset_byte_offset) = (uint32_t)v;
+				if (vd->view_count_byte_offset >= 0)
+					*(uint32_t*)(sys_copy + vd->view_count_byte_offset) = 1;
+				skr_renderer_draw(draw->list, sys_copy, draw->system_data_size, 1);
 			}
 
 			_skr_renderer_end_pass_layer();
