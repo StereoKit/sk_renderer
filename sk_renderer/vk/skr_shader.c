@@ -101,6 +101,7 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 		skr_log(skr_log_critical, "Failed to find shader variant %d", variant);
 		sksc_shader_file_destroy(&file);
 		return skr_err_failure;
+	}
 
 	// Create shader stages from the selected variant
 	skr_shader_stage_t v_stage = _skr_shader_create_from_index(_skr_vk.device, &file, v->vertex_stage,  skr_stage_vertex);
