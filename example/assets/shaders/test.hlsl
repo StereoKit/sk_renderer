@@ -20,7 +20,6 @@ struct psIn {
 	float4 pos   : SV_POSITION;
 	float2 uv    : TEXCOORD0;
 	float3 color   : COLOR0;
-	SKR_LAYER_OUTPUT
 };
 
 Texture2D    tex         : register(t3);
@@ -29,10 +28,8 @@ float4       tex_trans;
 
 //--tex_trans = 0,0,1,1
 
-psIn vs(vsIn input, skr_input_t sys) {
+psIn vs(vsIn input, skr_ids_t ids) {
 	const float3 light_dir = normalize(float3(1, 4, 2));
-
-	skr_ids_t ids = skr_resolve_ids(sys);
 
 	psIn output;
 	output.pos = mul(float4(input.pos, 1), inst[ids.inst].world);
@@ -40,7 +37,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	float3 normal = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
 	output.color = (float3(.05,.05,.1) + saturate(dot(normal, light_dir)*0.8).xxx) * input.color.rgb;
 	output.uv    = (input.uv * tex_trans.zw) + tex_trans.xy;
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 float4 ps(psIn input) : SV_TARGET {

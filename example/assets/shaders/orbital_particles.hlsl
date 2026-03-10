@@ -22,12 +22,9 @@ RWStructuredBuffer<Particle> particles_out : register(u2, space0);
 struct psIn {
 	float4 pos   : SV_POSITION;
 	float3 color : COLOR0;
-	SKR_LAYER_OUTPUT
 };
 
-psIn vs(uint vertex_id : SV_VertexID, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(uint vertex_id : SV_VertexID, skr_ids_t ids) {
 	const float size = 0.002;
 
 	uint particle_idx = vertex_id / 6;
@@ -101,7 +98,6 @@ psIn vs(uint vertex_id : SV_VertexID, skr_input_t sys) {
 	psIn output;
 	output.pos   = mul(view_pos, projection[ids.view]);
 	output.color = base_color;
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

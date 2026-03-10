@@ -83,16 +83,13 @@ struct psIn {
 	float3 world_pos  : TEXCOORD1;
 	float3 view_dir   : TEXCOORD2;
 	float3 shadow_uv  : TEXCOORD3;
-	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
 	output.world_pos = mul(float4(input.pos, 1), inst[ids.inst].world).xyz;
@@ -109,7 +106,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	float4 shadow_pos = mul(float4(output.world_pos + bias, 1), shadow_transform);
 	output.shadow_uv  = float3(shadow_pos.xy * float2(0.5, -0.5) + 0.5, shadow_pos.z / shadow_pos.w);
 
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

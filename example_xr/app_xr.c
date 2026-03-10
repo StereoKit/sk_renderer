@@ -203,9 +203,10 @@ void app_xr_render_stereo(skr_tex_t* color_target, skr_tex_t* resolve_target, sk
 		.clear_depth = 1.0f,
 		.viewport    = {0, 0, (float)width, (float)height},
 		.scissor     = {0, 0, width, height},
-		.view_count  = sys.view_count,
+		.view_count       = sys.view_count,
+		.views_correlated = true,
 	};
-	skr_pass_add_draw(&pass, &s_render_list, &sys, sizeof(sys), &su_view_desc);
+	skr_pass_add_draw(&pass, &s_render_list, &sys, sizeof(sys));
 	skr_pass_submit(&pass);
 	skr_render_list_clear(&s_render_list);
 }

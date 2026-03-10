@@ -20,15 +20,12 @@ struct psIn {
 	float3 normal    : TEXCOORD1;
 	float  roughness : TEXCOORD2;
 	float3 cam_pos   : TEXCOORD3;
-	SKR_LAYER_OUTPUT
 };
 
 TextureCube  cubemap         : register(t0);
 SamplerState cubemap_sampler : register(s0);
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 	float4 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world);
 	output.world_pos = world_pos.xyz;
@@ -36,7 +33,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	output.normal = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
 	output.roughness = inst[ids.inst].roughness;
 	output.cam_pos = cam_pos[ids.view].xyz;
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

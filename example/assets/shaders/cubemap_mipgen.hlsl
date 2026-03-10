@@ -12,9 +12,8 @@ TextureCube<float4> src_tex     : register(t1);  // Source cubemap texture
 SamplerState        src_sampler : register(s1);  // Linear sampler for source
 
 struct psIn {
-	float4 pos   : SV_POSITION;
-	float2 uv    : TEXCOORD0;
-	uint   layer : SV_RenderTargetArrayIndex;
+	float4 pos : SV_POSITION;
+	float2 uv  : TEXCOORD0;
 };
 
 // Convert UV coordinates to cubemap direction for a specific face
@@ -42,23 +41,22 @@ float3 uv_to_direction(float2 uv, uint face) {
 	return normalize(dir);
 }
 
-// Vertex shader - fullscreen triangle per cubemap face
-psIn vs(uint id : SV_VertexID, uint instance_id : SV_InstanceID) {
+// Vertex shader - fullscreen triangle, face index from SV_ViewID
+psIn vs(uint id : SV_VertexID) {
 	psIn output;
 
 	// Generate fullscreen triangle
 	output.uv  = float2((id << 1) & 2, id & 2);
 	output.pos = float4(output.uv * 2.0 - 1.0, 0, 1);
-	output.layer = instance_id; // Which cubemap face to render to
 
 	return output;
 }
 
 // High-quality filter with multiple samples
 // The number of samples increases with mip level for better quality
-float4 ps(psIn input) : SV_Target {
+float4 ps(psIn input, uint face : SV_ViewID) : SV_Target {
 	// Get the main direction for this pixel
-	float3 main_dir = uv_to_direction(input.uv, input.layer);
+	float3 main_dir = uv_to_direction(input.uv, face);
 
 	// Calculate roughness based on destination mip level
 	// We're generating mip (src_mip_level + 1), so higher src means more blur needed

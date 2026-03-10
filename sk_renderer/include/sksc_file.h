@@ -170,12 +170,6 @@ typedef struct {
 	sksc_shader_ops_t      ops_pixel;
 } sksc_shader_meta_t;
 
-typedef enum {
-	sksc_variant_default         = 0, // Has VK_EXT_shader_viewport_index_layer
-	sksc_variant_no_layer_select = 1, // No layer selection in shader
-	sksc_variant_count_
-} sksc_variant_;
-
 typedef struct {
 	skr_shader_lang_ language;
 	skr_stage_       stage;
@@ -184,27 +178,17 @@ typedef struct {
 } sksc_shader_file_stage_t;
 
 typedef struct {
-	uint16_t variant_id;
-	int16_t  vertex_stage;  // Index into file's stages[], -1 if absent
-	int16_t  pixel_stage;   // Index into file's stages[], -1 if absent
-	int16_t  compute_stage; // Index into file's stages[], -1 if absent
-} sksc_shader_file_variant_t;
-
-typedef struct {
-	sksc_shader_meta_t          *meta;
-	uint32_t                     stage_count;    // Total deduplicated stages
-	sksc_shader_file_stage_t    *stages;         // Flat pool of unique stages
-	uint32_t                     variant_count;
-	sksc_shader_file_variant_t  *variants;
+	sksc_shader_meta_t       *meta;
+	uint32_t                  stage_count;
+	sksc_shader_file_stage_t *stages;
 } sksc_shader_file_t;
 
 
 ///////////////////////////////////////////////////////////////////////////////
 
-SKSC_API bool                              sksc_shader_file_verify         (const void *file_memory, uint32_t file_size, uint16_t *out_version, char *out_name, uint32_t out_name_size);
-SKSC_API sksc_result_                      sksc_shader_file_load_memory    (const void *file_memory, uint32_t file_size, sksc_shader_file_t *out_file);
-SKSC_API void                              sksc_shader_file_destroy        (sksc_shader_file_t *ref_file);
-SKSC_API const sksc_shader_file_variant_t* sksc_shader_file_get_variant    (const sksc_shader_file_t *file, sksc_variant_ variant);
+SKSC_API bool                     sksc_shader_file_verify         (const void *file_memory, uint32_t file_size, uint16_t *out_version, char *out_name, uint32_t out_name_size);
+SKSC_API sksc_result_             sksc_shader_file_load_memory    (const void *file_memory, uint32_t file_size, sksc_shader_file_t *out_file);
+SKSC_API void                     sksc_shader_file_destroy        (sksc_shader_file_t *ref_file);
 
 SKSC_API skr_bind_t               sksc_shader_meta_get_bind       (const sksc_shader_meta_t*     meta, const char *name);
 SKSC_API int32_t                  sksc_shader_meta_get_var_count  (const sksc_shader_meta_t*     meta);

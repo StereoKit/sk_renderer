@@ -36,13 +36,13 @@ void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 	*ref_stage = (skr_shader_stage_t){0};
 }
 
-static skr_shader_stage_t _skr_shader_create_from_index(VkDevice device, const sksc_shader_file_t* file, int16_t stage_index, skr_stage_ stage_type) {
-	if (stage_index < 0 || stage_index >= (int16_t)file->stage_count) {
-		skr_shader_stage_t empty = {0};
-		return empty;
+static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const sksc_shader_file_t* file, skr_stage_ stage_type) {
+	for (uint32_t i = 0; i < file->stage_count; i++) {
+		if (file->stages[i].stage == stage_type && file->stages[i].code_size > 0)
+			return _skr_shader_stage_create(device, file->stages[i].code, file->stages[i].code_size, stage_type);
 	}
-	const sksc_shader_file_stage_t* s = &file->stages[stage_index];
-	return _skr_shader_stage_create(device, s->code, s->code_size, stage_type);
+	skr_shader_stage_t empty = {0};
+	return empty;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -91,22 +91,10 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 		return err;
 	}
 
-	// Select the appropriate variant based on device capabilities
-	static const char* variant_names[] = { "default", "no_layer_select" };
-	sksc_variant_ variant = _skr_vk.has_viewport_layer
-		? sksc_variant_default
-		: sksc_variant_no_layer_select;
-	const sksc_shader_file_variant_t* v = sksc_shader_file_get_variant(&file, variant);
-	if (!v) {
-		skr_log(skr_log_critical, "Failed to find shader variant %d", variant);
-		sksc_shader_file_destroy(&file);
-		return skr_err_failure;
-	}
-
-	// Create shader stages from the selected variant
-	skr_shader_stage_t v_stage = _skr_shader_create_from_index(_skr_vk.device, &file, v->vertex_stage,  skr_stage_vertex);
-	skr_shader_stage_t p_stage = _skr_shader_create_from_index(_skr_vk.device, &file, v->pixel_stage,   skr_stage_pixel);
-	skr_shader_stage_t c_stage = _skr_shader_create_from_index(_skr_vk.device, &file, v->compute_stage, skr_stage_compute);
+	// Create shader stages from the file
+	skr_shader_stage_t v_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_vertex);
+	skr_shader_stage_t p_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_pixel);
+	skr_shader_stage_t c_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_compute);
 
 	*out_shader = _skr_shader_create_manual(file.meta, v_stage, p_stage, c_stage);
 

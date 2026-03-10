@@ -305,8 +305,7 @@ typedef enum skr_capability_ {
 	skr_capability_external_ahb,          // Android Hardware Buffer
 	skr_capability_external_dma,          // DMA-BUF via VK_EXT_external_memory_dma_buf
 	skr_capability_vk_video,              // Vulkan video decode (VK_KHR_video_decode_queue)
-	skr_capability_viewport_layer,        // VK_EXT_shader_viewport_index_layer
-	skr_capability_count_                 // Must be last - array size
+	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
 typedef enum skr_clear_ {
@@ -521,16 +520,10 @@ typedef struct skr_tex_t         skr_tex_t;
 typedef struct skr_render_list_t skr_render_list_t;
 typedef struct skr_material_t    skr_material_t;
 
-typedef struct skr_pass_view_desc_t {
-	int32_t view_count_byte_offset;   // Where to write view_count in system_data (-1 to skip)
-	int32_t view_offset_byte_offset;  // Where to write view_offset in system_data (-1 to skip)
-} skr_pass_view_desc_t;
-
 typedef struct skr_pass_draw_t {
 	skr_render_list_t*   list;
 	const void*          system_data;
 	uint32_t             system_data_size;
-	skr_pass_view_desc_t view_desc;
 } skr_pass_draw_t;
 
 typedef struct skr_pass_t {
@@ -545,6 +538,8 @@ typedef struct skr_pass_t {
 	skr_rect_t  viewport;
 	skr_recti_t scissor;
 	int32_t     view_count;         // Number of views to render (1 = single, 2 = stereo, etc.)
+	bool        views_correlated;  // True if views see the same geometry from different viewpoints
+	                                // (VR stereo). False for cubemap faces or independent layers.
 
 	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
 	uint32_t        draw_count;
@@ -698,7 +693,7 @@ SKR_API void              skr_render_list_add_indexed      (skr_render_list_t* r
 
 SKR_API void              skr_renderer_frame_begin         (void);
 SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_surfaces, uint32_t count);  // Submit frame with surface synchronization
-SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil);
+SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);
 SKR_API void              skr_renderer_set_global_texture  (int32_t bind, const skr_tex_t* tex);
@@ -706,12 +701,12 @@ SKR_API void              skr_renderer_set_viewport        (skr_rect_t viewport)
 SKR_API void              skr_renderer_set_scissor         (skr_recti_t scissor);
 SKR_API void              skr_renderer_blit                (skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px);
 
-SKR_API void              skr_renderer_draw                (skr_render_list_t* list, const void* system_data, uint32_t system_data_size, int32_t instance_multiplier);
+SKR_API void              skr_renderer_draw                (skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
 SKR_API void              skr_renderer_draw_mesh_immediate (skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, int32_t instance_count);
 SKR_API uint64_t          skr_renderer_get_gpu_time_us     (void);
 SKR_API uint64_t          skr_renderer_get_cpu_time_us     (void);
 
-SKR_API void              skr_pass_add_draw                (skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size, const skr_pass_view_desc_t* opt_view_desc);
+SKR_API void              skr_pass_add_draw                (skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
 SKR_API void              skr_pass_add_postfx              (skr_pass_t* pass, skr_material_t* postfx_material);
 SKR_API void              skr_pass_submit                  (skr_pass_t* pass);
 

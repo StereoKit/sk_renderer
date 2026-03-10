@@ -236,7 +236,7 @@ static void _render_sphere_to_icon(scene_tex_copy_t* scene, int32_t sphere_idx, 
 		.viewport    = {0, 0, (float)ICON_SIZE, (float)ICON_SIZE},
 		.scissor     = {0, 0, ICON_SIZE, ICON_SIZE},
 	};
-	skr_pass_add_draw(&icon_pass, &icon_list, &icon_system, sizeof(su_system_buffer_t), NULL);
+	skr_pass_add_draw(&icon_pass, &icon_list, &icon_system, sizeof(su_system_buffer_t));
 	skr_pass_submit  (&icon_pass);
 
 	skr_render_list_destroy(&icon_list);

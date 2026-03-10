@@ -11,12 +11,9 @@ StructuredBuffer<Star> stars : register(t3);
 struct psIn {
 	float4 pos   : SV_POSITION;
 	float4 color : COLOR0;
-	SKR_LAYER_OUTPUT
 };
 
-psIn vs(uint vertex_id : SV_VertexID, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(uint vertex_id : SV_VertexID, skr_ids_t ids) {
 	uint star_idx = vertex_id / 3;
 	uint corner   = vertex_id % 3;
 
@@ -37,7 +34,6 @@ psIn vs(uint vertex_id : SV_VertexID, skr_input_t sys) {
 
 	output.pos   = clip_pos;
 	output.color = float4(star.brightness, star.brightness, star.brightness, 1);
-	SKR_SET_LAYER(output, ids.view);
 
 	return output;
 }

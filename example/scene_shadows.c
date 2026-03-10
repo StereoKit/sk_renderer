@@ -269,7 +269,7 @@ static void _scene_shadows_render(scene_t* base, int32_t width, int32_t height, 
 		.viewport    = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
 		.scissor     = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
 	};
-	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys_buffer, sizeof(su_system_buffer_t), NULL);
+	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys_buffer, sizeof(su_system_buffer_t));
 	skr_pass_submit  (&shadow_pass);
 	skr_render_list_clear(&scene->shadow_list);
 

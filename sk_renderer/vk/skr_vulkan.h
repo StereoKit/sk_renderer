@@ -73,9 +73,6 @@ typedef struct skr_tex_t {
 	VkFramebuffer          framebuffer;            // Cached framebuffer (color only, no depth)
 	VkFramebuffer          framebuffer_depth;      // Cached framebuffer (color + depth, if last used with depth)
 	VkRenderPass           framebuffer_pass;       // Render pass the framebuffer was created for
-	VkImageView*           layer_views;            // Per-layer 2D views for multi-view fallback (NULL when not needed)
-	VkFramebuffer*         layer_framebuffers;     // Per-layer framebuffers for multi-view fallback (NULL when not needed)
-	VkRenderPass           layer_framebuffer_pass; // Render pass the layer framebuffers were created for
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;

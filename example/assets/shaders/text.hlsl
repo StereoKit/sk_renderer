@@ -67,7 +67,6 @@ struct psIn {
 	float2 glyph_pos : TEXCOORD1;   // Position in glyph space
 	nointerpolation uint glyph_idx : TEXCOORD2;
 	float3 color     : COLOR0;
-	SKR_LAYER_OUTPUT
 };
 
 // Unpack RGBA8 color from uint (0xAABBGGRR format)
@@ -78,9 +77,7 @@ float3 unpack_color(uint packed) {
 	return float3(r, g, b);
 }
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	Instance instance = inst[ids.inst];
 	Glyph glyph = glyphs[instance.glyph_index];
 
@@ -102,7 +99,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	output.glyph_pos = local_pos;
 	output.glyph_idx = instance.glyph_index;
 	output.color     = unpack_color(instance.color);
-	SKR_SET_LAYER(output, ids.view);
 
 	return output;
 }

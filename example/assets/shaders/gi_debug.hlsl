@@ -62,16 +62,13 @@ struct psIn {
 	float4 pos       : SV_POSITION;
 	float3 normal    : NORMAL0;
 	float3 world_pos : TEXCOORD0;
-	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
 	float  scale = inst[ids.inst].pos_scale.w;
@@ -79,7 +76,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	output.world_pos = input.pos * scale + center;
 	output.pos       = mul(float4(output.world_pos, 1), viewproj[ids.view]);
 	output.normal    = input.norm; // uniform scale, normal unchanged
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

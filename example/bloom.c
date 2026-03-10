@@ -171,9 +171,9 @@ void bloom_apply(skr_tex_t* scene_color, skr_tex_t* target, float bloom_strength
 
 	skr_render_list_t render_list;
 	skr_render_list_create(&render_list);
-	skr_renderer_begin_pass(target, NULL, NULL, skr_clear_none, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
+	skr_renderer_begin_pass(target, NULL, NULL, skr_clear_none, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0, 0x1, 0x1);
 	skr_render_list_add    (&render_list, &g_bloom.fullscreen_quad, &g_bloom.bloom_composite_mat, NULL, 0, 1);
-	skr_renderer_draw      (&render_list, NULL, 0, 1);  // No system buffer needed for fullscreen quad
+	skr_renderer_draw      (&render_list, NULL, 0);  // No system buffer needed for fullscreen quad
 	skr_render_list_destroy(&render_list);
 	skr_renderer_end_pass  ();
 }

@@ -362,15 +362,16 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		.clear_depth = 1.0f,
 		.viewport    = {0, 0, (float)width, (float)height},
 		.scissor     = {0, 0, width, height},
-		.view_count  = sys_buffer.view_count,
+		.view_count       = sys_buffer.view_count,
+		.views_correlated = true,
 	};
-	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t), &su_view_desc);
+	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	skr_pass_submit(&pass);
 	skr_render_list_clear(&app->render_list);
 
 	// ImGui in separate immediate-mode pass
 	skr_tex_t* imgui_target = resolve_target ? resolve_target : color_target;
-	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0);
+	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1);
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
 	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
 	ImGui_ImplSkRenderer_RenderDrawData(width, height);

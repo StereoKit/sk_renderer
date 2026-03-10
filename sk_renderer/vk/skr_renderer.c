@@ -209,9 +209,19 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 	_skr_vk.flight_idx = _skr_vk.frame % SKR_MAX_FRAMES_IN_FLIGHT;
 }
 
-void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil) {
+void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask) {
 	// Require at least one attachment (color or depth)
 	if (!color && !depth) return;
+
+	// Validate multiview view count against device limits
+	if (view_mask) {
+		uint32_t view_count = 0;
+		for (uint32_t m = view_mask; m; m >>= 1) view_count += (m & 1);
+		if (view_count > _skr_vk.max_multiview_view_count) {
+			skr_log(skr_log_critical, "Multiview pass requires %u views, device supports %u", view_count, _skr_vk.max_multiview_view_count);
+			return;
+		}
+	}
 
 	// Lock pipeline cache for the duration of this render pass.
 	// This protects all pipeline get operations during drawing.
@@ -232,6 +242,8 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		.samples         = color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
 		.depth_store_op  = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op   = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+		.view_mask        = view_mask,
+		.correlation_mask = correlation_mask,
 	};
 	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 
@@ -428,6 +440,11 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	bool     is_array    = (to->flags & skr_tex_flags_array  ) != 0;
 	uint32_t layer_count = to->layer_count;
 
+	if ((is_cubemap || is_array) && layer_count > _skr_vk.max_multiview_view_count) {
+		skr_log(skr_log_critical, "Blit requires %u multiview layers, device supports %u", layer_count, _skr_vk.max_multiview_view_count);
+		return;
+	}
+
 	// Determine if this is a full-image blit or partial
 	bool is_full_blit = 
 		(bounds_px.w <= 0 || bounds_px.h <= 0) ||
@@ -525,78 +542,19 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	VkImageView   temp_view     = VK_NULL_HANDLE;
 	uint32_t      draw_instances = 1;
 
-	if ((is_cubemap || is_array) && !_skr_vk.has_viewport_layer) {
-		// Fallback: per-layer rendering when viewport layer extension is missing.
-		// Draw one layer at a time using firstInstance to pass the layer index
-		// (shader reads SV_InstanceID which maps to gl_InstanceIndex).
-		VkPipeline pipeline = _skr_pipeline_get(material->pipeline_material_idx, renderpass_idx, vert_idx);
-		if (pipeline == VK_NULL_HANDLE) {
+	if (is_cubemap || is_array) {
+		// Multiview rendering: single render pass broadcasts across all layers.
+		// Shaders read SV_ViewID (gl_ViewIndex) for the layer/face index.
+		rp_key.view_mask = (1u << layer_count) - 1;
+		renderpass_idx   = _skr_pipeline_register_renderpass_unlocked(&rp_key);
+		render_pass      = _skr_pipeline_get_renderpass(renderpass_idx);
+		if (render_pass == VK_NULL_HANDLE) {
 			_skr_cmd_release(ctx.cmd);
 			_skr_pipeline_unlock();
 			return;
 		}
 
-		for (uint32_t layer = 0; layer < layer_count; layer++) {
-			VkImageView layer_view = VK_NULL_HANDLE;
-			VkResult vr = vkCreateImageView(_skr_vk.device, &(VkImageViewCreateInfo){
-				.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-				.image      = to->image,
-				.viewType   = VK_IMAGE_VIEW_TYPE_2D,
-				.format     = skr_tex_fmt_to_native(to->format),
-				.subresourceRange = {
-					.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-					.baseMipLevel   = 0,
-					.levelCount     = 1,
-					.baseArrayLayer = layer,
-					.layerCount     = 1,
-				},
-			}, NULL, &layer_view);
-			if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (blit layer)"); continue; }
-
-			VkFramebuffer layer_fb = VK_NULL_HANDLE;
-			vr = vkCreateFramebuffer(_skr_vk.device, &(VkFramebufferCreateInfo){
-				.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				.renderPass      = render_pass,
-				.attachmentCount = 1,
-				.pAttachments    = &layer_view,
-				.width           = width,
-				.height          = height,
-				.layers          = 1,
-			}, NULL, &layer_fb);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (blit layer)");
-				vkDestroyImageView(_skr_vk.device, layer_view, NULL);
-				continue;
-			}
-
-			vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
-				.sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-				.renderPass  = render_pass,
-				.framebuffer = layer_fb,
-				.renderArea  = {{bounds_px.x, bounds_px.y}, {width, height}},
-			}, VK_SUBPASS_CONTENTS_INLINE);
-
-			vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){(float)bounds_px.x, (float)bounds_px.y, (float)width, (float)height, 0.0f, 1.0f});
-			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{bounds_px.x, bounds_px.y}, {width, height}});
-
-			_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                      _skr_pipeline_get_layout(material->pipeline_material_idx),
-			                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx),
-			                      writes, write_ct);
-
-			// firstInstance = layer so SV_InstanceID == layer in the shader
-			vkCmdDraw(ctx.cmd, 3, 1, 0, layer);
-			vkCmdEndRenderPass(ctx.cmd);
-
-			_skr_cmd_destroy_framebuffer(ctx.destroy_list, layer_fb);
-			_skr_cmd_destroy_image_view (ctx.destroy_list, layer_view);
-		}
-	} else if (is_cubemap || is_array) {
-		// Extension available: layered rendering with multi-layer framebuffer
-		// IMPORTANT: For framebuffer attachments with SV_RenderTargetArrayIndex, we must use
-		// VK_IMAGE_VIEW_TYPE_2D_ARRAY even for cubemaps. Cube views are for sampling, but for
-		// rendering to individual layers we treat the cubemap as a 6-layer 2D array.
+		// Use 2D_ARRAY view for framebuffer (even for cubemaps — cube views are for sampling)
 		VkResult vr = vkCreateImageView(_skr_vk.device, &(VkImageViewCreateInfo){
 			.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 			.image      = to->image,
@@ -624,7 +582,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			.pAttachments    = &temp_view,
 			.width           = width,
 			.height          = height,
-			.layers          = layer_count,
+			.layers          = 1,  // Multiview: layers=1, view_mask controls layer count
 		}, NULL, &framebuffer);
 		if (vr != VK_SUCCESS) {
 			SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer");
@@ -633,8 +591,6 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			_skr_pipeline_unlock();
 			return;
 		}
-
-		draw_instances = layer_count;  // One instance per layer
 
 		vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
 			.sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -654,7 +610,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx),
 			                      writes, write_ct);
 
-			vkCmdDraw(ctx.cmd, 3, draw_instances, 0, 0);
+			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
 		}
 
 		vkCmdEndRenderPass(ctx.cmd);
@@ -703,9 +659,8 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	_skr_pipeline_unlock();
 }
 
-void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_t system_data_size, int32_t instance_multiplier) {
+void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_t system_data_size) {
 	if (!list || list->count == 0) return;
-	instance_multiplier = (instance_multiplier < 1) ? 1 : instance_multiplier;
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 	VkCommandBuffer cmd = ctx.cmd;
@@ -883,13 +838,12 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		}
 
 		// Draw with instancing (using inlined mesh data)
-		uint32_t draw_instances = total_instances * instance_multiplier;
 		if (item->index_buffer != VK_NULL_HANDLE) {
 			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (VkIndexType)item->index_format);
 			uint32_t draw_index_count = item->index_count > 0 ? (uint32_t)item->index_count : item->ind_count;
-			vkCmdDrawIndexed(cmd, draw_index_count, draw_instances, item->first_index, item->vertex_offset, 0);
+			vkCmdDrawIndexed(cmd, draw_index_count, total_instances, item->first_index, item->vertex_offset, 0);
 		} else {
-			vkCmdDraw(cmd, item->vert_count, draw_instances, 0, 0);
+			vkCmdDraw(cmd, item->vert_count, total_instances, 0, 0);
 		}
 
 		i += batch_count;
@@ -1047,238 +1001,18 @@ uint64_t skr_renderer_get_cpu_time_us() {
 // Deferred Pass Assembly
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_pass_add_draw(skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size, const skr_pass_view_desc_t* opt_view_desc) {
+void skr_pass_add_draw(skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size) {
 	if (!pass || pass->draw_count >= SKR_PASS_MAX_DRAWS) return;
 
 	uint32_t idx = pass->draw_count++;
 	pass->draws[idx].list             = list;
 	pass->draws[idx].system_data      = system_data;
 	pass->draws[idx].system_data_size = system_data_size;
-	if (opt_view_desc) {
-		pass->draws[idx].view_desc = *opt_view_desc;
-	} else {
-		pass->draws[idx].view_desc = (skr_pass_view_desc_t){ .view_count_byte_offset = -1, .view_offset_byte_offset = -1 };
-	}
 }
 
 void skr_pass_add_postfx(skr_pass_t* pass, skr_material_t* postfx_material) {
 	if (!pass || pass->postfx_count >= SKR_PASS_MAX_POSTFX) return;
 	pass->postfx[pass->postfx_count++] = postfx_material;
-}
-
-// Internal: ensure per-layer 2D views exist for a multi-layer texture.
-// Called lazily when the multi-view fallback needs per-layer framebuffers
-// for textures that weren't created with layer_views (e.g. external/swapchain).
-static void _skr_ensure_layer_views(skr_tex_t* tex) {
-	if (!tex || tex->layer_views || tex->layer_count <= 1) return;
-
-	VkFormat vk_format = skr_tex_fmt_to_native(tex->format);
-	tex->layer_views = (VkImageView*)_skr_calloc(tex->layer_count, sizeof(VkImageView));
-	for (uint32_t i = 0; i < (uint32_t)tex->layer_count; i++) {
-		VkResult vr = vkCreateImageView(_skr_vk.device, &(VkImageViewCreateInfo){
-			.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.image    = tex->image,
-			.viewType = VK_IMAGE_VIEW_TYPE_2D,
-			.format   = vk_format,
-			.subresourceRange = {
-				.aspectMask     = tex->aspect_mask,
-				.baseMipLevel   = 0,
-				.levelCount     = 1,
-				.baseArrayLayer = i,
-				.layerCount     = 1,
-			},
-		}, NULL, &tex->layer_views[i]);
-		if (vr != VK_SUCCESS) {
-			skr_log(skr_log_warning, "Failed to create per-layer view %u for resolve target", i);
-			tex->layer_views[i] = VK_NULL_HANDLE;
-		}
-	}
-}
-
-// Internal: get or create a cached per-layer framebuffer for the multi-view fallback.
-// Uses color->layer_framebuffers[layer] for caching (similar to _skr_get_or_create_framebuffer).
-// Attachment order matches _skr_create_framebuffer: color, resolve, depth.
-static VkFramebuffer _skr_get_or_create_layer_framebuffer(VkDevice device, skr_tex_t* color, skr_tex_t* resolve, skr_tex_t* depth, uint32_t layer, VkRenderPass render_pass) {
-	// Ensure layer views exist for all textures that need them
-	_skr_ensure_layer_views(color);
-	_skr_ensure_layer_views(resolve);
-	_skr_ensure_layer_views(depth);
-
-	// Cache on resolve target when present (matches fast path fb_cache_target logic).
-	// This ensures framebuffers are invalidated when the swapchain image changes.
-	skr_tex_t* cache_target = resolve ? resolve : (color ? color : depth);
-	if (!cache_target || !cache_target->layer_views) return VK_NULL_HANDLE;
-
-	// Allocate framebuffer cache array if needed
-	if (!cache_target->layer_framebuffers) {
-		cache_target->layer_framebuffers = (VkFramebuffer*)_skr_calloc(cache_target->layer_count, sizeof(VkFramebuffer));
-	}
-
-	// Check if cached framebuffer is still valid for this render pass
-	if (cache_target->layer_framebuffers[layer] != VK_NULL_HANDLE && cache_target->layer_framebuffer_pass == render_pass) {
-		return cache_target->layer_framebuffers[layer];
-	}
-
-	// Render pass changed — destroy all cached layer framebuffers
-	if (cache_target->layer_framebuffer_pass != render_pass) {
-		for (uint32_t i = 0; i < cache_target->layer_count; i++) {
-			if (cache_target->layer_framebuffers[i] != VK_NULL_HANDLE) {
-				_skr_cmd_destroy_framebuffer(NULL, cache_target->layer_framebuffers[i]);
-				cache_target->layer_framebuffers[i] = VK_NULL_HANDLE;
-			}
-		}
-		cache_target->layer_framebuffer_pass = render_pass;
-	}
-
-	// Build attachment list from single-layer views
-	// Order: color, resolve, depth (matches _skr_create_framebuffer)
-	VkImageView attachments[3];
-	uint32_t    attachment_count = 0;
-	uint32_t    width  = 1, height = 1;
-
-	if (color) {
-		attachments[attachment_count++] = color->layer_views[layer];
-		width  = color->size.x;
-		height = color->size.y;
-	}
-	if (resolve && resolve->layer_views) {
-		attachments[attachment_count++] = resolve->layer_views[layer];
-	}
-	if (depth && depth->layer_views) {
-		attachments[attachment_count++] = depth->layer_views[layer];
-		if (!color) { width = depth->size.x; height = depth->size.y; }
-	} else if (depth) {
-		attachments[attachment_count++] = depth->view;
-		if (!color) { width = depth->size.x; height = depth->size.y; }
-	}
-
-	VkFramebuffer fb = VK_NULL_HANDLE;
-	VkResult vr = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
-		.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-		.renderPass      = render_pass,
-		.attachmentCount = attachment_count,
-		.pAttachments    = attachments,
-		.width           = width,
-		.height          = height,
-		.layers          = 1,
-	}, NULL, &fb);
-	SKR_VK_CHECK_RET(vr, "vkCreateFramebuffer (layer)", VK_NULL_HANDLE);
-
-	cache_target->layer_framebuffers[layer] = fb;
-	return fb;
-}
-
-// Internal: begin a render pass targeting a single layer of an array texture.
-// Mirrors skr_renderer_begin_pass but uses per-layer cached views/framebuffers.
-// Supports renderpass-integrated MSAA resolve when opt_resolve is provided.
-// Paired with _skr_renderer_end_pass_layer().
-static void _skr_renderer_begin_pass_layer(skr_tex_t* color, skr_tex_t* opt_resolve, skr_tex_t* depth, uint32_t layer, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil) {
-	if (!color && !depth) return;
-
-	_skr_pipeline_lock();
-
-	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
-	_skr_flush_texture_transitions(cmd);
-
-	bool use_resolve = opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT;
-
-	// Register renderpass (single-layer, with resolve if MSAA)
-	skr_pipeline_renderpass_key_t rp_key = {
-		.color_format   = color       ? skr_tex_fmt_to_native(color->format)       : VK_FORMAT_UNDEFINED,
-		.depth_format   = depth       ? skr_tex_fmt_to_native(depth->format)       : VK_FORMAT_UNDEFINED,
-		.resolve_format = use_resolve ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
-		.samples        = color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
-		.depth_store_op = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-		.color_load_op  = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-	};
-	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
-
-	VkRenderPass render_pass = _skr_pipeline_get_renderpass(_skr_vk.current_renderpass_idx);
-	if (render_pass == VK_NULL_HANDLE) { _skr_cmd_release(cmd); _skr_pipeline_unlock(); return; }
-
-	VkFramebuffer framebuffer = _skr_get_or_create_layer_framebuffer(_skr_vk.device, color, use_resolve ? opt_resolve : NULL, depth, layer, render_pass);
-	if (framebuffer == VK_NULL_HANDLE) { _skr_cmd_release(cmd); _skr_pipeline_unlock(); return; }
-
-	// Depth transition (same as skr_renderer_begin_pass)
-	if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
-		_skr_tex_transition(cmd, depth,
-			VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-			VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-			VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
-	}
-	if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
-		_skr_tex_transition(cmd, color,
-			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-	}
-
-	// Clear values — order: color, [resolve], depth
-	VkClearValue clear_values[3];
-	uint32_t     clear_value_count = 0;
-	if (color) {
-		if (clear & skr_clear_color) {
-			clear_values[clear_value_count] = (VkClearValue){ .color = {.float32 = {clear_color.x, clear_color.y, clear_color.z, clear_color.w}} };
-		}
-		clear_value_count++;
-
-		if (use_resolve) {
-			// Resolve has loadOp = DONT_CARE, but still needs an entry
-			clear_value_count++;
-		}
-	}
-	if (depth) {
-		if (clear & (skr_clear_depth | skr_clear_stencil)) {
-			clear_values[clear_value_count] = (VkClearValue){ .depthStencil = {.depth = clear_depth, .stencil = clear_stencil} };
-		}
-		clear_value_count++;
-	}
-
-	uint32_t render_width  = color ? color->size.x : (depth ? depth->size.x : 0);
-	uint32_t render_height = color ? color->size.y : (depth ? depth->size.y : 0);
-
-	vkCmdBeginRenderPass(cmd, &(VkRenderPassBeginInfo){
-		.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-		.renderPass      = render_pass,
-		.framebuffer     = framebuffer,
-		.clearValueCount = clear_value_count,
-		.pClearValues    = clear_values,
-		.renderArea      = { .extent = {render_width, render_height} },
-	}, VK_SUBPASS_CONTENTS_INLINE);
-
-	if (color)      _skr_tex_transition_notify_layout(color,       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	if (use_resolve) _skr_tex_transition_notify_layout(opt_resolve, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	if (depth)      _skr_tex_transition_notify_layout(depth,       VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-
-	_skr_vk.current_color_texture = color;
-	_skr_vk.current_depth_texture = depth;
-
-	_skr_cmd_release(cmd);
-}
-
-// Internal: end a per-layer render pass without shader-read transitions.
-// Transitions are deferred until all layers are rendered (the caller does them).
-static void _skr_renderer_end_pass_layer(void) {
-	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
-	vkCmdEndRenderPass(cmd);
-	_skr_vk.current_color_texture = NULL;
-	_skr_vk.current_depth_texture = NULL;
-	_skr_cmd_release(cmd);
-	_skr_pipeline_unlock();
-}
-
-// Internal: run a single render pass using begin_pass/draw/end_pass (fast path)
-static void _skr_pass_render_fast(skr_pass_t* pass) {
-	skr_renderer_begin_pass(pass->color, pass->depth, pass->resolve, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil);
-	skr_renderer_set_viewport(pass->viewport);
-	skr_renderer_set_scissor (pass->scissor);
-
-	int32_t view_count = pass->view_count > 0 ? pass->view_count : 1;
-	for (uint32_t i = 0; i < pass->draw_count; i++) {
-		skr_renderer_draw(pass->draws[i].list, pass->draws[i].system_data, pass->draws[i].system_data_size, view_count);
-	}
-
-	skr_renderer_end_pass();
 }
 
 void skr_pass_submit(skr_pass_t* pass) {
@@ -1291,62 +1025,19 @@ void skr_pass_submit(skr_pass_t* pass) {
 		skr_log(skr_log_warning, "skr_pass_submit: postfx subpasses not yet implemented, ignoring %u postfx", pass->postfx_count);
 	}
 
-	int32_t view_count = pass->view_count > 0 ? pass->view_count : 1;
-	bool needs_fallback = !_skr_vk.has_viewport_layer && view_count > 1;
+	// Always use multiview: view_mask=1 for single-view, 0x3 for stereo, etc.
+	// The driver handles broadcasting across views; shaders use SV_ViewID.
+	int32_t  view_count = pass->view_count > 0 ? pass->view_count : 1;
+	uint32_t view_mask  = (1u << view_count) - 1;
 
-	if (!needs_fallback) {
-		// Fast path: single render pass, use instance multiplier for multi-view
-		_skr_pass_render_fast(pass);
-	} else {
-		// Fallback path: one render pass per view layer.
-		// Set view_offset so shaders index into the correct view slot directly.
-		uint32_t max_sys_size = 0;
-		for (uint32_t d = 0; d < pass->draw_count; d++) {
-			if (pass->draws[d].system_data_size > max_sys_size)
-				max_sys_size = pass->draws[d].system_data_size;
-		}
-		uint8_t* sys_copy = (uint8_t*)_skr_malloc(max_sys_size);
+	uint32_t correlation = pass->views_correlated ? view_mask : 0;
+	skr_renderer_begin_pass(pass->color, pass->depth, pass->resolve, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil, view_mask, correlation);
+	skr_renderer_set_viewport(pass->viewport);
+	skr_renderer_set_scissor (pass->scissor);
 
-		for (int32_t v = 0; v < view_count; v++) {
-			_skr_renderer_begin_pass_layer(pass->color, pass->resolve, pass->depth, (uint32_t)v,
-				pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil);
-			skr_renderer_set_viewport(pass->viewport);
-			skr_renderer_set_scissor (pass->scissor);
-
-			for (uint32_t d = 0; d < pass->draw_count; d++) {
-				skr_pass_draw_t*      draw = &pass->draws[d];
-				skr_pass_view_desc_t* vd   = &draw->view_desc;
-
-				memcpy(sys_copy, draw->system_data, draw->system_data_size);
-				if (vd->view_offset_byte_offset >= 0)
-					*(uint32_t*)(sys_copy + vd->view_offset_byte_offset) = (uint32_t)v;
-				if (vd->view_count_byte_offset >= 0)
-					*(uint32_t*)(sys_copy + vd->view_count_byte_offset) = 1;
-				skr_renderer_draw(draw->list, sys_copy, draw->system_data_size, 1);
-			}
-
-			_skr_renderer_end_pass_layer();
-		}
-		_skr_free(sys_copy);
-
-		// Transition readable textures to shader-read after all layers are done
-		VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
-		if (pass->resolve && (pass->resolve->flags & skr_tex_flags_readable)) {
-			_skr_tex_transition_for_shader_read(cmd, pass->resolve,
-				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		}
-		if (pass->color && (pass->color->flags & skr_tex_flags_readable)) {
-			_skr_tex_transition_for_shader_read(cmd, pass->color,
-				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		}
-		if (pass->depth && (pass->depth->flags & skr_tex_flags_readable)) {
-			bool is_msaa_depth = pass->depth->samples > VK_SAMPLE_COUNT_1_BIT &&
-			                     (pass->depth->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT);
-			if (!is_msaa_depth) {
-				_skr_tex_transition_for_shader_read(cmd, pass->depth,
-					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-			}
-		}
-		_skr_cmd_release(cmd);
+	for (uint32_t i = 0; i < pass->draw_count; i++) {
+		skr_renderer_draw(pass->draws[i].list, pass->draws[i].system_data, pass->draws[i].system_data_size);
 	}
+
+	skr_renderer_end_pass();
 }

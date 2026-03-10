@@ -87,16 +87,13 @@ struct psIn {
 	float4 color         : COLOR0;
 	float3 gi_irradiance : TEXCOORD1;  // GI irradiance evaluated per-vertex
 	float4 shadow_uv     : TEXCOORD2;  // .xyz = shadow coords, .w = ndotl
-	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
 	float3 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world).xyz;
@@ -126,7 +123,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	float4 shadow_pos  = mul(float4(world_pos + bias, 1), shadow_transform);
 	output.shadow_uv   = float4(shadow_pos.xy * float2(0.5, -0.5) + 0.5, shadow_pos.z / shadow_pos.w, ndotl);
 
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

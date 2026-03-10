@@ -73,16 +73,9 @@ typedef struct {
 	float4   screen_size;                   // .xy = width/height, .zw = 1/width, 1/height
 	float    time;                          // Time in seconds
 	uint32_t view_count;                    // Number of active views (1-6)
-	uint32_t view_offset;                   // Base view index (set by pass system in fallback)
+	uint32_t view_offset;                   // Unused, kept for ABI compatibility
 	uint32_t _pad;
 } su_system_buffer_t;
-
-// View descriptor for su_system_buffer_t — tells the pass system where to
-// write view_count and view_offset for multi-view fallback rendering.
-static const skr_pass_view_desc_t su_view_desc = {
-	.view_count_byte_offset  = offsetof(su_system_buffer_t, view_count),
-	.view_offset_byte_offset = offsetof(su_system_buffer_t, view_offset),
-};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Common Vertex Format

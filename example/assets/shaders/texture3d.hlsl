@@ -18,15 +18,12 @@ struct psIn {
 	float4 pos       : SV_POSITION;
 	float3 local_pos : TEXCOORD0;
 	float3 cam_local : TEXCOORD1;
-	SKR_LAYER_OUTPUT
 };
 
 Texture3D    tex         : register(t0);
 SamplerState tex_sampler : register(s0);
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	float4x4 world     = inst[ids.inst].world;
 	float4x4 world_inv = inst[ids.inst].world_inv;
 
@@ -39,7 +36,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	output.pos       = mul(world_position, viewproj[ids.view]);
 	output.local_pos = input.pos;
 	output.cam_local = cam_local;
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

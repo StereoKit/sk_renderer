@@ -33,7 +33,6 @@ struct psIn {
 	float3 world_pos    : TEXCOORD2;
 	float  shadow_ndotl : TEXCOORD3;
 	float3 color        : COLOR0;
-	SKR_LAYER_OUTPUT
 };
 
 Texture2D              tex              : register(t3);
@@ -41,9 +40,7 @@ SamplerState           tex_sampler      : register(s3);
 Texture2D              shadow_map       : register(t14);
 SamplerComparisonState shadow_map_sampler : register(s14);
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 	float4 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world);
 	output.pos = mul(world_pos, viewproj[ids.view]);
@@ -72,7 +69,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	float diffuse = saturate(output.shadow_ndotl) * 0.8;
 	output.color = (ambient + diffuse) * input.color.rgb;
 
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

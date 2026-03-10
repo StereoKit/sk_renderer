@@ -18,16 +18,12 @@ struct vsIn {
 
 struct psIn {
 	float4 pos : SV_POSITION;
-	SKR_LAYER_OUTPUT
 };
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 	output.pos = mul(float4(input.pos, 1), inst[ids.inst].world);
 	output.pos = mul(output.pos, viewproj[ids.view]);
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

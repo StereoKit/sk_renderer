@@ -234,9 +234,10 @@ static void _scene_array_texture_render(scene_t* base, int32_t width, int32_t he
 		.clear_depth = 1.0f,
 		.viewport    = {0, 0, (float)w, (float)h},
 		.scissor     = {0, 0, w, h},
-		.view_count  = sys_buffer.view_count,
+		.view_count       = sys_buffer.view_count,
+		.views_correlated = true,
 	};
-	skr_pass_add_draw(&stereo_pass, &scene->render_list, &sys_buffer, sizeof(su_system_buffer_t), &su_view_desc);
+	skr_pass_add_draw(&stereo_pass, &scene->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	skr_pass_submit(&stereo_pass);
 	skr_render_list_clear(&scene->render_list);
 

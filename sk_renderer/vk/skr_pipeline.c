@@ -604,8 +604,18 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		},
 	};
 
+	// Chain multiview info when view_mask is set
+	VkRenderPassMultiviewCreateInfo multiview_info = {
+		.sType                = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+		.subpassCount         = 1,
+		.pViewMasks           = &key->view_mask,
+		.correlationMaskCount = key->correlation_mask ? 1 : 0,
+		.pCorrelationMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
+	};
+
 	VkRenderPassCreateInfo render_pass_info = {
 		.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		.pNext           = key->view_mask != 0 ? &multiview_info : NULL,
 		.attachmentCount = attachment_count,
 		.pAttachments    = attachments,
 		.subpassCount    = 1,
@@ -819,17 +829,8 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 		.subpass             = 0,
 	};
 
-	VkPipeline pipeline;
-	VkResult   result = vkCreateGraphicsPipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &pipeline);
-	if (result != VK_SUCCESS) {
-		skr_log(skr_log_critical, "Failed to create graphics pipeline");
-		return VK_NULL_HANDLE;
-	}
-
-	// Generate debug name based on all three pipeline dimensions: material + renderpass + vertex format
+	// Build debug name before creation so it's available for error logging
 	char name[256];
-
-	// Material dimension (shader + blend mode)
 	const char* shader_name = (mat_key->shader->meta && mat_key->shader->meta->name[0])
 		? mat_key->shader->meta->name
 		: "shader";
@@ -841,6 +842,14 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 	strcat(name, ")_(");
 	_skr_append_vertex_format    (name, sizeof(name), vert_type->components, vert_type->component_count);
 	strcat(name, ")");
+
+	VkPipeline pipeline;
+	VkResult   result = vkCreateGraphicsPipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &pipeline);
+	if (result != VK_SUCCESS) {
+		skr_log(skr_log_critical, "Failed to create graphics pipeline: %s (VkResult %d, stages %u, view_mask 0x%x)", name, result, stage_count, rp_key->view_mask);
+		return VK_NULL_HANDLE;
+	}
+
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_PIPELINE, (uint64_t)pipeline, name);
 
 	return pipeline;
@@ -861,10 +870,9 @@ VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass,
 		attachments[attachment_count++] = color->view;
 		width                           = color->size.x;
 		height                          = color->size.y;
-		// For array textures, layer_count holds the number of layers
-		if (color->flags & skr_tex_flags_array) {
-			layers = color->layer_count;
-		}
+		// Multiview renderpasses require layers=1; the view_mask controls
+		// which array layers are rendered to. The image view already covers
+		// all layers, so we always use layers=1 here.
 	}
 
 	// Resolve attachment comes after color but before depth
@@ -878,10 +886,7 @@ VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass,
 			width  = depth->size.x;
 			height = depth->size.y;
 		}
-		// Depth buffer should have same layer count as color
-		if (depth->flags & skr_tex_flags_array) {
-			layers = depth->layer_count;
-		}
+		// Multiview handles array layers via view_mask, so layers stays 1
 	}
 
 	VkFramebufferCreateInfo framebuffer_info = {

@@ -1040,32 +1040,6 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	// Store texture properties
 	out_tex->sampler = _skr_sampler_cache_acquire(sampler);
 
-	// Create per-layer 2D views for multi-view fallback rendering.
-	// Only needed for writeable array textures when the viewport layer
-	// extension is absent — the fallback renders one layer at a time.
-	if (!_skr_vk.has_viewport_layer && out_tex->layer_count > 1 && (flags & skr_tex_flags_writeable)) {
-		out_tex->layer_views = (VkImageView*)_skr_calloc(out_tex->layer_count, sizeof(VkImageView));
-		for (uint32_t i = 0; i < out_tex->layer_count; i++) {
-			vr = vkCreateImageView(_skr_vk.device, &(VkImageViewCreateInfo){
-				.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-				.image    = out_tex->image,
-				.viewType = VK_IMAGE_VIEW_TYPE_2D,
-				.format   = vk_format,
-				.subresourceRange = {
-					.aspectMask     = out_tex->aspect_mask,
-					.baseMipLevel   = 0,
-					.levelCount     = 1,
-					.baseArrayLayer = i,
-					.layerCount     = 1,
-				},
-			}, NULL, &out_tex->layer_views[i]);
-			if (vr != VK_SUCCESS) {
-				skr_log(skr_log_warning, "Failed to create per-layer view %u", i);
-				out_tex->layer_views[i] = VK_NULL_HANDLE;
-			}
-		}
-	}
-
 	return skr_err_success;
 }
 
@@ -1074,18 +1048,6 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
-
-	// Destroy per-layer views and framebuffers (multi-view fallback cache)
-	if (ref_tex->layer_views) {
-		for (uint32_t i = 0; i < ref_tex->layer_count; i++)
-			_skr_cmd_destroy_image_view(NULL, ref_tex->layer_views[i]);
-		_skr_free(ref_tex->layer_views);
-	}
-	if (ref_tex->layer_framebuffers) {
-		for (uint32_t i = 0; i < ref_tex->layer_count; i++)
-			_skr_cmd_destroy_framebuffer(NULL, ref_tex->layer_framebuffers[i]);
-		_skr_free(ref_tex->layer_framebuffers);
-	}
 
 	// Only release from sampler cache if we acquired from it (not YCbCr immutable samplers)
 	if (ref_tex->ycbcr_sampler == VK_NULL_HANDLE) {
@@ -1293,6 +1255,10 @@ static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t*
 }
 
 static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, int32_t mip_levels, const skr_shader_t* fragment_shader) {
+	if (ref_tex->layer_count > 1 && ref_tex->layer_count > _skr_vk.max_multiview_view_count) {
+		skr_log(skr_log_critical, "Mipgen requires %u multiview layers, device supports %u", ref_tex->layer_count, _skr_vk.max_multiview_view_count);
+		return;
+	}
 	if (!skr_shader_is_valid(fragment_shader)) {
 		skr_log(skr_log_warning, "Invalid fragment shader provided for mipmap generation");
 		return;
@@ -1322,7 +1288,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	_skr_pipeline_lock();
 
 	// Register render pass format with pipeline system (cached for reuse)
-	VkFormat format = skr_tex_fmt_to_native(ref_tex->format);
+	// Use multiview for multi-layer textures (cubemaps, arrays)
+	VkFormat format    = skr_tex_fmt_to_native(ref_tex->format);
+	uint32_t view_mask = ref_tex->layer_count > 1 ? (1u << ref_tex->layer_count) - 1 : 0;
 	skr_pipeline_renderpass_key_t rp_key = {
 		.color_format   = format,
 		.depth_format   = VK_FORMAT_UNDEFINED,
@@ -1330,6 +1298,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		.samples        = VK_SAMPLE_COUNT_1_BIT,
 		.depth_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,  // Full blit
+		.view_mask      = view_mask,
 	};
 	int32_t renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	int32_t vert_idx       = _skr_pipeline_register_vertformat_unlocked((skr_vert_type_t){0});
@@ -1406,9 +1375,6 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		skr_buffer_create(all_params, num_mips, aligned_stride, skr_buffer_type_constant, skr_use_static, &params_buffer);
 		_skr_free(all_params);
 	}
-
-	// Does this texture need per-layer fallback?
-	bool needs_layer_fallback = !_skr_vk.has_viewport_layer && ref_tex->layer_count > 1;
 
 	// Ensure mip 0 data is visible — the upload may have been in a prior
 	// command buffer submission, and layout tracking alone doesn't guarantee
@@ -1504,68 +1470,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			continue;
 		}
 
-		if (needs_layer_fallback) {
-			// Per-layer fallback: render each face/layer separately
-			for (uint32_t layer = 0; layer < ref_tex->layer_count; layer++) {
-				VkImageView layer_view = VK_NULL_HANDLE;
-				VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
-					.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-					.image      = ref_tex->image,
-					.viewType   = VK_IMAGE_VIEW_TYPE_2D,
-					.format     = format,
-					.subresourceRange = {
-						.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-						.baseMipLevel   = mip,
-						.levelCount     = 1,
-						.baseArrayLayer = layer,
-						.layerCount     = 1,
-					},
-				}, NULL, &layer_view);
-				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip layer)"); continue; }
-
-				VkFramebuffer layer_fb = VK_NULL_HANDLE;
-				vr = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
-					.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-					.renderPass      = render_pass,
-					.attachmentCount = 1,
-					.pAttachments    = &layer_view,
-					.width           = mip_width,
-					.height          = mip_height,
-					.layers          = 1,
-				}, NULL, &layer_fb);
-				if (vr != VK_SUCCESS) {
-					SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (mip layer)");
-					vkDestroyImageView(device, layer_view, NULL);
-					continue;
-				}
-
-				vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
-					.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-					.renderPass      = render_pass,
-					.framebuffer     = layer_fb,
-					.renderArea      = {{0, 0}, {mip_width, mip_height}},
-					.clearValueCount = 0,
-				}, VK_SUBPASS_CONTENTS_INLINE);
-
-				vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f});
-				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
-
-				_skr_bind_descriptors(
-					ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-					_skr_pipeline_get_layout           (material.pipeline_material_idx),
-					_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
-					writes, write_ct);
-
-				// firstInstance = layer so SV_InstanceID == layer in the shader
-				vkCmdDraw(ctx.cmd, 3, 1, 0, layer);
-				vkCmdEndRenderPass(ctx.cmd);
-
-				_skr_cmd_destroy_framebuffer(ctx.destroy_list, layer_fb);
-				_skr_cmd_destroy_image_view (ctx.destroy_list, layer_view);
-			}
-		} else {
-			// Fast path: multi-layer framebuffer with SV_RenderTargetArrayIndex
+		{
+			// Multiview mipgen: single renderpass broadcasts across all layers.
+			// For single-layer textures, this is a regular non-multiview renderpass.
 			VkImageView mip_view = VK_NULL_HANDLE;
 			{
 				// For framebuffer attachments, use 2D_ARRAY even for cubemaps
@@ -1598,7 +1505,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 					.pAttachments    = &mip_view,
 					.width           = mip_width,
 					.height          = mip_height,
-					.layers          = ref_tex->layer_count,
+					.layers          = 1,  // Multiview: layers=1, view_mask controls layer count
 				}, NULL, &framebuffer);
 				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (mip)"); continue; }
 				_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
@@ -1622,7 +1529,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 				_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
 				writes, write_ct);
 
-			vkCmdDraw(ctx.cmd, 3, ref_tex->layer_count, 0, 0);
+			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
 			vkCmdEndRenderPass(ctx.cmd);
 		}
 
@@ -2095,23 +2002,6 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 
 	if (old_view != VK_NULL_HANDLE) {
 		_skr_cmd_destroy_image_view(NULL, old_view);
-	}
-
-	// Invalidate per-layer views and framebuffers — they reference the old image
-	if (ref_tex->layer_views) {
-		for (uint32_t i = 0; i < (uint32_t)ref_tex->layer_count; i++)
-			_skr_cmd_destroy_image_view(NULL, ref_tex->layer_views[i]);
-		_skr_free(ref_tex->layer_views);
-		ref_tex->layer_views = NULL;
-	}
-	if (ref_tex->layer_framebuffers) {
-		for (uint32_t i = 0; i < (uint32_t)ref_tex->layer_count; i++) {
-			if (ref_tex->layer_framebuffers[i] != VK_NULL_HANDLE)
-				_skr_cmd_destroy_framebuffer(NULL, ref_tex->layer_framebuffers[i]);
-		}
-		_skr_free(ref_tex->layer_framebuffers);
-		ref_tex->layer_framebuffers     = NULL;
-		ref_tex->layer_framebuffer_pass = VK_NULL_HANDLE;
 	}
 
 	// Update layout tracking

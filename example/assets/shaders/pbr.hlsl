@@ -72,16 +72,13 @@ struct psIn {
 	float4 color      : COLOR0;
 	float3 world_pos  : TEXCOORD1;
 	float3 view_dir   : TEXCOORD2;
-	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
 	// Transform to world space
@@ -98,7 +95,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	// Calculate view direction
 	output.view_dir = cam_pos[ids.view].xyz - output.world_pos;
 
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

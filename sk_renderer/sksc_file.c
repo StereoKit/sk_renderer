@@ -131,20 +131,10 @@ sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;
 
-	// Header: stage_count(u16) + variant_count(u16)
-	uint16_t stage_count_16   = 0;
-	uint16_t variant_count_16 = 0;
-	memcpy(&stage_count_16,   &bytes[at], sizeof(stage_count_16));   at += sizeof(stage_count_16);
-	memcpy(&variant_count_16, &bytes[at], sizeof(variant_count_16)); at += sizeof(variant_count_16);
-	out_file->stage_count   = stage_count_16;
-	out_file->variant_count = variant_count_16;
+	memcpy(&out_file->stage_count, &bytes[at], sizeof(out_file->stage_count)); at += sizeof(out_file->stage_count);
+	out_file->stages = (sksc_shader_file_stage_t*)malloc(sizeof(sksc_shader_file_stage_t) * out_file->stage_count);
+	if (out_file->stages == NULL) return sksc_result_out_of_memory;
 
-	// Allocate stages and variants
-	out_file->stages   = (sksc_shader_file_stage_t  *)malloc(sizeof(sksc_shader_file_stage_t  ) * out_file->stage_count);
-	out_file->variants = (sksc_shader_file_variant_t*)malloc(sizeof(sksc_shader_file_variant_t) * out_file->variant_count);
-	if (out_file->stages == NULL || out_file->variants == NULL) return sksc_result_out_of_memory;
-
-	// Meta (shared across all variants)
 	out_file->meta = (sksc_shader_meta_t*)malloc(sizeof(sksc_shader_meta_t));
 	if (out_file->meta == NULL) return sksc_result_out_of_memory;
 	*out_file->meta = (sksc_shader_meta_t){0};
@@ -152,16 +142,6 @@ sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_
 	sksc_shader_meta_reference(out_file->meta);
 	at = _sksc_load_meta(bytes, at, out_file->meta);
 
-	// Variants
-	for (uint32_t i = 0; i < out_file->variant_count; i++) {
-		sksc_shader_file_variant_t *v = &out_file->variants[i];
-		memcpy(&v->variant_id,    &bytes[at], sizeof(v->variant_id));    at += sizeof(v->variant_id);
-		memcpy(&v->vertex_stage,  &bytes[at], sizeof(v->vertex_stage));  at += sizeof(v->vertex_stage);
-		memcpy(&v->pixel_stage,   &bytes[at], sizeof(v->pixel_stage));   at += sizeof(v->pixel_stage);
-		memcpy(&v->compute_stage, &bytes[at], sizeof(v->compute_stage)); at += sizeof(v->compute_stage);
-	}
-
-	// Stages (deduplicated pool)
 	for (uint32_t i = 0; i < out_file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &out_file->stages[i];
 		memcpy(&stage->language,  &bytes[at], sizeof(stage->language));  at += sizeof(stage->language);
@@ -186,26 +166,8 @@ void sksc_shader_file_destroy(sksc_shader_file_t *ref_file) {
 		free(ref_file->stages[i].code);
 	}
 	free(ref_file->stages);
-	free(ref_file->variants);
 	sksc_shader_meta_release(ref_file->meta);
 	*ref_file = (sksc_shader_file_t){0};
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-const sksc_shader_file_variant_t* sksc_shader_file_get_variant(const sksc_shader_file_t *file, sksc_variant_ variant) {
-	// Search for exact match
-	for (uint32_t i = 0; i < file->variant_count; i++) {
-		if (file->variants[i].variant_id == (uint16_t)variant)
-			return &file->variants[i];
-	}
-	// Fall back to default variant
-	for (uint32_t i = 0; i < file->variant_count; i++) {
-		if (file->variants[i].variant_id == (uint16_t)sksc_variant_default)
-			return &file->variants[i];
-	}
-	// Last resort: first variant
-	return file->variant_count > 0 ? &file->variants[0] : NULL;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

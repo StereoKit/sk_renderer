@@ -31,6 +31,14 @@ typedef struct {
 	VkSampleCountFlagBits samples;
 	VkAttachmentStoreOp   depth_store_op;   // How to store depth (STORE or DONT_CARE)
 	VkAttachmentLoadOp    color_load_op;    // How to load color (LOAD, CLEAR, or DONT_CARE)
+	uint32_t              view_mask;        // 0 = single-view, non-zero = multiview (e.g. 0x3 for stereo)
+	uint32_t              correlation_mask; // Bitmask of views that see the same geometry from different
+	                                        // viewpoints (e.g. VR stereo eyes). The driver may reuse
+	                                        // vertex processing, clipping, and binning across correlated
+	                                        // views. Set to view_mask for stereo VR (0x3 for 2 eyes),
+	                                        // 0 for cubemap faces (0x3F view_mask, 0x0 correlation) or
+	                                        // independent array layers where each view sees different
+	                                        // content. Single-view (view_mask=0x1) should use 0x1.
 } skr_pipeline_renderpass_key_t;
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
@@ -180,11 +188,11 @@ typedef struct {
 	bool                     has_external_memory_dma_buf; // VK_EXT_external_memory_dma_buf
 	bool                     has_drm_format_modifier;     // VK_EXT_image_drm_format_modifier
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
-	bool                     has_viewport_layer;          // VK_EXT_shader_viewport_index_layer
 	bool                     initialized;
+	uint32_t                 max_multiview_view_count;    // From VkPhysicalDeviceMultiviewProperties
 
 	// Capability system (runtime-queried feature support)
-	bool                     capabilities[skr_capability_count_];
+	bool                     capabilities[skr_capability_max];
 
 	// Memory allocators
 	void*                  (*malloc_func) (size_t size);

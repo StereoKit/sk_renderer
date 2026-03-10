@@ -50,16 +50,13 @@ struct psIn {
 	float4 pos       : SV_POSITION;
 	float3 normal    : NORMAL0;
 	float3 color     : TEXCOORD0;
-	SKR_LAYER_OUTPUT
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, skr_input_t sys) {
-	skr_ids_t ids = skr_resolve_ids(sys);
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
 	float3 center = inst[ids.inst].pos;
@@ -74,7 +71,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 		output.pos    = asfloat(0x7FC00000); // NaN kills the primitive
 		output.normal = float3(0, 0, 0);
 		output.color  = float3(0, 0, 0);
-		SKR_SET_LAYER(output, ids.view);
 		return output;
 	}
 
@@ -84,7 +80,6 @@ psIn vs(vsIn input, skr_input_t sys) {
 	float3 world_pos = input.pos * cell_size + center;
 	output.pos       = mul(float4(world_pos, 1), viewproj[ids.view]);
 	output.normal    = input.norm;
-	SKR_SET_LAYER(output, ids.view);
 	return output;
 }
 

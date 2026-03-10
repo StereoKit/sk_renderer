@@ -148,6 +148,11 @@ bool skr_init(skr_settings_t settings) {
 	VkResult vr = volkInitialize();
 	SKR_VK_CHECK_RET(vr, volkInitialize, false);
 
+	// Save global vkGetInstanceProcAddr before volkLoadInstance replaces it.
+	// OpenXR runtimes (Quest) call vkGetInstanceProcAddr(NULL, ...) which only
+	// works with the global loader version, not the instance-specific one.
+	PFN_vkGetInstanceProcAddr global_get_instance_proc_addr = vkGetInstanceProcAddr;
+
 	///////////////////////////////////////////////////////////////////////////
 	// Extension definitions
 	///////////////////////////////////////////////////////////////////////////
@@ -167,7 +172,6 @@ bool skr_init(skr_settings_t settings) {
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 	};
 	const char* optional_device_exts[] = {
-		VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME, // Our primary multi-view rendering strategy
 		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,          // External memory extensions for GL interop and Android Hardware Buffer
 		VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,     // DMA-BUF import extensions
 		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
@@ -300,7 +304,7 @@ bool skr_init(skr_settings_t settings) {
 	if (settings.instance_create_callback) {
 		skr_instance_create_info_t create_info = {
 			.instance_create_info   = &instance_info,
-			.get_instance_proc_addr = vkGetInstanceProcAddr,
+			.get_instance_proc_addr = global_get_instance_proc_addr,
 		};
 		_skr_vk.instance = (VkInstance)settings.instance_create_callback(&create_info, settings.instance_create_user_data);
 		if (_skr_vk.instance == VK_NULL_HANDLE) {
@@ -586,13 +590,11 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_android_hardware_buffer = false;
 	_skr_vk.has_external_memory_dma_buf = false;
 	_skr_vk.has_drm_format_modifier     = false;
-	_skr_vk.has_viewport_layer          = false;
 	bool has_image_format_list          = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
 		if (_skr_ext_available(optional_device_exts[i], available_device_exts, available_device_ext_count)) {
 			device_exts[device_ext_count++] = optional_device_exts[i];
 			if (strcmp(optional_device_exts[i], VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME            ) == 0) _skr_vk.has_push_descriptors        = true;
-			if (strcmp(optional_device_exts[i], VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME) == 0) _skr_vk.has_viewport_layer           = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME         ) == 0) _skr_vk.has_external_memory_fd       = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
@@ -628,10 +630,6 @@ bool skr_init(skr_settings_t settings) {
 	if (!_skr_vk.has_push_descriptors) {
 		skr_log(skr_log_info, "Device extension '%s' not available, using descriptor set fallback", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 	}
-	if (!_skr_vk.has_viewport_layer) {
-		skr_log(skr_log_warning, "Device extension '%s' not available, multi-view fallback will be used", VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
-	}
-
 	// Query available device features
 	VkPhysicalDeviceFeatures available_features;
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
@@ -648,9 +646,28 @@ bool skr_init(skr_settings_t settings) {
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
 	};
 
+	// Multiview is Vulkan 1.1 core - always enable for multi-view rendering
+	VkPhysicalDeviceMultiviewFeatures multiview_features = {
+		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+		.multiview = VK_TRUE,
+	};
+
+	// Query multiview properties
+	VkPhysicalDeviceMultiviewProperties multiview_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES,
+	};
+	VkPhysicalDeviceProperties2 props2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &multiview_props,
+	};
+	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
+	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
+	skr_log(skr_log_info, "Multiview: max %u views", _skr_vk.max_multiview_view_count);
+
 	// YCbCr conversion is Vulkan 1.1 core - always enable for YUV texture support
 	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
 		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext                  = &multiview_features,
 		.samplerYcbcrConversion = VK_TRUE,
 	};
 
@@ -681,7 +698,7 @@ bool skr_init(skr_settings_t settings) {
 		skr_device_create_info_t create_info = {
 			.vk_physical_device     = _skr_vk.physical_device,
 			.device_create_info     = &device_info,
-			.get_instance_proc_addr = vkGetInstanceProcAddr,
+			.get_instance_proc_addr = global_get_instance_proc_addr,
 		};
 		_skr_vk.device = (VkDevice)settings.device_create_callback(&create_info, settings.device_create_user_data);
 		if (_skr_vk.device == VK_NULL_HANDLE) {
@@ -830,7 +847,6 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.capabilities[skr_capability_external_ahb] = _skr_vk.has_android_hardware_buffer;
 	_skr_vk.capabilities[skr_capability_external_dma] = _skr_vk.has_external_memory_dma_buf && _skr_vk.has_drm_format_modifier && has_image_format_list;
 	_skr_vk.capabilities[skr_capability_vk_video]          = _skr_vk.has_video_decode;
-	_skr_vk.capabilities[skr_capability_viewport_layer]    = _skr_vk.has_viewport_layer;
 
 	_skr_vk.initialized = true;
 	return true;
@@ -931,7 +947,7 @@ int32_t skr_get_max_msaa_samples(void) {
 }
 
 bool skr_is_capable(skr_capability_ capability) {
-	if ((int32_t)capability < 0 || capability >= skr_capability_count_)
+	if ((int32_t)capability < 0 || capability >= skr_capability_max)
 		return false;
 	return _skr_vk.capabilities[capability];
 }
