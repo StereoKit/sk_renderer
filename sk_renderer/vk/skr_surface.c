@@ -264,6 +264,8 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 
 	_skr_cmd_destroy_surface  (NULL, ref_surface->surface  );
 	_skr_cmd_destroy_swapchain(NULL, ref_surface->swapchain);
+
+	*ref_surface = (skr_surface_t){0};
 }
 
 void skr_surface_resize(skr_surface_t* ref_surface) {
