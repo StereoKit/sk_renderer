@@ -239,6 +239,34 @@ int main(int argc, char* argv[]) {
 					suspended = false;
 					break;
 
+				case ska_event_window_hidden:
+					// Native window destroyed (screen off, backgrounded).
+					// The VkSurfaceKHR is now invalid — tear down immediately.
+					su_log(su_log_info, "Window hidden — destroying surface");
+					if (skr_get_vk_device()) vkDeviceWaitIdle(skr_get_vk_device());
+					skr_surface_destroy(&surface);
+					break;
+
+				case ska_event_window_shown:
+					// New native window available — recreate Vulkan surface.
+					// Skip the initial shown event: the surface was already
+					// created during startup.
+					if (skr_surface_is_valid(&surface)) break;
+					su_log(su_log_info, "Window shown — recreating surface");
+					VkSurfaceKHR new_vk_surface;
+					if (!ska_vk_create_surface(window, skr_get_vk_instance(), &new_vk_surface)) {
+						su_log(su_log_critical, "Failed to recreate Vulkan surface: %s", ska_error_get());
+						running = false;
+						break;
+					}
+					skr_surface_create(new_vk_surface, &surface);
+					if (!skr_surface_is_valid(&surface)) {
+						su_log(su_log_critical, "Failed to recreate sk_renderer surface");
+						running = false;
+						break;
+					}
+					break;
+
 				case ska_event_window_resized:
 					skr_surface_resize(&surface);
 					break;
@@ -251,6 +279,12 @@ int main(int argc, char* argv[]) {
 		// Skip rendering and updates while suspended (backgrounded/minimized)
 		if (suspended) {
 			ska_time_sleep(100);  // Reduce CPU usage while suspended
+			continue;
+		}
+
+		// Skip rendering without a valid native window (screen off)
+		if (!skr_surface_is_valid(&surface)) {
+			ska_time_sleep(16);
 			continue;
 		}
 
@@ -299,28 +333,8 @@ int main(int argc, char* argv[]) {
 				su_log(su_log_info, "Surface issue during shutdown - exiting gracefully");
 				break;
 			}
-
 			if (acquire_result == skr_acquire_needs_resize) {
 				skr_surface_resize(&surface);
-			} else if (acquire_result == skr_acquire_surface_lost) {
-				// Surface was lost (Android app resume) - need to recreate from sk_app
-				su_log(su_log_info, "Recreating surface after loss");
-				vkDeviceWaitIdle(skr_get_vk_device());
-
-				VkSurfaceKHR new_vk_surface;
-				if (!ska_vk_create_surface(window, skr_get_vk_instance(), &new_vk_surface)) {
-					su_log(su_log_critical, "Failed to recreate Vulkan surface: %s", ska_error_get());
-					running = false;
-					break;
-				}
-
-				skr_surface_destroy(&surface);
-				skr_surface_create(new_vk_surface, &surface);
-				if (surface.surface == VK_NULL_HANDLE) {
-					su_log(su_log_critical, "Failed to recreate sk_renderer surface");
-					running = false;
-					break;
-				}
 			}
 		}
 	}

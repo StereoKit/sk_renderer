@@ -648,6 +648,7 @@ SKR_API skr_vec3i_t       skr_tex_calc_mip_dimensions      (skr_vec3i_t base_siz
 SKR_API uint64_t          skr_tex_calc_mip_size            (skr_tex_fmt_ format, skr_vec3i_t base_size, uint32_t mip_level);
 
 SKR_API skr_err_          skr_surface_create               (void* vk_surface_khr, skr_surface_t* out_surface);
+SKR_API bool              skr_surface_is_valid             (const skr_surface_t*     surface);
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
 SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
 SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_tex_t** out_tex);
