@@ -13,41 +13,43 @@ set(SKA_BUILD_EXAMPLES OFF CACHE BOOL "Disable sk_app examples" FORCE)
 if(ANDROID)
 	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
+message(STATUS "Fetching sk_app...")
 FetchContent_Declare(sk_app
 	GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-	GIT_TAG        42d3193afcaf16a0b2f1c1aacb7c964d1f0910cc
+	GIT_TAG        v2026.3.11
 	GIT_SHALLOW    TRUE
 	GIT_PROGRESS   TRUE
 )
 FetchContent_MakeAvailable(sk_app)
+#set(sk_app_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../sk_app)
+#add_subdirectory(${sk_app_SOURCE_DIR} ${sk_app_SOURCE_DIR}/build)
 if(ANDROID)
 	set_target_properties(sk_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 # stb for image loading
+message(STATUS "Fetching stb...")
 FetchContent_Declare(stb
 	GIT_REPOSITORY https://github.com/nothings/stb.git
 	GIT_TAG        f1c79c02822848a9bed4315b12c8c8f3761e1296
-	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
 )
 FetchContent_MakeAvailable(stb)
 
 # cgltf for GLTF model loading
+message(STATUS "Fetching cgltf...")
 FetchContent_Declare(cgltf
 	GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
 	GIT_TAG        v1.14
 	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
 )
 FetchContent_MakeAvailable(cgltf)
 
 # cimgui C bindings for ImGui
+message(STATUS "Fetching cimgui...")
 FetchContent_Declare(cimgui
 	GIT_REPOSITORY https://github.com/cimgui/cimgui.git
 	GIT_TAG        1.91.6
 	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
 )
 FetchContent_MakeAvailable(cimgui)
 
