@@ -539,6 +539,11 @@ skr_future_t skr_cmd_end() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+bool skr_cmd_is_active() {
+	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
+	return pool && pool->ref_count > 0;
+}
+
 skr_future_t skr_cmd_flush() {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
