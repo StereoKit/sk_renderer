@@ -634,13 +634,14 @@ bool skr_init(skr_settings_t settings) {
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
 
 	// Track feature availability
-	_skr_vk.has_depth_clamp = available_features.depthClamp;
+	_skr_vk.has_depth_clamp          = available_features.depthClamp;
+	_skr_vk.has_fill_mode_non_solid  = available_features.fillModeNonSolid;
 
 	// Enable features we need (only if available)
 	VkPhysicalDeviceFeatures device_features = {
 		.samplerAnisotropy              = available_features.samplerAnisotropy,
 		.sampleRateShading              = VK_FALSE, // Not using sample shading yet
-		.fillModeNonSolid               = VK_FALSE, // Not using wireframe
+		.fillModeNonSolid               = available_features.fillModeNonSolid,
 		.depthClamp                     = available_features.depthClamp,
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
 	};

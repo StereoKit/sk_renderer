@@ -190,8 +190,9 @@ typedef struct {
 	VkDescriptorPool         descriptor_pool;
 	VkDebugUtilsMessengerEXT debug_messenger;
 	bool                     validation_enabled;
-	bool                     has_push_descriptors;  // VK_KHR_push_descriptor support
-	bool                     has_depth_clamp;       // VkPhysicalDeviceFeatures::depthClamp support
+	bool                     has_push_descriptors;        // VK_KHR_push_descriptor support
+	bool                     has_depth_clamp;             // VkPhysicalDeviceFeatures::depthClamp support
+	bool                     has_fill_mode_non_solid;     // VkPhysicalDeviceFeatures::fillModeNonSolid support
 	bool                     has_external_memory_fd;      // VK_KHR_external_memory_fd
 	bool                     has_external_memory_win32;   // VK_KHR_external_memory_win32
 	bool                     has_android_hardware_buffer; // VK_ANDROID_external_memory_android_hardware_buffer

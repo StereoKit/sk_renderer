@@ -506,6 +506,7 @@ typedef struct skr_material_info_t {
 	skr_blend_state_t    blend_state;
 	bool                 alpha_to_coverage;
 	bool                 depth_clamp;   // Clamp depth to [0,1] instead of clipping (useful for shadow mapping)
+	bool                 wireframe;    // Render as wireframe lines instead of filled polygons
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)

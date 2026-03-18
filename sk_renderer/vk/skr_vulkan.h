@@ -202,6 +202,7 @@ typedef struct {
 	skr_blend_state_t    blend_state;
 	bool                 alpha_to_coverage;
 	bool                 depth_clamp;
+	bool                 wireframe;
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 #define SKR_MAX_IMMUTABLE_SAMPLERS 2
