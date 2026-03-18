@@ -291,6 +291,11 @@ float4 ps(psIn input) : SV_TARGET {
 	float coverage = CalcCoverage(xcov, ycov, xwgt, ywgt);
 	coverage = saturate(coverage);
 
+	// Boost optical weight for thin strokes (Slug SLUG_WEIGHT option).
+	// sqrt makes coverage transitions gentler, reducing sparkle at small sizes
+	// and glancing angles.
+	coverage = sqrt(coverage);
+
 	if (coverage < 0.01) discard;
 
 	return float4(input.color, coverage);
