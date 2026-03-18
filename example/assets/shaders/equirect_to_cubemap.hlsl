@@ -11,8 +11,9 @@ struct psIn {
 
 // Convert UV coordinates to cubemap direction for a specific face
 float3 uv_to_direction(float2 uv, uint face) {
-	// UV goes from 0 to 1, convert to -1 to 1
-	float2 ndc = uv * 2.0 - 1.0;
+	// UV goes from 0 to 1, convert to -1 to 1.
+	// Y is flipped because the blit viewport uses negative height (Vulkan Y-flip).
+	float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
 	// Map to cubemap face direction
 	// Faces: +X=0, -X=1, +Y=2, -Y=3, +Z=4, -Z=5
@@ -59,7 +60,7 @@ psIn vs(uint id : SV_VertexID) {
 
 	// Generate fullscreen triangle
 	output.uv  = float2((id << 1) & 2, id & 2);
-	output.pos = float4(output.uv * 2.0 - 1.0, 0, 1);
+	output.pos = float4(output.uv * float2(2, -2) + float2(-1, 1), 0, 1);
 
 	return output;
 }

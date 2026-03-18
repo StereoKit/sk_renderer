@@ -39,6 +39,11 @@ typedef struct {
 	                                        // 0 for cubemap faces (0x3F view_mask, 0x0 correlation) or
 	                                        // independent array layers where each view sees different
 	                                        // content. Single-view (view_mask=0x1) should use 0x1.
+	uint8_t               subpass_index;    // 0 for geometry, 1+ for resolve/postfx subpasses
+	uint8_t               postfx_count;     // 0 = single-subpass (legacy), 1+ = multi-subpass with postfx
+	bool                  has_resolve_subpass;      // Manual MSAA resolve subpass between geometry and postfx
+	bool                  use_custom_resolve_flags; // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
+	VkFormat              postfx_output_format;     // Format of the final postfx output attachment
 } skr_pipeline_renderpass_key_t;
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
@@ -48,7 +53,12 @@ typedef struct {
 // Bind shifts (hardcoded to match skshaderc)
 #define SKR_BIND_SHIFT_BUFFER  0
 #define SKR_BIND_SHIFT_TEXTURE 100
-#define SKR_BIND_SHIFT_UAV     200
+#define SKR_BIND_SHIFT_UAV              200
+#define SKR_BIND_SHIFT_INPUT_ATTACHMENT 300
+
+// PostFX multi-subpass limits
+#define SKR_POSTFX_MAX_ATTACHMENTS 8
+#define SKR_POSTFX_MAX_SUBPASSES   (SKR_PASS_MAX_POSTFX + 2)  // geometry + resolve + postfx
 
 #define SKR_VK_CHECK_RET(vkResult, fnName, returnVal) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); return returnVal; } }
 #define SKR_VK_CHECK_NRET(vkResult, fnName) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); } }
@@ -188,6 +198,7 @@ typedef struct {
 	bool                     has_external_memory_dma_buf; // VK_EXT_external_memory_dma_buf
 	bool                     has_drm_format_modifier;     // VK_EXT_image_drm_format_modifier
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
+	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
 	bool                     initialized;
 	uint32_t                 max_multiview_view_count;    // From VkPhysicalDeviceMultiviewProperties
 
@@ -225,8 +236,9 @@ typedef struct {
 
 	// Current render pass (for pipeline lookup)
 	int32_t                  current_renderpass_idx;
-	skr_tex_t*               current_color_texture;  // Track color texture for layout transitions
-	skr_tex_t*               current_depth_texture;  // Track depth texture for layout transitions
+	skr_tex_t*               current_color_texture;    // Track color texture for layout transitions
+	skr_tex_t*               current_depth_texture;    // Track depth texture for layout transitions
+	skr_tex_t*               current_resolve_texture;  // Track resolve target for layout transitions
 
 	// Global bindings (merged with material bindings at draw time)
 	skr_buffer_t*            global_buffers[16];
@@ -265,6 +277,7 @@ extern _skr_vk_t _skr_vk;
 ///////////////////////////////////////////////////////////////////////////////
 
 VkFramebuffer         _skr_create_framebuffer               (VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve);
+VkDeviceMemory        _skr_allocate_image_memory            (VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory);
 VkSampler             _skr_sampler_create_vk                (VkDevice device, skr_tex_sampler_t settings);
 VkDescriptorSetLayout _skr_shader_make_layout               (VkDevice device, bool has_push_descriptors, const sksc_shader_meta_t* meta, skr_stage_ stage_mask, const VkSampler* immutable_samplers, const int32_t* immutable_sampler_slots, int32_t immutable_sampler_count);
 
@@ -312,7 +325,7 @@ void                  _skr_log_descriptor_writes            (const VkWriteDescri
 
 // Automatic layout transition system
 void                  _skr_tex_transition                   (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
-void                  _skr_tex_barrier                      (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
+void                  _skr_tex_barrier                      (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags src_stage, VkAccessFlags src_access, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
 void                  _skr_tex_transition_for_shader_read   (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage);
 void                  _skr_tex_transition_for_storage       (VkCommandBuffer cmd, skr_tex_t* ref_tex);
 void                  _skr_tex_transition_queue_family      (VkCommandBuffer cmd, skr_tex_t* ref_tex, uint32_t src_queue_family, uint32_t dst_queue_family, VkImageLayout layout);

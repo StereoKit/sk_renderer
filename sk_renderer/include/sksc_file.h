@@ -83,6 +83,7 @@ typedef enum {
 	skr_register_read_buffer,
 	skr_register_readwrite,
 	skr_register_readwrite_tex,
+	skr_register_input_attachment,
 } skr_register_;
 
 typedef enum {

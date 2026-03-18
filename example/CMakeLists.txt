@@ -244,6 +244,10 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gi_voxelize.hlsl
 	assets/shaders/gi_fast_voxelize.hlsl
 	assets/shaders/gi_voxel_to_sh.hlsl
+	assets/shaders/postfx_invert.hlsl
+	assets/shaders/msaa_resolve.hlsl
+	assets/shaders/msaa_resolve_wide.hlsl
+	assets/shaders/upscale.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

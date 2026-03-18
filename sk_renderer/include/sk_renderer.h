@@ -194,8 +194,9 @@ typedef enum skr_tex_flags_ {
 	skr_tex_flags_array     = 1 << 4,
 	skr_tex_flags_3d        = 1 << 5,
 	skr_tex_flags_in_tile_msaa = 1 << 6,
-	skr_tex_flags_compute   = 1 << 7,  // For compute shader RWTexture (storage image)
-	skr_tex_flags_cubemap   = 1 << 8,  // Cubemap texture (requires 6 array layers)
+	skr_tex_flags_compute          = 1 << 7,  // For compute shader RWTexture (storage image)
+	skr_tex_flags_cubemap          = 1 << 8,  // Cubemap texture (requires 6 array layers)
+	skr_tex_flags_input_attachment = 1 << 9,  // Used as input attachment in subpass (SubpassInput)
 } skr_tex_flags_;
 
 typedef enum skr_tex_sample_ {
@@ -544,6 +545,9 @@ typedef struct skr_pass_t {
 	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
 	uint32_t        draw_count;
 
+	// Populated by skr_pass_add_resolve()
+	skr_material_t* resolve_material;  // Manual MSAA resolve shader (reads SubpassInputMS)
+
 	// Populated by skr_pass_add_postfx()
 	skr_material_t* postfx[SKR_PASS_MAX_POSTFX];
 	uint32_t        postfx_count;
@@ -709,6 +713,7 @@ SKR_API uint64_t          skr_renderer_get_gpu_time_us     (void);
 SKR_API uint64_t          skr_renderer_get_cpu_time_us     (void);
 
 SKR_API void              skr_pass_add_draw                (skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
+SKR_API void              skr_pass_add_resolve             (skr_pass_t* pass, skr_material_t* resolve_material);
 SKR_API void              skr_pass_add_postfx              (skr_pass_t* pass, skr_material_t* postfx_material);
 SKR_API void              skr_pass_submit                  (skr_pass_t* pass);
 

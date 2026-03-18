@@ -43,7 +43,7 @@ static uint32_t _skr_find_memory_type(VkPhysicalDevice phys_device, VkMemoryRequ
 }
 
 // Allocate device memory for an image, trying lazily-allocated first for transient attachments
-static VkDeviceMemory _skr_allocate_image_memory(VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory) {
+VkDeviceMemory _skr_allocate_image_memory(VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory) {
 	VkMemoryRequirements mem_requirements;
 	vkGetImageMemoryRequirements(device, image, &mem_requirements);
 
@@ -363,7 +363,7 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 // _skr_tex_transition, this always emits a barrier even when the tracked
 // layout already matches — needed for cross-submission synchronization
 // where the layout is correct but the data may not yet be visible.
-void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags src_stage, VkAccessFlags src_access, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
 	if (!ref_tex->image) return;
 
 	VkImageLayout layout = ref_tex->is_transient_discard
@@ -373,11 +373,12 @@ void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFl
 	_skr_transition_image_layout(cmd, ref_tex->image, ref_tex->aspect_mask,
 		0, ref_tex->mip_levels, ref_tex->layer_count,
 		layout, layout,
-		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst_stage,
-		VK_ACCESS_MEMORY_WRITE_BIT,         dst_access);
+		src_stage,  dst_stage,
+		src_access, dst_access);
 }
 
 // Specialized: Transition for shader read (most common case)
+// Also enqueues a deferred barrier for cross-submission visibility.
 void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage) {
 	// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
 	VkImageLayout target_layout = (ref_tex->flags & skr_tex_flags_compute)
@@ -385,6 +386,7 @@ void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex
 		: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
 	_skr_tex_transition(cmd, ref_tex, target_layout, dst_stage, VK_ACCESS_SHADER_READ_BIT);
+	_skr_tex_transition_enqueue(ref_tex, 0);
 }
 
 // Specialized: Transition for storage image (compute RWTexture)
@@ -837,8 +839,10 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 
 	// Determine usage flags
 	// Don't add SAMPLED_BIT for MSAA depth textures - not supported by some drivers (NVIDIA returns size=0)
-	bool is_msaa_depth = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT) && is_depth;
-	VkImageUsageFlags usage = is_msaa_depth ? 0 : VK_IMAGE_USAGE_SAMPLED_BIT;
+	// Don't add SAMPLED_BIT for in-tile textures - they stay in tile memory, never sampled
+	bool is_msaa_depth  = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT) && is_depth;
+	bool is_in_tile     = (out_tex->flags & skr_tex_flags_in_tile_msaa) && !(out_tex->flags & skr_tex_flags_readable);
+	VkImageUsageFlags usage = (is_msaa_depth || is_in_tile) ? 0 : VK_IMAGE_USAGE_SAMPLED_BIT;
 	
 	if (out_tex->flags & skr_tex_flags_readable) {
 		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -851,9 +855,9 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	if (out_tex->aspect_mask == 0)          { out_tex->aspect_mask   = VK_IMAGE_ASPECT_COLOR_BIT;   }
 
 
-	// For MSAA attachments, add transient bit for in-tile resolve optimization
+	// For MSAA or in-tile attachments, add transient bit for tile-local optimization
 	// But only if the texture is NOT readable (transient means no memory backing)
-	bool is_msaa_attachment = out_tex->samples > VK_SAMPLE_COUNT_1_BIT && (out_tex->flags & skr_tex_flags_writeable) && !(out_tex->flags & skr_tex_flags_readable);
+	bool is_transient_candidate = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT || is_in_tile) && (out_tex->flags & skr_tex_flags_writeable) && !(out_tex->flags & skr_tex_flags_readable);
 
 	if (out_tex->flags & skr_tex_flags_writeable) {
 		if (is_depth) {
@@ -861,7 +865,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		} else {
 			usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 			// TRANSIENT_ATTACHMENT_BIT can't be combined with TRANSFER_DST_BIT
-			if (!is_msaa_attachment) {
+			if (!is_transient_candidate) {
 				usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 			}
 		}
@@ -872,7 +876,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 
 	// Only use transient attachment if format+usage combination is supported
 	// AND lazily allocated memory is available (required for transient attachments)
-	if (is_msaa_attachment) {
+	if (is_transient_candidate) {
 		VkImageUsageFlags test_usage = usage | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
 		test_usage &= ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
@@ -906,16 +910,21 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 			usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
 			// Remove SAMPLED_BIT and TRANSFER_DST_BIT for transient attachments
 			usage &= ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-			// is_msaa_attachment stays true - request lazy memory allocation
+			// is_transient_candidate stays true - request lazy memory allocation
 		} else {
 			// Transient not supported, fall back to regular memory
-			is_msaa_attachment = false;
+			is_transient_candidate = false;
 		}
 	}
 
 	// For compute shader storage images (RWTexture2D)
 	if (out_tex->flags & skr_tex_flags_compute) {
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+	}
+
+	// For input attachments (SubpassInput in shaders)
+	if (out_tex->flags & skr_tex_flags_input_attachment) {
+		usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 	}
 
 	// For dynamic textures (updated via skr_tex_set_data)
@@ -968,7 +977,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	}
 
 	// Allocate memory using helper
-	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_msaa_attachment, &out_tex->memory) == VK_NULL_HANDLE) {
+	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_transient_candidate, &out_tex->memory) == VK_NULL_HANDLE) {
 		skr_log(skr_log_critical, "Failed to allocate texture memory - Format: %d, Size: %dx%dx%d, Mips: %d, Layers: %d, Samples: %d, Usage: 0x%x, Flags: 0x%x",
 			format, size.x, size.y, size.z, out_tex->mip_levels, out_tex->layer_count, out_tex->samples, usage, out_tex->flags);
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
@@ -984,8 +993,8 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	out_tex->current_layout       = VK_IMAGE_LAYOUT_UNDEFINED;
 	out_tex->current_queue_family = _skr_vk.graphics_queue_family;
 	out_tex->first_use            = true;
-	// Transient discard optimization for non-readable depth/MSAA (tile GPU optimization)
-	out_tex->is_transient_discard = (is_msaa_attachment || (is_depth && !(flags & skr_tex_flags_readable)));
+	// Transient discard optimization for non-readable depth/MSAA/in-tile (tile GPU optimization)
+	out_tex->is_transient_discard = (is_transient_candidate || (is_depth && !(flags & skr_tex_flags_readable)));
 
 	// Upload texture data if provided (or just transition to shader read layout)
 	if (opt_data && opt_data->data) {
@@ -996,9 +1005,9 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 			*out_tex = (skr_tex_t){0};
 			return upload_err;
 		}
-	} else if (!is_msaa_attachment && !(out_tex->flags & skr_tex_flags_writeable)) {
+	} else if (!is_transient_candidate && !(out_tex->flags & skr_tex_flags_writeable)) {
 		// No data provided, transition to appropriate layout for read-only textures
-		// Skip for transient MSAA attachments - they don't need initial layout transition
+		// Skip for transient attachments - they don't need initial layout transition
 		// Skip for writeable textures - let the first render pass handle the transition
 
 		_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
@@ -1380,6 +1389,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	// command buffer submission, and layout tracking alone doesn't guarantee
 	// cross-submission memory visibility.
 	_skr_tex_barrier(ctx.cmd, ref_tex,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
 		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
 	// Generate each mip level by rendering from previous mip

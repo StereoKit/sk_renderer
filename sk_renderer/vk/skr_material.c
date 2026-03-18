@@ -712,6 +712,27 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			(*ref_write_ct)++;
 			(*ref_image_ct)++;
 		} break;
+		case skr_register_input_attachment: { // Input attachments (SubpassInput)
+			if (*ref_write_ct >= write_max || *ref_image_ct >= image_max) continue;
+
+			skr_tex_t* tex = binds[i].texture;
+			if (!tex) return (int32_t)i;
+
+			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
+				.sampler     = VK_NULL_HANDLE,
+				.imageView   = tex->view,
+				.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
+			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
+				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstBinding      = slot,
+				.descriptorCount = 1,
+				.descriptorType  = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+				.pImageInfo      = &ref_image_infos[*ref_image_ct],
+			};
+			(*ref_write_ct)++;
+			(*ref_image_ct)++;
+		} break;
 		default: break;}
 	}
 	return -1;

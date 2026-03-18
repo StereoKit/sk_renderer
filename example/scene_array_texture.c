@@ -7,6 +7,8 @@
 #include "tools/scene_util.h"
 #include "app.h"
 
+#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#include <cimgui.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -29,8 +31,9 @@ typedef struct {
 	skr_shader_t   stereo_shader;
 	skr_material_t stereo_material;
 
-	float rotation;
-	float eye_separation;
+	float    rotation;
+	float    eye_separation;
+	uint32_t mode; // 0 = red-blue, 1 = red-cyan
 } scene_array_texture_t;
 
 static scene_t* _scene_array_texture_create(void) {
@@ -245,6 +248,20 @@ static void _scene_array_texture_render(scene_t* base, int32_t width, int32_t he
 	skr_render_list_add(ref_render_list, &scene->fullscreen_quad, &scene->stereo_material, NULL, 0, 1);
 }
 
+static void _scene_array_texture_render_ui(scene_t* base) {
+	scene_array_texture_t* scene = (scene_array_texture_t*)base;
+
+	const char* mode_names[] = { "Red-Blue", "Red-Cyan" };
+	int32_t     mode_int     = (int32_t)scene->mode;
+
+	igText("Anaglyph Settings:");
+	if (igCombo_Str_arr("Mode", &mode_int, mode_names, 2, 0)) {
+		scene->mode = (uint32_t)mode_int;
+		skr_material_set_param(&scene->stereo_material, "mode", sksc_shader_var_uint, 1, &scene->mode);
+	}
+	igSliderFloat("Eye Separation", &scene->eye_separation, 0.0f, 1.0f, "%.2f", 0);
+}
+
 const scene_vtable_t scene_array_texture_vtable = {
 	.name       = "Array Texture Stereo",
 	.create     = _scene_array_texture_create,
@@ -252,4 +269,5 @@ const scene_vtable_t scene_array_texture_vtable = {
 	.update     = _scene_array_texture_update,
 	.render     = _scene_array_texture_render,
 	.get_camera = NULL,
+	.render_ui  = _scene_array_texture_render_ui,
 };

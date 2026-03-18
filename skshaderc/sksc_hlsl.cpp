@@ -280,6 +280,11 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 				// u registers - shift by 200
 				new_binding = old_binding + 200;
 				break;
+
+			case SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+				// input attachments - shift by 300
+				new_binding = old_binding + 300;
+				break;
 			default:break;
 		}
 		

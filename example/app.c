@@ -14,22 +14,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #include <sk_app.h>
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include <cimgui.h>
 
-const bool enable_offscreen = false;
-const bool enable_bloom     = false;
-const bool enable_stereo    = true;
+const bool enable_offscreen       = false;
+const bool enable_bloom           = false;
+const bool enable_stereo          = true;
+enum resolve_mode_ {
+	resolve_mode_normal,         // No postfx, auto resolve
+	resolve_mode_auto_postfx,    // Auto resolve + postfx invert
+	resolve_mode_manual_postfx,  // Manual resolve + integral invert
+	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
+	resolve_mode_max,
+};
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Manual Resolve + Invert", "Wide Kernel Resolve" };
 
 // Application state
 struct app_t {
 	// Rendering configuration
 	int32_t       msaa;
+	int32_t       resolve_mode;           // enum resolve_mode_
+	int32_t       resolve_mode_previous;
 	skr_tex_fmt_  offscreen_format;
 	skr_tex_fmt_  depth_format;
+
+	// Resolution scaling
+	float render_scale;           // 0.25–1.0, determines render target allocation size
+	float render_scale_previous;  // For detecting changes that need reallocation
+	float viewport_scale;         // 0.25–1.0, determines active viewport (no realloc)
 
 	// Scene management
 	const scene_vtable_t* scene_types[32];  // Array of available scenes
@@ -41,11 +57,27 @@ struct app_t {
 	skr_tex_t color_msaa;
 	skr_tex_t depth_buffer;
 	skr_tex_t scene_color;
+	skr_tex_t upscale_target;  // Readable postfx output when upscale + postfx both active
 	int32_t   current_width;
 	int32_t   current_height;
 
 	// Shared render list (reused each frame)
 	skr_render_list_t render_list;
+
+	// PostFX
+	skr_shader_t   postfx_shader;
+	skr_material_t postfx_mat;
+
+	// Manual MSAA resolve
+	skr_shader_t   resolve_shader;
+	skr_material_t resolve_mat;
+
+	// Wide-kernel resolve (Texture2DMS, separate pass)
+	skr_shader_t      wide_resolve_shader;
+	skr_material_t    wide_resolve_mat;
+	// Upscale (resolution scaling blit)
+	skr_shader_t   upscale_shader;
+	skr_material_t upscale_mat;
 
 	// Performance tracking
 	float   frame_time_ms;
@@ -100,29 +132,67 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	skr_tex_sampler_t no_sampler   = {0};
 	skr_tex_sampler_t linear_clamp = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
 
-	// MSAA buffer must match the format of its resolve target
-	skr_tex_fmt_ msaa_format = enable_offscreen ? app->offscreen_format : render_target->format;
-	skr_tex_create(msaa_format,       skr_tex_flags_writeable, no_sampler, (skr_vec3i_t){width, height, 1}, app->msaa, 1, NULL, &app->color_msaa);
-	skr_tex_create(app->depth_format, skr_tex_flags_writeable, no_sampler, (skr_vec3i_t){width, height, 1}, app->msaa, 1, NULL, &app->depth_buffer);
+	// Apply render scale. Even dimensions required for MSAA.
+	int32_t render_w = (int32_t)(width  * app->render_scale) & ~1;
+	int32_t render_h = (int32_t)(height * app->render_scale) & ~1;
+	if (render_w < 2) render_w = 2;
+	if (render_h < 2) render_h = 2;
 
-	if (enable_offscreen) {
+	bool needs_upscale = (app->render_scale < 1.0f) || (app->viewport_scale < 1.0f);
+
+	// MSAA buffer must match the format of its resolve target.
+	// input_attachment flag needed for manual MSAA resolve (SubpassInputMS reads samples directly).
+	skr_tex_fmt_ msaa_format = (enable_offscreen || needs_upscale) ? app->offscreen_format : render_target->format;
+	// input_attachment only when manual resolve reads MSAA samples as SubpassInputMS.
+	// Wide-kernel resolve needs readable (SAMPLED_BIT) for Texture2DMS access in a separate pass.
+	bool wide_kernel     = (app->resolve_mode == resolve_mode_wide_kernel);
+	bool manual_resolve  = (app->resolve_mode == resolve_mode_manual_postfx);
+	skr_tex_flags_ msaa_flags = skr_tex_flags_writeable
+		| (manual_resolve ? skr_tex_flags_input_attachment : 0)
+		| (wide_kernel    ? skr_tex_flags_readable         : 0);
+	skr_tex_create(msaa_format,       msaa_flags, wide_kernel ? linear_clamp : no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->color_msaa);
+	skr_tex_flags_ depth_flags = skr_tex_flags_writeable | ((app->msaa > 1) ? skr_tex_flags_input_attachment : 0);
+	skr_tex_create(app->depth_format, depth_flags, no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->depth_buffer);
+
+	if (enable_offscreen || needs_upscale) {
+		// Offscreen target at render scale. Readable so the upscale blit can sample it.
+		// Also writeable + input_attachment for use as resolve intermediate in multi-subpass.
 		skr_tex_create(app->offscreen_format,
-			skr_tex_flags_readable | skr_tex_flags_compute,
+			skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_input_attachment
+				| (enable_offscreen ? skr_tex_flags_compute : 0),
 			linear_clamp,
-			(skr_vec3i_t){width, height, 1}, 1, 1, NULL, &app->scene_color);
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
+		// When upscaling with postfx + MSAA, scene_color is the resolve intermediate
+		// and we need a separate readable target for the postfx output → upscale source.
+		if (needs_upscale) {
+			skr_tex_create(app->offscreen_format,
+				skr_tex_flags_readable | skr_tex_flags_writeable,
+				linear_clamp,
+				(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->upscale_target);
+		}
+	} else if (app->msaa > 1) {
+		// Intermediate color target for auto-resolve + postfx mode.
+		// Data stays in tile memory (transient) — postfx reads as input, writes to render_target.
+		skr_tex_create(render_target->format,
+			skr_tex_flags_writeable | skr_tex_flags_input_attachment | skr_tex_flags_in_tile_msaa,
+			no_sampler,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
 	}
 
 	app->current_width  = width;
 	app->current_height = height;
 
-	su_log(su_log_info, "Render target: %dx%d @ %dx, %s / %s",
-		width, height, app->msaa, _tex_fmt_name(skr_tex_get_format(&app->color_msaa)), _tex_fmt_name(app->depth_format));
+	su_log(su_log_info, "Render target: %dx%d (render %dx%d @ %.0f%%) @ %dx MSAA, %s / %s",
+		width, height, render_w, render_h, app->render_scale * 100.0f,
+		app->msaa, _tex_fmt_name(skr_tex_get_format(&app->color_msaa)), _tex_fmt_name(app->depth_format));
 }
 
 static void _destroy_render_targets(app_t* app) {
 	skr_tex_destroy(&app->color_msaa);
 	skr_tex_destroy(&app->depth_buffer);
-	if (enable_offscreen) {
+	skr_tex_destroy(&app->upscale_target);
+	bool needs_upscale = (app->render_scale < 1.0f) || (app->viewport_scale < 1.0f);
+	if (enable_offscreen || needs_upscale || app->msaa > 1) {
 		skr_tex_destroy(&app->scene_color);
 	}
 }
@@ -154,7 +224,11 @@ app_t* app_create(int32_t start_scene) {
 	app->gpu_time_min_ms = 1e10f;
 	app->offscreen_format = skr_tex_fmt_rgba32_srgb;//skr_tex_fmt_bgra32_srgb;
 
-	skr_log(skr_log_info, "Max MSAA samples: %d", max_msaa);
+	app->render_scale          = 1.0f;
+	app->render_scale_previous = 1.0f;
+	app->viewport_scale        = 1.0f;
+
+	skr_log(skr_log_info, "Max MSAA samples: %d (using %d)", max_msaa, app->msaa);
 
 	// Choose depth format (prefer smaller/faster formats with stencil for stencil masking demo)
 	if (skr_tex_fmt_is_supported(skr_tex_fmt_depth16s8, skr_tex_flags_writeable, app->msaa)) {
@@ -172,10 +246,45 @@ app_t* app_create(int32_t start_scene) {
 		free(app);
 		return NULL;
 	}
+	app->depth_format = skr_tex_fmt_depth16;
 
 
 	// Create shared render list
 	skr_render_list_create(&app->render_list);
+
+	// Load all PostFX / resolve shaders upfront so dropdown can switch at runtime
+	app->postfx_shader = su_shader_load("shaders/postfx_invert.hlsl.sks", "postfx_invert");
+	if (skr_shader_is_valid(&app->postfx_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->postfx_shader,
+			.cull       = skr_cull_none,
+			.depth_test = skr_compare_always,
+		}, &app->postfx_mat);
+	}
+	app->resolve_shader = su_shader_load("shaders/msaa_resolve.hlsl.sks", "msaa_resolve");
+	if (skr_shader_is_valid(&app->resolve_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->resolve_shader,
+			.cull       = skr_cull_none,
+			.depth_test = skr_compare_always,
+		}, &app->resolve_mat);
+	}
+	app->wide_resolve_shader = su_shader_load("shaders/msaa_resolve_wide.hlsl.sks", "msaa_resolve_wide");
+	if (skr_shader_is_valid(&app->wide_resolve_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->wide_resolve_shader,
+			.cull       = skr_cull_none,
+			.depth_test = skr_compare_always,
+		}, &app->wide_resolve_mat);
+	}
+	app->upscale_shader = su_shader_load("shaders/upscale.hlsl.sks", "upscale");
+	if (skr_shader_is_valid(&app->upscale_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->upscale_shader,
+			.cull       = skr_cull_none,
+			.depth_test = skr_compare_always,
+		}, &app->upscale_mat);
+	}
 
 	// Register available scenes
 	app->scene_types[0]  = &scene_meshes_vtable;
@@ -204,6 +313,8 @@ app_t* app_create(int32_t start_scene) {
 	su_log(su_log_info, "Application created successfully!");
 	su_log(su_log_info, "Available scenes: %d (use arrow keys to switch)", app->scene_count);
 
+	//start_scene = 17;
+	
 	// Start with the requested scene (default to 0 if out of range or -1)
 	app->scene_index = -1;
 	int32_t initial_scene = (start_scene >= 0 && start_scene < app->scene_count) ? start_scene : 0;
@@ -234,6 +345,24 @@ void app_destroy(app_t* app) {
 
 	// Destroy render list
 	skr_render_list_destroy(&app->render_list);
+
+	// Destroy postfx (always destroy if created, regardless of runtime toggle)
+	if (skr_shader_is_valid(&app->postfx_shader)) {
+		skr_material_destroy(&app->postfx_mat);
+		skr_shader_destroy(&app->postfx_shader);
+	}
+	if (skr_shader_is_valid(&app->resolve_shader)) {
+		skr_material_destroy(&app->resolve_mat);
+		skr_shader_destroy(&app->resolve_shader);
+	}
+	if (skr_shader_is_valid(&app->wide_resolve_shader)) {
+		skr_material_destroy(&app->wide_resolve_mat);
+		skr_shader_destroy(&app->wide_resolve_shader);
+	}
+	if (skr_shader_is_valid(&app->upscale_shader)) {
+		skr_material_destroy(&app->upscale_mat);
+		skr_shader_destroy(&app->upscale_shader);
+	}
 
 	// Destroy bloom
 	if (enable_bloom) {
@@ -298,6 +427,18 @@ void app_set_frame_time(app_t* app, float frame_time_ms) {
 void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t height) {
 	if (!app || !app->scene_current) return;
 
+	// Force render target recreation when settings change that affect texture flags/sizes
+	bool needs_upscale   = (app->render_scale < 1.0f) || (app->viewport_scale < 1.0f);
+	bool mode_changed    = (app->resolve_mode != app->resolve_mode_previous);
+	bool scale_changed   = (app->render_scale != app->render_scale_previous);
+	bool upscale_changed = needs_upscale != skr_tex_is_valid(&app->upscale_target);
+	if ((mode_changed || scale_changed || upscale_changed) && app->current_width != 0) {
+		_destroy_render_targets(app);
+		_create_render_targets(app, width, height, render_target);
+	}
+	app->resolve_mode_previous = app->resolve_mode;
+	app->render_scale_previous = app->render_scale;
+
 	// Check if we need to create or resize render targets
 	if (app->current_width != width || app->current_height != height) {
 		if (app->current_width == 0) {
@@ -312,8 +453,16 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		}
 	}
 
-	// Calculate view-projection matrix (float_math handles Y flip and row-major layout internally)
-	float    aspect     = (float)width / (float)height;
+	// Compute effective viewport from render target size × viewport_scale
+	int32_t render_w      = app->color_msaa.size.x;
+	int32_t render_h      = app->color_msaa.size.y;
+	int32_t view_w        = (int32_t)(render_w * app->viewport_scale) & ~1;
+	int32_t view_h        = (int32_t)(render_h * app->viewport_scale) & ~1;
+	if (view_w < 2) view_w = 2;
+	if (view_h < 2) view_h = 2;
+
+	// Calculate view-projection matrix using viewport dimensions for correct aspect ratio
+	float    aspect     = (float)view_w / (float)view_h;
 	float4x4 projection = float4x4_perspective(60.0f * (3.14159265359f / 180.0f), aspect, 0.1f, 100.0f);
 
 	// Use scene camera if provided, otherwise use default
@@ -330,7 +479,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// Calculate camera direction
 	float3 cam_forward = float3_norm(float3_sub(cam_target, cam_position));
 
-	// Setup application system buffer
+	// Setup application system buffer — screen_size reflects viewport dimensions
 	su_system_buffer_t sys_buffer = {0};
 	sys_buffer.view_count = 1;
 	sys_buffer.view          [0] = view;
@@ -340,47 +489,115 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	sys_buffer.projection_inv[0] = float4x4_invert(projection);
 	sys_buffer.cam_pos       [0] = (float4){cam_position.x, cam_position.y, cam_position.z, 0.0f};
 	sys_buffer.cam_dir       [0] = (float4){cam_forward.x,  cam_forward.y,  cam_forward.z,  0.0f};
-	sys_buffer.screen_size       = (float4){(float)width, (float)height, 1.0f / width, 1.0f / height};
+	sys_buffer.screen_size       = (float4){(float)view_w, (float)view_h, 1.0f / view_w, 1.0f / view_h};
 
 	// Let the scene populate the render list (and optionally do its own render passes)
-	scene_render(vtable, app->scene_current, width, height, &app->render_list, &sys_buffer);
+	scene_render(vtable, app->scene_current, view_w, view_h, &app->render_list, &sys_buffer);
 
 	// Prepare ImGui mesh data OUTSIDE render pass (uploads via vkCmdCopyBuffer)
 	ImGui_ImplSkRenderer_PrepareDrawData();
 
-	// Determine render targets
-	skr_tex_t* color_target   = (app->msaa > 1) ? &app->color_msaa : (enable_offscreen ? &app->scene_color : render_target);
-	skr_tex_t* resolve_target = (app->msaa > 1) ? (enable_offscreen ? &app->scene_color : render_target) : NULL;
+	// Determine render targets based on resolve mode
+	//
+	// Mode              | color_target    | resolve_target  | postfx_output
+	// ------------------|-----------------|-----------------|---------------
+	// normal, no MSAA   | render_target*  | NULL            | NULL
+	// normal, MSAA      | color_msaa      | render_target*  | NULL
+	// auto_postfx, !MSAA| scene_color     | NULL            | final_output
+	// auto_postfx, MSAA | color_msaa      | scene_color     | final_output
+	// manual_resolve    | color_msaa      | final_output    | NULL
+	// wide_kernel       | color_msaa      | NULL            | NULL (separate pass)
+	//
+	// *render_target = scene_color when enable_offscreen or needs_upscale
+	// final_output   = render_target when !needs_upscale, else upscale_src
+	bool use_postfx         = (app->resolve_mode == resolve_mode_auto_postfx)   && skr_material_is_valid(&app->postfx_mat);
+	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
+	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
+
+	// When upscaling, the scene writes to an offscreen target, then a blit upscales to swapchain.
+	// When postfx + MSAA + upscale: scene_color is the resolve intermediate, so postfx output
+	// goes to upscale_target (a separate readable texture) to avoid aliasing in the framebuffer.
+	skr_tex_t* upscale_src = NULL;  // What the upscale blit reads from (NULL = no upscale)
+	if (needs_upscale)
+		upscale_src = (use_postfx && app->msaa > 1) ? &app->upscale_target : &app->scene_color;
+
+	skr_tex_t* final_output = needs_upscale ? upscale_src : render_target;
+
+	skr_tex_t* color_target;
+	skr_tex_t* resolve_target;
+	skr_tex_t* postfx_output = NULL;
+
+	if (use_wide_kernel) {
+		// Wide-kernel: geometry writes MSAA color (no auto-resolve).
+		// Separate pass reads it as Texture2DMS and writes to final_output.
+		color_target   = &app->color_msaa;
+		resolve_target = NULL;
+	} else if (use_manual_resolve) {
+		// Manual resolve: geometry writes MSAA color, resolve subpass reads it as
+		// SubpassInputMS and writes directly to final_output (no intermediate).
+		color_target   = &app->color_msaa;
+		resolve_target = final_output;
+	} else if (use_postfx) {
+		// Auto postfx: geometry writes to scene_color (or resolves there for MSAA),
+		// postfx reads as input attachment (tile-local), writes to final_output.
+		color_target   = (app->msaa > 1) ? &app->color_msaa : &app->scene_color;
+		resolve_target = (app->msaa > 1) ? &app->scene_color : NULL;
+		postfx_output  = final_output;
+	} else {
+		color_target   = (app->msaa > 1) ? &app->color_msaa : ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target);
+		resolve_target = (app->msaa > 1) ? ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target) : NULL;
+	}
 
 	// Scene geometry via deferred pass (handles multi-view transparently)
 	skr_pass_t pass = {
-		.color       = color_target,
-		.depth       = &app->depth_buffer,
-		.resolve     = resolve_target,
-		.clear       = skr_clear_all,
-		.clear_color = {0, 0, 0, 0},
-		.clear_depth = 1.0f,
-		.viewport    = {0, 0, (float)width, (float)height},
-		.scissor     = {0, 0, width, height},
+		.color         = color_target,
+		.depth         = &app->depth_buffer,
+		.resolve       = resolve_target,
+		.postfx_output = postfx_output,
+		.clear         = skr_clear_all,
+		.clear_color   = {0, 0, 0, 0},
+		.clear_depth   = 1.0f,
+		.viewport      = {0, 0, (float)view_w, (float)view_h},
+		.scissor       = {0, 0, view_w, view_h},
 		.view_count       = sys_buffer.view_count,
 		.views_correlated = true,
 	};
 	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t));
+	if (use_manual_resolve)
+		skr_pass_add_resolve(&pass, &app->resolve_mat);
+	if (use_postfx)
+		skr_pass_add_postfx(&pass, &app->postfx_mat);
 	skr_pass_submit(&pass);
 	skr_render_list_clear(&app->render_list);
 
-	// ImGui in separate immediate-mode pass
-	skr_tex_t* imgui_target = resolve_target ? resolve_target : color_target;
+	// Wide-kernel resolve: separate pass reads MSAA color as Texture2DMS
+	if (use_wide_kernel) {
+		skr_material_set_tex(&app->wide_resolve_mat, "msaa_color", &app->color_msaa);
+		skr_renderer_blit(&app->wide_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+	}
+
+	// Post-processing (operates at render resolution, before upscale)
+	if (enable_offscreen && enable_bloom) {
+		bloom_apply(&app->scene_color, final_output, 1.0f, 4.0f, 0.75f);
+	}
+
+	// Upscale: offscreen → swapchain at full window resolution
+	if (upscale_src && skr_material_is_valid(&app->upscale_mat)) {
+		float uv_scale[4] = { (float)view_w / (float)render_w, (float)view_h / (float)render_h, 0, 0 };
+		skr_material_set_params(&app->upscale_mat, uv_scale, sizeof(uv_scale));
+		skr_material_set_tex   (&app->upscale_mat, "src_tex", upscale_src);
+		skr_renderer_blit(&app->upscale_mat, render_target, (skr_recti_t){0, 0, width, height});
+	}
+
+	// ImGui: always renders to swapchain at native resolution (sharp UI)
+	skr_tex_t* imgui_target = upscale_src ? render_target
+		: (use_postfx || use_manual_resolve || use_wide_kernel) ? render_target
+		: (resolve_target ? resolve_target : color_target);
 	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1);
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
 	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
 	ImGui_ImplSkRenderer_RenderDrawData(width, height);
 	skr_renderer_end_pass();
-
-	// Post-processing
-	if (enable_offscreen && enable_bloom) {
-		bloom_apply(&app->scene_color, render_target, 1.0f, 4.0f, 0.75f);
-	}
 }
 
 void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32_t height) {
@@ -412,9 +629,24 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 
 	igSeparator();
 
-	// Show render info
-	igText("Resolution: %d x %d", width, height);
+	// Show render info and controls
+	igText("Window: %d x %d", width, height);
+	{
+		float rs = app->render_scale   * 100.0f;
+		float vs = app->viewport_scale * 100.0f;
+		if (igSliderFloat("Render Scale",   &rs, 25.0f, 100.0f, "%.0f%%", 0)) app->render_scale   = rs / 100.0f;
+		if (igSliderFloat("Viewport Scale", &vs, 25.0f, 100.0f, "%.0f%%", 0)) app->viewport_scale = vs / 100.0f;
+	}
+	{
+		int32_t rw = (int32_t)(width  * app->render_scale) & ~1;
+		int32_t rh = (int32_t)(height * app->render_scale) & ~1;
+		int32_t vw = (int32_t)(rw * app->viewport_scale) & ~1;
+		int32_t vh = (int32_t)(rh * app->viewport_scale) & ~1;
+		igText("Render: %d x %d, Viewport: %d x %d", rw, rh, vw, vh);
+	}
 	igText("MSAA: %dx", app->msaa);
+	if (app->msaa > 1)
+		igCombo_Str_arr("Resolve Mode", &app->resolve_mode, resolve_mode_names, resolve_mode_max, 0);
 
 	float gpu_ms   = skr_renderer_get_gpu_time_us() / 1000.0f;
 	float cpu_ms   = skr_renderer_get_cpu_time_us() / 1000.0f;
