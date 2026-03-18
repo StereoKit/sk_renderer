@@ -378,7 +378,6 @@ void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFl
 }
 
 // Specialized: Transition for shader read (most common case)
-// Also enqueues a deferred barrier for cross-submission visibility.
 void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage) {
 	// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
 	VkImageLayout target_layout = (ref_tex->flags & skr_tex_flags_compute)
@@ -386,7 +385,6 @@ void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex
 		: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
 	_skr_tex_transition(cmd, ref_tex, target_layout, dst_stage, VK_ACCESS_SHADER_READ_BIT);
-	_skr_tex_transition_enqueue(ref_tex, 0);
 }
 
 // Specialized: Transition for storage image (compute RWTexture)
@@ -1054,6 +1052,12 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 
 void skr_tex_destroy(skr_tex_t* ref_tex) {
 	if (!ref_tex) return;
+
+	// Remove from deferred transition queue to prevent dangling pointer access.
+	// _skr_tex_transition_for_shader_read enqueues textures for cross-submission
+	// barriers; if the texture is destroyed before the next flush, the pointer
+	// would be dangling.
+	_skr_tex_transition_dequeue(ref_tex);
 
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);

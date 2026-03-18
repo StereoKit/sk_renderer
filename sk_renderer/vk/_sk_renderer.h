@@ -332,6 +332,7 @@ void                  _skr_tex_transition_queue_family      (VkCommandBuffer cmd
 void                  _skr_tex_transition_notify_layout     (      skr_tex_t* ref_tex, VkImageLayout new_layout);  // Called after render pass implicit transitions
 bool                  _skr_tex_needs_transition             (const skr_tex_t*     tex, uint8_t type); // Check if texture needs transition for given type (0=shader_read, 1=storage)
 void                  _skr_tex_transition_enqueue           (      skr_tex_t* ref_tex, uint8_t type); // Deferred texture transition queue (to avoid in-renderpass barriers) type: 0=shader_read, 1=storage
+void                  _skr_tex_transition_dequeue           (      skr_tex_t* ref_tex);               // Remove from deferred queue (called on texture destroy)
 
 // Command buffer management
 bool                  _skr_cmd_init                         (void);

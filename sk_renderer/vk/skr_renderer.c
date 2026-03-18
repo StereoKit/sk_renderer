@@ -77,6 +77,19 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 // Deferred Texture Transition System
 ///////////////////////////////////////////////////////////////////////////////
 
+// Remove a texture from the deferred transition queue (called on destroy)
+void _skr_tex_transition_dequeue(skr_tex_t* ref_tex) {
+	for (uint32_t i = 0; i < _skr_vk.pending_transition_count; i++) {
+		if (_skr_vk.pending_transitions[i] == ref_tex) {
+			// Swap with last element
+			_skr_vk.pending_transition_count--;
+			_skr_vk.pending_transitions [i] = _skr_vk.pending_transitions [_skr_vk.pending_transition_count];
+			_skr_vk.pending_transition_types[i] = _skr_vk.pending_transition_types[_skr_vk.pending_transition_count];
+			return;
+		}
+	}
+}
+
 // Queue a texture for transition (will be flushed before next render pass)
 void _skr_tex_transition_enqueue(skr_tex_t* ref_tex, uint8_t type) {
 	if (!ref_tex || !ref_tex->image) return;
@@ -368,16 +381,17 @@ void skr_renderer_end_pass() {
 
 	// Transition readable color attachments to shader-read layout for next use
 	// Automatic system handles this - tracks that color is currently in COLOR_ATTACHMENT_OPTIMAL
+	// Transition readable render targets to shader-read layout and enqueue for
+	// cross-submission visibility barriers. The enqueue is safe here because
+	// these are app-owned render targets with known lifetimes (not scene textures).
 	if (_skr_vk.current_color_texture && (_skr_vk.current_color_texture->flags & skr_tex_flags_readable)) {
 		_skr_tex_transition_for_shader_read(cmd, _skr_vk.current_color_texture,
 			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		_skr_tex_transition_enqueue(_skr_vk.current_color_texture, 0);
 	}
 
-	// Transition readable depth texture to shader-read layout for next use (e.g., shadow maps)
-	// Automatic system handles this - tracks that depth is currently in DEPTH_STENCIL_ATTACHMENT_OPTIMAL
 	// NOTE: MSAA depth textures don't have SAMPLED_BIT and can't be transitioned to SHADER_READ_ONLY
 	if (_skr_vk.current_depth_texture && (_skr_vk.current_depth_texture->flags & skr_tex_flags_readable)) {
-		// Only transition to shader-read if not MSAA depth (MSAA depth doesn't have SAMPLED_BIT)
 		bool is_msaa_depth = _skr_vk.current_depth_texture->samples > VK_SAMPLE_COUNT_1_BIT &&
 		                     (_skr_vk.current_depth_texture->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT);
 		if (!is_msaa_depth) {
@@ -386,12 +400,10 @@ void skr_renderer_end_pass() {
 		}
 	}
 
-	// Transition readable resolve target (e.g., scene_color used as upscale source)
-	// The render pass leaves the resolve attachment in COLOR_ATTACHMENT_OPTIMAL;
-	// if it will be sampled later (e.g., upscale blit), transition to SHADER_READ.
 	if (_skr_vk.current_resolve_texture && (_skr_vk.current_resolve_texture->flags & skr_tex_flags_readable)) {
 		_skr_tex_transition_for_shader_read(cmd, _skr_vk.current_resolve_texture,
 			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		_skr_tex_transition_enqueue(_skr_vk.current_resolve_texture, 0);
 	}
 
 	_skr_vk.current_color_texture   = NULL;
@@ -679,6 +691,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	_skr_tex_transition_notify_layout(to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	if (to->flags & skr_tex_flags_readable) {
 		_skr_tex_transition_for_shader_read(ctx.cmd, to, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		_skr_tex_transition_enqueue(to, 0);
 	}
 
 	_skr_cmd_release(ctx.cmd);
