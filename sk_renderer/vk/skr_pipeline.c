@@ -888,7 +888,9 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.storeOp        = key->depth_store_op,  // Use the store op from the key (based on readable flag)
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, // Preserves HTILE for fast clears
+			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
+				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL  // Readable depth: explicitly transitioned before render pass
+				: VK_IMAGE_LAYOUT_UNDEFINED,                        // Transient discard: never explicitly transitioned, loadOp=CLEAR handles it
 			.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 		};
 

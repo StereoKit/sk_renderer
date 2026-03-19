@@ -19,7 +19,7 @@
 
 #include "gi_voxel.hlsli"
 
-Texture3D<float4>               voxel_tex     : register(t0);
+Texture3D  <float4>              voxel_tex     : register(t0);
 TextureCube<float4>              env_cubemap   : register(t1);
 SamplerState                     env_cubemap_s : register(s1);
 RWStructuredBuffer<SHProbe>      sh_probes     : register(u0);

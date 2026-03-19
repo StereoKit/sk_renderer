@@ -50,6 +50,7 @@ SamplerComparisonState shadow_map_sampler : register(s14);
 // 3D Voxel Output (storage image)
 ///////////////////////////////////////////
 
+[[vk::image_format("rgba8")]]
 RWTexture3D<unorm float4> voxel_tex : register(u0);
 
 ///////////////////////////////////////////

@@ -8,6 +8,7 @@
 
 uint cascade_offset;
 
+[[vk::image_format("rgba8")]]
 RWTexture3D<unorm float4> voxel_tex : register(u0);
 
 [numthreads(4, 4, 4)]
