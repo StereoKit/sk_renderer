@@ -610,7 +610,7 @@ SKR_API skr_err_          skr_vert_type_create             (const skr_vert_compo
 SKR_API bool              skr_vert_type_is_valid           (const skr_vert_type_t*     type);
 SKR_API void              skr_vert_type_destroy            (      skr_vert_type_t* ref_type);
 
-SKR_API skr_err_          skr_mesh_create                  (const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh);
+SKR_API skr_err_          skr_mesh_create                  (const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* opt_vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh);
 SKR_API bool              skr_mesh_is_valid                (const skr_mesh_t*     mesh);
 SKR_API void              skr_mesh_destroy                 (      skr_mesh_t* ref_mesh);
 SKR_API uint32_t          skr_mesh_get_vert_count          (const skr_mesh_t*     mesh);

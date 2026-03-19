@@ -122,13 +122,13 @@ void skr_vert_type_destroy(skr_vert_type_t* ref_type) {
 // Mesh creation
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_err_ skr_mesh_create(const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh) {
+skr_err_ skr_mesh_create(const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* opt_vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh) {
 	if (!out_mesh) return skr_err_invalid_parameter;
 
 	// Zero out immediately
 	*out_mesh = (skr_mesh_t){0};
 
-	if (vert_count == 0) {
+	if (opt_vert_data && vert_count == 0) {
 		return skr_err_invalid_parameter;
 	}
 
@@ -149,8 +149,8 @@ skr_err_ skr_mesh_create(const skr_vert_type_t* vert_type, skr_index_fmt_ ind_ty
 	out_mesh->ind_format = ind_type;
 	out_mesh->vert_count = vert_count;
 
-	// Create buffers from provided data (skips if vert_data is NULL)
-	skr_err_ err = skr_mesh_set_data(out_mesh, vert_data, vert_count, opt_ind_data, ind_count);
+	// Create buffers from provided data (skips if opt_vert_data is NULL)
+	skr_err_ err = skr_mesh_set_data(out_mesh, opt_vert_data, vert_count, opt_ind_data, ind_count);
 	if (err != skr_err_success) {
 		*out_mesh = (skr_mesh_t){0};
 		return err;
