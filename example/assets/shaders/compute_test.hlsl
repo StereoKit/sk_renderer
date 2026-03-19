@@ -10,7 +10,9 @@ uint  size;
 
 StructuredBuffer  <float2> input  : register(t1);
 RWStructuredBuffer<float2> output : register(u2);
-RWTexture2D       <float4> out_tex: register(u3);
+
+[[vk::image_format("rgba8")]]
+RWTexture2D <float4> out_tex: register(u3);
 
 float2 GetLaplacian(int2 pos) {
 	int2 offsets[9] = { 

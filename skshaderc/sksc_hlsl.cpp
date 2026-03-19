@@ -28,7 +28,10 @@ void sksc_glslang_shutdown() {
 class SkscIncluder : public DirStackFileIncluder {
 public:
 	virtual IncludeResult* includeSystem(const char* header_name, const char* includer_name, size_t inclusion_depth) override {
-		return readLocalPath(header_name, includer_name, (int)inclusion_depth);
+		recordLocalPath(includer_name, inclusion_depth);
+		IncludeResult* result = readLocalPath(header_name);
+		if (result) return result;
+		return readSystemPath(header_name);
 	}
 };
 
@@ -156,9 +159,9 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 
 	// Setup includer
 	SkscIncluder includer;
-	includer.pushExternalLocalDirectory(settings->folder);
+	includer.pushExternalDirectory(settings->folder);
 	for (int32_t i = 0; i < settings->include_folder_ct; i++) {
-		includer.pushExternalLocalDirectory(settings->include_folders[i]);
+		includer.pushExternalDirectory(settings->include_folders[i]);
 	}
 
 	std::string preprocessed_glsl;

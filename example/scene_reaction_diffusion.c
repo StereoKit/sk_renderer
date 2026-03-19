@@ -105,7 +105,7 @@ static scene_t* _scene_reaction_diffusion_create(void) {
 	free(initial_data);
 
 	skr_tex_sampler_t default_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
-	skr_tex_create(skr_tex_fmt_rgba128,
+	skr_tex_create(skr_tex_fmt_rgba32_linear,
 		skr_tex_flags_readable | skr_tex_flags_compute,
 		default_sampler,
 		(skr_vec3i_t){scene->sim_size, scene->sim_size, 1}, 1, 1, NULL, &scene->compute_output);

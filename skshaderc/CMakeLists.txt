@@ -198,10 +198,8 @@ target_link_libraries     (skshaderc_lib PUBLIC spirv-reflect-static)
 # and generates a much larger binary.
 message(STATUS "Fetching glslang...")
 FetchContent_Declare( glslang
-	GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
-	GIT_TAG        ${VULKAN_VERSION}
-	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
+	GIT_REPOSITORY https://github.com/maluoi/glslang.git # Custom fork of glslang for vk::image_format support
+	GIT_TAG        1d31fc505b53016a62167496da49bf0386fa08f7
 )
 set(GLSLANG_ENABLE_INSTALL  OFF  CACHE BOOL "")
 set(GLSLANG_TESTS           OFF  CACHE BOOL "")
