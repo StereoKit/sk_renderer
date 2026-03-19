@@ -91,7 +91,7 @@ void _skr_append_material_config(char* ref_str, size_t str_size, const _skr_pipe
 	write_str[write_pos] = '\0';
 
 	size_t pos = strlen(ref_str);
-	snprintf(ref_str + pos, str_size - pos, "%s%s%s-%s", cull_str, depth_str, blend_str, write_str);
+	snprintf(ref_str + pos, str_size - pos, "%s%s%s%s-%s", cull_str, depth_str, blend_str, mat_key->wireframe ? "W" : "", write_str);
 }
 
 void _skr_append_renderpass_config(char* ref_str, size_t str_size, const skr_pipeline_renderpass_key_t* rp_key) {

@@ -541,6 +541,26 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 		}
 	}
 
+	// Look for input attachments (SubpassInput in HLSL)
+	for (uint32_t i = 0; i < binding_count; i++) {
+		SpvReflectDescriptorBinding* binding = bindings[i];
+
+		if (binding->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) {
+			const char* name = binding->name ? binding->name : "";
+			int64_t id = resource_list.index_where([](const sksc_shader_resource_t &res, void *data) {
+				return strcmp(res.name, (char*)data) == 0;
+			}, (void*)name);
+			if (id == -1)
+				id = resource_list.add({});
+
+			sksc_shader_resource_t *res = &resource_list[id];
+			res->bind.slot          = binding->binding;
+			res->bind.stage_bits   |= spirv_stage->stage;
+			res->bind.register_type = skr_register_input_attachment;
+			strncpy(res->name, name, sizeof(res->name));
+		}
+	}
+
 	free(bindings);
 
 	// Get vertex input info

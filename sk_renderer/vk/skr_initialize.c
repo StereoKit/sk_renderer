@@ -148,6 +148,11 @@ bool skr_init(skr_settings_t settings) {
 	VkResult vr = volkInitialize();
 	SKR_VK_CHECK_RET(vr, volkInitialize, false);
 
+	// Save global vkGetInstanceProcAddr before volkLoadInstance replaces it.
+	// OpenXR runtimes (Quest) call vkGetInstanceProcAddr(NULL, ...) which only
+	// works with the global loader version, not the instance-specific one.
+	PFN_vkGetInstanceProcAddr global_get_instance_proc_addr = vkGetInstanceProcAddr;
+
 	///////////////////////////////////////////////////////////////////////////
 	// Extension definitions
 	///////////////////////////////////////////////////////////////////////////
@@ -167,24 +172,21 @@ bool skr_init(skr_settings_t settings) {
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 	};
 	const char* optional_device_exts[] = {
+		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,          // External memory extensions for GL interop and Android Hardware Buffer
+		VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,     // DMA-BUF import extensions
+		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
+		VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
+
 #ifndef __ANDROID__
-		// Push descriptors have ~0.7ms overhead per call on Qualcomm Adreno (Quest 2/3),
-		// making the descriptor pool fallback significantly faster on mobile VR.
-		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
 #endif
-		VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME,
-		// External memory extensions for GL interop and Android Hardware Buffer
-		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 		VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 #endif
 #ifdef VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME
 		VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
 #endif
-		// DMA-BUF import extensions
-		VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 	};
 	const uint32_t required_device_ext_count = sizeof(required_device_exts) / sizeof(required_device_exts[0]);
 	const uint32_t optional_device_ext_count = sizeof(optional_device_exts) / sizeof(optional_device_exts[0]);
@@ -303,7 +305,7 @@ bool skr_init(skr_settings_t settings) {
 	if (settings.instance_create_callback) {
 		skr_instance_create_info_t create_info = {
 			.instance_create_info   = &instance_info,
-			.get_instance_proc_addr = vkGetInstanceProcAddr,
+			.get_instance_proc_addr = global_get_instance_proc_addr,
 		};
 		_skr_vk.instance = (VkInstance)settings.instance_create_callback(&create_info, settings.instance_create_user_data);
 		if (_skr_vk.instance == VK_NULL_HANDLE) {
@@ -589,23 +591,23 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_android_hardware_buffer = false;
 	_skr_vk.has_external_memory_dma_buf = false;
 	_skr_vk.has_drm_format_modifier     = false;
-	bool has_viewport_layer             = false;
+	_skr_vk.has_custom_resolve          = false;
 	bool has_image_format_list          = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
 		if (_skr_ext_available(optional_device_exts[i], available_device_exts, available_device_ext_count)) {
 			device_exts[device_ext_count++] = optional_device_exts[i];
-			if (strcmp(optional_device_exts[i], VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME            ) == 0) _skr_vk.has_push_descriptors        = true;
-			if (strcmp(optional_device_exts[i], VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME) == 0) has_viewport_layer                   = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME            ) == 0) _skr_vk.has_push_descriptors         = true;
+			if (strcmp(optional_device_exts[i], VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME) == 0) _skr_vk.has_custom_resolve           = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME         ) == 0) _skr_vk.has_external_memory_fd       = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME    ) == 0) _skr_vk.has_external_memory_dma_buf  = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME  ) == 0) _skr_vk.has_drm_format_modifier      = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME          ) == 0) has_image_format_list                = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
 #ifdef VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) == 0) _skr_vk.has_android_hardware_buffer  = true;
 #endif
-			if (strcmp(optional_device_exts[i], VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME    ) == 0) _skr_vk.has_external_memory_dma_buf  = true;
-			if (strcmp(optional_device_exts[i], VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME   ) == 0) _skr_vk.has_drm_format_modifier      = true;
-			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME           ) == 0) has_image_format_list                 = true;
 		}
 	}
 
@@ -626,35 +628,46 @@ bool skr_init(skr_settings_t settings) {
 	}
 
 	_skr_free(available_device_exts);
-
-	// Log optional extension status
-	if (!_skr_vk.has_push_descriptors) {
-		skr_log(skr_log_info, "Device extension '%s' not available, using descriptor set fallback", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-	}
-	if (!has_viewport_layer) {
-		skr_log(skr_log_warning, "Device extension '%s' not available, multi-view rendering will not work", VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
-	}
-
+	
 	// Query available device features
 	VkPhysicalDeviceFeatures available_features;
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
 
 	// Track feature availability
-	_skr_vk.has_depth_clamp = available_features.depthClamp;
+	_skr_vk.has_depth_clamp          = available_features.depthClamp;
+	_skr_vk.has_fill_mode_non_solid  = available_features.fillModeNonSolid;
 
 	// Enable features we need (only if available)
 	VkPhysicalDeviceFeatures device_features = {
 		.samplerAnisotropy              = available_features.samplerAnisotropy,
 		.sampleRateShading              = VK_FALSE, // Not using sample shading yet
-		.fillModeNonSolid               = VK_FALSE, // Not using wireframe
+		.fillModeNonSolid               = available_features.fillModeNonSolid,
 		.depthClamp                     = available_features.depthClamp,
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
 		.fragmentStoresAndAtomics       = available_features.fragmentStoresAndAtomics,
 	};
 
+	// Multiview is Vulkan 1.1 core - always enable for multi-view rendering
+	VkPhysicalDeviceMultiviewFeatures multiview_features = {
+		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+		.multiview = VK_TRUE,
+	};
+
+	// Query multiview properties
+	VkPhysicalDeviceMultiviewProperties multiview_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES,
+	};
+	VkPhysicalDeviceProperties2 props2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &multiview_props,
+	};
+	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
+	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
+
 	// YCbCr conversion is Vulkan 1.1 core - always enable for YUV texture support
 	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
 		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext                  = &multiview_features,
 		.samplerYcbcrConversion = VK_TRUE,
 	};
 
@@ -685,7 +698,7 @@ bool skr_init(skr_settings_t settings) {
 		skr_device_create_info_t create_info = {
 			.vk_physical_device     = _skr_vk.physical_device,
 			.device_create_info     = &device_info,
-			.get_instance_proc_addr = vkGetInstanceProcAddr,
+			.get_instance_proc_addr = global_get_instance_proc_addr,
 		};
 		_skr_vk.device = (VkDevice)settings.device_create_callback(&create_info, settings.device_create_user_data);
 		if (_skr_vk.device == VK_NULL_HANDLE) {
@@ -829,11 +842,16 @@ bool skr_init(skr_settings_t settings) {
 	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
 
 	// Populate capability array
-	_skr_vk.capabilities[skr_capability_external_vk]  = true;
-	_skr_vk.capabilities[skr_capability_external_gl]  = _skr_vk.has_external_memory_fd || _skr_vk.has_external_memory_win32;
+	_skr_vk.capabilities[skr_capability_external_vk ] = true;
+	_skr_vk.capabilities[skr_capability_external_gl ] = _skr_vk.has_external_memory_fd || _skr_vk.has_external_memory_win32;
 	_skr_vk.capabilities[skr_capability_external_ahb] = _skr_vk.has_android_hardware_buffer;
 	_skr_vk.capabilities[skr_capability_external_dma] = _skr_vk.has_external_memory_dma_buf && _skr_vk.has_drm_format_modifier && has_image_format_list;
-	_skr_vk.capabilities[skr_capability_vk_video]    = _skr_vk.has_video_decode;
+	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode;
+
+	// Log optional extension status
+	skr_log(skr_log_info, "[%s] %s",           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,             _skr_vk.has_push_descriptors ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s",           VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME, _skr_vk.has_custom_resolve   ? "true" : "false");
+	skr_log(skr_log_info, "[%s] max %u views", VK_KHR_MULTIVIEW_EXTENSION_NAME,                   _skr_vk.max_multiview_view_count);
 
 	_skr_vk.initialized = true;
 	return true;
@@ -934,7 +952,7 @@ int32_t skr_get_max_msaa_samples(void) {
 }
 
 bool skr_is_capable(skr_capability_ capability) {
-	if ((int32_t)capability < 0 || capability >= skr_capability_count_)
+	if ((int32_t)capability < 0 || capability >= skr_capability_max)
 		return false;
 	return _skr_vk.capabilities[capability];
 }

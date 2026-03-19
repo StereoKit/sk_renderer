@@ -7,8 +7,11 @@
 #include "tools/scene_util.h"
 #include "app.h"
 
+#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#include <cimgui.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 // Array texture scene - renders cubes to a 2-layer array texture, displays as red/cyan stereo
 typedef struct {
@@ -28,8 +31,9 @@ typedef struct {
 	skr_shader_t   stereo_shader;
 	skr_material_t stereo_material;
 
-	float rotation;
-	float eye_separation;
+	float    rotation;
+	float    eye_separation;
+	uint32_t mode; // 0 = red-blue, 1 = red-cyan
 } scene_array_texture_t;
 
 static scene_t* _scene_array_texture_create(void) {
@@ -219,18 +223,43 @@ static void _scene_array_texture_render(scene_t* base, int32_t width, int32_t he
 		}
 	}
 
-	// Render cubes to array texture (separate render pass)
-	skr_renderer_begin_pass(&scene->array_render_target, &scene->depth_buffer, NULL, skr_clear_all, (skr_vec4_t){0.0f, 0.0f, 0.0f, 0.0f}, 1.0f, 0);
-	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)scene->array_render_target.size.x, (float)scene->array_render_target.size.y});
-	skr_renderer_set_scissor ((skr_recti_t){0, 0, scene->array_render_target.size.x, scene->array_render_target.size.y});
+	// Render cubes to array texture via deferred pass (handles multi-view fallback)
+	int32_t w = scene->array_render_target.size.x;
+	int32_t h = scene->array_render_target.size.y;
 
-	skr_render_list_add  (&scene->render_list, &scene->cube_mesh, &scene->cube_material, cube_instances, sizeof(float4x4), total_cubes);
-	skr_renderer_draw    (&scene->render_list, &sys_buffer, sizeof(su_system_buffer_t), sys_buffer.view_count);
+	skr_render_list_add(&scene->render_list, &scene->cube_mesh, &scene->cube_material, cube_instances, sizeof(float4x4), total_cubes);
+
+	skr_pass_t stereo_pass = {
+		.color       = &scene->array_render_target,
+		.depth       = &scene->depth_buffer,
+		.clear       = skr_clear_all,
+		.clear_color = {0, 0, 0, 0},
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)w, (float)h},
+		.scissor     = {0, 0, w, h},
+		.view_count       = sys_buffer.view_count,
+		.views_correlated = true,
+	};
+	skr_pass_add_draw(&stereo_pass, &scene->render_list, &sys_buffer, sizeof(su_system_buffer_t));
+	skr_pass_submit(&stereo_pass);
 	skr_render_list_clear(&scene->render_list);
-	skr_renderer_end_pass();
 
 	// Display array texture as red/cyan stereo to swapchain (in the main render pass)
 	skr_render_list_add(ref_render_list, &scene->fullscreen_quad, &scene->stereo_material, NULL, 0, 1);
+}
+
+static void _scene_array_texture_render_ui(scene_t* base) {
+	scene_array_texture_t* scene = (scene_array_texture_t*)base;
+
+	const char* mode_names[] = { "Red-Blue", "Red-Cyan" };
+	int32_t     mode_int     = (int32_t)scene->mode;
+
+	igText("Anaglyph Settings:");
+	if (igCombo_Str_arr("Mode", &mode_int, mode_names, 2, 0)) {
+		scene->mode = (uint32_t)mode_int;
+		skr_material_set_param(&scene->stereo_material, "mode", sksc_shader_var_uint, 1, &scene->mode);
+	}
+	igSliderFloat("Eye Separation", &scene->eye_separation, 0.0f, 1.0f, "%.2f", 0);
 }
 
 const scene_vtable_t scene_array_texture_vtable = {
@@ -240,4 +269,5 @@ const scene_vtable_t scene_array_texture_vtable = {
 	.update     = _scene_array_texture_update,
 	.render     = _scene_array_texture_render,
 	.get_camera = NULL,
+	.render_ui  = _scene_array_texture_render_ui,
 };

@@ -72,35 +72,29 @@ struct psIn {
 	float4 color      : COLOR0;
 	float3 world_pos  : TEXCOORD1;
 	float3 view_dir   : TEXCOORD2;
-	uint   layer      : SV_RenderTargetArrayIndex;
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
-	// Multi-view support - extract view index
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
-
 	// Transform to world space
-	output.world_pos = mul(float4(input.pos, 1), inst[inst_idx].world).xyz;
-	output.pos       = mul(float4(output.world_pos, 1), viewproj[view_idx]);
+	output.world_pos = mul(float4(input.pos, 1), inst[ids.inst].world).xyz;
+	output.pos       = mul(float4(output.world_pos, 1), viewproj[ids.view]);
 
 	// Transform normal to world space
-	output.normal = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
+	output.normal = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
 
 	// Apply texture transform and pass through vertex color
 	output.uv    = (input.uv * tex_trans.zw) + tex_trans.xy;
 	output.color = input.color * color;
 
 	// Calculate view direction
-	output.view_dir = cam_pos[view_idx].xyz - output.world_pos;
+	output.view_dir = cam_pos[ids.view].xyz - output.world_pos;
 
-	output.layer = view_idx;
 	return output;
 }
 

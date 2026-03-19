@@ -70,9 +70,9 @@ typedef struct skr_tex_t {
 	VkImage                image;
 	VkDeviceMemory         memory;
 	VkImageView            view;
-	VkFramebuffer          framebuffer;      // Cached framebuffer (color only, no depth)
-	VkFramebuffer          framebuffer_depth; // Cached framebuffer (color + depth, if last used with depth)
-	VkRenderPass           framebuffer_pass; // Render pass the framebuffer was created for
+	VkFramebuffer          framebuffer;            // Cached framebuffer (color only, no depth)
+	VkFramebuffer          framebuffer_depth;      // Cached framebuffer (color + depth, if last used with depth)
+	VkRenderPass           framebuffer_pass;       // Render pass the framebuffer was created for
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;
@@ -202,6 +202,7 @@ typedef struct {
 	skr_blend_state_t    blend_state;
 	bool                 alpha_to_coverage;
 	bool                 depth_clamp;
+	bool                 wireframe;
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 #define SKR_MAX_IMMUTABLE_SAMPLERS 2

@@ -76,12 +76,12 @@ extern XrViewConfigurationType xr_config_view;
 // Function pointers for OpenXR extensions
 ///////////////////////////////////////////
 
-extern PFN_xrGetVulkanInstanceExtensionsKHR  ext_xrGetVulkanInstanceExtensionsKHR;
-extern PFN_xrGetVulkanDeviceExtensionsKHR    ext_xrGetVulkanDeviceExtensionsKHR;
-extern PFN_xrGetVulkanGraphicsDeviceKHR      ext_xrGetVulkanGraphicsDeviceKHR;
-extern PFN_xrGetVulkanGraphicsRequirementsKHR ext_xrGetVulkanGraphicsRequirementsKHR;
-extern PFN_xrCreateDebugUtilsMessengerEXT    ext_xrCreateDebugUtilsMessengerEXT;
-extern PFN_xrDestroyDebugUtilsMessengerEXT   ext_xrDestroyDebugUtilsMessengerEXT;
+extern PFN_xrCreateVulkanInstanceKHR           ext_xrCreateVulkanInstanceKHR;
+extern PFN_xrCreateVulkanDeviceKHR             ext_xrCreateVulkanDeviceKHR;
+extern PFN_xrGetVulkanGraphicsDevice2KHR       ext_xrGetVulkanGraphicsDevice2KHR;
+extern PFN_xrGetVulkanGraphicsRequirements2KHR ext_xrGetVulkanGraphicsRequirements2KHR;
+extern PFN_xrCreateDebugUtilsMessengerEXT      ext_xrCreateDebugUtilsMessengerEXT;
+extern PFN_xrDestroyDebugUtilsMessengerEXT     ext_xrDestroyDebugUtilsMessengerEXT;
 
 ///////////////////////////////////////////
 // OpenXR Functions

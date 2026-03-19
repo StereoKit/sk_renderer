@@ -18,29 +18,24 @@ struct psIn {
 	float4 pos       : SV_POSITION;
 	float3 local_pos : TEXCOORD0;
 	float3 cam_local : TEXCOORD1;
-	uint   layer     : SV_RenderTargetArrayIndex;
 };
 
 Texture3D    tex         : register(t0);
 SamplerState tex_sampler : register(s0);
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	uint inst_idx = id / view_count;
-	uint view_idx = id % view_count;
-
-	float4x4 world     = inst[inst_idx].world;
-	float4x4 world_inv = inst[inst_idx].world_inv;
+psIn vs(vsIn input, skr_ids_t ids) {
+	float4x4 world     = inst[ids.inst].world;
+	float4x4 world_inv = inst[ids.inst].world_inv;
 
 	// Transform camera position to local space using precomputed inverse
-	float3 cam_world = cam_pos[view_idx].xyz;
+	float3 cam_world = cam_pos[ids.view].xyz;
 	float3 cam_local = mul(float4(cam_world, 1), world_inv).xyz;
 
 	psIn output;
 	float4 world_position = mul(float4(input.pos, 1), world);
-	output.pos       = mul(world_position, viewproj[view_idx]);
+	output.pos       = mul(world_position, viewproj[ids.view]);
 	output.local_pos = input.pos;
 	output.cam_local = cam_local;
-	output.layer     = view_idx;
 	return output;
 }
 

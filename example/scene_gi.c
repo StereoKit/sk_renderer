@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
@@ -968,7 +969,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			}
 
 			skr_renderer_begin_pass(&scene->gi_voxel_rt, NULL, NULL,
-				skr_clear_color, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
+				skr_clear_color, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0, 0x7, 0);
 			skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)GI_VOXEL_SIZE, (float)GI_VOXEL_SIZE});
 			skr_renderer_set_scissor ((skr_recti_t){0, 0, GI_VOXEL_SIZE, GI_VOXEL_SIZE});
 
@@ -977,7 +978,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			if (state == su_gltf_state_ready)
 				su_gltf_add_to_render_list_shader(scene->model, &scene->gi_voxel_list, &model_transform, 1);
 
-			skr_renderer_draw    (&scene->gi_voxel_list, &vox_sys, sizeof(su_system_buffer_t), 3);
+			skr_renderer_draw    (&scene->gi_voxel_list, &vox_sys, sizeof(su_system_buffer_t));
 			skr_render_list_clear(&scene->gi_voxel_list);
 			skr_renderer_end_pass();
 		}
@@ -1039,19 +1040,22 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	// bound as a texture while being used as the depth render target.
 	skr_renderer_set_global_texture(14, &scene->white_texture);
 
-	skr_renderer_begin_pass(NULL, &scene->shadow_map, NULL, skr_clear_depth, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION});
-	skr_renderer_set_scissor ((skr_recti_t){0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION});
-
 	if (scene->show_floor)
 		skr_render_list_add(&scene->shadow_list, &scene->floor_mesh, &scene->shadow_caster_material, &floor_instance, sizeof(float4x4), 1);
 	if (state == su_gltf_state_ready) {
 		su_gltf_add_to_render_list_override(scene->model, &scene->shadow_list, &model_transform, &scene->shadow_caster_material);
 	}
 
-	skr_renderer_draw    (&scene->shadow_list, &shadow_sys, sizeof(su_system_buffer_t), 1);
+	skr_pass_t shadow_pass = {
+		.depth       = &scene->shadow_map,
+		.clear       = skr_clear_depth,
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
+		.scissor     = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
+	};
+	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys, sizeof(su_system_buffer_t));
+	skr_pass_submit  (&shadow_pass);
 	skr_render_list_clear(&scene->shadow_list);
-	skr_renderer_end_pass();
 
 	// --- Main pass setup ---
 	skr_renderer_set_global_constants(13, &scene->shadow_buffer);

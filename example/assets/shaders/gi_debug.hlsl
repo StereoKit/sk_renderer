@@ -42,25 +42,20 @@ struct psIn {
 	float4 pos       : SV_POSITION;
 	float3 normal    : NORMAL0;
 	float3 world_pos : TEXCOORD0;
-	uint   layer     : SV_RenderTargetArrayIndex;
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
-
-	float  scale = inst[inst_idx].pos_scale.w;
-	float3 center = inst[inst_idx].pos_scale.xyz;
+	float  scale = inst[ids.inst].pos_scale.w;
+	float3 center = inst[ids.inst].pos_scale.xyz;
 	output.world_pos = input.pos * scale + center;
-	output.pos       = mul(float4(output.world_pos, 1), viewproj[view_idx]);
+	output.pos       = mul(float4(output.world_pos, 1), viewproj[ids.view]);
 	output.normal    = input.norm; // uniform scale, normal unchanged
-	output.layer     = view_idx;
 	return output;
 }
 

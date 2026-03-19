@@ -28,24 +28,20 @@ struct psIn {
 	float4                     pos     : SV_POSITION;
 	float3                     normal  : NORMAL0;
 	nointerpolation float3     vox_col : TEXCOORD0;
-	uint                       layer   : SV_RenderTargetArrayIndex;
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
-
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
 
 	// Derive 3D voxel coordinate from linear instance index
 	int3 vpos = int3(
-		inst_idx % GI_VOXEL_RES,
-		(inst_idx / GI_VOXEL_RES) % GI_VOXEL_RES,
-		inst_idx / (GI_VOXEL_RES * GI_VOXEL_RES));
+		ids.inst % GI_VOXEL_RES,
+		(ids.inst / GI_VOXEL_RES) % GI_VOXEL_RES,
+		ids.inst / (GI_VOXEL_RES * GI_VOXEL_RES));
 
 	float4 voxel = gi_voxel_tex.Load(int4(vpos.x, vpos.y, vpos.z + gi_active_cascade * GI_VOXEL_RES, 0));
 
@@ -53,7 +49,6 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 		output.pos     = asfloat(0x7FC00000); // NaN kills the primitive
 		output.normal  = float3(0, 0, 0);
 		output.vox_col = float3(0, 0, 0);
-		output.layer   = view_idx;
 		return output;
 	}
 
@@ -65,9 +60,8 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	float3 center   = gi_cascades[gi_active_cascade].volume_min + (float3(vpos) + 0.5) * cell;
 
 	float3 world_pos = input.pos * cell + center;
-	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
+	output.pos       = mul(float4(world_pos, 1), viewproj[ids.view]);
 	output.normal    = input.norm;
-	output.layer     = view_idx;
 	return output;
 }
 

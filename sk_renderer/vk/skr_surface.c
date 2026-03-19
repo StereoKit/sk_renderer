@@ -76,13 +76,6 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		}
 	}
 
-	const char* mode_name =
-		present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO_RELAXED" :
-		present_mode == VK_PRESENT_MODE_FIFO_KHR         ? "FIFO"         :
-		present_mode == VK_PRESENT_MODE_MAILBOX_KHR      ? "MAILBOX"      :
-		present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR    ? "IMMEDIATE"    : "UNKNOWN";
-	skr_log(skr_log_info, "Present mode: %s", mode_name);
-
 	// Determine extent
 	VkExtent2D extent = capabilities.currentExtent;
 	if (extent.width == UINT32_MAX) {
@@ -271,6 +264,8 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 
 	_skr_cmd_destroy_surface  (NULL, ref_surface->surface  );
 	_skr_cmd_destroy_swapchain(NULL, ref_surface->swapchain);
+
+	*ref_surface = (skr_surface_t){0};
 }
 
 void skr_surface_resize(skr_surface_t* ref_surface) {
@@ -294,6 +289,21 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_te
 	if (!ref_surface || !out_tex) return skr_acquire_error;
 
 	*out_tex = NULL;
+
+	// Check if the surface needs to be recreated before touching any per-frame
+	// state. Some drivers (e.g. Adreno) do not return VK_SUBOPTIMAL_KHR on
+	// dimension mismatch — they silently scale in the compositor instead.
+	// Polling capabilities is the only reliable cross-driver way to detect
+	// this.
+	{
+		VkSurfaceCapabilitiesKHR caps;
+		vkGetPhysicalDeviceSurfaceCapabilitiesKHR(_skr_vk.physical_device, ref_surface->surface, &caps);
+
+		if ( caps.currentExtent.width  != UINT32_MAX &&
+		    (caps.currentExtent.width  != (uint32_t)ref_surface->size.x ||
+		     caps.currentExtent.height != (uint32_t)ref_surface->size.y))
+			return skr_acquire_needs_resize;
+	}
 
 	// Track wait time for CPU timing (excluded from CPU busy time)
 	// Both skr_future_wait and vkAcquireNextImageKHR can block
@@ -374,6 +384,10 @@ void skr_surface_present(skr_surface_t* ref_surface) {
 	mtx_unlock(_skr_vk.present_queue_mutex);
 
 	ref_surface->frame_idx = (ref_surface->frame_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+}
+
+bool skr_surface_is_valid(const skr_surface_t* surface) {
+	return surface && surface->surface != VK_NULL_HANDLE;
 }
 
 skr_vec2i_t skr_surface_get_size(const skr_surface_t* surface) {

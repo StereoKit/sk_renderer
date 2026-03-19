@@ -33,7 +33,6 @@ struct psIn {
 	float3 world_pos    : TEXCOORD2;
 	float  shadow_ndotl : TEXCOORD3;
 	float3 color        : COLOR0;
-	uint   layer        : SV_RenderTargetArrayIndex;
 };
 
 Texture2D              tex              : register(t3);
@@ -41,18 +40,14 @@ SamplerState           tex_sampler      : register(s3);
 Texture2D              shadow_map       : register(t14);
 SamplerComparisonState shadow_map_sampler : register(s14);
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	// Multi-view instancing: extract instance index and view index
-	uint inst_idx = id / view_count;
-	uint view_idx = id % view_count;
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
-	float4 world_pos = mul(float4(input.pos, 1), inst[inst_idx].world);
-	output.pos = mul(world_pos, viewproj[view_idx]);
+	float4 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world);
+	output.pos = mul(world_pos, viewproj[ids.view]);
 	output.world_pos = world_pos.xyz;
 
 	// Calculate normal in world space
-	float3 normal = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
+	float3 normal = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
 	output.shadow_ndotl = dot(normal, light_direction);
 
 	// Apply bias to shadow map position in world space
@@ -74,7 +69,6 @@ psIn vs(vsIn input, uint id : SV_InstanceID) {
 	float diffuse = saturate(output.shadow_ndotl) * 0.8;
 	output.color = (ambient + diffuse) * input.color.rgb;
 
-	output.layer = view_idx;
 	return output;
 }
 

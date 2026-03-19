@@ -8,6 +8,7 @@
 #include "app.h"
 
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <math.h>
 
@@ -258,15 +259,19 @@ static void _scene_shadows_render(scene_t* base, int32_t width, int32_t height, 
 	skr_renderer_set_global_texture  (14, NULL);
 
 	// Render shadow map (depth-only pass)
-	skr_renderer_begin_pass(NULL, &scene->shadow_map, NULL, skr_clear_depth, (skr_vec4_t){0, 0, 0, 0}, 1.0f, 0);
-	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION});
-	skr_renderer_set_scissor ((skr_recti_t){0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION});
+	skr_render_list_add(&scene->shadow_list, &scene->cube_mesh,  &scene->shadow_caster_material,  cube_instances, sizeof(float4x4), cube_count);
+	skr_render_list_add(&scene->shadow_list, &scene->floor_mesh, &scene->shadow_caster_material, &floor_instance, sizeof(float4x4), 1);
 
-	skr_render_list_add  (&scene->shadow_list, &scene->cube_mesh,  &scene->shadow_caster_material,  cube_instances, sizeof(float4x4), cube_count);
-	skr_render_list_add  (&scene->shadow_list, &scene->floor_mesh, &scene->shadow_caster_material, &floor_instance, sizeof(float4x4), 1);
-	skr_renderer_draw    (&scene->shadow_list, &shadow_sys_buffer, sizeof(su_system_buffer_t), 1);
+	skr_pass_t shadow_pass = {
+		.depth       = &scene->shadow_map,
+		.clear       = skr_clear_depth,
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
+		.scissor     = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
+	};
+	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys_buffer, sizeof(su_system_buffer_t));
+	skr_pass_submit  (&shadow_pass);
 	skr_render_list_clear(&scene->shadow_list);
-	skr_renderer_end_pass();
 
 	// Bind shadow buffer and shadow map globally (b13 for constants, t14 for texture to avoid slot conflicts)
 	skr_renderer_set_global_constants(13, &scene->shadow_buffer);

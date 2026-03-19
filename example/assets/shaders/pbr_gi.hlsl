@@ -65,32 +65,28 @@ struct vsIn {
 };
 
 struct psIn {
-	float4      pos       : SV_POSITION;
-	half3 normal    : NORMAL0;
-	float2      uv        : TEXCOORD0;
-	half4 color     : COLOR0;
-	float3      world_pos : TEXCOORD1;
-	uint        layer     : SV_RenderTargetArrayIndex;
+	float4 pos       : SV_POSITION;
+	float3 normal    : NORMAL0;
+	float2 uv        : TEXCOORD0;
+	float4 color     : COLOR0;
+	float3 world_pos : TEXCOORD1;
 };
 
 ///////////////////////////////////////////
 // Vertex Shader
 ///////////////////////////////////////////
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
 
-	uint view_idx = id % view_count;
-	uint inst_idx = id / view_count;
-
-	float3 world_pos = mul(float4(input.pos, 1), inst[inst_idx].world).xyz;
-	float3 normal    = normalize(mul(float4(input.norm, 0), inst[inst_idx].world).xyz);
-	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
-	output.normal    = (half3)normal;
+	float3 world_pos = mul(float4(input.pos, 1), inst[ids.inst].world).xyz;
+	float3 normal    = normalize(mul(float4(input.norm, 0), inst[ids.inst].world).xyz);
+	output.pos       = mul(float4(world_pos, 1), viewproj[ids.view]);
+	output.normal    = normal;
 	output.uv        = (input.uv * tex_trans.zw) + tex_trans.xy;
-	output.color     = (half4)(input.color * color);
+	output.color     = input.color * color;
 	output.world_pos = world_pos;
-	output.layer     = view_idx;
+
 	return output;
 }
 

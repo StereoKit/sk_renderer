@@ -18,7 +18,6 @@ struct psIn {
 	float4 pos   : SV_POSITION;
 	float2 uv    : TEXCOORD0;
 	float4 color : COLOR0;
-	uint   layer : SV_RenderTargetArrayIndex;
 };
 
 Texture2D    tex         : register(t3);
@@ -27,16 +26,12 @@ float4       tex_trans;
 
 //--tex_trans = 0,0,1,1
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	uint inst_idx = id / view_count;
-	uint view_idx = id % view_count;
-
+psIn vs(vsIn input, skr_ids_t ids) {
 	psIn output;
-	output.pos   = mul(float4(input.pos, 1), inst[inst_idx].world);
-	output.pos   = mul(output.pos, viewproj[view_idx]);
+	output.pos   = mul(float4(input.pos, 1), inst[ids.inst].world);
+	output.pos   = mul(output.pos, viewproj[ids.view]);
 	output.color = input.color;
 	output.uv    = (input.uv * tex_trans.zw) + tex_trans.xy;
-	output.layer = view_idx;
 	return output;
 }
 

@@ -19,6 +19,11 @@
 #include <android/hardware_buffer.h>
 #endif
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // Helper functions
 ///////////////////////////////////////////////////////////////////////////////
@@ -38,7 +43,7 @@ static uint32_t _skr_find_memory_type(VkPhysicalDevice phys_device, VkMemoryRequ
 }
 
 // Allocate device memory for an image, trying lazily-allocated first for transient attachments
-static VkDeviceMemory _skr_allocate_image_memory(VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory) {
+VkDeviceMemory _skr_allocate_image_memory(VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory) {
 	VkMemoryRequirements mem_requirements;
 	vkGetImageMemoryRequirements(device, image, &mem_requirements);
 
@@ -310,9 +315,19 @@ bool _skr_tex_needs_transition(const skr_tex_t* tex, uint8_t type) {
 	return tex->current_layout != target_layout;
 }
 
+// Notify the system that a render pass has performed an implicit layout transition
+// This updates tracked state without issuing a barrier
+void _skr_tex_transition_notify_layout(skr_tex_t* ref_tex, VkImageLayout new_layout) {
+	// Don't update transient discard textures - they conceptually stay in UNDEFINED
+	if (!ref_tex->is_transient_discard) {
+		ref_tex->current_layout = new_layout;
+	}
+	ref_tex->first_use = false;
+}
+
 // General-purpose automatic transition - tracks state and inserts barrier if needed
 void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
-	if (!ref_tex || !ref_tex->image) return;
+	if (!ref_tex->image) return;
 
 	// For transient discard textures (non-readable depth/MSAA), always use UNDEFINED as old layout
 	VkImageLayout old_layout = ref_tex->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : ref_tex->current_layout;
@@ -353,19 +368,32 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 			old_layout, new_layout,
 			src_stage,  dst_stage,
 			src_access, dst_access);
-
-		// Update tracked state (unless it's transient discard - always stays UNDEFINED conceptually)
-		if (!ref_tex->is_transient_discard) {
-			ref_tex->current_layout = new_layout;
-		}
 	}
-	ref_tex->first_use = false;
+
+	_skr_tex_transition_notify_layout(ref_tex, new_layout);
+}
+
+// Memory barrier without layout change. Ensures ALL prior writes to this
+// texture are visible for the given destination stage/access. Unlike
+// _skr_tex_transition, this always emits a barrier even when the tracked
+// layout already matches — needed for cross-submission synchronization
+// where the layout is correct but the data may not yet be visible.
+void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags src_stage, VkAccessFlags src_access, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+	if (!ref_tex->image) return;
+
+	VkImageLayout layout = ref_tex->is_transient_discard
+		? VK_IMAGE_LAYOUT_UNDEFINED
+		: ref_tex->current_layout;
+
+	_skr_transition_image_layout(cmd, ref_tex->image, ref_tex->aspect_mask,
+		0, ref_tex->mip_levels, ref_tex->layer_count,
+		layout, layout,
+		src_stage,  dst_stage,
+		src_access, dst_access);
 }
 
 // Specialized: Transition for shader read (most common case)
 void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage) {
-	if (!ref_tex) return;
-
 	// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
 	VkImageLayout target_layout = (ref_tex->flags & skr_tex_flags_compute)
 		? VK_IMAGE_LAYOUT_GENERAL
@@ -376,22 +404,9 @@ void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex
 
 // Specialized: Transition for storage image (compute RWTexture)
 void _skr_tex_transition_for_storage(VkCommandBuffer cmd, skr_tex_t* ref_tex) {
-	if (!ref_tex) return;
 	_skr_tex_transition(cmd, ref_tex, VK_IMAGE_LAYOUT_GENERAL,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-}
-
-// Notify the system that a render pass has performed an implicit layout transition
-// This updates tracked state without issuing a barrier
-void _skr_tex_transition_notify_layout(skr_tex_t* ref_tex, VkImageLayout new_layout) {
-	if (!ref_tex) return;
-
-	// Don't update transient discard textures - they conceptually stay in UNDEFINED
-	if (!ref_tex->is_transient_discard) {
-		ref_tex->current_layout = new_layout;
-	}
-	ref_tex->first_use = false;
 }
 
 // Queue family ownership transfer (for future async upload)
@@ -428,11 +443,8 @@ void _skr_tex_transition_queue_family(VkCommandBuffer cmd, skr_tex_t* ref_tex,
 	vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &barrier);
 
 	// Update tracked state
-	if (!ref_tex->is_transient_discard) {
-		ref_tex->current_layout = layout;
-	}
+	_skr_tex_transition_notify_layout(ref_tex, layout);
 	ref_tex->current_queue_family = dst_queue_family;
-	ref_tex->first_use = false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -840,8 +852,10 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 
 	// Determine usage flags
 	// Don't add SAMPLED_BIT for MSAA depth textures - not supported by some drivers (NVIDIA returns size=0)
-	bool is_msaa_depth = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT) && is_depth;
-	VkImageUsageFlags usage = is_msaa_depth ? 0 : VK_IMAGE_USAGE_SAMPLED_BIT;
+	// Don't add SAMPLED_BIT for in-tile textures - they stay in tile memory, never sampled
+	bool is_msaa_depth  = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT) && is_depth;
+	bool is_in_tile     = (out_tex->flags & skr_tex_flags_in_tile_msaa) && !(out_tex->flags & skr_tex_flags_readable);
+	VkImageUsageFlags usage = (is_msaa_depth || is_in_tile) ? 0 : VK_IMAGE_USAGE_SAMPLED_BIT;
 	
 	if (out_tex->flags & skr_tex_flags_readable) {
 		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -854,9 +868,9 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	if (out_tex->aspect_mask == 0)          { out_tex->aspect_mask   = VK_IMAGE_ASPECT_COLOR_BIT;   }
 
 
-	// For MSAA attachments, add transient bit for in-tile resolve optimization
+	// For MSAA or in-tile attachments, add transient bit for tile-local optimization
 	// But only if the texture is NOT readable (transient means no memory backing)
-	bool is_msaa_attachment = out_tex->samples > VK_SAMPLE_COUNT_1_BIT && (out_tex->flags & skr_tex_flags_writeable) && !(out_tex->flags & skr_tex_flags_readable);
+	bool is_transient_candidate = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT || is_in_tile) && (out_tex->flags & skr_tex_flags_writeable) && !(out_tex->flags & skr_tex_flags_readable);
 
 	if (out_tex->flags & skr_tex_flags_writeable) {
 		if (is_depth) {
@@ -864,7 +878,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		} else {
 			usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 			// TRANSIENT_ATTACHMENT_BIT can't be combined with TRANSFER_DST_BIT
-			if (!is_msaa_attachment) {
+			if (!is_transient_candidate) {
 				usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 			}
 		}
@@ -875,7 +889,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 
 	// Only use transient attachment if format+usage combination is supported
 	// AND lazily allocated memory is available (required for transient attachments)
-	if (is_msaa_attachment) {
+	if (is_transient_candidate) {
 		VkImageUsageFlags test_usage = usage | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
 		test_usage &= ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
@@ -909,16 +923,21 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 			usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
 			// Remove SAMPLED_BIT and TRANSFER_DST_BIT for transient attachments
 			usage &= ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-			// is_msaa_attachment stays true - request lazy memory allocation
+			// is_transient_candidate stays true - request lazy memory allocation
 		} else {
 			// Transient not supported, fall back to regular memory
-			is_msaa_attachment = false;
+			is_transient_candidate = false;
 		}
 	}
 
 	// For compute shader storage images (RWTexture2D)
 	if (out_tex->flags & skr_tex_flags_compute) {
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+	}
+
+	// For input attachments (SubpassInput in shaders)
+	if (out_tex->flags & skr_tex_flags_input_attachment) {
+		usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 	}
 
 	// For dynamic textures (updated via skr_tex_set_data)
@@ -971,7 +990,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	}
 
 	// Allocate memory using helper
-	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_msaa_attachment, &out_tex->memory) == VK_NULL_HANDLE) {
+	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_transient_candidate, &out_tex->memory) == VK_NULL_HANDLE) {
 		skr_log(skr_log_critical, "Failed to allocate texture memory - Format: %d, Size: %dx%dx%d, Mips: %d, Layers: %d, Samples: %d, Usage: 0x%x, Flags: 0x%x",
 			format, size.x, size.y, size.z, out_tex->mip_levels, out_tex->layer_count, out_tex->samples, usage, out_tex->flags);
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
@@ -987,10 +1006,8 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	out_tex->current_layout       = VK_IMAGE_LAYOUT_UNDEFINED;
 	out_tex->current_queue_family = _skr_vk.graphics_queue_family;
 	out_tex->first_use            = true;
-	// All attachments track layout so render passes can use non-UNDEFINED
-	// initialLayouts, avoiding DCC/HTILE metadata re-initialization.
-	// Tiled GPU optimization is driven by loadOp/storeOp, not initialLayout.
-	out_tex->is_transient_discard = false;
+	// Transient discard optimization for non-readable depth/MSAA/in-tile (tile GPU optimization)
+	out_tex->is_transient_discard = (is_transient_candidate || (is_depth && !(flags & skr_tex_flags_readable)));
 
 	// Upload texture data if provided (or just transition to shader read layout)
 	if (opt_data && opt_data->data) {
@@ -1001,9 +1018,9 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 			*out_tex = (skr_tex_t){0};
 			return upload_err;
 		}
-	} else if (!is_msaa_attachment && !(out_tex->flags & skr_tex_flags_writeable)) {
+	} else if (!is_transient_candidate && !(out_tex->flags & skr_tex_flags_writeable)) {
 		// No data provided, transition to appropriate layout for read-only textures
-		// Skip for transient MSAA attachments - they don't need initial layout transition
+		// Skip for transient attachments - they don't need initial layout transition
 		// Skip for writeable textures - let the first render pass handle the transition
 
 		_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
@@ -1051,8 +1068,15 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 void skr_tex_destroy(skr_tex_t* ref_tex) {
 	if (!ref_tex) return;
 
+	// Remove from deferred transition queue to prevent dangling pointer access.
+	// _skr_tex_transition_for_shader_read enqueues textures for cross-submission
+	// barriers; if the texture is destroyed before the next flush, the pointer
+	// would be dangling.
+	_skr_tex_transition_dequeue(ref_tex);
+
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
+
 	// Only release from sampler cache if we acquired from it (not YCbCr immutable samplers)
 	if (ref_tex->ycbcr_sampler == VK_NULL_HANDLE) {
 		_skr_sampler_cache_release(ref_tex->sampler_settings);
@@ -1192,9 +1216,16 @@ static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t*
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
-	// Transition mip 0 to TRANSFER_SRC_OPTIMAL (automatic system tracks current layout)
-	_skr_tex_transition(ctx.cmd, ref_tex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	// Transition to TRANSFER_SRC with broad source scope — the upload may
+	// have been in a prior submission, and _skr_tex_transition alone would
+	// derive srcStage from the tracked layout (SHADER_READ → FRAGMENT_SHADER)
+	// which doesn't cover the upload's TRANSFER_WRITE.
+	_skr_transition_image_layout(ctx.cmd, ref_tex->image, ref_tex->aspect_mask,
+		0, ref_tex->mip_levels, ref_tex->layer_count,
+		ref_tex->current_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_MEMORY_WRITE_BIT,         VK_ACCESS_TRANSFER_READ_BIT);
+	ref_tex->current_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
 	// Generate each mip level by blitting from the previous level
 	int32_t mip_width  = ref_tex->size.x;
@@ -1252,6 +1283,10 @@ static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t*
 }
 
 static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, int32_t mip_levels, const skr_shader_t* fragment_shader) {
+	if (ref_tex->layer_count > 1 && ref_tex->layer_count > _skr_vk.max_multiview_view_count) {
+		skr_log(skr_log_critical, "Mipgen requires %u multiview layers, device supports %u", ref_tex->layer_count, _skr_vk.max_multiview_view_count);
+		return;
+	}
 	if (!skr_shader_is_valid(fragment_shader)) {
 		skr_log(skr_log_warning, "Invalid fragment shader provided for mipmap generation");
 		return;
@@ -1281,7 +1316,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	_skr_pipeline_lock();
 
 	// Register render pass format with pipeline system (cached for reuse)
-	VkFormat format = skr_tex_fmt_to_native(ref_tex->format);
+	// Use multiview for multi-layer textures (cubemaps, arrays)
+	VkFormat format    = skr_tex_fmt_to_native(ref_tex->format);
+	uint32_t view_mask = ref_tex->layer_count > 1 ? (1u << ref_tex->layer_count) - 1 : 0;
 	skr_pipeline_renderpass_key_t rp_key = {
 		.color_format   = format,
 		.depth_format   = VK_FORMAT_UNDEFINED,
@@ -1289,6 +1326,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		.samples        = VK_SAMPLE_COUNT_1_BIT,
 		.depth_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,  // Full blit
+		.view_mask      = view_mask,
 	};
 	int32_t renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	int32_t vert_idx       = _skr_pipeline_register_vertformat_unlocked((skr_vert_type_t){0});
@@ -1366,60 +1404,23 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_free(all_params);
 	}
 
+	// Ensure mip 0 data is visible — the upload may have been in a prior
+	// command buffer submission, and layout tracking alone doesn't guarantee
+	// cross-submission memory visibility.
+	_skr_tex_barrier(ctx.cmd, ref_tex,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
 	// Generate each mip level by rendering from previous mip
 	for (int32_t mip = 1; mip < mip_levels; mip++) {
 		skr_vec3i_t mip_dims   = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
 		uint32_t    mip_width  = mip_dims.x;
 		uint32_t    mip_height = mip_dims.y;
 
-		// Create image view for this mip level (target)
-		VkImageView mip_view = VK_NULL_HANDLE;
-		{
-			VkImageViewCreateInfo view_info = {
-				.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-				.image      = ref_tex->image,
-				.viewType   = view_type,
-				.format     = format,
-				.subresourceRange = {
-					.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-					.baseMipLevel   = mip,
-					.levelCount     = 1,
-					.baseArrayLayer = 0,
-					.layerCount     = ref_tex->layer_count,
-				},
-			};
-			VkResult vr = vkCreateImageView(device, &view_info, NULL, &mip_view);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateImageView");
-				continue;
-			}
-			_skr_cmd_destroy_image_view(ctx.destroy_list, mip_view);
-		}
-
-		// Create framebuffer for this mip level
-		VkFramebuffer framebuffer = VK_NULL_HANDLE;
-		{
-			VkFramebufferCreateInfo fb_info = {
-				.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				.renderPass      = render_pass,
-				.attachmentCount = 1,
-				.pAttachments    = &mip_view,
-				.width           = mip_width,
-				.height          = mip_height,
-				.layers          = ref_tex->layer_count,
-			};
-			VkResult vr = vkCreateFramebuffer(device, &fb_info, NULL, &framebuffer);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer");
-				continue;
-			}
-			_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
-		}
-
-		// Create image view for the previous mip level (source)
+		// Create source view for sampling the previous mip (always full layer count)
 		VkImageView src_view = VK_NULL_HANDLE;
 		{
-			VkImageViewCreateInfo src_view_info = {
+			VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
 				.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 				.image      = ref_tex->image,
 				.viewType   = view_type,
@@ -1431,55 +1432,13 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 					.baseArrayLayer = 0,
 					.layerCount     = ref_tex->layer_count,
 				},
-			};
-			VkResult vr = vkCreateImageView(device, &src_view_info, NULL, &src_view);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateImageView");
-				continue;
-			}
+			}, NULL, &src_view);
+			if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip src)"); continue; }
 			_skr_cmd_destroy_image_view(ctx.destroy_list, src_view);
 		}
 
-		// Transition current mip to color attachment (automatic tracking handles UNDEFINED vs previous layout)
-		VkImageMemoryBarrier barrier = {
-			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			.srcAccessMask       = 0,
-			.dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
-			.newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image               = ref_tex->image,
-			.subresourceRange    = {
-				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel   = mip,
-				.levelCount     = 1,
-				.baseArrayLayer = 0,
-				.layerCount     = ref_tex->layer_count,
-			},
-		};
-		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                     0, 0, NULL, 0, NULL, 1, &barrier);
 
-		// Begin render pass
-		vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
-			.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-			.renderPass      = render_pass,
-			.framebuffer     = framebuffer,
-			.renderArea      = {{0, 0}, {mip_width, mip_height}},
-			.clearValueCount = 0,
-		}, VK_SUBPASS_CONTENTS_INLINE);
-
-		// Bind pipeline
-		vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-
-		// Set viewport and scissor
-		VkViewport viewport = {0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f};
-		VkRect2D   scissor  = {{0, 0}, {mip_width, mip_height}};
-		vkCmdSetViewport(ctx.cmd, 0, 1, &viewport);
-		vkCmdSetScissor (ctx.cmd, 0, 1, &scissor);
-
-		// Build descriptor writes using material system
+		// Build descriptor writes (shared across layers)
 		VkWriteDescriptorSet   writes      [32];
 		VkDescriptorBufferInfo buffer_infos[16];
 		VkDescriptorImageInfo  image_infos [16];
@@ -1537,29 +1496,91 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		if (fail_idx >= 0) {
 			const sksc_shader_meta_t* meta = material.key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
-			vkCmdEndRenderPass(ctx.cmd);
 			continue;
 		}
 
-		// Push descriptors and draw
-		_skr_bind_descriptors(
-			ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			_skr_pipeline_get_layout           (material.pipeline_material_idx),
-			_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
-			writes, write_ct);
+		{
+			// Multiview mipgen: single renderpass broadcasts across all layers.
+			// For single-layer textures, this is a regular non-multiview renderpass.
+			VkImageView mip_view = VK_NULL_HANDLE;
+			{
+				// For framebuffer attachments, use 2D_ARRAY even for cubemaps
+				VkImageViewType fb_view_type = (ref_tex->layer_count > 1)
+					? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+					: VK_IMAGE_VIEW_TYPE_2D;
+				VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
+					.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+					.image      = ref_tex->image,
+					.viewType   = fb_view_type,
+					.format     = format,
+					.subresourceRange = {
+						.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel   = mip,
+						.levelCount     = 1,
+						.baseArrayLayer = 0,
+						.layerCount     = ref_tex->layer_count,
+					},
+				}, NULL, &mip_view);
+				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip target)"); continue; }
+				_skr_cmd_destroy_image_view(ctx.destroy_list, mip_view);
+			}
 
-		// Draw fullscreen triangle (with instances for each layer/face)
-		vkCmdDraw(ctx.cmd, 3, ref_tex->layer_count, 0, 0);
+			VkFramebuffer framebuffer = VK_NULL_HANDLE;
+			{
+				VkResult vr = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
+					.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+					.renderPass      = render_pass,
+					.attachmentCount = 1,
+					.pAttachments    = &mip_view,
+					.width           = mip_width,
+					.height          = mip_height,
+					.layers          = 1,  // Multiview: layers=1, view_mask controls layer count
+				}, NULL, &framebuffer);
+				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (mip)"); continue; }
+				_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
+			}
 
-		// End render pass
-		vkCmdEndRenderPass(ctx.cmd);
+			vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
+				.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+				.renderPass      = render_pass,
+				.framebuffer     = framebuffer,
+				.renderArea      = {{0, 0}, {mip_width, mip_height}},
+				.clearValueCount = 0,
+			}, VK_SUBPASS_CONTENTS_INLINE);
+
+			vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f});
+			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
+
+			_skr_bind_descriptors(
+				ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
+				_skr_pipeline_get_layout           (material.pipeline_material_idx),
+				_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
+				writes, write_ct);
+
+			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
+			vkCmdEndRenderPass(ctx.cmd);
+		}
 
 		// Transition current mip to shader read for next iteration
-		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		barrier.oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		vkCmdPipelineBarrier( ctx.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+		VkImageMemoryBarrier barrier = {
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image               = ref_tex->image,
+			.subresourceRange    = {
+				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel   = mip,
+				.levelCount     = 1,
+				.baseArrayLayer = 0,
+				.layerCount     = ref_tex->layer_count,
+			},
+		};
+		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
 	}
 
 	_skr_cmd_release(ctx.cmd);

@@ -64,6 +64,7 @@ FetchContent_MakeAvailable(cimgui)
 add_skapp(sk_renderer_xr_test
 	PACKAGE_NAME net.stereokit.renderer_test_xr
 	APP_NAME "sk_renderer_test_xr"
+	MIN_SDK 29
 	MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/AndroidManifest.xml)
 
 set(EXAMPLE_DIR ${CMAKE_SOURCE_DIR}/example)

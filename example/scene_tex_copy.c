@@ -14,6 +14,7 @@
 #include "app.h"
 
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -226,11 +227,17 @@ static void _render_sphere_to_icon(scene_tex_copy_t* scene, int32_t sphere_idx, 
 		&world, sizeof(float4x4), 1);
 
 	// Render to MSAA target
-	skr_renderer_begin_pass(&scene->icon_msaa, &scene->icon_depth, NULL, skr_clear_all, (skr_vec4_t){0.1f, 0.1f, 0.15f, 1.0f}, 1.0f, 0);
-	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)ICON_SIZE, (float)ICON_SIZE});
-	skr_renderer_set_scissor ((skr_recti_t){0, 0, ICON_SIZE, ICON_SIZE});
-	skr_renderer_draw(&icon_list, &icon_system, sizeof(su_system_buffer_t), icon_system.view_count);
-	skr_renderer_end_pass();
+	skr_pass_t icon_pass = {
+		.color       = &scene->icon_msaa,
+		.depth       = &scene->icon_depth,
+		.clear       = skr_clear_all,
+		.clear_color = {0.1f, 0.1f, 0.15f, 1.0f},
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)ICON_SIZE, (float)ICON_SIZE},
+		.scissor     = {0, 0, ICON_SIZE, ICON_SIZE},
+	};
+	skr_pass_add_draw(&icon_pass, &icon_list, &icon_system, sizeof(su_system_buffer_t));
+	skr_pass_submit  (&icon_pass);
 
 	skr_render_list_destroy(&icon_list);
 }

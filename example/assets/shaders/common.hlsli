@@ -17,7 +17,19 @@ cbuffer SystemBuffer : register(b1, space0) {
 	float4   screen_size;        // .xy = width/height, .zw = 1/width, 1/height
 	float    time;               // Time in seconds
 	uint     view_count;         // Number of active views (1-6)
-	uint2    _pad;
+	uint     view_offset;        // Unused, kept for ABI compatibility
+	uint     _pad;
+};
+
+///////////////////////////////////////////
+// Multi-view abstractions (VK_KHR_multiview)
+///////////////////////////////////////////
+
+// System vertex IDs — multiview provides SV_ViewID via the driver,
+// SV_InstanceID is the real instance index (no view packing).
+struct skr_ids_t {
+	uint inst : SV_InstanceID;
+	uint view : SV_ViewID;
 };
 
 #endif // COMMON_HLSLI

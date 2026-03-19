@@ -13,6 +13,7 @@
 #include <sk_app.h>
 
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <math.h>
 
@@ -192,24 +193,20 @@ void app_xr_render_stereo(skr_tex_t* color_target, skr_tex_t* resolve_target, sk
 	// Let the scene populate the render list
 	scene_render(s_scene_types[s_scene_index], s_scene_current, width, height, &s_render_list, &sys);
 
-	// Begin render pass with MSAA resolve
-	skr_renderer_begin_pass(
-		color_target,
-		depth_target,
-		resolve_target,
-		skr_clear_all,
-		(skr_vec4_t){ 0.0f, 0.0f, 0.0f, 0.0f },
-		1.0f,
-		0
-	);
-
-	skr_renderer_set_viewport((skr_rect_t){ 0, 0, (float)width, (float)height });
-	skr_renderer_set_scissor((skr_recti_t){ 0, 0, width, height });
-
-	// Draw with multi-view instancing
-	skr_renderer_draw(&s_render_list, &sys, sizeof(sys), view_count);
-
-	skr_renderer_end_pass();
-
+	// Submit via pass system (handles multi-view fallback automatically)
+	skr_pass_t pass = {
+		.color       = color_target,
+		.depth       = depth_target,
+		.resolve     = resolve_target,
+		.clear       = skr_clear_all,
+		.clear_color = {0, 0, 0, 0},
+		.clear_depth = 1.0f,
+		.viewport    = {0, 0, (float)width, (float)height},
+		.scissor     = {0, 0, width, height},
+		.view_count       = sys.view_count,
+		.views_correlated = true,
+	};
+	skr_pass_add_draw(&pass, &s_render_list, &sys, sizeof(sys));
+	skr_pass_submit(&pass);
 	skr_render_list_clear(&s_render_list);
 }

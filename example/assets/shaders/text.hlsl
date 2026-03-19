@@ -1,8 +1,12 @@
 //--name = text_vector
 
-// GPU-evaluated vector text rendering
+// GPU-evaluated vector text rendering using Slug algorithm.
 // Evaluates quadratic Bezier curves directly in the fragment shader
-// for resolution-independent text at any scale or angle.
+// using sign-based root classification and dual-ray coverage for
+// resolution-independent, artifact-free text at any scale or angle.
+//
+// Based on: Eric Lengyel, "GPU-Centered Font Rendering Directly from
+// Glyph Outlines", JCGT 2017. Reference code released under MIT License.
 
 #include "common.hlsli"
 
@@ -12,43 +16,38 @@
 
 struct Curve {
 	float2 p0;      // Start point
-	float2 p1;      // Control point
+	float2 p1;      // Control point (off-curve)
 	float2 p2;      // End point
-	float  x_min;   // Curve AABB (precomputed)
-	float  x_max;
-	float  y_min;
-	float  y_max;
 };
 
-#define BAND_COUNT 32    // Must match TEXT_BAND_COUNT in C
+#define H_BAND_COUNT 16   // Must match TEXT_H_BAND_COUNT in C
+#define V_BAND_COUNT 16   // Must match TEXT_V_BAND_COUNT in C
 
 struct Glyph {
 	uint   curve_start;     // Base index into curves array
-	uint   curve_count;     // Total number of curves for this glyph
+	uint   curve_count;     // Total curves for this glyph (all bands)
 	float2 bounds_min;      // Glyph bounding box
 	float2 bounds_max;
 	float  advance;         // Horizontal advance
 	float  lsb;             // Left side bearing
-	uint   bands[BAND_COUNT]; // Packed (offset << 16) | count per band
+	uint   h_bands[H_BAND_COUNT]; // Horizontal bands: packed (offset << 16) | count
+	uint   v_bands[V_BAND_COUNT]; // Vertical bands:   packed (offset << 16) | count
 };
 
 struct Instance {
-	float3 pos;             // World position - 12 bytes, offset 0
-	uint   glyph_index;     // Index into glyphs array - 4 bytes, offset 12
-	float3 right;           // X axis * scale - 12 bytes, offset 16
-	uint   color;           // Packed RGBA8 (0xAABBGGRR) - 4 bytes, offset 28
-	float3 up;              // Y axis * scale - 12 bytes, offset 32
-	uint   _pad;            // Padding - 4 bytes, offset 44
-};                          // 48 bytes total
+	float3 pos;             // World position
+	uint   glyph_index;     // Index into glyphs array
+	float3 right;           // X axis * scale
+	uint   color;           // Packed RGBA8 (0xAABBGGRR)
+	float3 up;              // Y axis * scale
+	uint   _pad;
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Buffers
 ///////////////////////////////////////////////////////////////////////////////
 
-// Instance data - passed via skr_render_list_add (automatic instancing)
-StructuredBuffer<Instance> inst : register(t2, space0);
-
-// Font data - bound via skr_material_set_buffer
+StructuredBuffer<Instance> inst   : register(t2, space0);
 StructuredBuffer<Curve>    curves : register(t3);
 StructuredBuffer<Glyph>    glyphs : register(t4);
 
@@ -63,14 +62,14 @@ struct vsIn {
 
 struct psIn {
 	float4 pos       : SV_POSITION;
-	float2 glyph_uv  : TEXCOORD0;   // UV in glyph bounds [0,1]
-	float2 glyph_pos : TEXCOORD1;   // Position in glyph space
-	nointerpolation uint glyph_idx : TEXCOORD2;
+	float2 glyph_pos : TEXCOORD0;   // Position in glyph space (em-space)
+	nointerpolation uint   glyph_idx   : TEXCOORD1;
+	nointerpolation float4 band_xform  : TEXCOORD2; // (v_scale, h_scale, v_offset, h_offset)
+	nointerpolation uint2  band_max    : TEXCOORD3; // (v_max, h_max)
+	nointerpolation uint   curve_start : TEXCOORD4;
 	float3 color     : COLOR0;
-	uint   layer     : SV_RenderTargetArrayIndex;  // Multi-view output layer
 };
 
-// Unpack RGBA8 color from uint (0xAABBGGRR format)
 float3 unpack_color(uint packed) {
 	float r = float((packed >>  0) & 0xFF) / 255.0;
 	float g = float((packed >>  8) & 0xFF) / 255.0;
@@ -78,176 +77,128 @@ float3 unpack_color(uint packed) {
 	return float3(r, g, b);
 }
 
-psIn vs(vsIn input, uint id : SV_InstanceID) {
-	// Multi-view instancing
-	uint inst_idx = id / view_count;
-	uint view_idx = id % view_count;
+psIn vs(vsIn input, skr_ids_t ids) {
+	Instance instance = inst[ids.inst];
+	Glyph    glyph    = glyphs[instance.glyph_index];
 
-	Instance instance = inst[inst_idx];
-	Glyph glyph = glyphs[instance.glyph_index];
-
-	// Transform quad vertex to glyph bounds with small expansion for edge pixels
-	// This ensures pixels at curve boundaries have room for anti-aliasing
 	float2 glyph_size = glyph.bounds_max - glyph.bounds_min;
-	float2 expand     = glyph_size * 0.02; // 2% expansion on each side
-	float2 local_pos  = (glyph.bounds_min - expand) + input.uv * (glyph_size + expand * 2.0);
 
-	// Transform to world space using position + right/up vectors
-	// This is simpler and faster than full matrix multiply for 2D glyphs
+	// Dynamic dilation: expand quad by exactly 0.5 pixels in glyph space.
+	// Project the instance origin and its right/up basis vectors to screen
+	// pixels, then invert to get glyph-space size of half a pixel.
+	float4 center_clip = mul(float4(instance.pos, 1), viewproj[ids.view]);
+	float4 right_clip  = mul(float4(instance.pos + instance.right, 1), viewproj[ids.view]);
+	float4 up_clip     = mul(float4(instance.pos + instance.up,    1), viewproj[ids.view]);
+
+	float2 center_px = center_clip.xy / center_clip.w * screen_size.xy * 0.5;
+	float2 right_px  = right_clip.xy  / right_clip.w  * screen_size.xy * 0.5;
+	float2 up_px     = up_clip.xy     / up_clip.w     * screen_size.xy * 0.5;
+
+	float pix_per_glyph_x = length(right_px - center_px);
+	float pix_per_glyph_y = length(up_px    - center_px);
+
+	// Clamp to avoid extreme expansion for sub-pixel glyphs
+	float2 expand = float2(
+		0.5 / max(pix_per_glyph_x, 0.5),
+		0.5 / max(pix_per_glyph_y, 0.5)
+	);
+
+	// Transform quad vertex to glyph bounds with dynamic expansion
+	float2 local_pos = (glyph.bounds_min - expand) + input.uv * (glyph_size + expand * 2.0);
+
+	// Transform to world space
 	float3 world_pos = instance.pos
 	                 + local_pos.x * instance.right
 	                 + local_pos.y * instance.up;
 
+	// Precompute band transform: pos * scale + offset → band index
+	// Avoids per-pixel reciprocals (Slug passes this as vertex attribute)
+	float2 inv_size = float2(
+		V_BAND_COUNT / max(glyph_size.x, 1e-6),
+		H_BAND_COUNT / max(glyph_size.y, 1e-6)
+	);
+
 	psIn output;
-	output.pos       = mul(float4(world_pos, 1), viewproj[view_idx]);
-	output.glyph_uv  = input.uv;
-	output.glyph_pos = local_pos;
-	output.glyph_idx = instance.glyph_index;
-	output.color     = unpack_color(instance.color);
-	output.layer     = view_idx;  // Route to correct render target layer
+	output.pos         = mul(float4(world_pos, 1), viewproj[ids.view]);
+	output.glyph_pos   = local_pos;
+	output.glyph_idx   = instance.glyph_index;
+	output.band_xform  = float4(inv_size, -inv_size * glyph.bounds_min);
+	output.band_max    = uint2(V_BAND_COUNT - 1, H_BAND_COUNT - 1);
+	output.curve_start = glyph.curve_start;
+	output.color       = unpack_color(instance.color);
 
 	return output;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Curve Evaluation Functions
+// Slug Algorithm — Root Classification and Coverage
 ///////////////////////////////////////////////////////////////////////////////
 
-// Evaluate only X coordinate of quadratic Bezier at parameter t
-float bezier_x(float x0, float x1, float x2, float t) {
-	float it = 1.0 - t;
-	return it * it * x0 + 2.0 * it * t * x1 + t * t * x2;
+// Classify a quadratic Bezier curve by the signs of its three control point
+// y-coordinates (relative to the sample point). Returns a 2-bit code packed
+// into bits 0 and 8 indicating which roots contribute to the winding number.
+// This is unconditionally robust — no epsilon comparisons, no t-range checks.
+// Reference: Lengyel 2017, Table 1 and Equation 2.
+uint CalcRootCode(float y1, float y2, float y3) {
+	uint i1 = asuint(y1) >> 31U;
+	uint i2 = asuint(y2) >> 30U;
+	uint i3 = asuint(y3) >> 29U;
+
+	uint shift = (i2 & 2U) | (i1 & ~2U);
+	shift = (i3 & 4U) | (shift & ~4U);
+
+	return ((0x2E74U >> shift) & 0x0101U);
 }
 
-// Calculate coverage contribution from a single MONOTONIC curve.
-// Curves are preprocessed to be monotonic in Y, meaning each curve
-// only goes up OR down, never both. This simplifies the math significantly.
-//
-// Returns coverage contribution: positive for exit, negative for entry.
-// Based on Sebastian Lague's approach.
-float curve_coverage(float2 pos, Curve c, float inv_pixel_size) {
-	// Translate curve so pos is at origin
-	float2 p0 = c.p0 - pos;
-	float2 p2 = c.p2 - pos;
+// Solve for the x-coordinates where a quadratic Bezier crosses y = 0.
+// The polynomial is: a*t^2 - 2*b*t + c, where a = p1 - 2*p2 + p3,
+// b = p1 - p2, c = p1. Returns (x at t1, x at t2).
+float2 SolveHorizPoly(float4 p12, float2 p3) {
+	float2 a = p12.xy - p12.zw * 2.0 + p3;
+	float2 b = p12.xy - p12.zw;
+	float ra = 1.0 / a.y;
+	float rb = 0.5 / b.y;
 
-	// Determine curve direction (is it going down in Y?)
-	// Downward = exiting shape (winding +), Upward = entering shape (winding -)
-	bool is_downward = p0.y > p2.y;
+	float d = sqrt(max(b.y * b.y - a.y * p12.y, 0.0));
+	float t1 = (b.y - d) * ra;
+	float t2 = (b.y + d) * ra;
 
-	// Skip curves entirely above or below the ray using asymmetric comparisons.
-	// This handles shared endpoints correctly: the "exiting" endpoint gets
-	// the inclusive boundary to avoid double-counting.
-	if (is_downward) {
-		if (p0.y < 0.0 && p2.y <= 0.0) return 0.0;  // Both below
-		if (p0.y > 0.0 && p2.y >= 0.0) return 0.0;  // Both above
-	} else {
-		if (p0.y <= 0.0 && p2.y < 0.0) return 0.0;  // Both below
-		if (p0.y >= 0.0 && p2.y > 0.0) return 0.0;  // Both above
-	}
+	// Nearly linear case: solve -2*b*t + c = 0
+	if (abs(a.y) < 1.0 / 65536.0) t1 = t2 = p12.y * rb;
 
-	// Quick X rejection: curve entirely to left of ray
-	if (c.x_max < pos.x) return 0.0;
-
-	float2 p1 = c.p1 - pos;
-
-	// Quadratic coefficients for y(t) = a*t^2 + b*t + c
-	float a = p0.y - 2.0 * p1.y + p2.y;
-	float b = 2.0 * (p1.y - p0.y);
-	float c_coef = p0.y;
-
-	// Find intersection with y=0
-	float t = 0.0;
-	const float epsilon = 1e-4;
-
-	if (abs(a) < 1e-6) {
-		// Linear case
-		if (abs(b) > 1e-6) {
-			t = -c_coef / b;
-		}
-	} else {
-		// Quadratic case - with monotonic curves, at most one root in [0,1]
-		float discriminant = b * b - 4.0 * a * c_coef;
-		if (discriminant >= -epsilon) {
-			float sqrt_d = sqrt(max(0.0, discriminant));
-			float inv_2a = 0.5 / a;
-			float t1 = (-b - sqrt_d) * inv_2a;
-			float t2 = (-b + sqrt_d) * inv_2a;
-
-			// Pick the root that's in [0, 1]
-			if (t1 >= -epsilon && t1 <= 1.0 + epsilon) t = t1;
-			else if (t2 >= -epsilon && t2 <= 1.0 + epsilon) t = t2;
-			else return 0.0;
-		} else {
-			return 0.0;
-		}
-	}
-
-	// Check if intersection is valid
-	t = saturate(t);
-
-	// Calculate X position of intersection
-	float intersect_x = a * t * t + b * t + c_coef;  // Wait, this is Y, need X
-	float ax = p0.x - 2.0 * p1.x + p2.x;
-	float bx = 2.0 * (p1.x - p0.x);
-	intersect_x = ax * t * t + bx * t + p0.x;
-
-	// Calculate coverage: 0 at left edge of pixel, 1 at right edge
-	// This gives smooth AA based on where the intersection falls within the pixel
-	float coverage = saturate(0.5 + intersect_x * inv_pixel_size);
-
-	// Sign based on direction: downward = exit = positive, upward = entry = negative
-	return is_downward ? coverage : -coverage;
+	return float2(
+		(a.x * t1 - b.x * 2.0) * t1 + p12.x,
+		(a.x * t2 - b.x * 2.0) * t2 + p12.x
+	);
 }
 
-// Analytical squared distance to quadratic Bezier curve (Inigo Quilez method)
-// Only called for edge pixels where winding-based AA isn't sufficient
-float curve_distance_sq(float2 pos, Curve c) {
-	float2 A = c.p0;
-	float2 B = c.p1;
-	float2 C = c.p2;
+// Solve for the y-coordinates where a quadratic Bezier crosses x = 0.
+float2 SolveVertPoly(float4 p12, float2 p3) {
+	float2 a = p12.xy - p12.zw * 2.0 + p3;
+	float2 b = p12.xy - p12.zw;
+	float ra = 1.0 / a.x;
+	float rb = 0.5 / b.x;
 
-	float2 a = B - A;
-	float2 b = A - 2.0 * B + C;
-	float2 cc = a * 2.0;
-	float2 d = A - pos;
+	float d = sqrt(max(b.x * b.x - a.x * p12.x, 0.0));
+	float t1 = (b.x - d) * ra;
+	float t2 = (b.x + d) * ra;
 
-	float bb = dot(b, b);
-	if (bb < 1e-8) {
-		float2 ac = C - A;
-		float t = clamp(dot(pos - A, ac) / dot(ac, ac), 0.0, 1.0);
-		float2 diff = pos - (A + ac * t);
-		return dot(diff, diff);
-	}
+	if (abs(a.x) < 1.0 / 65536.0) t1 = t2 = p12.x * rb;
 
-	float kk = 1.0 / bb;
-	float kx = kk * dot(a, b);
-	float ky = kk * (2.0 * dot(a, a) + dot(d, b)) / 3.0;
-	float kz = kk * dot(d, a);
+	return float2(
+		(a.y * t1 - b.y * 2.0) * t1 + p12.y,
+		(a.y * t2 - b.y * 2.0) * t2 + p12.y
+	);
+}
 
-	float p  = ky - kx * kx;
-	float p3 = p * p * p;
-	float q  = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
-	float h  = q * q + 4.0 * p3;
-
-	float res;
-	if (h >= 0.0) {
-		h = sqrt(h);
-		float2 x  = (float2(h, -h) - q) / 2.0;
-		float2 uv = sign(x) * pow(abs(x), 1.0 / 3.0);
-		float  t  = clamp(uv.x + uv.y - kx, 0.0, 1.0);
-		float2 dd = d + (cc + b * t) * t;
-		res = dot(dd, dd);
-	} else {
-		float z = sqrt(-p);
-		float v = acos(q / (p * z * 2.0)) / 3.0;
-		float m = cos(v);
-		float n = sin(v) * 1.732050808;
-		float3 t = clamp(float3(m + m, -n - m, n - m) * z - kx, 0.0, 1.0);
-		float2 d1 = d + (cc + b * t.x) * t.x;
-		float2 d2 = d + (cc + b * t.y) * t.y;
-		res = min(dot(d1, d1), dot(d2, d2));
-	}
-	return res;
+// Combine horizontal and vertical ray coverage using proximity-based weights.
+// Each ray's weight reflects how close the intersection is to the pixel center.
+// The max() fallback ensures robustness when one ray has very low weight.
+float CalcCoverage(float xcov, float ycov, float xwgt, float ywgt) {
+	return max(
+		abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0),
+		min(abs(xcov), abs(ycov))
+	);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -258,65 +209,94 @@ float4 ps(psIn input) : SV_TARGET {
 	Glyph  glyph = glyphs[input.glyph_idx];
 	float2 pos   = input.glyph_pos;
 
-	// Compute pixel size in glyph space for anti-aliasing
-	float pixel_size = length(fwidth(pos));
-	float inv_pixel_size = 1.0 / pixel_size;
+	// Pixel dimensions in glyph space, computed independently per axis.
+	float2 emsPerPixel = fwidth(pos);
+	float2 pixelsPerEm = 1.0 / emsPerPixel;
 
-	// Determine which band this pixel falls into
-	float glyph_height = glyph.bounds_max.y - glyph.bounds_min.y;
-	float normalized_y = (pos.y - glyph.bounds_min.y) / max(glyph_height, 1e-6);
-	uint  band_idx     = clamp((uint)(normalized_y * BAND_COUNT), 0, BAND_COUNT - 1);
+	// Band indices via precomputed scale+offset (no per-pixel reciprocals)
+	int2 bandIndex = clamp(int2(pos * input.band_xform.xy + input.band_xform.zw),
+	                       int2(0, 0), int2(input.band_max));
 
-	// Unpack band data
-	uint band_data   = glyph.bands[band_idx];
-	uint band_offset = band_data >> 16;
-	uint band_count  = band_data & 0xFFFF;
-	uint curve_start = glyph.curve_start + band_offset;
+	// _______________________________________________________________
+	// Horizontal ray: fire in +x direction, accumulate coverage (xcov)
+	// Curves sorted by descending max-x for early-out.
+	// _______________________________________________________________
+	float xcov = 0.0;
+	float xwgt = 0.0;
 
-	// Calculate winding using coverage (handles monotonic curves correctly)
-	float coverage = 0.0;
-	for (uint i = 0; i < band_count; i++) {
-		Curve c = curves[curve_start + i];
-		coverage += curve_coverage(pos, c, inv_pixel_size);
-	}
-	coverage = saturate(coverage);
+	uint h_data   = glyph.h_bands[bandIndex.y];
+	uint h_offset = h_data >> 16;
+	uint h_count  = h_data & 0xFFFF;
+	uint h_start  = input.curve_start + h_offset;
 
-	// Early out for clearly outside pixels
-	if (coverage < 0.01) {
-		discard;
-	}
+	for (uint i = 0; i < h_count; i++) {
+		Curve  c   = curves[h_start + i];
+		float4 p12 = float4(c.p0, c.p1) - float4(pos, pos);
+		float2 p3  = c.p2 - pos;
 
-	// For solidly inside pixels, skip SDF - just use full opacity
-	// This prevents internal curves from causing AA bleeding
-	if (coverage > 0.99) {
-		return float4(input.color, 1.0);
-	}
+		// Early-out: curve's max x is past the pixel (sorted descending)
+		if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) break;
 
-	// Edge pixel: use SDF for smooth anti-aliasing
-	bool is_inside = coverage > 0.5;
+		uint code = CalcRootCode(p12.y, p12.w, p3.y);
+		if (code != 0U) {
+			float2 r = SolveHorizPoly(p12, p3) * pixelsPerEm.x;
 
-	// Find minimum squared distance to any curve in this band
-	float min_dist_sq = 1e10;
-	for (uint j = 0; j < band_count; j++) {
-		Curve c = curves[curve_start + j];
-		// Quick AABB rejection - expand by 1 pixel for edge detection
-		if (pos.x >= c.x_min - pixel_size && pos.x <= c.x_max + pixel_size &&
-		    pos.y >= c.y_min - pixel_size && pos.y <= c.y_max + pixel_size) {
-			float dist_sq = curve_distance_sq(pos, c);
-			min_dist_sq = min(min_dist_sq, dist_sq);
+			if ((code & 1U) != 0U) {
+				xcov += saturate(r.x + 0.5);
+				xwgt  = max(xwgt, saturate(1.0 - abs(r.x) * 2.0));
+			}
+			if (code > 1U) {
+				xcov -= saturate(r.y + 0.5);
+				xwgt  = max(xwgt, saturate(1.0 - abs(r.y) * 2.0));
+			}
 		}
 	}
 
-	float dist = sqrt(min_dist_sq);
+	// _______________________________________________________________
+	// Vertical ray: fire in +y direction, accumulate coverage (ycov)
+	// Curves sorted by descending max-y for early-out.
+	// _______________________________________________________________
+	float ycov = 0.0;
+	float ywgt = 0.0;
 
-	// Use signed distance for anti-aliasing
-	// Sign comes from coverage (handles monotonic curves correctly)
-	float signed_dist = is_inside ? -dist : dist;
-	float alpha = saturate(0.5 - signed_dist * inv_pixel_size);
+	uint v_data   = glyph.v_bands[bandIndex.x];
+	uint v_offset = v_data >> 16;
+	uint v_count  = v_data & 0xFFFF;
+	uint v_start  = input.curve_start + v_offset;
 
-	if (alpha < 0.01) {
-		discard;
+	for (uint j = 0; j < v_count; j++) {
+		Curve  c   = curves[v_start + j];
+		float4 p12 = float4(c.p0, c.p1) - float4(pos, pos);
+		float2 p3  = c.p2 - pos;
+
+		// Early-out: curve's max y is past the pixel (sorted descending)
+		if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) break;
+
+		uint code = CalcRootCode(p12.x, p12.z, p3.x);
+		if (code != 0U) {
+			float2 r = SolveVertPoly(p12, p3) * pixelsPerEm.y;
+
+			if ((code & 1U) != 0U) {
+				ycov -= saturate(r.x + 0.5);
+				ywgt  = max(ywgt, saturate(1.0 - abs(r.x) * 2.0));
+			}
+			if (code > 1U) {
+				ycov += saturate(r.y + 0.5);
+				ywgt  = max(ywgt, saturate(1.0 - abs(r.y) * 2.0));
+			}
+		}
 	}
 
-	return float4(input.color, alpha);
+	// Combine dual-ray coverage
+	float coverage = CalcCoverage(xcov, ycov, xwgt, ywgt);
+	coverage = saturate(coverage);
+
+	// Boost optical weight for thin strokes (Slug SLUG_WEIGHT option).
+	// sqrt makes coverage transitions gentler, reducing sparkle at small sizes
+	// and glancing angles.
+	coverage = sqrt(coverage);
+
+	if (coverage < 0.01) discard;
+
+	return float4(input.color, coverage);
 }

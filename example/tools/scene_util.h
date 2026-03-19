@@ -8,6 +8,7 @@
 #include <sk_renderer.h>
 #include "float_math.h"
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -45,8 +46,8 @@ static inline void su_log(su_log_ level, const char* text, ...) {
 	__android_log_write(priority, "sk_example", buffer);
 #else
 	const char* prefix = 
-		level == su_log_info     ? "[app:info] "     :
-		level == su_log_warning  ? "[app:warn] "  :
+		level == su_log_info     ? "[app:info] " :
+		level == su_log_warning  ? "[app:warn] " :
 		level == su_log_critical ? "[app:crit] " : "[app:unkn] ";
 	printf("%s%s\n", prefix, buffer);
 #endif
@@ -72,7 +73,8 @@ typedef struct {
 	float4   screen_size;                   // .xy = width/height, .zw = 1/width, 1/height
 	float    time;                          // Time in seconds
 	uint32_t view_count;                    // Number of active views (1-6)
-	uint32_t _pad[2];
+	uint32_t view_offset;                   // Unused, kept for ABI compatibility
+	uint32_t _pad;
 } su_system_buffer_t;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -351,3 +353,4 @@ void su_gltf_add_to_render_list_override(su_gltf_t* gltf, skr_render_list_t* lis
 #ifdef __cplusplus
 }
 #endif
+

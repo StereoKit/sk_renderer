@@ -194,8 +194,9 @@ typedef enum skr_tex_flags_ {
 	skr_tex_flags_array     = 1 << 4,
 	skr_tex_flags_3d        = 1 << 5,
 	skr_tex_flags_in_tile_msaa = 1 << 6,
-	skr_tex_flags_compute   = 1 << 7,  // For compute shader RWTexture (storage image)
-	skr_tex_flags_cubemap   = 1 << 8,  // Cubemap texture (requires 6 array layers)
+	skr_tex_flags_compute          = 1 << 7,  // For compute shader RWTexture (storage image)
+	skr_tex_flags_cubemap          = 1 << 8,  // Cubemap texture (requires 6 array layers)
+	skr_tex_flags_input_attachment = 1 << 9,  // Used as input attachment in subpass (SubpassInput)
 } skr_tex_flags_;
 
 typedef enum skr_tex_sample_ {
@@ -305,7 +306,7 @@ typedef enum skr_capability_ {
 	skr_capability_external_ahb,          // Android Hardware Buffer
 	skr_capability_external_dma,          // DMA-BUF via VK_EXT_external_memory_dma_buf
 	skr_capability_vk_video,              // Vulkan video decode (VK_KHR_video_decode_queue)
-	skr_capability_count_                 // Must be last - array size
+	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
 typedef enum skr_clear_ {
@@ -505,10 +506,55 @@ typedef struct skr_material_info_t {
 	skr_blend_state_t    blend_state;
 	bool                 alpha_to_coverage;
 	bool                 depth_clamp;   // Clamp depth to [0,1] instead of clipping (useful for shadow mapping)
+	bool                 wireframe;    // Render as wireframe lines instead of filled polygons
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)
 } skr_material_info_t;
+
+///////////////////////////////////////////////////////////////////////////////
+// Deferred pass assembly
+
+#define SKR_PASS_MAX_DRAWS  4
+#define SKR_PASS_MAX_POSTFX 2
+
+typedef struct skr_tex_t         skr_tex_t;
+typedef struct skr_render_list_t skr_render_list_t;
+typedef struct skr_material_t    skr_material_t;
+
+typedef struct skr_pass_draw_t {
+	skr_render_list_t*   list;
+	const void*          system_data;
+	uint32_t             system_data_size;
+} skr_pass_draw_t;
+
+typedef struct skr_pass_t {
+	skr_tex_t*  color;
+	skr_tex_t*  depth;
+	skr_tex_t*  resolve;
+	skr_tex_t*  postfx_output;      // Final output for postfx chain (NULL = write back to resolve/color)
+	skr_clear_  clear;
+	skr_vec4_t  clear_color;
+	float       clear_depth;
+	uint32_t    clear_stencil;
+	skr_rect_t  viewport;
+	skr_recti_t scissor;
+	int32_t     view_count;         // Number of views to render (1 = single, 2 = stereo, etc.)
+	bool        views_correlated;  // True if views see the same geometry from different viewpoints
+	                                // (VR stereo). False for cubemap faces or independent layers.
+
+	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
+	uint32_t        draw_count;
+
+	// Populated by skr_pass_add_resolve()
+	skr_material_t* resolve_material;  // Manual MSAA resolve shader (reads SubpassInputMS)
+
+	// Populated by skr_pass_add_postfx()
+	skr_material_t* postfx[SKR_PASS_MAX_POSTFX];
+	uint32_t        postfx_count;
+} skr_pass_t;
+
+///////////////////////////////////////////////////////////////////////////////
 
 // While this project is primarily Vulkan, the option to add backends in the
 // future would be nice. WebGPU or D3D12 could be targets. However, we don't
@@ -546,6 +592,7 @@ SKR_API void              skr_future_wait                  (const skr_future_t* 
 SKR_API void              skr_cmd_begin                    (void);
 SKR_API skr_future_t      skr_cmd_end                      (void);
 SKR_API skr_future_t      skr_cmd_flush                    (void);
+SKR_API bool              skr_cmd_is_active                (void);
 
 SKR_API void              skr_callback_log                 (void (*callback)(skr_log_ level, const char* text));
 SKR_API void              skr_log                          (skr_log_ level, const char* text, ...);
@@ -563,7 +610,7 @@ SKR_API skr_err_          skr_vert_type_create             (const skr_vert_compo
 SKR_API bool              skr_vert_type_is_valid           (const skr_vert_type_t*     type);
 SKR_API void              skr_vert_type_destroy            (      skr_vert_type_t* ref_type);
 
-SKR_API skr_err_          skr_mesh_create                  (const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh);
+SKR_API skr_err_          skr_mesh_create                  (const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* opt_vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh);
 SKR_API bool              skr_mesh_is_valid                (const skr_mesh_t*     mesh);
 SKR_API void              skr_mesh_destroy                 (      skr_mesh_t* ref_mesh);
 SKR_API uint32_t          skr_mesh_get_vert_count          (const skr_mesh_t*     mesh);
@@ -607,6 +654,7 @@ SKR_API skr_vec3i_t       skr_tex_calc_mip_dimensions      (skr_vec3i_t base_siz
 SKR_API uint64_t          skr_tex_calc_mip_size            (skr_tex_fmt_ format, skr_vec3i_t base_size, uint32_t mip_level);
 
 SKR_API skr_err_          skr_surface_create               (void* vk_surface_khr, skr_surface_t* out_surface);
+SKR_API bool              skr_surface_is_valid             (const skr_surface_t*     surface);
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
 SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
 SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_tex_t** out_tex);
@@ -652,7 +700,7 @@ SKR_API void              skr_render_list_add_indexed      (skr_render_list_t* r
 
 SKR_API void              skr_renderer_frame_begin         (void);
 SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_surfaces, uint32_t count);  // Submit frame with surface synchronization
-SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil);
+SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);
 SKR_API void              skr_renderer_set_global_texture  (int32_t bind, const skr_tex_t* tex);
@@ -660,10 +708,15 @@ SKR_API void              skr_renderer_set_viewport        (skr_rect_t viewport)
 SKR_API void              skr_renderer_set_scissor         (skr_recti_t scissor);
 SKR_API void              skr_renderer_blit                (skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px);
 
-SKR_API void              skr_renderer_draw                (skr_render_list_t* list, const void* system_data, uint32_t system_data_size, int32_t instance_multiplier);
+SKR_API void              skr_renderer_draw                (skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
 SKR_API void              skr_renderer_draw_mesh_immediate (skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, int32_t instance_count);
 SKR_API uint64_t          skr_renderer_get_gpu_time_us     (void);
 SKR_API uint64_t          skr_renderer_get_cpu_time_us     (void);
+
+SKR_API void              skr_pass_add_draw                (skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
+SKR_API void              skr_pass_add_resolve             (skr_pass_t* pass, skr_material_t* resolve_material);
+SKR_API void              skr_pass_add_postfx              (skr_pass_t* pass, skr_material_t* postfx_material);
+SKR_API void              skr_pass_submit                  (skr_pass_t* pass);
 
 #ifdef __cplusplus
 }

@@ -36,10 +36,10 @@ void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 	*ref_stage = (skr_shader_stage_t){0};
 }
 
-skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const sksc_shader_file_t* file, skr_stage_ stage) {
+static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const sksc_shader_file_t* file, skr_stage_ stage_type) {
 	for (uint32_t i = 0; i < file->stage_count; i++) {
-		if (file->stages[i].language == skr_shader_lang_spirv && file->stages[i].stage == stage)
-			return _skr_shader_stage_create(device, file->stages[i].code, file->stages[i].code_size, stage);
+		if (file->stages[i].stage == stage_type && file->stages[i].code_size > 0)
+			return _skr_shader_stage_create(device, file->stages[i].code, file->stages[i].code_size, stage_type);
 	}
 	skr_shader_stage_t empty = {0};
 	return empty;
@@ -91,7 +91,7 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 		return err;
 	}
 
-	// Create shader stages based on what's in the file
+	// Create shader stages from the file
 	skr_shader_stage_t v_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_vertex);
 	skr_shader_stage_t p_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_pixel);
 	skr_shader_stage_t c_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_compute);
@@ -220,12 +220,13 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 		// Determine descriptor type based on register type
 		VkDescriptorType desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
 		switch (bind.register_type) {
-			case skr_register_constant:      desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         break;
-			case skr_register_texture:       desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; break;
-			case skr_register_read_buffer:   desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (StructuredBuffer)
-			case skr_register_readwrite:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
-			case skr_register_readwrite_tex: desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
-			default:                         desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM; break;
+			case skr_register_constant:         desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         break;
+			case skr_register_texture:          desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; break;
+			case skr_register_read_buffer:      desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (StructuredBuffer)
+			case skr_register_readwrite:        desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
+			case skr_register_readwrite_tex:    desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
+			case skr_register_input_attachment: desc_type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;       break; // (SubpassInput)
+			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
 
 		VkShaderStageFlags stages = 0;
@@ -251,12 +252,13 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 		// Determine descriptor type based on register type
 		VkDescriptorType desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
 		switch (bind.register_type) {
-			case skr_register_constant:      desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         break;
-			case skr_register_texture:       desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; break;
-			case skr_register_read_buffer:   desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (StructuredBuffer)
-			case skr_register_readwrite:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
-			case skr_register_readwrite_tex: desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
-			default:                         desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM; break;
+			case skr_register_constant:         desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;         break;
+			case skr_register_texture:          desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; break;
+			case skr_register_read_buffer:      desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (StructuredBuffer)
+			case skr_register_readwrite:        desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
+			case skr_register_readwrite_tex:    desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
+			case skr_register_input_attachment: desc_type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;       break; // (SubpassInput)
+			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
 
 		VkShaderStageFlags stages = 0;

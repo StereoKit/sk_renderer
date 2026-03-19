@@ -11,10 +11,9 @@ StructuredBuffer<Star> stars : register(t3);
 struct psIn {
 	float4 pos   : SV_POSITION;
 	float4 color : COLOR0;
-	uint   layer : SV_RenderTargetArrayIndex;
 };
 
-psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
+psIn vs(uint vertex_id : SV_VertexID, skr_ids_t ids) {
 	uint star_idx = vertex_id / 3;
 	uint corner   = vertex_id % 3;
 
@@ -22,7 +21,7 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 
 	psIn output;
 
-	float4 clip_pos = mul(float4(star.position, 1), viewproj[view_idx]);
+	float4 clip_pos = mul(float4(star.position, 1), viewproj[ids.view]);
 
 	// Expand triangle to cover approximately 1 pixel
 	float2 pixel_size = screen_size.zw * 2.0 * clip_pos.w;
@@ -35,7 +34,6 @@ psIn vs(uint vertex_id : SV_VertexID, uint view_idx : SV_InstanceID) {
 
 	output.pos   = clip_pos;
 	output.color = float4(star.brightness, star.brightness, star.brightness, 1);
-	output.layer = view_idx;
 
 	return output;
 }

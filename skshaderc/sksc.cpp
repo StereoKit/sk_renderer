@@ -46,6 +46,7 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 	skr_stage_ compile_stages[3] = { skr_stage_vertex, skr_stage_pixel, skr_stage_compute };
 	char*      entrypoints   [3] = { settings->vs_entrypoint, settings->ps_entrypoint, settings->cs_entrypoint };
+
 	for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
 		if (entrypoints[i][0] == 0)
 			continue;
@@ -58,7 +59,7 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 			return false;
 		} else if (spirv_result == compile_result_skip)
 			continue;
-			
+
 		// Extract metadata from the SPIRV
 		sksc_spirv_to_meta(&spirv_stage, out_file->meta);
 
@@ -236,13 +237,8 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 		}
 	}
 
-	// Only log buffer binds for the stages of a single language
-	skr_shader_lang_ stage_lang = file->stage_count > 0 ? file->stages[0].language : skr_shader_lang_hlsl;
 	for (uint32_t s = 0; s < file->stage_count; s++) {
 		const sksc_shader_file_stage_t* stage = &file->stages[s];
-
-		if (stage->language != stage_lang)
-			continue;
 
 		const char *stage_name = "";
 		switch (stage->stage) {
@@ -324,7 +320,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 5;
+	uint16_t version = 6;
 	data.write(tag);
 	data.write(version);
 
