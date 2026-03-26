@@ -106,6 +106,7 @@ typedef struct skr_tex_external_info_t {
 	VkImageView       view;           // Optional - will create if VK_NULL_HANDLE
 	VkDeviceMemory    memory;         // Optional - VK_NULL_HANDLE for external memory
 	skr_tex_fmt_      format;         // Texture format
+	skr_tex_flags_    flags;          // Usage flags (readable/writeable/etc.) - 0 = infer from format
 	skr_vec3i_t       size;           // Dimensions (for array textures, z = layer count)
 	VkImageLayout     current_layout; // Current layout of the image
 	skr_tex_sampler_t sampler;        // Sampler settings

@@ -44,6 +44,9 @@ typedef struct {
 	bool                  has_resolve_subpass;      // Manual MSAA resolve subpass between geometry and postfx
 	bool                  use_custom_resolve_flags; // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
 	VkFormat              postfx_output_format;     // Format of the final postfx output attachment
+	VkImageLayout         final_color_layout;       // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
+	VkImageLayout         final_resolve_layout;     // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
+	VkImageLayout         final_depth_layout;       // 0 or DEPTH_STENCIL_ATTACHMENT_OPTIMAL = default; DEPTH_STENCIL_READ_ONLY = readable
 } skr_pipeline_renderpass_key_t;
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
@@ -245,6 +248,9 @@ typedef struct {
 	skr_buffer_t*            global_buffers[16];
 	skr_tex_t*               global_textures[16];
 
+	// Deferred compute→graphics barrier (flushed before next render pass)
+	bool                     pending_compute_barrier;
+
 	// Deferred texture transition tracking (to avoid in-renderpass barriers)
 	skr_tex_t**              pending_transitions;
 	uint8_t*                 pending_transition_types;  // 0=shader_read, 1=storage
@@ -323,6 +329,22 @@ void                  _skr_append_vertex_format             (char* ref_str, size
 void                  _skr_append_material_config           (char* ref_str, size_t str_size, const _skr_pipeline_material_key_t* mat_key);
 void                  _skr_append_renderpass_config         (char* ref_str, size_t str_size, const skr_pipeline_renderpass_key_t* rp_key);
 void                  _skr_log_descriptor_writes            (const VkWriteDescriptorSet* writes, uint32_t write_ct, uint32_t buffer_ct, uint32_t image_ct);
+
+// Barrier batch collector — accumulates barriers and flushes in one vkCmdPipelineBarrier
+#define SKR_MAX_BATCHED_IMAGE_BARRIERS 32
+typedef struct {
+	VkImageMemoryBarrier image_barriers[SKR_MAX_BATCHED_IMAGE_BARRIERS];
+	uint32_t             image_count;
+	VkMemoryBarrier      mem_barrier;
+	bool                 has_mem_barrier;
+	VkPipelineStageFlags src_stages;
+	VkPipelineStageFlags dst_stages;
+} _skr_barrier_batch_t;
+
+void                  _skr_barrier_batch_init               (_skr_barrier_batch_t* batch);
+void                  _skr_barrier_batch_add                (_skr_barrier_batch_t* batch, VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
+void                  _skr_barrier_batch_add_memory         (_skr_barrier_batch_t* batch, VkPipelineStageFlags src_stage, VkAccessFlags src_access, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
+void                  _skr_barrier_batch_flush              (_skr_barrier_batch_t* batch, VkCommandBuffer cmd);
 
 // Automatic layout transition system
 void                  _skr_tex_transition                   (VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access);
