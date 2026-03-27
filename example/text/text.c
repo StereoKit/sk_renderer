@@ -562,6 +562,7 @@ static void _organize_into_bands(
 		int32_t  band_count  = 0;
 
 		for (int32_t c = 0; c < curve_count; c++) {
+			if (glyph_curves[c].y_min == glyph_curves[c].y_max) continue; // Perfectly horizontal curves can't cross horizontal rays
 			if (glyph_curves[c].y_max >= by_min && glyph_curves[c].y_min <= by_max)
 				band_temp[band_count++] = glyph_curves[c];
 		}
@@ -589,6 +590,7 @@ static void _organize_into_bands(
 		int32_t  band_count  = 0;
 
 		for (int32_t c = 0; c < curve_count; c++) {
+			if (glyph_curves[c].x_min == glyph_curves[c].x_max) continue; // Perfectly vertical curves can't cross vertical rays
 			if (glyph_curves[c].x_max >= bx_min && glyph_curves[c].x_min <= bx_max)
 				band_temp[band_count++] = glyph_curves[c];
 		}
