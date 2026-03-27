@@ -14,11 +14,16 @@
 // GPU Buffer Structures (must match C exactly)
 ///////////////////////////////////////////////////////////////////////////////
 
+// Curve control points packed as float16 pairs (12 bytes per curve)
 struct Curve {
-	float2 p0;      // Start point
-	float2 p1;      // Control point (off-curve)
-	float2 p2;      // End point
+	uint p0;        // Start point    (xy as two float16)
+	uint p1;        // Control point  (xy as two float16)
+	uint p2;        // End point      (xy as two float16)
 };
+
+float2 UnpackHalf2(uint packed) {
+	return float2(f16tof32(packed), f16tof32(packed >> 16));
+}
 
 #define H_BAND_COUNT 16   // Must match TEXT_H_BAND_COUNT in C
 #define V_BAND_COUNT 16   // Must match TEXT_V_BAND_COUNT in C
@@ -61,13 +66,13 @@ struct vsIn {
 };
 
 struct psIn {
-	float4 pos       : SV_POSITION;
-	float2 glyph_pos : TEXCOORD0;   // Position in glyph space (em-space)
+	float4 pos                         : SV_POSITION;
+	float2 glyph_pos                   : TEXCOORD0;   // Position in glyph space (em-space)
 	nointerpolation uint   glyph_idx   : TEXCOORD1;
 	nointerpolation float4 band_xform  : TEXCOORD2; // (v_scale, h_scale, v_offset, h_offset)
 	nointerpolation uint2  band_max    : TEXCOORD3; // (v_max, h_max)
 	nointerpolation uint   curve_start : TEXCOORD4;
-	float3 color     : COLOR0;
+	min16float3            color       : COLOR0;
 };
 
 float3 unpack_color(uint packed) {
@@ -231,8 +236,8 @@ float4 ps(psIn input) : SV_TARGET {
 
 	for (uint i = 0; i < h_count; i++) {
 		Curve  c   = curves[h_start + i];
-		float4 p12 = float4(c.p0, c.p1) - float4(pos, pos);
-		float2 p3  = c.p2 - pos;
+		float4 p12 = float4(UnpackHalf2(c.p0), UnpackHalf2(c.p1)) - float4(pos, pos);
+		float2 p3  = UnpackHalf2(c.p2) - pos;
 
 		// Early-out: curve's max x is past the pixel (sorted descending)
 		if (max(max(p12.x, p12.z), p3.x) * pixelsPerEm.x < -0.5) break;
@@ -266,8 +271,8 @@ float4 ps(psIn input) : SV_TARGET {
 
 	for (uint j = 0; j < v_count; j++) {
 		Curve  c   = curves[v_start + j];
-		float4 p12 = float4(c.p0, c.p1) - float4(pos, pos);
-		float2 p3  = c.p2 - pos;
+		float4 p12 = float4(UnpackHalf2(c.p0), UnpackHalf2(c.p1)) - float4(pos, pos);
+		float2 p3  = UnpackHalf2(c.p2) - pos;
 
 		// Early-out: curve's max y is past the pixel (sorted descending)
 		if (max(max(p12.y, p12.w), p3.y) * pixelsPerEm.y < -0.5) break;
