@@ -5,15 +5,15 @@
 // Grid Constants
 ///////////////////////////////////////////
 
-// SH probe grid (16^3)
-#define GI_GRID      16
-#define GI_GRID2     256       // GI_GRID * GI_GRID
-#define GI_GRID3     4096      // GI_GRID * GI_GRID * GI_GRID
-#define GI_INV_GRID  0.0625    // 1.0 / GI_GRID
+// SH probe grid
+#define GI_GRID      32
+#define GI_GRID2     (GI_GRID * GI_GRID)
+#define GI_GRID3     (GI_GRID * GI_GRID * GI_GRID)
+#define GI_INV_GRID  (1.0 / (float)GI_GRID)
 
 // Voxel 3D texture (64^3 per cascade)
-#define GI_VOXEL_RES     64
-#define GI_INV_VOXEL_RES 0.015625 // 1.0 / GI_VOXEL_RES
+#define GI_VOXEL_RES     128
+#define GI_INV_VOXEL_RES (1.0 / (float)GI_VOXEL_RES)
 
 // Cascade configuration
 #define GI_CASCADE_COUNT 3

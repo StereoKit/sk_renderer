@@ -32,8 +32,8 @@ static const float   SHADOW_MAP_FAR        = 50.0f;
 // GI probe configuration
 ///////////////////////////////////////////
 
-#define GI_GRID_SIZE       16
-#define GI_VOXEL_SIZE      64
+#define GI_GRID_SIZE       32
+#define GI_VOXEL_SIZE      128
 #define GI_CASCADE_COUNT   3
 
 ///////////////////////////////////////////
@@ -901,9 +901,11 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
 			skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
 
-			// Dispatch scroll compute shader for each cascade
+			// Dispatch scroll compute shader for each cascade, coarsest-to-finest.
+			// Each cascade fills invalidated probes from the next coarser cascade,
+			// so the coarser one must be up-to-date first.
 			int32_t scroll_dispatch = (GI_GRID_SIZE + 3) / 4;
-			for (int32_t c = 0; c < GI_CASCADE_COUNT; c++) {
+			for (int32_t c = GI_CASCADE_COUNT - 1; c >= 0; c--) {
 				skr_compute_set_buffer(&scene->gi_scroll_compute, "GIBuffer",      &scene->gi_const_buffer);
 				skr_compute_set_param (&scene->gi_scroll_compute, "shift_x",       sksc_shader_var_int, 1, &per_cascade_shift[c][0]);
 				skr_compute_set_param (&scene->gi_scroll_compute, "shift_y",       sksc_shader_var_int, 1, &per_cascade_shift[c][1]);

@@ -100,10 +100,13 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	// Weight per ray: full sphere sampling (4*pi), equal weight per frame
 	float w = 12.56637 / (float)ray_count;
 
-	// Per-probe angular offset: hash probe position to rotate the Fibonacci
-	// spiral uniquely per probe. Decorrelates neighboring probes so they don't
-	// flicker in unison. Deterministic — same probe always gets the same offset.
-	uint  probe_hash  = _hash(pid.x + _hash(pid.y + _hash(pid.z)));
+	// Per-probe angular offset: hash the BUFFER position (not grid position)
+	// to rotate the Fibonacci spiral uniquely per probe. Buffer position is
+	// stable across toroidal scrolls, so valid probes keep the same offset
+	// and their history remains directionally consistent.
+	int3  scroll  = int3(gi_cascades[probe_cascade].scroll_x, gi_cascades[probe_cascade].scroll_y, gi_cascades[probe_cascade].scroll_z);
+	uint3 buf_pos = uint3((int3(pid) + scroll + GI_GRID * 256) % GI_GRID);
+	uint  probe_hash  = _hash(buf_pos.x + _hash(buf_pos.y + _hash(buf_pos.z)));
 	float probe_offset = float(probe_hash) / 4294967295.0;
 
 	// Temporal stratification: total pool = history_size * ray_count directions.
