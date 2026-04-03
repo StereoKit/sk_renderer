@@ -1107,7 +1107,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			cas_size.y / GI_GRID_SIZE,
 			cas_size.z / GI_GRID_SIZE,
 		};
-		float probe_radius = fminf(fminf(cell_size.x, cell_size.y), cell_size.z) * 0.07f;
+		float probe_radius = scene->gi_probe_spacing * 0.07f;
 
 		int32_t total_probes = GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE;
 		float4  probe_data[GI_GRID_SIZE * GI_GRID_SIZE * GI_GRID_SIZE];

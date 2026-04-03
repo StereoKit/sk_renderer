@@ -41,7 +41,7 @@ float env_strength;  // multiplier for environment cubemap contribution
 // Uniform stepping may skip diagonal voxel corners (~29% miss rate at 45 deg,
 // ~42% on body diagonal) but SH probes average over many random rays with EMA,
 // making this statistically invisible.
-#define RAY_MARCH_UNIFORM 1
+#define RAY_MARCH_UNIFORM 0
 
 #if !RAY_MARCH_UNIFORM
 // Single DDA step: advances voxel_pos and t_max along the nearest axis.
@@ -131,12 +131,15 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		// Per iteration: 12 float-to-int + 12 float-add + 4 loads + 4 alpha checks
 		// All ALU ops are independent (no dependency chains), enabling full VALU
 		// throughput. Compare to DDA's ~68 ALU with 4-deep SGPR dependency chain.
+		bool prev_cascade_marched = false;
 		for (uint cascade = 0; cascade < GI_CASCADE_COUNT && !hit; cascade++) {
 			float3 origin = (probe_world - gi_cascades[cascade].volume_min) * gi_cascades[cascade].volume_inv;
 			uint start_s = 1;
 
-			// For cascade > 0: skip inner region covered by previous cascade
-			if (cascade > 0) {
+			// Skip inner region [0.25, 0.75] only if the finer cascade was
+			// actually marched. If the probe was outside the finer cascade,
+			// its region was never checked and must not be skipped here.
+			if (cascade > 0 && prev_cascade_marched) {
 				float3 t_lo  = (float3(0.25, 0.25, 0.25) - origin) / dir;
 				float3 t_hi  = (float3(0.75, 0.75, 0.75) - origin) / dir;
 				float3 t_far = max(t_lo, t_hi);
@@ -144,7 +147,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				if (t_skip > 0) start_s = max(1u, (uint)(t_skip * GI_VOXEL_RES) + 1u);
 			}
 
-			if (any(origin < 0) || any(origin >= 1.0)) continue;
+			if (any(origin < 0) || any(origin >= 1.0)) { prev_cascade_marched = false; continue; }
+			prev_cascade_marched = true;
 
 			// Pre-compute exit distance via ray-AABB intersection (~6 ALU).
 			// Division by zero gives +-inf (IEEE 754), correctly handled by
@@ -206,10 +210,11 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		t_delta.y = abs_dir.y > 0.0001 ? GI_INV_VOXEL_RES / abs_dir.y : 1e30;
 		t_delta.z = abs_dir.z > 0.0001 ? GI_INV_VOXEL_RES / abs_dir.z : 1e30;
 
+		bool prev_cascade_marched_dda = false;
 		for (uint cascade = 0; cascade < GI_CASCADE_COUNT && !hit; cascade++) {
 			float3 origin = (probe_world - gi_cascades[cascade].volume_min) * gi_cascades[cascade].volume_inv;
 
-			if (cascade > 0) {
+			if (cascade > 0 && prev_cascade_marched_dda) {
 				float3 t_lo  = (float3(0.25, 0.25, 0.25) - origin) / dir;
 				float3 t_hi  = (float3(0.75, 0.75, 0.75) - origin) / dir;
 				float3 t_far = max(t_lo, t_hi);
@@ -217,7 +222,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				if (t_skip > 0) origin = origin + dir * (t_skip + 0.001);
 			}
 
-			if (any(origin < 0) || any(origin >= 1.0)) continue;
+			if (any(origin < 0) || any(origin >= 1.0)) { prev_cascade_marched_dda = false; continue; }
+			prev_cascade_marched_dda = true;
 
 			int3 voxel_pos = clamp(int3(origin * (float)GI_VOXEL_RES),
 			                       int3(0, 0, 0),
