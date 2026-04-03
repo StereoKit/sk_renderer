@@ -236,6 +236,7 @@ VkPipelineStageFlags _layout_to_src_stage(VkImageLayout layout) {
 			return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
 			return VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
 		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 			return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 		case VK_IMAGE_LAYOUT_GENERAL:
@@ -260,6 +261,7 @@ VkAccessFlags _layout_to_access_flags(VkImageLayout layout) {
 			return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
 		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
 			return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
 		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
 			return VK_ACCESS_SHADER_READ_BIT;
 		case VK_IMAGE_LAYOUT_GENERAL:
@@ -445,6 +447,89 @@ void _skr_tex_transition_queue_family(VkCommandBuffer cmd, skr_tex_t* ref_tex,
 	// Update tracked state
 	_skr_tex_transition_notify_layout(ref_tex, layout);
 	ref_tex->current_queue_family = dst_queue_family;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Barrier Batch Collector
+///////////////////////////////////////////////////////////////////////////////
+
+void _skr_barrier_batch_init(_skr_barrier_batch_t* batch) {
+	batch->image_count     = 0;
+	batch->has_mem_barrier = false;
+	batch->src_stages      = 0;
+	batch->dst_stages      = 0;
+	batch->mem_barrier = (VkMemoryBarrier){
+		.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = 0,
+		.dstAccessMask = 0,
+	};
+}
+
+void _skr_barrier_batch_add(_skr_barrier_batch_t* batch, VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout new_layout, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+	if (!ref_tex || !ref_tex->image) return;
+
+	VkImageLayout old_layout = ref_tex->is_transient_discard ? VK_IMAGE_LAYOUT_UNDEFINED : ref_tex->current_layout;
+
+	// Skip if already in target layout (unless transient discard or GENERAL storage)
+	if (!ref_tex->is_transient_discard && ref_tex->current_layout == new_layout && new_layout != VK_IMAGE_LAYOUT_GENERAL)
+		return;
+
+	VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+	VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
+
+	batch->src_stages |= src_stage;
+	batch->dst_stages |= dst_stage;
+
+	if (old_layout == new_layout) {
+		// Same-layout case (e.g. GENERAL→GENERAL): memory barrier only
+		batch->has_mem_barrier          = true;
+		batch->mem_barrier.srcAccessMask |= src_access;
+		batch->mem_barrier.dstAccessMask |= dst_access;
+	} else {
+		// Auto-flush if full
+		if (batch->image_count >= SKR_MAX_BATCHED_IMAGE_BARRIERS)
+			_skr_barrier_batch_flush(batch, cmd);
+
+		batch->image_barriers[batch->image_count++] = (VkImageMemoryBarrier){
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.oldLayout           = old_layout,
+			.newLayout           = new_layout,
+			.srcAccessMask       = src_access,
+			.dstAccessMask       = dst_access,
+			.image               = ref_tex->image,
+			.subresourceRange    = {
+				.aspectMask     = ref_tex->aspect_mask,
+				.baseMipLevel   = 0,
+				.levelCount     = ref_tex->mip_levels,
+				.baseArrayLayer = 0,
+				.layerCount     = ref_tex->layer_count,
+			},
+		};
+	}
+
+	_skr_tex_transition_notify_layout(ref_tex, new_layout);
+}
+
+void _skr_barrier_batch_add_memory(_skr_barrier_batch_t* batch, VkPipelineStageFlags src_stage, VkAccessFlags src_access, VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+	batch->has_mem_barrier            = true;
+	batch->mem_barrier.srcAccessMask |= src_access;
+	batch->mem_barrier.dstAccessMask |= dst_access;
+	batch->src_stages                |= src_stage;
+	batch->dst_stages                |= dst_stage;
+}
+
+void _skr_barrier_batch_flush(_skr_barrier_batch_t* batch, VkCommandBuffer cmd) {
+	if (batch->image_count == 0 && !batch->has_mem_barrier) return;
+
+	vkCmdPipelineBarrier(cmd,
+		batch->src_stages, batch->dst_stages, 0,
+		batch->has_mem_barrier ? 1 : 0, batch->has_mem_barrier ? &batch->mem_barrier : NULL,
+		0, NULL,
+		batch->image_count, batch->image_count > 0 ? batch->image_barriers : NULL);
+
+	_skr_barrier_batch_init(batch);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1216,12 +1301,13 @@ static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t*
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
-	// Transition to TRANSFER_SRC with broad source scope — the upload may
-	// have been in a prior submission, and _skr_tex_transition alone would
-	// derive srcStage from the tracked layout (SHADER_READ → FRAGMENT_SHADER)
-	// which doesn't cover the upload's TRANSFER_WRITE.
+	// Transition only mip 0 to TRANSFER_SRC — it has valid data that needs
+	// to be read. Higher mips may be in an inconsistent layout (e.g. after
+	// blit which transitions all mips but the render pass only touches mip
+	// 0). The loop handles each subsequent mip individually using UNDEFINED
+	// as old layout, which is valid regardless of actual layout.
 	_skr_transition_image_layout(ctx.cmd, ref_tex->image, ref_tex->aspect_mask,
-		0, ref_tex->mip_levels, ref_tex->layer_count,
+		0, 1, ref_tex->layer_count,
 		ref_tex->current_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		VK_ACCESS_MEMORY_WRITE_BIT,         VK_ACCESS_TRANSFER_READ_BIT);
@@ -1940,7 +2026,7 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 	out_tex->memory      = info.memory;  // May be VK_NULL_HANDLE for truly external memory
 	out_tex->size        = (skr_vec3i_t){ info.size.x, info.size.y, 1 };
 	out_tex->format      = info.format;
-	out_tex->flags       = is_array ? skr_tex_flags_array : skr_tex_flags_none;
+	out_tex->flags       = is_array ? (skr_tex_flags_)(info.flags | skr_tex_flags_array) : info.flags;
 	out_tex->samples     = vk_samples;
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = layer_count;

@@ -111,12 +111,28 @@ static inline uint32_t _utf16_next(const uint16_t** str) {
 // GPU Buffer Structures (must match shader exactly)
 ///////////////////////////////////////////////////////////////////////////////
 
-// GPU curve: just control points, stored directly in band arrays
+// Float32 to IEEE 754 float16 conversion
+static inline uint16_t _float_to_half(float f) {
+	uint32_t x = *(uint32_t*)&f;
+	uint32_t sign = (x >> 16) & 0x8000;
+	int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
+	uint32_t mant = x & 0x7FFFFF;
+
+	if (exp <= 0)       return (uint16_t)sign;             // Underflow to zero
+	if (exp >= 0x1F)    return (uint16_t)(sign | 0x7C00);  // Overflow to inf
+	return (uint16_t)(sign | (exp << 10) | (mant >> 13));
+}
+
+static inline uint32_t _pack_half2(float a, float b) {
+	return (uint32_t)_float_to_half(a) | ((uint32_t)_float_to_half(b) << 16);
+}
+
+// GPU curve: control points packed as float16 pairs (12 bytes, half of float32)
 typedef struct {
-	float p0[2];        // Start point
-	float p1[2];        // Control point (off-curve)
-	float p2[2];        // End point
-} text_curve_gpu_t;     // 24 bytes
+	uint32_t p0;        // Start point    (xy as two float16)
+	uint32_t p1;        // Control point  (xy as two float16)
+	uint32_t p2;        // End point      (xy as two float16)
+} text_curve_gpu_t;     // 12 bytes
 
 // CPU-side curve with AABB (used during preprocessing for band assignment)
 typedef struct {
@@ -516,12 +532,12 @@ static int _cmp_desc_y_max(const void* a, const void* b) {
 	return (by > ay) - (by < ay);
 }
 
-// Push a GPU curve (control points only) into the band curve array
+// Push a GPU curve (control points packed as float16 pairs) into the band curve array
 static inline void _push_gpu_curve(text_array_t* out, const text_curve_t* src) {
 	text_curve_gpu_t* gc = _array_push(out);
-	gc->p0[0] = src->p0[0]; gc->p0[1] = src->p0[1];
-	gc->p1[0] = src->p1[0]; gc->p1[1] = src->p1[1];
-	gc->p2[0] = src->p2[0]; gc->p2[1] = src->p2[1];
+	gc->p0 = _pack_half2(src->p0[0], src->p0[1]);
+	gc->p1 = _pack_half2(src->p1[0], src->p1[1]);
+	gc->p2 = _pack_half2(src->p2[0], src->p2[1]);
 }
 
 // Organize curves into horizontal and vertical bands for a single glyph.
@@ -562,6 +578,7 @@ static void _organize_into_bands(
 		int32_t  band_count  = 0;
 
 		for (int32_t c = 0; c < curve_count; c++) {
+			if (glyph_curves[c].y_min == glyph_curves[c].y_max) continue; // Perfectly horizontal curves can't cross horizontal rays
 			if (glyph_curves[c].y_max >= by_min && glyph_curves[c].y_min <= by_max)
 				band_temp[band_count++] = glyph_curves[c];
 		}
@@ -589,6 +606,7 @@ static void _organize_into_bands(
 		int32_t  band_count  = 0;
 
 		for (int32_t c = 0; c < curve_count; c++) {
+			if (glyph_curves[c].x_min == glyph_curves[c].x_max) continue; // Perfectly vertical curves can't cross vertical rays
 			if (glyph_curves[c].x_max >= bx_min && glyph_curves[c].x_min <= bx_max)
 				band_temp[band_count++] = glyph_curves[c];
 		}

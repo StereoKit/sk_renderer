@@ -121,38 +121,52 @@ void _skr_tex_transition_enqueue(skr_tex_t* ref_tex, uint8_t type) {
 
 // Flush all pending texture transitions (called before render pass begins)
 static void _skr_flush_texture_transitions(VkCommandBuffer cmd) {
+	if (_skr_vk.pending_transition_count == 0) return;
+
+	_skr_barrier_batch_t batch;
+	_skr_barrier_batch_init(&batch);
+
 	for (uint32_t i = 0; i < _skr_vk.pending_transition_count; i++) {
 		skr_tex_t* tex  = _skr_vk.pending_transitions[i];
 		uint8_t    type = _skr_vk.pending_transition_types[i];
 
 		if (type == 1) {  // storage
-			_skr_tex_transition_for_storage(cmd, tex);
+			_skr_barrier_batch_add(&batch, cmd, tex, VK_IMAGE_LAYOUT_GENERAL,
+				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 		} else {  // shader_read
-			// If the texture is already in the correct layout, use a
-			// memory-only barrier to ensure cross-submission visibility.
-			// This handles the case where a render target was written in
-			// a prior submission and needs to be sampled in the current
-			// one — the layout is correct but the data may not yet be
-			// visible without an explicit barrier.
-			if (!_skr_tex_needs_transition(tex, type)) {
-				bool is_depth = (tex->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
-				_skr_tex_barrier(cmd, tex,
-					is_depth ? VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT  : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-					is_depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-			} else {
-				_skr_tex_transition_for_shader_read(cmd, tex, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-			}
+			VkImageLayout target = (tex->flags & skr_tex_flags_compute)
+				? VK_IMAGE_LAYOUT_GENERAL
+				: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			// _skr_barrier_batch_add skips if already in target layout
+			_skr_barrier_batch_add(&batch, cmd, tex, target,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				VK_ACCESS_SHADER_READ_BIT);
 		}
 	}
 
-	// Clear the queue
+	_skr_barrier_batch_flush(&batch, cmd);
 	_skr_vk.pending_transition_count = 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Rendering
 ///////////////////////////////////////////////////////////////////////////////
+
+// Flush deferred compute→graphics barrier. Called before render passes and blits
+// to ensure compute writes are visible to vertex/fragment stages.
+static void _skr_flush_pending_compute_barrier(VkCommandBuffer cmd) {
+	if (!_skr_vk.pending_compute_barrier) return;
+	vkCmdPipelineBarrier(cmd,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+		0, 1, &(VkMemoryBarrier){
+			.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+		}, 0, NULL, 0, NULL);
+	_skr_vk.pending_compute_barrier = false;
+}
 
 void skr_renderer_frame_begin() {
 	_skr_vk.in_frame = true;
@@ -179,8 +193,11 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 
 	assert(count <= SKR_MAX_SURFACES && "Maximum surfaces supported for VR stereo");
 
-	// Write end timestamp
+	// Flush any pending compute→graphics barrier before present
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
+	_skr_flush_pending_compute_barrier(cmd);
+
+	// Write end timestamp
 	vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _skr_vk.timestamp_pool, _skr_vk.flight_idx * 2 + 1);
 	_skr_cmd_release(cmd);
 
@@ -257,8 +274,9 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 
-	// Flush all pending texture transitions BEFORE starting render pass
+	// Flush pending transitions and compute→graphics barrier BEFORE render pass
 	_skr_flush_texture_transitions(cmd);
+	_skr_flush_pending_compute_barrier(cmd);
 
 	// Register render pass format with pipeline system
 	skr_pipeline_renderpass_key_t rp_key = {
@@ -270,6 +288,12 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		.color_load_op   = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
 		.view_mask        = view_mask,
 		.correlation_mask = correlation_mask,
+		.final_color_layout   = (color && (color->flags & skr_tex_flags_readable))
+			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+		.final_resolve_layout = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT && (opt_resolve->flags & skr_tex_flags_readable))
+			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+		.final_depth_layout   = (depth && (depth->flags & skr_tex_flags_readable) && !(depth->samples > VK_SAMPLE_COUNT_1_BIT))
+			? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : 0,
 	};
 	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 
@@ -291,25 +315,31 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 
 	if (framebuffer == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
-	// Transition depth texture to attachment layout if needed
-	// Transient discard depth (non-readable) skips the explicit barrier — the render pass
-	// handles it via initialLayout=UNDEFINED with LOAD_OP_CLEAR. Readable depth (e.g. shadow
-	// maps reused as depth targets) still needs the explicit transition for synchronization.
-	if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
-		_skr_tex_transition(cmd, depth,
-			VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-			VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-			VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
-	}
+	// Batch pre-pass transitions into a single barrier
+	{
+		_skr_barrier_batch_t batch;
+		_skr_barrier_batch_init(&batch);
 
-	// When loading previous contents, transition color to attachment layout explicitly.
-	// Clear passes use initialLayout=UNDEFINED (no prior data needed), but LOAD passes
-	// must match the actual current layout.
-	if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
-		_skr_tex_transition(cmd, color,
-			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+		// Transition depth texture to attachment layout if needed.
+		// Transient discard depth (non-readable) skips — the render pass handles it
+		// via initialLayout=UNDEFINED with LOAD_OP_CLEAR.
+		if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
+			_skr_barrier_batch_add(&batch, cmd, depth,
+				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+		}
+
+		// When loading previous contents, transition color to attachment layout.
+		// Clear passes use initialLayout=UNDEFINED (no prior data needed).
+		if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+			_skr_barrier_batch_add(&batch, cmd, color,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+		}
+
+		_skr_barrier_batch_flush(&batch, cmd);
 	}
 
 	// Setup clear values
@@ -378,31 +408,23 @@ void skr_renderer_end_pass() {
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 	vkCmdEndRenderPass(cmd);
 
-	// Transition readable color attachments to shader-read layout for next use
-	// Automatic system handles this - tracks that color is currently in COLOR_ATTACHMENT_OPTIMAL
-	// Transition readable render targets to shader-read layout and enqueue for
-	// cross-submission visibility barriers. The enqueue is safe here because
-	// these are app-owned render targets with known lifetimes (not scene textures).
+	// Render pass finalLayout handles the transition to shader-read for readable
+	// attachments (free on tilers via the subpass→EXTERNAL dependency). We just
+	// need to update the tracked layout to match what the render pass did.
 	if (_skr_vk.current_color_texture && (_skr_vk.current_color_texture->flags & skr_tex_flags_readable)) {
-		_skr_tex_transition_for_shader_read(cmd, _skr_vk.current_color_texture,
-			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		_skr_tex_transition_enqueue(_skr_vk.current_color_texture, 0);
+		_skr_tex_transition_notify_layout(_skr_vk.current_color_texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	}
 
-	// NOTE: MSAA depth textures don't have SAMPLED_BIT and can't be transitioned to SHADER_READ_ONLY
 	if (_skr_vk.current_depth_texture && (_skr_vk.current_depth_texture->flags & skr_tex_flags_readable)) {
 		bool is_msaa_depth = _skr_vk.current_depth_texture->samples > VK_SAMPLE_COUNT_1_BIT &&
 		                     (_skr_vk.current_depth_texture->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT);
 		if (!is_msaa_depth) {
-			_skr_tex_transition_for_shader_read(cmd, _skr_vk.current_depth_texture,
-				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			_skr_tex_transition_notify_layout(_skr_vk.current_depth_texture, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 		}
 	}
 
 	if (_skr_vk.current_resolve_texture && (_skr_vk.current_resolve_texture->flags & skr_tex_flags_readable)) {
-		_skr_tex_transition_for_shader_read(cmd, _skr_vk.current_resolve_texture,
-			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		_skr_tex_transition_enqueue(_skr_vk.current_resolve_texture, 0);
+		_skr_tex_transition_notify_layout(_skr_vk.current_resolve_texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	}
 
 	_skr_vk.current_color_texture   = NULL;
@@ -495,12 +517,13 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	// Register render pass format with pipeline system
 	// Use DONT_CARE for full blit (discard previous contents), LOAD for partial (preserve)
 	skr_pipeline_renderpass_key_t rp_key = {
-		.color_format   = skr_tex_fmt_to_native(to->format),
-		.depth_format   = VK_FORMAT_UNDEFINED,
-		.resolve_format = VK_FORMAT_UNDEFINED,
-		.samples        = to->samples,
-		.depth_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE,  // No depth in blit
-		.color_load_op  = is_full_blit ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+		.color_format       = skr_tex_fmt_to_native(to->format),
+		.depth_format       = VK_FORMAT_UNDEFINED,
+		.resolve_format     = VK_FORMAT_UNDEFINED,
+		.samples            = to->samples,
+		.depth_store_op     = VK_ATTACHMENT_STORE_OP_DONT_CARE,  // No depth in blit
+		.color_load_op      = is_full_blit ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+		.final_color_layout = (to->flags & skr_tex_flags_readable) ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
 	};
 	int32_t renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	int32_t vert_idx       = _skr_pipeline_register_vertformat_unlocked((skr_vert_type_t){0});
@@ -513,6 +536,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	}
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+	_skr_flush_pending_compute_barrier(ctx.cmd);
 
 	// Build per-draw descriptor writes
 	VkWriteDescriptorSet   writes      [32];
@@ -559,18 +583,31 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		return;
 	}
 
-	// Transition any source textures in material to shader-read layout
-	for (uint32_t i=0; i<meta->resource_count; i++) {
-		skr_material_bind_t* res = &mat_binds[meta->buffer_count + i];
-		if (res->texture)
-			_skr_tex_transition_for_shader_read(ctx.cmd, res->texture, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	// Batch source + target transitions into a single barrier
+	{
+		_skr_barrier_batch_t batch;
+		_skr_barrier_batch_init(&batch);
+
+		// Transition source textures to shader-read layout
+		for (uint32_t i = 0; i < meta->resource_count; i++) {
+			skr_material_bind_t* res = &mat_binds[meta->buffer_count + i];
+			if (res->texture) {
+				VkImageLayout target = (res->texture->flags & skr_tex_flags_compute)
+					? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+				_skr_barrier_batch_add(&batch, ctx.cmd, res->texture, target,
+					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			}
+		}
+
+		// Transition target texture to color attachment layout
+		_skr_barrier_batch_add(&batch, ctx.cmd, to,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+		_skr_barrier_batch_flush(&batch, ctx.cmd);
 	}
 	_skr_bind_pool_unlock();
-
-	// Transition target texture to color attachment layout
-	_skr_tex_transition(ctx.cmd, to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 	// Create framebuffer - layered for cubemaps/arrays, cached for 2D
 	VkFramebuffer framebuffer   = VK_NULL_HANDLE;
@@ -685,12 +722,12 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		vkCmdEndRenderPass(ctx.cmd);
 	}
 
-	// Transition target texture back to shader read layout if it will be sampled.
-	// Skip for textures without SAMPLED_BIT (e.g., swapchain images used as final output).
-	_skr_tex_transition_notify_layout(to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	// Render pass finalLayout handles the transition for readable targets.
+	// Just update tracking to match what the render pass did.
 	if (to->flags & skr_tex_flags_readable) {
-		_skr_tex_transition_for_shader_read(ctx.cmd, to, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		_skr_tex_transition_enqueue(to, 0);
+		_skr_tex_transition_notify_layout(to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	} else {
+		_skr_tex_transition_notify_layout(to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	}
 
 	_skr_cmd_release(ctx.cmd);
@@ -1147,6 +1184,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	_skr_pipeline_lock();
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 	_skr_flush_texture_transitions(ctx.cmd);
+	_skr_flush_pending_compute_barrier(ctx.cmd);
 
 	bool has_resolve = pass->resolve_material && skr_material_is_valid(pass->resolve_material);
 
@@ -1165,6 +1203,12 @@ void skr_pass_submit(skr_pass_t* pass) {
 		.postfx_output_format = skr_tex_fmt_to_native(final_output->format),
 		.has_resolve_subpass      = has_resolve,
 		.use_custom_resolve_flags = has_resolve && pass->postfx_count == 0 && _skr_vk.has_custom_resolve,
+		.final_color_layout       = (final_output->flags & skr_tex_flags_readable)
+			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+		.final_resolve_layout     = (use_msaa && has_resolve && pass->postfx_count == 0 && (resolve->flags & skr_tex_flags_readable))
+			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+		.final_depth_layout       = (has_depth && (depth->flags & skr_tex_flags_readable) && !(depth->samples > VK_SAMPLE_COUNT_1_BIT))
+			? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : 0,
 	};
 
 	// Register geometry subpass
@@ -1300,18 +1344,25 @@ void skr_pass_submit(skr_pass_t* pass) {
 			}
 		}
 
-		// Transition depth if needed (same logic as begin_pass)
-		if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
-			_skr_tex_transition(ctx.cmd, depth,
-				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
-		}
-		if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
-			_skr_tex_transition(ctx.cmd, color,
-				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+		// Batch pre-pass transitions (same logic as begin_pass)
+		{
+			_skr_barrier_batch_t batch;
+			_skr_barrier_batch_init(&batch);
+
+			if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
+				_skr_barrier_batch_add(&batch, ctx.cmd, depth,
+					VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+					VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+					VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+			}
+			if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+				_skr_barrier_batch_add(&batch, ctx.cmd, color,
+					VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+					VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+			}
+
+			_skr_barrier_batch_flush(&batch, ctx.cmd);
 		}
 
 		// Clear values: match attachment order
@@ -1483,12 +1534,11 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 		vkCmdEndRenderPass(ctx.cmd);
 
-		// Notify layout tracking that final output is now in COLOR_ATTACHMENT_OPTIMAL
-		// (renderpass finalLayout). frame_end will transition swapchain images to PRESENT_SRC.
-		_skr_tex_transition_notify_layout(final_output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		// Render pass finalLayout handles the transition. Just update tracking.
 		if (final_output->flags & skr_tex_flags_readable) {
-			_skr_tex_transition_for_shader_read(ctx.cmd, final_output,
-				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			_skr_tex_transition_notify_layout(final_output, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		} else {
+			_skr_tex_transition_notify_layout(final_output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 		}
 
 		// Defer-destroy transient resources (cached framebuffer is not destroyed here)

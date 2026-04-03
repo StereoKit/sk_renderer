@@ -454,16 +454,17 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 
 	vkCmdDispatch(cmd, x, y, z);
 
-	// Add memory barrier for storage resources to ensure writes are visible to next operation
-	// This includes compute→compute, compute→vertex, and compute→fragment transitions
+	// Compute→compute memory barrier (immediate). Compute→graphics barrier is
+	// deferred via pending_compute_barrier and flushed before the next render pass.
 	vkCmdPipelineBarrier(cmd,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		0, 1, &(VkMemoryBarrier){
 			.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
 			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
 		}, 0, NULL, 0, NULL);
+	_skr_vk.pending_compute_barrier = true;
 
 	_skr_cmd_release(cmd);
 }
@@ -501,6 +502,22 @@ void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indi
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ref_compute->pipeline);
 
+	// Transition all bound textures to appropriate layouts before dispatch
+	for (uint32_t i = 0; i < ref_compute->bind_count; i++) {
+		skr_material_bind_t *res = &ref_compute->binds[i];
+		if      (res->bind.register_type == skr_register_readwrite_tex && res->texture) {_skr_tex_transition_for_storage    (cmd, res->texture); }
+		else if (res->bind.register_type == skr_register_texture       && res->texture) {_skr_tex_transition_for_shader_read(cmd, res->texture, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); }
+	}
+
+	// Barrier for indirect args buffer (compute writes → indirect read)
+	vkCmdPipelineBarrier(cmd,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+		0, 1, &(VkMemoryBarrier){
+			.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+		}, 0, NULL, 0, NULL);
+
 	VkWriteDescriptorSet   writes      [32];
 	VkDescriptorBufferInfo buffer_infos[16];
 	VkDescriptorImageInfo  image_infos [16];
@@ -522,5 +539,17 @@ void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indi
 	                      ref_compute->layout, ref_compute->descriptor_layout, writes, write_ct);
 
 	vkCmdDispatchIndirect(cmd, indirect_args->buffer, 0);
+
+	// Compute→compute memory barrier (immediate). Compute→graphics deferred.
+	vkCmdPipelineBarrier(cmd,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, 1, &(VkMemoryBarrier){
+			.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+		}, 0, NULL, 0, NULL);
+	_skr_vk.pending_compute_barrier = true;
+
 	_skr_cmd_release(cmd);
 }

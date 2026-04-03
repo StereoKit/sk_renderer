@@ -286,7 +286,10 @@ static bool _skr_renderpass_key_matches_base(const skr_pipeline_renderpass_key_t
 	    && a->postfx_count             == b->postfx_count
 	    && a->has_resolve_subpass      == b->has_resolve_subpass
 	    && a->use_custom_resolve_flags == b->use_custom_resolve_flags
-	    && a->postfx_output_format     == b->postfx_output_format;
+	    && a->postfx_output_format     == b->postfx_output_format
+	    && a->final_color_layout       == b->final_color_layout
+	    && a->final_resolve_layout     == b->final_resolve_layout
+	    && a->final_depth_layout       == b->final_depth_layout;
 }
 
 // Unlocked version - caller must hold the mutex via _skr_pipeline_lock()
@@ -595,6 +598,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// [2] Depth attachment
+	VkImageLayout depth_final = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 	if (has_depth) {
 		bool has_stencil = _skr_format_has_stencil(key->depth_format);
 		depth_idx = (int32_t)attachment_count;
@@ -604,9 +608,11 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
 			.storeOp        = key->depth_store_op,
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = has_stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
+				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL  // Readable depth: explicitly transitioned before render pass
+				: VK_IMAGE_LAYOUT_UNDEFINED,                        // Transient discard: loadOp=CLEAR handles it
+			.finalLayout    = depth_final,
 		};
 	}
 
@@ -633,6 +639,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// [last] Final postfx output attachment (skip when resolve-only — resolve attachment is final)
+	VkImageLayout final_output_layout = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	if (!resolve_is_final) {
 		VkFormat output_format = key->postfx_output_format != VK_FORMAT_UNDEFINED
 			? key->postfx_output_format
@@ -646,8 +653,14 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.finalLayout    = final_output_layout,
 		};
+	} else {
+		// resolve-only: the resolve attachment is the final output
+		// Update its finalLayout to match the requested final layout
+		if (resolve_idx >= 0 && key->final_resolve_layout) {
+			attachments[resolve_idx].finalLayout = key->final_resolve_layout;
+		}
 	}
 
 	// --- Build subpass descriptions ---
@@ -745,7 +758,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// --- Subpass dependencies ---
-	VkSubpassDependency dependencies[SKR_POSTFX_MAX_SUBPASSES + 2];
+	VkSubpassDependency dependencies[SKR_POSTFX_MAX_SUBPASSES + 4]; // +4: 2 external→0, N-1 chains, up to 2 subpass→external
 	uint32_t dep_count = 0;
 
 	// External → subpass 0: color
@@ -781,6 +794,30 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask   = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
 			.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+		};
+	}
+
+	// Subpass → EXTERNAL: ensure writes complete before downstream shader reads
+	// when finalLayout transitions to a readable layout (free on tilers).
+	if (final_output_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+	    (resolve_is_final && key->final_resolve_layout && key->final_resolve_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
+		dependencies[dep_count++] = (VkSubpassDependency){
+			.srcSubpass    = subpass_count - 1,
+			.dstSubpass    = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
+	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+		dependencies[dep_count++] = (VkSubpassDependency){
+			.srcSubpass    = 0,  // Depth is only used in geometry subpass
+			.dstSubpass    = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
 	}
 
@@ -849,7 +886,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = color_initial,
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.finalLayout    = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 
 		color_ref.attachment = attachment_count;
@@ -867,8 +904,8 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED, // loadOp=DONT_CARE, no DCC init cost from UNDEFINED
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = key->final_resolve_layout ? key->final_resolve_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 		resolve_ref.attachment = attachment_count;
 		resolve_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -877,6 +914,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 
 	// Depth attachment (if present)
 	VkAttachmentReference depth_ref = {0};
+	VkImageLayout depth_final = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 	if (key->depth_format != VK_FORMAT_UNDEFINED) {
 		// Check if this is a depth+stencil format
 		bool has_stencil = _skr_format_has_stencil(key->depth_format);
@@ -891,7 +929,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
 				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL  // Readable depth: explicitly transitioned before render pass
 				: VK_IMAGE_LAYOUT_UNDEFINED,                        // Transient discard: never explicitly transitioned, loadOp=CLEAR handles it
-			.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			.finalLayout    = depth_final,
 		};
 
 		depth_ref.attachment = attachment_count;
@@ -912,26 +950,54 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 	// Use TOP_OF_PIPE for clears to avoid unnecessary execution dependency on
 	// prior fragment/color work. loadOp=CLEAR discards previous contents so
 	// there's no data hazard with earlier passes.
-	VkSubpassDependency dependencies[2] = {
-		{
-			.srcSubpass    = VK_SUBPASS_EXTERNAL,
-			.dstSubpass    = 0,
-			.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
-				? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-				: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.srcAccessMask = 0,
-			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		},
-		{
-			.srcSubpass    = VK_SUBPASS_EXTERNAL,
-			.dstSubpass    = 0,
-			.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // Depth always clears, no prior dependency needed
-			.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.srcAccessMask = 0,
-			.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-		},
+	VkSubpassDependency dependencies[4];
+	uint32_t dep_count = 0;
+
+	dependencies[dep_count++] = (VkSubpassDependency){
+		.srcSubpass    = VK_SUBPASS_EXTERNAL,
+		.dstSubpass    = 0,
+		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
+			? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+			: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	};
+	dependencies[dep_count++] = (VkSubpassDependency){
+		.srcSubpass    = VK_SUBPASS_EXTERNAL,
+		.dstSubpass    = 0,
+		.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // Depth always clears, no prior dependency needed
+		.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+	};
+
+	// When finalLayout differs from the in-pass layout, the render pass performs
+	// an implicit transition. Add subpass→EXTERNAL dependency to ensure writes
+	// complete before downstream shader reads. This is free on tile-based GPUs.
+	VkImageLayout color_final   = key->final_color_layout   ? key->final_color_layout   : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	VkImageLayout resolve_final = key->final_resolve_layout  ? key->final_resolve_layout  : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	if ((has_color && color_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ||
+	    (use_msaa  && resolve_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
+		dependencies[dep_count++] = (VkSubpassDependency){
+			.srcSubpass    = 0,
+			.dstSubpass    = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
+	if (key->depth_format != VK_FORMAT_UNDEFINED && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+		dependencies[dep_count++] = (VkSubpassDependency){
+			.srcSubpass    = 0,
+			.dstSubpass    = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
 
 	// Chain multiview info when view_mask is set
 	VkRenderPassMultiviewCreateInfo multiview_info = {
@@ -949,7 +1015,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		.pAttachments    = attachments,
 		.subpassCount    = 1,
 		.pSubpasses      = &subpass,
-		.dependencyCount = 2,
+		.dependencyCount = dep_count,
 		.pDependencies   = dependencies,
 	};
 
