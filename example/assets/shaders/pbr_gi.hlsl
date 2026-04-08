@@ -105,6 +105,65 @@ float shadow_factor_pcf4(float3 uv, float scale) {
 }
 
 ///////////////////////////////////////////
+// GI Probe Sampling (tetrahedral interpolation)
+///////////////////////////////////////////
+
+void gi_sample_probes(float3 world_pos, uint cascade, out float4 shr, out float4 shg, out float4 shb) {
+	float3 uvw      = saturate((world_pos - gi_cascades[cascade].volume_min) * gi_cascades[cascade].volume_inv);
+	float3 grid_pos = uvw * (float)GI_GRID - 0.5;
+	int3   base     = int3(floor(grid_pos));
+	float3 f        = grid_pos - float3(base);
+	int3   max_idx  = int3(GI_GRID - 1, GI_GRID - 1, GI_GRID - 1);
+
+	uint3 p0 = uint3(clamp(base,     int3(0, 0, 0), max_idx));
+	uint3 p1 = uint3(clamp(base + 1, int3(0, 0, 0), max_idx));
+
+	uint  idx0 = probe_index_scrolled(p0, cascade);
+	uint  idx3 = probe_index_scrolled(p1, cascade);
+	uint  idx1, idx2;
+	float tw0, tw1, tw2, tw3;
+
+	if (f.x >= f.y) {
+		if (f.y >= f.z) {
+			idx1 = probe_index_scrolled(uint3(p1.x, p0.y, p0.z), cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p1.y, p0.z), cascade);
+			tw0 = 1-f.x; tw1 = f.x-f.y; tw2 = f.y-f.z; tw3 = f.z;
+		} else if (f.x >= f.z) {
+			idx1 = probe_index_scrolled(uint3(p1.x, p0.y, p0.z), cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p0.y, p1.z), cascade);
+			tw0 = 1-f.x; tw1 = f.x-f.z; tw2 = f.z-f.y; tw3 = f.y;
+		} else {
+			idx1 = probe_index_scrolled(uint3(p0.x, p0.y, p1.z), cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p0.y, p1.z), cascade);
+			tw0 = 1-f.z; tw1 = f.z-f.x; tw2 = f.x-f.y; tw3 = f.y;
+		}
+	} else {
+		if (f.x >= f.z) {
+			idx1 = probe_index_scrolled(uint3(p0.x, p1.y, p0.z), cascade);
+			idx2 = probe_index_scrolled(uint3(p1.x, p1.y, p0.z), cascade);
+			tw0 = 1-f.y; tw1 = f.y-f.x; tw2 = f.x-f.z; tw3 = f.z;
+		} else if (f.y >= f.z) {
+			idx1 = probe_index_scrolled(uint3(p0.x, p1.y, p0.z), cascade);
+			idx2 = probe_index_scrolled(uint3(p0.x, p1.y, p1.z), cascade);
+			tw0 = 1-f.y; tw1 = f.y-f.z; tw2 = f.z-f.x; tw3 = f.x;
+		} else {
+			idx1 = probe_index_scrolled(uint3(p0.x, p0.y, p1.z), cascade);
+			idx2 = probe_index_scrolled(uint3(p0.x, p1.y, p1.z), cascade);
+			tw0 = 1-f.z; tw1 = f.z-f.y; tw2 = f.y-f.x; tw3 = f.x;
+		}
+	}
+
+	SHProbe sp0 = gi_sh_probes[idx0];
+	SHProbe sp1 = gi_sh_probes[idx1];
+	SHProbe sp2 = gi_sh_probes[idx2];
+	SHProbe sp3 = gi_sh_probes[idx3];
+
+	shr = sh_unpack(sp0.r)*tw0 + sh_unpack(sp1.r)*tw1 + sh_unpack(sp2.r)*tw2 + sh_unpack(sp3.r)*tw3;
+	shg = sh_unpack(sp0.g)*tw0 + sh_unpack(sp1.g)*tw1 + sh_unpack(sp2.g)*tw2 + sh_unpack(sp3.g)*tw3;
+	shb = sh_unpack(sp0.b)*tw0 + sh_unpack(sp1.b)*tw1 + sh_unpack(sp2.b)*tw2 + sh_unpack(sp3.b)*tw3;
+}
+
+///////////////////////////////////////////
 // Pixel Shader
 ///////////////////////////////////////////
 
@@ -125,67 +184,33 @@ float4 ps(psIn input) : SV_TARGET {
 		shadow = shadow_factor_pcf4(float3(spos.xy * float2(0.5, -0.5) + 0.5, spos.z / spos.w), 1.0);
 	}
 
-	// GI probe cascade selection: find finest cascade containing this fragment
-	uint gi_cascade = GI_CASCADE_COUNT - 1;
+	// GI cascade selection: find finest cascade, compute blend at boundary
+	float  cascade_blend = 1.0;
+	uint   gi_cascade    = GI_CASCADE_COUNT - 1;
+	float  blend_margin  = 2.0 / (float)GI_GRID; // 2 probe cells
+
 	for (uint c = 0; c < GI_CASCADE_COUNT - 1; c++) {
 		float3 test_uvw = (world_pos - gi_cascades[c].volume_min) * gi_cascades[c].volume_inv;
-		if (all(test_uvw >= 0) && all(test_uvw <= 1)) { gi_cascade = c; break; }
-	}
-
-	// GI probe irradiance (tetrahedral interpolation, 4 probes)
-	float3 uvw      = saturate((world_pos - gi_cascades[gi_cascade].volume_min) * gi_cascades[gi_cascade].volume_inv);
-	float3 grid_pos = uvw * (float)GI_GRID - 0.5;
-	int3   base     = int3(floor(grid_pos));
-	float3 f        = grid_pos - float3(base);
-	int3   max_idx  = int3(GI_GRID - 1, GI_GRID - 1, GI_GRID - 1);
-
-	uint3 p0 = uint3(clamp(base,     int3(0, 0, 0), max_idx));
-	uint3 p1 = uint3(clamp(base + 1, int3(0, 0, 0), max_idx));
-
-	// Sort fractional coords to select tetrahedron (4 of 8 corners)
-	uint  idx0 = probe_index_scrolled(p0, gi_cascade);
-	uint  idx3 = probe_index_scrolled(p1, gi_cascade);
-	uint  idx1, idx2;
-	float tw0, tw1, tw2, tw3;
-
-	if (f.x >= f.y) {
-		if (f.y >= f.z) {
-			idx1 = probe_index_scrolled(uint3(p1.x, p0.y, p0.z), gi_cascade);
-			idx2 = probe_index_scrolled(uint3(p1.x, p1.y, p0.z), gi_cascade);
-			tw0 = 1-f.x; tw1 = f.x-f.y; tw2 = f.y-f.z; tw3 = f.z;
-		} else if (f.x >= f.z) {
-			idx1 = probe_index_scrolled(uint3(p1.x, p0.y, p0.z), gi_cascade);
-			idx2 = probe_index_scrolled(uint3(p1.x, p0.y, p1.z), gi_cascade);
-			tw0 = 1-f.x; tw1 = f.x-f.z; tw2 = f.z-f.y; tw3 = f.y;
-		} else {
-			idx1 = probe_index_scrolled(uint3(p0.x, p0.y, p1.z), gi_cascade);
-			idx2 = probe_index_scrolled(uint3(p1.x, p0.y, p1.z), gi_cascade);
-			tw0 = 1-f.z; tw1 = f.z-f.x; tw2 = f.x-f.y; tw3 = f.y;
-		}
-	} else {
-		if (f.x >= f.z) {
-			idx1 = probe_index_scrolled(uint3(p0.x, p1.y, p0.z), gi_cascade);
-			idx2 = probe_index_scrolled(uint3(p1.x, p1.y, p0.z), gi_cascade);
-			tw0 = 1-f.y; tw1 = f.y-f.x; tw2 = f.x-f.z; tw3 = f.z;
-		} else if (f.y >= f.z) {
-			idx1 = probe_index_scrolled(uint3(p0.x, p1.y, p0.z), gi_cascade);
-			idx2 = probe_index_scrolled(uint3(p0.x, p1.y, p1.z), gi_cascade);
-			tw0 = 1-f.y; tw1 = f.y-f.z; tw2 = f.z-f.x; tw3 = f.x;
-		} else {
-			idx1 = probe_index_scrolled(uint3(p0.x, p0.y, p1.z), gi_cascade);
-			idx2 = probe_index_scrolled(uint3(p0.x, p1.y, p1.z), gi_cascade);
-			tw0 = 1-f.z; tw1 = f.z-f.y; tw2 = f.y-f.x; tw3 = f.x;
+		if (all(test_uvw >= 0) && all(test_uvw <= 1)) {
+			gi_cascade    = c;
+			float3 edge_d = min(test_uvw, 1.0 - test_uvw);
+			cascade_blend = saturate(min(edge_d.x, min(edge_d.y, edge_d.z)) / blend_margin);
+			break;
 		}
 	}
 
-	SHProbe sp0 = gi_sh_probes[idx0];
-	SHProbe sp1 = gi_sh_probes[idx1];
-	SHProbe sp2 = gi_sh_probes[idx2];
-	SHProbe sp3 = gi_sh_probes[idx3];
+	// Sample finest cascade (tetrahedral interpolation)
+	float4 shr, shg, shb;
+	gi_sample_probes(world_pos, gi_cascade, shr, shg, shb);
 
-	float4 shr = sh_unpack(sp0.r)*tw0 + sh_unpack(sp1.r)*tw1 + sh_unpack(sp2.r)*tw2 + sh_unpack(sp3.r)*tw3;
-	float4 shg = sh_unpack(sp0.g)*tw0 + sh_unpack(sp1.g)*tw1 + sh_unpack(sp2.g)*tw2 + sh_unpack(sp3.g)*tw3;
-	float4 shb = sh_unpack(sp0.b)*tw0 + sh_unpack(sp1.b)*tw1 + sh_unpack(sp2.b)*tw2 + sh_unpack(sp3.b)*tw3;
+	// Blend with coarser cascade in the transition zone
+	if (cascade_blend < 1.0 && gi_cascade < GI_CASCADE_COUNT - 1) {
+		float4 shr_c, shg_c, shb_c;
+		gi_sample_probes(world_pos, gi_cascade + 1, shr_c, shg_c, shb_c);
+		shr = lerp(shr_c, shr, cascade_blend);
+		shg = lerp(shg_c, shg, cascade_blend);
+		shb = lerp(shb_c, shb, cascade_blend);
+	}
 
 	float4 sh_basis   = float4(0.88623, 1.02333 * normal.yzx);
 	float3 irradiance = max(float3(0, 0, 0), float3(
