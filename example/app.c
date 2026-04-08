@@ -29,9 +29,10 @@ enum resolve_mode_ {
 	resolve_mode_auto_postfx,    // Auto resolve + postfx invert
 	resolve_mode_manual_postfx,  // Manual resolve + integral invert
 	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
+	resolve_mode_oled_subpixel,  // OLED subpixel-aware resolve (Texture2DMS, separate pass)
 	resolve_mode_max,
 };
-const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Manual Resolve + Invert", "Wide Kernel Resolve" };
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve" };
 
 // Application state
 struct app_t {
@@ -75,6 +76,9 @@ struct app_t {
 	// Wide-kernel resolve (Texture2DMS, separate pass)
 	skr_shader_t      wide_resolve_shader;
 	skr_material_t    wide_resolve_mat;
+	// OLED subpixel resolve (Texture2DMS, separate pass)
+	skr_shader_t      oled_resolve_shader;
+	skr_material_t    oled_resolve_mat;
 	// Upscale (resolution scaling blit)
 	skr_shader_t   upscale_shader;
 	skr_material_t upscale_mat;
@@ -146,11 +150,13 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	// input_attachment only when manual resolve reads MSAA samples as SubpassInputMS.
 	// Wide-kernel resolve needs readable (SAMPLED_BIT) for Texture2DMS access in a separate pass.
 	bool wide_kernel     = (app->resolve_mode == resolve_mode_wide_kernel);
+	bool oled_subpixel   = (app->resolve_mode == resolve_mode_oled_subpixel);
 	bool manual_resolve  = (app->resolve_mode == resolve_mode_manual_postfx);
+	bool separate_pass   = wide_kernel || oled_subpixel;
 	skr_tex_flags_ msaa_flags = skr_tex_flags_writeable
 		| (manual_resolve ? skr_tex_flags_input_attachment : 0)
-		| (wide_kernel    ? skr_tex_flags_readable         : 0);
-	skr_tex_create(msaa_format,       msaa_flags, wide_kernel ? linear_clamp : no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->color_msaa);
+		| (separate_pass  ? skr_tex_flags_readable         : 0);
+	skr_tex_create(msaa_format,       msaa_flags, separate_pass ? linear_clamp : no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->color_msaa);
 	skr_tex_flags_ depth_flags = skr_tex_flags_writeable | ((app->msaa > 1) ? skr_tex_flags_input_attachment : 0);
 	skr_tex_create(app->depth_format, depth_flags, no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->depth_buffer);
 
@@ -277,6 +283,14 @@ app_t* app_create(int32_t start_scene) {
 			.depth_test = skr_compare_always,
 		}, &app->wide_resolve_mat);
 	}
+	app->oled_resolve_shader = su_shader_load("shaders/msaa_resolve_oled.hlsl.sks", "msaa_resolve_oled");
+	if (skr_shader_is_valid(&app->oled_resolve_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->oled_resolve_shader,
+			.cull       = skr_cull_none,
+			.depth_test = skr_compare_always,
+		}, &app->oled_resolve_mat);
+	}
 	app->upscale_shader = su_shader_load("shaders/upscale.hlsl.sks", "upscale");
 	if (skr_shader_is_valid(&app->upscale_shader)) {
 		skr_material_create((skr_material_info_t){
@@ -358,6 +372,10 @@ void app_destroy(app_t* app) {
 	if (skr_shader_is_valid(&app->wide_resolve_shader)) {
 		skr_material_destroy(&app->wide_resolve_mat);
 		skr_shader_destroy(&app->wide_resolve_shader);
+	}
+	if (skr_shader_is_valid(&app->oled_resolve_shader)) {
+		skr_material_destroy(&app->oled_resolve_mat);
+		skr_shader_destroy(&app->oled_resolve_shader);
 	}
 	if (skr_shader_is_valid(&app->upscale_shader)) {
 		skr_material_destroy(&app->upscale_mat);
@@ -511,12 +529,14 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// auto_postfx, MSAA | color_msaa      | scene_color     | final_output
 	// manual_resolve    | color_msaa      | final_output    | NULL
 	// wide_kernel       | color_msaa      | NULL            | NULL (separate pass)
+	// oled_subpixel     | color_msaa      | NULL            | NULL (separate pass)
 	//
 	// *render_target = scene_color when enable_offscreen or needs_upscale
 	// final_output   = render_target when !needs_upscale, else upscale_src
 	bool use_postfx         = (app->resolve_mode == resolve_mode_auto_postfx)   && skr_material_is_valid(&app->postfx_mat);
 	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
 	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
+	bool use_oled_subpixel  = (app->resolve_mode == resolve_mode_oled_subpixel) && app->msaa > 1 && skr_material_is_valid(&app->oled_resolve_mat);
 
 	// When upscaling, the scene writes to an offscreen target, then a blit upscales to swapchain.
 	// When postfx + MSAA + upscale: scene_color is the resolve intermediate, so postfx output
@@ -531,8 +551,8 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	skr_tex_t* resolve_target;
 	skr_tex_t* postfx_output = NULL;
 
-	if (use_wide_kernel) {
-		// Wide-kernel: geometry writes MSAA color (no auto-resolve).
+	if (use_wide_kernel || use_oled_subpixel) {
+		// Wide-kernel / OLED subpixel: geometry writes MSAA color (no auto-resolve).
 		// Separate pass reads it as Texture2DMS and writes to final_output.
 		color_target   = &app->color_msaa;
 		resolve_target = NULL;
@@ -579,6 +599,11 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		skr_material_set_tex(&app->wide_resolve_mat, "msaa_color", &app->color_msaa);
 		skr_renderer_blit(&app->wide_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
 	}
+	// OLED subpixel resolve: per-channel weights based on physical subpixel layout
+	if (use_oled_subpixel) {
+		skr_material_set_tex(&app->oled_resolve_mat, "msaa_color", &app->color_msaa);
+		skr_renderer_blit(&app->oled_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+	}
 
 	// Post-processing (operates at render resolution, before upscale)
 	if (enable_offscreen && enable_bloom) {
@@ -595,7 +620,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 
 	// ImGui: always renders to swapchain at native resolution (sharp UI)
 	skr_tex_t* imgui_target = upscale_src ? render_target
-		: (use_postfx || use_manual_resolve || use_wide_kernel) ? render_target
+		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel) ? render_target
 		: (resolve_target ? resolve_target : color_target);
 	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1);
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
