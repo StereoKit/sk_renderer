@@ -361,6 +361,28 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 		out_stage->code_size = (uint32_t)(spirv_optimized.size() * sizeof(unsigned int));
 		out_stage->code      = malloc(out_stage->code_size);
 		memcpy(out_stage->code, spirv_optimized.data(), out_stage->code_size);
+	} else if (settings->debug) {
+		// In debug mode, still run DCE to strip unused bindings (e.g.
+		// SubpassInput surviving in vertex stage), but skip everything
+		// else to preserve debuggability.
+		spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_1);
+		optimizer.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
+			printf("SPIRV optimization error: %s\n", m);
+		});
+		optimizer.RegisterPass(spvtools::CreateEliminateDeadConstantPass());
+		optimizer.RegisterPass(spvtools::CreateDeadVariableEliminationPass());
+		optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass());
+
+		std::vector<uint32_t> spirv_cleaned;
+		if (optimizer.Run(spirv.data(), spirv.size(), &spirv_cleaned)) {
+			out_stage->code_size = (uint32_t)(spirv_cleaned.size() * sizeof(unsigned int));
+			out_stage->code      = malloc(out_stage->code_size);
+			memcpy(out_stage->code, spirv_cleaned.data(), out_stage->code_size);
+		} else {
+			out_stage->code_size = (uint32_t)(spirv.size() * sizeof(unsigned int));
+			out_stage->code      = malloc(out_stage->code_size);
+			memcpy(out_stage->code, spirv.data(), out_stage->code_size);
+		}
 	} else {
 		out_stage->code_size = (uint32_t)(spirv.size() * sizeof(unsigned int));
 		out_stage->code      = malloc(out_stage->code_size);

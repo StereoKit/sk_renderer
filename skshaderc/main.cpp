@@ -140,6 +140,11 @@ int main(int argc, const char **argv) {
 
 	sksc_shutdown();
 
+	for (int32_t i = 0; i < settings.shaderc.include_folder_ct; i++)
+		free(settings.shaderc.include_folders[i]);
+	free(settings.shaderc.include_folders);
+	free(settings.out_folder);
+
 	return failed_count > 0 ? 1 : 0;
 }
 

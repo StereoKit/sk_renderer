@@ -433,11 +433,11 @@ static bool _skr_vert_type_equals(const skr_vert_type_t* a, const skr_vert_type_
 	if (a->component_count != b->component_count) return false;
 
 	// Compare bindings (deep comparison)
-	if (memcmp(a->bindings, b->bindings, sizeof(VkVertexInputBindingDescription) * a->binding_count) != 0)
+	if (a->binding_count > 0 && memcmp(a->bindings, b->bindings, sizeof(VkVertexInputBindingDescription) * a->binding_count) != 0)
 		return false;
 
 	// Compare attributes (deep comparison)
-	if (memcmp(a->attributes, b->attributes, sizeof(VkVertexInputAttributeDescription) * a->component_count) != 0)
+	if (a->component_count > 0 && memcmp(a->attributes, b->attributes, sizeof(VkVertexInputAttributeDescription) * a->component_count) != 0)
 		return false;
 
 	return true;

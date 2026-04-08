@@ -631,9 +631,6 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_material_destroy(&scene->placeholder_material);
 	skr_tex_destroy     (&scene->white_texture);
 	skr_tex_destroy     (&scene->black_texture);
-	skr_shader_destroy  (&scene->shader);
-	skr_shader_destroy  (&scene->shader_vertex_gi);
-	skr_shader_destroy  (&scene->shader_cubemap);
 
 	// Skybox
 	_destroy_skybox(scene);
@@ -645,12 +642,17 @@ static void _scene_gi_destroy(scene_t* base) {
 	skr_tex_destroy        (&scene->shadow_map);
 	skr_buffer_destroy     (&scene->shadow_buffer);
 
-	// Floor
+	// Floor (materials before shaders — materials hold refs to shader meta)
 	skr_mesh_destroy    (&scene->floor_mesh);
 	skr_material_destroy(&scene->floor_material);
 	skr_material_destroy(&scene->floor_material_vtx);
 	skr_material_destroy(&scene->floor_material_cubemap);
 	skr_tex_destroy     (&scene->floor_texture);
+
+	// PBR shaders (after all materials referencing them are destroyed)
+	skr_shader_destroy  (&scene->shader);
+	skr_shader_destroy  (&scene->shader_vertex_gi);
+	skr_shader_destroy  (&scene->shader_cubemap);
 
 	// GI probes
 	skr_tex_destroy        (&scene->gi_sh_r);

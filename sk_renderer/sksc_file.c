@@ -166,7 +166,10 @@ void sksc_shader_file_destroy(sksc_shader_file_t *ref_file) {
 		free(ref_file->stages[i].code);
 	}
 	free(ref_file->stages);
-	sksc_shader_meta_release(ref_file->meta);
+	sksc_shader_meta_t *meta = ref_file->meta;
+	sksc_shader_meta_release(meta);
+	if (meta->references == 0)
+		free(meta);
 	*ref_file = (sksc_shader_file_t){0};
 }
 

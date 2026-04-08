@@ -383,6 +383,10 @@ void app_set_scene(app_t* app, int32_t scene_index) {
 	_switch_scene(app, scene_index);
 }
 
+int32_t app_scene_index(app_t* app) {
+	return app ? app->scene_index : 0;
+}
+
 int32_t app_scene_count(app_t* app) {
 	return app ? app->scene_count : 0;
 }

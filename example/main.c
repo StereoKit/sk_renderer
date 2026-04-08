@@ -36,11 +36,15 @@ static bool _ska_file_read(const char* filename, void** out_data, size_t* out_si
 
 int main(int argc, char* argv[]) {
 	// Parse command line arguments
-	int test_frames   = 0;   // 0 = run normally, >0 = exit after N frames
-	int start_scene   = -1;  // -1 = use default, >= 0 = start with this scene
+	int  test_frames   = 0;   // 0 = run normally, >0 = exit after N frames
+	int  start_scene   = -1;  // -1 = use default, >= 0 = start with this scene
+	bool test_all      = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-test") == 0) {
 			test_frames = 10;  // Default test mode: 10 frames
+		} else if (strcmp(argv[i], "-testall") == 0) {
+			test_all    = true;
+			test_frames = test_frames > 0 ? test_frames : 10;
 		} else if (strcmp(argv[i], "-frames") == 0 && i + 1 < argc) {
 			test_frames = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "-scene") == 0 && i + 1 < argc) {
@@ -155,6 +159,7 @@ int main(int argc, char* argv[]) {
 	ImFontConfig* font_cfg = ImFontConfig_ImFontConfig();
 	font_cfg->SizePixels = 16.0f;  // Larger default font (13px default -> 20px)
 	ImFontAtlas_AddFontDefault(io->Fonts, font_cfg);
+	ImFontConfig_destroy(font_cfg);
 
 	#if defined(ANDROID)
 	ImGuiStyle* style = igGetStyle();
@@ -203,10 +208,21 @@ int main(int argc, char* argv[]) {
 	while (running) {
 		frame_count++;
 
-		// Exit after N frames in test mode
+		// Exit after N frames in test mode, or advance to next scene in testall mode
 		if (test_frames > 0 && frame_count >= test_frames) {
-			running = false;
-			break;
+			if (test_all) {
+				int32_t next = app_scene_index(app) + 1;
+				if (next < app_scene_count(app)) {
+					app_set_scene(app, next);
+					frame_count = 0;
+				} else {
+					running = false;
+					break;
+				}
+			} else {
+				running = false;
+				break;
+			}
 		}
 
 		// Handle events

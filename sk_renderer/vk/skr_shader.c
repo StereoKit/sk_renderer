@@ -98,8 +98,9 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 
 	*out_shader = _skr_shader_create_manual(file.meta, v_stage, p_stage, c_stage);
 
-	// Don't destroy meta here, it's now owned by the shader
-	// Just clean up the file structure
+	// The shader now holds its own reference (via _skr_shader_create_manual),
+	// release the file's original reference and clean up the file structure.
+	sksc_shader_meta_release(file.meta);
 	for (uint32_t i = 0; i < file.stage_count; i++) {
 		_skr_free(file.stages[i].code);
 	}
@@ -125,7 +126,10 @@ void skr_shader_destroy(skr_shader_t* ref_shader) {
 	_skr_shader_stage_destroy(&ref_shader->compute_stage);
 
 	if (ref_shader->meta) {
-		sksc_shader_meta_release(ref_shader->meta);
+		sksc_shader_meta_t *meta = ref_shader->meta;
+		sksc_shader_meta_release(meta);
+		if (meta->references == 0)
+			free(meta);
 		ref_shader->meta = NULL;
 	}
 
