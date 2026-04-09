@@ -372,7 +372,6 @@ void                  _skr_cmd_release                      (VkCommandBuffer buf
 skr_destroy_list_t    _skr_destroy_list_create              (void);
 void                  _skr_destroy_list_free                (skr_destroy_list_t* ref_list);
 void                  _skr_destroy_list_execute             (skr_destroy_list_t* ref_list);
-void                  _skr_destroy_list_clear               (skr_destroy_list_t* ref_list);
 
 // Add functions for each Vulkan resource type
 void                  _skr_cmd_destroy_buffer               (skr_destroy_list_t* opt_ref_list, VkBuffer                 handle);
