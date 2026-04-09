@@ -111,11 +111,10 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 
 bool skr_shader_is_valid(const skr_shader_t* shader) {
 	if (!shader) return false;
-	return
-		shader->meta                 == NULL           ||
-		shader->vertex_stage.shader  != VK_NULL_HANDLE ||
-		shader->pixel_stage.shader   != VK_NULL_HANDLE ||
-		shader->compute_stage.shader != VK_NULL_HANDLE;
+	return shader->meta != NULL &&
+		(shader->vertex_stage.shader  != VK_NULL_HANDLE ||
+		 shader->pixel_stage.shader   != VK_NULL_HANDLE ||
+		 shader->compute_stage.shader != VK_NULL_HANDLE);
 }
 
 void skr_shader_destroy(skr_shader_t* ref_shader) {

@@ -1247,8 +1247,9 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 		return;
 	}
 
-	// size.z is always the actual depth (1 for non-3D textures)
-	int32_t mip_levels = skr_tex_calc_mip_count(ref_tex->size);
+	// Use the actual mip count the VkImage was created with, not the
+	// theoretical max from dimensions, to avoid accessing non-existent levels.
+	int32_t mip_levels = ref_tex->mip_levels;
 
 	if (mip_levels <= 1) {
 		skr_log(skr_log_info, "Texture only has 1 mip level, nothing to generate");

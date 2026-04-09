@@ -725,6 +725,7 @@ bool skr_init(skr_settings_t settings) {
 	// Initialize queue mutexes for thread-safe queue submission
 	// We use 4 slots but may only need 1-3 if queues are aliased
 	for (int32_t i = 0; i < SKR_QUEUE_TYPE_COUNT; i++) mtx_init(&_skr_vk.queue_mutexes[i], mtx_plain);
+	mtx_init(&_skr_vk.thread_pool_mutex, mtx_plain);
 
 	// Set up mutex pointers based on queue aliasing
 	_skr_vk.graphics_queue_mutex = &_skr_vk.queue_mutexes[0];
@@ -878,10 +879,9 @@ void skr_shutdown(void) {
 	if (_skr_vk.pending_transitions)      _skr_free(_skr_vk.pending_transitions);
 	if (_skr_vk.pending_transition_types) _skr_free(_skr_vk.pending_transition_types);
 
-	// Destroy queue mutexes
-	for (int32_t i = 0; i < SKR_QUEUE_TYPE_COUNT; i++) {
-		mtx_destroy(&_skr_vk.queue_mutexes[i]);
-	}
+	// Destroy mutexes
+	for (int32_t i = 0; i < SKR_QUEUE_TYPE_COUNT; i++) mtx_destroy(&_skr_vk.queue_mutexes[i]);
+	mtx_destroy(&_skr_vk.thread_pool_mutex);
 
 	// Destroy device and instance directly (special cases not in destroy list)
 	if (_skr_vk.device   != VK_NULL_HANDLE) { vkDestroyDevice  (_skr_vk.device,   NULL); }

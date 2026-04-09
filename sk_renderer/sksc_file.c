@@ -77,6 +77,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		memcpy(&default_size, &bytes[at], sizeof(buffer->size)); at += sizeof(buffer->size);
 		buffer->defaults = NULL;
 		if (default_size != 0) {
+			if (default_size > buffer->size) default_size = buffer->size;
 			buffer->defaults = malloc(buffer->size);
 			memcpy(buffer->defaults, &bytes[at], default_size); at += default_size;
 		}
