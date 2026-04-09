@@ -332,6 +332,7 @@ int main(int argc, char* argv[]) {
 		last_frame_ns       = now_ns;
 		app_set_frame_time(app, frame_time);
 
+		skr_acquire_ surface_result = acquire_result;
 		if (acquire_result == skr_acquire_success && target) {
 			// Render (ImGui is rendered inside app_render, in the same pass)
 			app_render(app, target, surface.size.x, surface.size.y);
@@ -341,15 +342,18 @@ int main(int argc, char* argv[]) {
 			skr_renderer_frame_end(surfaces, 1);
 
 			// Present
-			skr_surface_present(&surface);
-
-		} else { // Failed to acquire swapchain image!
+			surface_result = skr_surface_present(&surface);
+		} else {
 			skr_renderer_frame_end(NULL, 0);
+		}
+
+		// Handle surface issues from either acquire or present
+		if (surface_result != skr_acquire_success) {
 			if (!running) {
 				su_log(su_log_info, "Surface issue during shutdown - exiting gracefully");
 				break;
 			}
-			if (acquire_result == skr_acquire_needs_resize) {
+			if (surface_result == skr_acquire_needs_resize) {
 				skr_surface_resize(&surface);
 			}
 		}

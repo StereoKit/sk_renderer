@@ -658,7 +658,7 @@ SKR_API bool              skr_surface_is_valid             (const skr_surface_t*
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
 SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
 SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_tex_t** out_tex);
-SKR_API void              skr_surface_present              (      skr_surface_t* ref_surface);
+SKR_API skr_acquire_      skr_surface_present              (      skr_surface_t* ref_surface);
 SKR_API skr_vec2i_t       skr_surface_get_size             (const skr_surface_t*     surface);
 
 SKR_API skr_err_          skr_shader_create                (const void *shader_data, uint32_t data_size, skr_shader_t* out_shader);

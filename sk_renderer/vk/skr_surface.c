@@ -369,12 +369,12 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_te
 	return skr_acquire_success;
 }
 
-void skr_surface_present(skr_surface_t* ref_surface) {
-	if (!ref_surface) return;
+skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
+	if (!ref_surface) return skr_acquire_error;
 
 	// Just present - all command buffer work happened before frame_end!
 	mtx_lock(_skr_vk.present_queue_mutex);
-	vkQueuePresentKHR(_skr_vk.present_queue, &(VkPresentInfoKHR){
+	VkResult result = vkQueuePresentKHR(_skr_vk.present_queue, &(VkPresentInfoKHR){
 		.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores    = &ref_surface->semaphore_submit[ref_surface->current_image],
@@ -385,6 +385,11 @@ void skr_surface_present(skr_surface_t* ref_surface) {
 	mtx_unlock(_skr_vk.present_queue_mutex);
 
 	ref_surface->frame_idx = (ref_surface->frame_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+
+	if (result == VK_ERROR_SURFACE_LOST_KHR)                                    return skr_acquire_surface_lost;
+	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)      return skr_acquire_needs_resize;
+	if (result != VK_SUCCESS)              { skr_log(skr_log_critical, "vkQueuePresentKHR failed: 0x%X", result); return skr_acquire_error; }
+	return skr_acquire_success;
 }
 
 bool skr_surface_is_valid(const skr_surface_t* surface) {
