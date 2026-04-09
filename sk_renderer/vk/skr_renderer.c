@@ -53,12 +53,11 @@ uint64_t _skr_time_get_ns(void) {
 }
 
 static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* cache_target, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, bool has_depth) {
-	VkFramebuffer* cached_fb = has_depth
-		? &cache_target->framebuffer_depth
-		: &cache_target->framebuffer;
+	VkFramebuffer* cached_fb   = has_depth ? &cache_target->framebuffer_depth      : &cache_target->framebuffer;
+	VkRenderPass*  cached_pass = has_depth ? &cache_target->framebuffer_depth_pass : &cache_target->framebuffer_pass;
 
 	// Check if we have a cached framebuffer for this render pass
-	if (*cached_fb != VK_NULL_HANDLE && cache_target->framebuffer_pass == render_pass) {
+	if (*cached_fb != VK_NULL_HANDLE && *cached_pass == render_pass) {
 		return *cached_fb;
 	}
 
@@ -68,8 +67,8 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 	}
 
 	// Create and cache new framebuffer
-	*cached_fb = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
-	cache_target->framebuffer_pass = render_pass;
+	*cached_fb   = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
+	*cached_pass = render_pass;
 	return *cached_fb;
 }
 
@@ -1318,7 +1317,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 		// With intermediates, create fresh each frame since they're transient.
 		VkFramebuffer framebuffer = VK_NULL_HANDLE;
 		bool cache_fb = (intermediate_count == 0);
-		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE && final_output->framebuffer_pass == render_pass) {
+		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE && final_output->framebuffer_depth_pass == render_pass) {
 			framebuffer = final_output->framebuffer_depth;
 		} else {
 			if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE) {
@@ -1339,8 +1338,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 				goto cleanup;
 			}
 			if (cache_fb) {
-				final_output->framebuffer_depth = framebuffer;
-				final_output->framebuffer_pass  = render_pass;
+				final_output->framebuffer_depth      = framebuffer;
+				final_output->framebuffer_depth_pass = render_pass;
 			}
 		}
 

@@ -166,8 +166,9 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		ref_surface->images[i].layer_count       = 1;
 		ref_surface->images[i].aspect_mask       = VK_IMAGE_ASPECT_COLOR_BIT;  // CRITICAL: Must be set!
 		ref_surface->images[i].framebuffer       = VK_NULL_HANDLE;
-		ref_surface->images[i].framebuffer_depth = VK_NULL_HANDLE;
-		ref_surface->images[i].framebuffer_pass  = VK_NULL_HANDLE;
+		ref_surface->images[i].framebuffer_depth      = VK_NULL_HANDLE;
+		ref_surface->images[i].framebuffer_pass       = VK_NULL_HANDLE;
+		ref_surface->images[i].framebuffer_depth_pass = VK_NULL_HANDLE;
 		ref_surface->images[i].sampler           = VK_NULL_HANDLE;
 		ref_surface->images[i].memory            = VK_NULL_HANDLE;  // Swapchain owns memory
 
