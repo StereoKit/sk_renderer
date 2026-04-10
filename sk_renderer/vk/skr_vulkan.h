@@ -178,7 +178,7 @@ typedef struct skr_shader_stage_t {
 } skr_shader_stage_t;
 
 typedef struct skr_shader_t {
-	sksc_shader_meta_t*  meta;
+	sksc_shader_meta_t   meta;
 	skr_shader_stage_t  vertex_stage;
 	skr_shader_stage_t  pixel_stage;
 	skr_shader_stage_t  compute_stage;

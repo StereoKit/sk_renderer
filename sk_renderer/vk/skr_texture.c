@@ -1566,7 +1566,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_bind_pool_unlock();
 
 		if (fail_idx >= 0) {
-			const sksc_shader_meta_t* meta = material.key.shader->meta;
+			const sksc_shader_meta_t* meta = &material.key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 			continue;
 		}

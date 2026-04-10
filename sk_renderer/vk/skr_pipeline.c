@@ -223,7 +223,7 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 
 	// Register new material
 	_skr_pipeline_cache.materials[free_slot].key               = *key;
-	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, key->shader->meta, skr_stage_vertex | skr_stage_pixel | skr_stage_compute, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
+	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, skr_stage_vertex | skr_stage_pixel | skr_stage_compute, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
 	_skr_pipeline_cache.materials[free_slot].layout            = _skr_pipeline_create_layout(_skr_pipeline_cache.materials[free_slot].descriptor_layout);
 	_skr_pipeline_cache.materials[free_slot].ref_count         = 1;
 
@@ -233,7 +233,7 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 
 	// Generate and set debug name for pipeline layout
 	char name[256];
-	const char* shader_name = (key->shader->meta && key->shader->meta->name[0]) ? key->shader->meta->name : "unknown";
+	const char* shader_name = key->shader->meta.name[0] ? key->shader->meta.name : "unknown";
 	snprintf(name, sizeof(name), "layout_%s_", shader_name);
 	_skr_append_material_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)_skr_pipeline_cache.materials[free_slot].layout, name);
@@ -1228,8 +1228,8 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 
 	// Build debug name before creation so it's available for error logging
 	char name[256];
-	const char* shader_name = (mat_key->shader->meta && mat_key->shader->meta->name[0])
-		? mat_key->shader->meta->name
+	const char* shader_name = mat_key->shader->meta.name[0]
+		? mat_key->shader->meta.name
 		: "shader";
 
 	snprintf(name, sizeof(name), "pipeline_%s_(", shader_name);

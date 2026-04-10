@@ -27,7 +27,7 @@ bool sksc_shader_file_verify(const void *data, uint32_t size, uint16_t *out_vers
 	const char    *prefix  = "SKSHADER";
 	const uint8_t *bytes   = (uint8_t*)data;
 
-	// check the first 5 bytes to see if this is a SKS shader file
+	// check the magic bytes to see if this is a SKS shader file
 	if (size < 10 || memcmp(bytes, prefix, 8) != 0)
 		return false;
 
@@ -51,12 +51,6 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->buffer_count,       &bytes[at], sizeof(meta->buffer_count      )); at += sizeof(meta->buffer_count);
 	memcpy(&meta->resource_count,     &bytes[at], sizeof(meta->resource_count    )); at += sizeof(meta->resource_count);
 	memcpy(&meta->vertex_input_count, &bytes[at], sizeof(meta->vertex_input_count)); at += sizeof(meta->vertex_input_count);
-	meta->buffers       = (sksc_shader_buffer_t  *)malloc(sizeof(sksc_shader_buffer_t  ) * meta->buffer_count);
-	meta->resources     = (sksc_shader_resource_t*)malloc(sizeof(sksc_shader_resource_t) * meta->resource_count);
-	meta->vertex_inputs = (skr_vert_component_t  *)malloc(sizeof(skr_vert_component_t  ) * meta->vertex_input_count);
-	memset(meta->buffers,       0, sizeof(sksc_shader_buffer_t  ) * meta->buffer_count);
-	memset(meta->resources,     0, sizeof(sksc_shader_resource_t) * meta->resource_count);
-	memset(meta->vertex_inputs, 0, sizeof(skr_vert_component_t ) * meta->vertex_input_count);
 
 	memcpy(&meta->ops_vertex.total,        &bytes[at], sizeof(meta->ops_vertex.total));        at += sizeof(meta->ops_vertex.total);
 	memcpy(&meta->ops_vertex.tex_read,     &bytes[at], sizeof(meta->ops_vertex.tex_read));     at += sizeof(meta->ops_vertex.tex_read);
@@ -65,6 +59,59 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->ops_pixel.tex_read,      &bytes[at], sizeof(meta->ops_pixel.tex_read));      at += sizeof(meta->ops_pixel.tex_read);
 	memcpy(&meta->ops_pixel.dynamic_flow,  &bytes[at], sizeof(meta->ops_pixel.dynamic_flow));  at += sizeof(meta->ops_pixel.dynamic_flow);
 
+	// --- Pass 1: scan buffer section to accumulate var/defaults totals ---
+	uint32_t buffer_section_start = at;
+	uint32_t total_var_count      = 0;
+	uint32_t total_defaults_size  = 0;
+
+	for (uint32_t i = 0; i < meta->buffer_count; i++) {
+		at += sizeof(((sksc_shader_buffer_t*)0)->name)  +
+		      sizeof(((sksc_shader_buffer_t*)0)->space) +
+		      sizeof(((sksc_shader_buffer_t*)0)->bind);
+
+		uint32_t buffer_size, var_count, default_size;
+		memcpy(&buffer_size, &bytes[at], sizeof(buffer_size)); at += sizeof(buffer_size);
+		memcpy(&var_count,   &bytes[at], sizeof(var_count));   at += sizeof(var_count);
+		memcpy(&default_size,&bytes[at], sizeof(default_size));at += sizeof(default_size);
+
+		total_var_count += var_count;
+		if (default_size != 0) {
+			if (default_size > buffer_size) default_size = buffer_size;
+			total_defaults_size += buffer_size;
+			at += default_size;
+		}
+		at += var_count * (
+			sizeof(((sksc_shader_var_t*)0)->name)      + sizeof(((sksc_shader_var_t*)0)->extra)    +
+			sizeof(((sksc_shader_var_t*)0)->type_name)  + sizeof(((sksc_shader_var_t*)0)->offset)   +
+			sizeof(((sksc_shader_var_t*)0)->size)       + sizeof(((sksc_shader_var_t*)0)->type)     +
+			sizeof(((sksc_shader_var_t*)0)->type_count));
+	}
+
+	// --- Single allocation for all sub-arrays ---
+	size_t buffers_size  = sizeof(sksc_shader_buffer_t  ) * meta->buffer_count;
+	size_t res_size      = sizeof(sksc_shader_resource_t) * meta->resource_count;
+	size_t vars_size     = sizeof(sksc_shader_var_t     ) * total_var_count;
+	size_t vinputs_size  = sizeof(skr_vert_component_t  ) * meta->vertex_input_count;
+	size_t total_size    = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size;
+
+	if (total_size == 0) {
+		meta->buffers       = NULL;
+		meta->resources     = NULL;
+		meta->vertex_inputs = NULL;
+		return at;
+	}
+
+	uint8_t *block = (uint8_t *)malloc(total_size);
+	memset(block, 0, total_size);
+
+	meta->buffers       = (sksc_shader_buffer_t  *)(block);
+	meta->resources     = (sksc_shader_resource_t*)(block + buffers_size);
+	meta->vertex_inputs = (skr_vert_component_t  *)(block + buffers_size + res_size + vars_size + total_defaults_size);
+	uint8_t *vars_cursor     = block + buffers_size + res_size;
+	uint8_t *defaults_cursor = block + buffers_size + res_size + vars_size;
+
+	// --- Pass 2: rewind and read buffer data ---
+	at = buffer_section_start;
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
 		sksc_shader_buffer_t *buffer = &meta->buffers[i];
 		memcpy( buffer->name,      &bytes[at], sizeof(buffer->name));      at += sizeof(buffer->name);
@@ -78,11 +125,15 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		buffer->defaults = NULL;
 		if (default_size != 0) {
 			if (default_size > buffer->size) default_size = buffer->size;
-			buffer->defaults = malloc(buffer->size);
+			buffer->defaults = defaults_cursor;
 			memcpy(buffer->defaults, &bytes[at], default_size); at += default_size;
+			defaults_cursor += buffer->size;
 		}
-		buffer->vars = (sksc_shader_var_t*)malloc(sizeof(sksc_shader_var_t) * buffer->var_count);
-		memset(buffer->vars, 0, sizeof(sksc_shader_var_t) * buffer->var_count);
+
+		if (buffer->var_count > 0) {
+			buffer->vars = (sksc_shader_var_t *)vars_cursor;
+			vars_cursor += sizeof(sksc_shader_var_t) * buffer->var_count;
+		}
 		buffer->name_hash = skr_hash(buffer->name);
 
 		for (uint32_t t = 0; t < buffer->var_count; t++) {
@@ -136,12 +187,9 @@ sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_
 	out_file->stages = (sksc_shader_file_stage_t*)malloc(sizeof(sksc_shader_file_stage_t) * out_file->stage_count);
 	if (out_file->stages == NULL) return sksc_result_out_of_memory;
 
-	out_file->meta = (sksc_shader_meta_t*)malloc(sizeof(sksc_shader_meta_t));
-	if (out_file->meta == NULL) return sksc_result_out_of_memory;
-	*out_file->meta = (sksc_shader_meta_t){0};
-	out_file->meta->global_buffer_id = -1;
-	sksc_shader_meta_reference(out_file->meta);
-	at = _sksc_load_meta(bytes, at, out_file->meta);
+	out_file->meta = (sksc_shader_meta_t){0};
+	out_file->meta.global_buffer_id = -1;
+	at = _sksc_load_meta(bytes, at, &out_file->meta);
 
 	for (uint32_t i = 0; i < out_file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &out_file->stages[i];
@@ -167,10 +215,7 @@ void sksc_shader_file_destroy(sksc_shader_file_t *ref_file) {
 		free(ref_file->stages[i].code);
 	}
 	free(ref_file->stages);
-	sksc_shader_meta_t *meta = ref_file->meta;
-	sksc_shader_meta_release(meta);
-	if (meta->references == 0)
-		free(meta);
+	sksc_shader_meta_free(&ref_file->meta);
 	*ref_file = (sksc_shader_file_t){0};
 }
 
@@ -231,23 +276,10 @@ const sksc_shader_var_t *sksc_shader_meta_get_var_info(const sksc_shader_meta_t 
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void sksc_shader_meta_reference(sksc_shader_meta_t *ref_meta) {
-	ref_meta->references += 1;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
-void sksc_shader_meta_release(sksc_shader_meta_t *ref_meta) {
+void sksc_shader_meta_free(sksc_shader_meta_t *ref_meta) {
 	if (!ref_meta) return;
-	ref_meta->references -= 1;
-	if (ref_meta->references == 0) {
-		for (uint32_t i = 0; i < ref_meta->buffer_count; i++) {
-			free(ref_meta->buffers[i].vars);
-			free(ref_meta->buffers[i].defaults);
-		}
-		free(ref_meta->buffers);
-		free(ref_meta->resources);
-		free(ref_meta->vertex_inputs);
-		*ref_meta = (sksc_shader_meta_t){0};
-	}
+	// All sub-arrays (resources, vertex_inputs, per-buffer vars/defaults)
+	// are carved from the single allocation starting at buffers.
+	free(ref_meta->buffers);
+	*ref_meta = (sksc_shader_meta_t){0};
 }

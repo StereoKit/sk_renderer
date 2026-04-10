@@ -565,7 +565,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	}
 
 	// Material texture and buffer binds
-	const sksc_shader_meta_t* meta = material->key.shader->meta;
+	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 	const int32_t ignore_slots[] = { SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot };
 
 	_skr_bind_pool_lock();
@@ -978,7 +978,7 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
 
 	// Add material texture and buffer bindings
-	const sksc_shader_meta_t* meta = material->key.shader->meta;
+	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 
 	_skr_bind_pool_lock();
 	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
@@ -1435,14 +1435,12 @@ void skr_pass_submit(skr_pass_t* pass) {
 			skr_material_t* resolve_mat = pass->resolve_material;
 
 			// Auto-bind input attachments by scanning shader metadata
-			const sksc_shader_meta_t* meta = resolve_mat->key.shader->meta;
-			if (meta) {
-				for (uint32_t r = 0; r < meta->resource_count; r++) {
-					if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
-					const char* name = meta->resources[r].name;
-					if (strcmp(name, "color") == 0 && color) {
-						skr_material_set_tex(resolve_mat, "color", color);
-					}
+			const sksc_shader_meta_t* meta = &resolve_mat->key.shader->meta;
+			for (uint32_t r = 0; r < meta->resource_count; r++) {
+				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
+				const char* name = meta->resources[r].name;
+				if (strcmp(name, "color") == 0 && color) {
+					skr_material_set_tex(resolve_mat, "color", color);
 				}
 			}
 
@@ -1485,16 +1483,14 @@ void skr_pass_submit(skr_pass_t* pass) {
 			bool is_last = (p == pass->postfx_count - 1);
 
 			// Auto-bind input attachments by scanning shader metadata
-			const sksc_shader_meta_t* meta = postfx_mat->key.shader->meta;
-			if (meta) {
-				for (uint32_t r = 0; r < meta->resource_count; r++) {
-					if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
-					const char* name = meta->resources[r].name;
-					if (strcmp(name, "color") == 0 && prev_color) {
-						skr_material_set_tex(postfx_mat, "color", prev_color);
-					} else if (strcmp(name, "depth") == 0 && depth) {
-						skr_material_set_tex(postfx_mat, "depth", depth);
-					}
+			const sksc_shader_meta_t* meta = &postfx_mat->key.shader->meta;
+			for (uint32_t r = 0; r < meta->resource_count; r++) {
+				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
+				const char* name = meta->resources[r].name;
+				if (strcmp(name, "color") == 0 && prev_color) {
+					skr_material_set_tex(postfx_mat, "color", prev_color);
+				} else if (strcmp(name, "depth") == 0 && depth) {
+					skr_material_set_tex(postfx_mat, "depth", depth);
 				}
 			}
 

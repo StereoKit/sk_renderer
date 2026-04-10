@@ -230,8 +230,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	};
 	out_material->queue_offset = info.queue_offset;
 
-	const sksc_shader_meta_t* meta = out_material->key.shader->meta;
-	sksc_shader_meta_reference(out_material->key.shader->meta);
+	const sksc_shader_meta_t* meta = &out_material->key.shader->meta;
 
 	// Allocate material parameter buffer if shader has $Global buffer
 	if (meta->global_buffer_id >= 0) {
@@ -241,9 +240,6 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 
 		if (!out_material->param_buffer) {
 			skr_log(skr_log_critical, "Failed to allocate material parameter buffer");
-			if (out_material->key.shader->meta) {
-				sksc_shader_meta_release(out_material->key.shader->meta);
-			}
 			*out_material = (skr_material_t){0};
 			return skr_err_out_of_memory;
 		}
@@ -262,9 +258,6 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	if (out_material->bind_start < 0 && out_material->bind_count > 0) {
 		skr_log(skr_log_critical, "Failed to allocate material bindings from pool");
 		_skr_free(out_material->param_buffer);
-		if (out_material->key.shader->meta) {
-			sksc_shader_meta_release(out_material->key.shader->meta);
-		}
 		*out_material = (skr_material_t){0};
 		return skr_err_out_of_memory;
 	}
@@ -297,9 +290,6 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		skr_log(skr_log_critical, "Failed to register material with pipeline system");
 		_skr_bind_pool_free(out_material->bind_start, out_material->bind_count);
 		_skr_free(out_material->param_buffer);
-		if (out_material->key.shader->meta) {
-			sksc_shader_meta_release(out_material->key.shader->meta);
-		}
 		*out_material = (skr_material_t){0};
 		return skr_err_device_error;
 	}
@@ -334,15 +324,11 @@ void skr_material_destroy(skr_material_t* ref_material) {
 	// Defer bind pool slot release until GPU is done with this material
 	_skr_cmd_destroy_bind_pool_slots(NULL, ref_material->bind_start, ref_material->bind_count);
 
-	if (ref_material->key.shader->meta) {
-		sksc_shader_meta_release(ref_material->key.shader->meta);
-	}
-
 	*ref_material = (skr_material_t){0};
 }
 
 void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_tex_t* texture) {
-	const sksc_shader_meta_t *meta = ref_material->key.shader->meta;
+	const sksc_shader_meta_t *meta = &ref_material->key.shader->meta;
 
 	int32_t  idx  = -1;
 	uint64_t hash = skr_hash(name);
@@ -423,7 +409,7 @@ void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_te
 }
 
 void skr_material_set_buffer(skr_material_t* ref_material, const char* name, skr_buffer_t* buffer) {
-	const sksc_shader_meta_t *meta = ref_material->key.shader->meta;
+	const sksc_shader_meta_t *meta = &ref_material->key.shader->meta;
 
 	int32_t  idx  = -1;
 	uint64_t hash = skr_hash(name);
@@ -483,15 +469,15 @@ static uint32_t _skr_shader_var_size(sksc_shader_var_ type) {
 }
 
 void skr_material_set_param(skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
-	if (!material || !material->key.shader || !material->key.shader->meta || !material->param_buffer) return;
+	if (!material || !material->key.shader || !material->param_buffer) return;
 
-	int32_t var_index = sksc_shader_meta_get_var_index(material->key.shader->meta, name);
+	int32_t var_index = sksc_shader_meta_get_var_index(&material->key.shader->meta, name);
 	if (var_index < 0) {
 		skr_log(skr_log_warning, "Material parameter '%s' not found", name);
 		return;
 	}
 
-	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(material->key.shader->meta, var_index);
+	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&material->key.shader->meta, var_index);
 	if (!var) return;
 
 	// When type is uint8, treat count as raw byte count and skip type check
@@ -515,15 +501,15 @@ void skr_material_set_param(skr_material_t* material, const char* name, sksc_sha
 }
 
 void skr_material_get_param(const skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
-	if (!material || !material->key.shader || !material->key.shader->meta || !material->param_buffer) return;
+	if (!material || !material->key.shader || !material->param_buffer) return;
 
-	int32_t var_index = sksc_shader_meta_get_var_index(material->key.shader->meta, name);
+	int32_t var_index = sksc_shader_meta_get_var_index(&material->key.shader->meta, name);
 	if (var_index < 0) {
 		skr_log(skr_log_warning, "Material parameter '%s' not found", name);
 		return;
 	}
 
-	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(material->key.shader->meta, var_index);
+	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&material->key.shader->meta, var_index);
 	if (!var) return;
 
 	// When type is uint8, treat count as raw byte count and skip type check
