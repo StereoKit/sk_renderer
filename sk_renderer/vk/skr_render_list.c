@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+_Static_assert(sizeof(skr_render_item_t) <= 80, "skr_render_item_t grew beyond 80 bytes!");
+
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_err_ skr_render_list_create(skr_render_list_t* out_list) {
@@ -21,6 +23,7 @@ skr_err_ skr_render_list_create(skr_render_list_t* out_list) {
 
 	out_list->capacity                       = 16;
 	out_list->items                          = _skr_malloc(sizeof(skr_render_item_t) * out_list->capacity);
+	out_list->items_tmp                      = _skr_malloc(sizeof(skr_render_item_t) * out_list->capacity);
 	out_list->instance_data_capacity         = 1024;
 	out_list->instance_data                  = _skr_malloc(out_list->instance_data_capacity);
 	out_list->instance_data_sorted_capacity  = 1024;
@@ -48,6 +51,9 @@ void skr_render_list_destroy(skr_render_list_t* ref_list) {
 	_skr_free(ref_list->instance_data_sorted);
 	_skr_free(ref_list->material_data);
 	_skr_free(ref_list->items);
+	_skr_free(ref_list->items_tmp);
+	_skr_free(ref_list->sort_scratch_a);
+	_skr_free(ref_list->sort_scratch_b);
 	*ref_list = (skr_render_list_t){0};
 }
 
@@ -60,10 +66,11 @@ void skr_render_list_clear(skr_render_list_t* ref_list) {
 }
 
 // Sort key layout (64 bits, ascending sort):
-// Bits 63-32 (32 bits): alpha_mode * 10000 + queue_offset (separates opaque/a2c/transparent)
-// Bits 31-16 (16 bits): pipeline_material_idx (groups by shader/render state)
-// Bits 15-0  (16 bits): mesh pointer hash (groups same mesh for instancing)
-static inline uint64_t _skr_render_sort_key(skr_material_t* material, VkBuffer first_vertex_buffer) {
+// Bits 63-50 (14): queue — alpha_mode * 1000 + (queue_offset + 100)
+// Bits 49-36 (14): pipeline_material_idx (up to 16384)
+// Bits 35-22 (14): mesh pointer hash (up to 16384)
+// Bits 21-0  (22): hash(first_index, index_count, vertex_offset) — sub-mesh collision reducer
+static inline uint64_t _skr_render_sort_key(skr_material_t* material, VkBuffer first_vertex_buffer, int32_t first_index, int32_t index_count, int32_t vertex_offset) {
 	// Derive alpha mode: 0 = opaque, 1 = alpha-to-coverage, 2 = transparent
 	uint32_t alpha_mode = 0;
 	if (material->key.alpha_to_coverage) {
@@ -71,50 +78,63 @@ static inline uint64_t _skr_render_sort_key(skr_material_t* material, VkBuffer f
 	} else if (material->key.blend_state.dst_color_factor != skr_blend_zero) {
 		alpha_mode = 2;
 	}
-	// Combine alpha mode and queue_offset into sections (bias queue to handle negatives)
-	uint32_t queue   = alpha_mode * 10000 + (uint32_t)(material->queue_offset + 1000);
-	uint16_t mat_idx = (uint16_t)material->pipeline_material_idx;
-	// Use VkBuffer handle bits for mesh grouping (shift past alignment, take 16 bits)
-	uint16_t mesh_id = (uint16_t)((uintptr_t)first_vertex_buffer >> 4);
-	return ((uint64_t)queue << 32) | ((uint64_t)mat_idx << 16) | mesh_id;
+	// Bias queue_offset by +100 so negative offsets stay positive
+	uint64_t queue   = (uint64_t)(alpha_mode * 1000 + (material->queue_offset + 100)) & 0x3FFF;
+	uint64_t mat_idx = (uint64_t)(material->pipeline_material_idx)                    & 0x3FFF;
+	uint64_t mesh_id = (uint64_t)((uintptr_t)first_vertex_buffer >> 4)                & 0x3FFF;
+
+	// Hash draw params into 22 bits to reduce collisions between different draw ranges
+	uint32_t sub = (uint32_t)first_index ^ ((uint32_t)index_count * 2654435761u) ^ ((uint32_t)vertex_offset * 2246822519u);
+	uint64_t sub_hash = (uint64_t)((sub ^ (sub >> 22)) & 0x3FFFFF);
+
+	return (queue << 50) | (mat_idx << 36) | (mesh_id << 22) | sub_hash;
 }
 
 void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, const void* opt_instance_data, uint32_t single_instance_data_size, uint32_t instance_count) {
 	if (!ref_list || !mesh || !material) return;
 
-	// Grow if needed
+	// Grow both items and items_tmp together (they get swapped during sort)
 	if (ref_list->count >= ref_list->capacity) {
 		uint32_t           new_capacity = ref_list->capacity * 2;
-		skr_render_item_t* new_items    = _skr_realloc(ref_list->items, sizeof(skr_render_item_t) * new_capacity);
-		if (!new_items) {
+		skr_render_item_t* new_items     = _skr_realloc(ref_list->items,     sizeof(skr_render_item_t) * new_capacity);
+		skr_render_item_t* new_items_tmp = _skr_realloc(ref_list->items_tmp, sizeof(skr_render_item_t) * new_capacity);
+		if (!new_items || !new_items_tmp) {
 			skr_log(skr_log_critical, "Failed to grow render list");
 			return;
 		}
-		ref_list->items    = new_items;
-		ref_list->capacity = new_capacity;
+		ref_list->items     = new_items;
+		ref_list->items_tmp = new_items_tmp;
+		ref_list->capacity  = new_capacity;
 	}
 
 	// Add item - copy mesh/material data so originals can be destroyed
 	skr_render_item_t* item = &ref_list->items[ref_list->count++];
 
 	// Copy mesh Vulkan handles
-	item->vertex_buffer_count = (uint8_t)mesh->vertex_buffer_count;
 	for (uint32_t i = 0; i < mesh->vertex_buffer_count && i < SKR_MAX_VERTEX_BUFFERS; i++) {
 		item->vertex_buffers[i] = mesh->vertex_buffers[i].buffer;
 	}
 	item->index_buffer      = mesh->index_buffer.buffer;
-	item->index_format      = (uint8_t)mesh->ind_format_vk;
 	item->vert_count        = mesh->vert_count;
-	item->ind_count         = mesh->ind_count;
 	item->pipeline_vert_idx = (uint16_t)mesh->vert_type->pipeline_idx;
 
 	// Copy material data
-	item->pipeline_material_idx  = (uint16_t)material->pipeline_material_idx;
-	item->param_buffer_size      = (uint16_t)material->param_buffer_size;
-	item->has_system_buffer      = material->has_system_buffer ? 1 : 0;
-	item->instance_buffer_stride = (uint16_t)material->instance_buffer_stride;
-	item->bind_start             = material->bind_start;
-	item->bind_count             = (uint8_t)material->bind_count;
+	item->pipeline_material_idx = (uint16_t)material->pipeline_material_idx;
+	item->param_buffer_size     = (uint16_t)material->param_buffer_size;
+	item->bind_start            = material->bind_start;
+	item->bind_count            = (uint8_t)material->bind_count;
+
+	// Pack flags (vertex_buffer_count in bits 2-3)
+	item->flags = (material->has_system_buffer       ? skr_item_flag_system_buffer : 0)
+	            | (mesh->ind_format_vk               ? skr_item_flag_index_32bit   : 0)
+	            | (material->instance_buffer_stride   ? skr_item_flag_instance_buffer  : 0)
+	            | (mesh->vertex_buffer_count << skr_item_flag_vb_count_shift);
+
+	// Validate instance_buffer_stride at add-time (removed from item)
+	if (material->instance_buffer_stride > 0 && single_instance_data_size != material->instance_buffer_stride) {
+		skr_log(skr_log_warning, "Instance data size mismatch: shader expects %u bytes, got %u bytes",
+			material->instance_buffer_stride, single_instance_data_size);
+	}
 
 	// Copy material param_buffer data (so material can be destroyed after add)
 	// Align offset for uniform buffer access (minUniformBufferOffsetAlignment)
@@ -142,12 +162,14 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 	// Align instance offset for storage buffer access (minStorageBufferOffsetAlignment)
 	uint32_t ssbo_align          = _skr_vk.min_ssbo_offset_align;
 	uint32_t aligned_inst_offset = (ref_list->instance_data_used + ssbo_align - 1) & ~(ssbo_align - 1);
-	item->sort_key               = _skr_render_sort_key(material, item->vertex_buffers[0]);
+	// Resolve index_count at add-time: 0 means "use mesh default"
+	int32_t resolved_index_count  = index_count > 0 ? index_count : (int32_t)mesh->ind_count;
+	item->sort_key               = _skr_render_sort_key(material, item->vertex_buffers[0], first_index, resolved_index_count, vertex_offset);
 	item->instance_offset        = aligned_inst_offset;
 	item->instance_data_size     = (uint16_t)single_instance_data_size;
 	item->instance_count         = instance_count;
 	item->first_index            = first_index;
-	item->index_count            = index_count;
+	item->index_count            = resolved_index_count;
 	item->vertex_offset          = vertex_offset;
 
 	// Copy instance data if provided
@@ -178,33 +200,160 @@ void skr_render_list_add(skr_render_list_t* ref_list, skr_mesh_t* mesh, skr_mate
 	skr_render_list_add_indexed(ref_list, mesh, material, 0, 0, 0, opt_instance_data, single_instance_data_size, instance_count);
 }
 
-static int _skr_render_item_compare(const void* a, const void* b) {
-	const skr_render_item_t* item_a = (const skr_render_item_t*)a;
-	const skr_render_item_t* item_b = (const skr_render_item_t*)b;
+///////////////////////////////////////////////////////////////////////////////
+// Radix sort
+///////////////////////////////////////////////////////////////////////////////
 
-	// Primary: sort by pre-computed key
-	if (item_a->sort_key < item_b->sort_key) return -1;
-	if (item_a->sort_key > item_b->sort_key) return  1;
+typedef struct {
+	uint64_t key;
+	uint32_t idx;
+} _skr_sort_pair_t;
 
-	// Secondary: indexed draw parameters (uncommon, only for sub-mesh draws)
-	if (item_a->first_index < item_b->first_index) return -1;
-	if (item_a->first_index > item_b->first_index) return  1;
+// Insertion sort for small lists — sorts items in-place by sort_key
+static void _skr_render_list_insertion_sort(skr_render_item_t* items, uint32_t count) {
+	for (uint32_t i = 1; i < count; i++) {
+		skr_render_item_t tmp = items[i];
+		uint32_t j = i;
+		while (j > 0 && items[j - 1].sort_key > tmp.sort_key) {
+			items[j] = items[j - 1];
+			j--;
+		}
+		items[j] = tmp;
+	}
+}
 
-	if (item_a->index_count < item_b->index_count) return -1;
-	if (item_a->index_count > item_b->index_count) return  1;
+// Ensure radix sort scratch buffers are large enough
+static bool _skr_render_list_ensure_scratch(skr_render_list_t* list, uint32_t count) {
+	if (count <= list->sort_scratch_capacity) return true;
 
-	if (item_a->vertex_offset < item_b->vertex_offset) return -1;
-	if (item_a->vertex_offset > item_b->vertex_offset) return  1;
+	// Grow to next power of 2, minimum 64
+	uint32_t cap = count < 64 ? 64 : count;
+	cap--;
+	cap |= cap >> 1;
+	cap |= cap >> 2;
+	cap |= cap >> 4;
+	cap |= cap >> 8;
+	cap |= cap >> 16;
+	cap++;
 
-	return 0;
+	_skr_free(list->sort_scratch_a);
+	_skr_free(list->sort_scratch_b);
+	list->sort_scratch_a        = _skr_malloc(sizeof(_skr_sort_pair_t) * cap);
+	list->sort_scratch_b        = _skr_malloc(sizeof(_skr_sort_pair_t) * cap);
+	list->sort_scratch_capacity = cap;
+
+	return list->sort_scratch_a && list->sort_scratch_b;
 }
 
 void _skr_render_list_sort(skr_render_list_t* ref_list) {
 	if (!ref_list || !ref_list->needs_sort || ref_list->count == 0) return;
 
-	qsort(ref_list->items, ref_list->count, sizeof(skr_render_item_t), _skr_render_item_compare);
+	uint32_t n = ref_list->count;
 	ref_list->needs_sort = false;
 
+	// Small lists: insertion sort directly on items (avoids scratch overhead)
+	if (n <= 32) {
+		_skr_render_list_insertion_sort(ref_list->items, n);
+		goto reorder_instance_data;
+	}
+
+	// Ensure scratch buffers are large enough
+	if (!_skr_render_list_ensure_scratch(ref_list, n)) {
+		skr_log(skr_log_critical, "Failed to allocate radix sort scratch");
+		goto reorder_instance_data;
+	}
+
+	// Initialize sort pairs from items, and build all 8 histograms in one pass
+	_skr_sort_pair_t* cur   = (_skr_sort_pair_t*)ref_list->sort_scratch_a;
+	_skr_sort_pair_t* other = (_skr_sort_pair_t*)ref_list->sort_scratch_b;
+	uint32_t histograms[8][256];
+	memset(histograms, 0, sizeof(histograms));
+	for (uint32_t i = 0; i < n; i++) {
+		uint64_t key     = ref_list->items[i].sort_key;
+		cur[i].key       = key;
+		cur[i].idx       = i;
+		histograms[0][(uint8_t)(key      )]++;
+		histograms[1][(uint8_t)(key >>  8)]++;
+		histograms[2][(uint8_t)(key >> 16)]++;
+		histograms[3][(uint8_t)(key >> 24)]++;
+		histograms[4][(uint8_t)(key >> 32)]++;
+		histograms[5][(uint8_t)(key >> 40)]++;
+		histograms[6][(uint8_t)(key >> 48)]++;
+		histograms[7][(uint8_t)(key >> 56)]++;
+	}
+
+	// Scatter passes — skip uniform bytes (histogram has single bucket == n)
+	// Find the last non-uniform pass so we can fuse it with the permute
+	int32_t last_pass = -1;
+	for (int32_t pass = 7; pass >= 0; pass--) {
+		bool uniform = false;
+		for (int32_t b = 0; b < 256; b++) {
+			if (histograms[pass][b] == n) { uniform = true; break; }
+		}
+		if (!uniform) { last_pass = pass; break; }
+	}
+
+	// All passes, except the last non-uniform one (which is fused with permute)
+	for (int32_t pass = 0; pass < 8; pass++) {
+		if (pass == last_pass) continue;
+		int32_t  shift   = pass * 8;
+		uint32_t* counts = histograms[pass];
+
+		// Skip uniform passes
+		bool uniform = false;
+		for (int32_t b = 0; b < 256; b++) {
+			if (counts[b] == n) { uniform = true; break; }
+		}
+		if (uniform) continue;
+
+		// Prefix sum (exclusive)
+		uint32_t offsets[256];
+		offsets[0] = 0;
+		for (int32_t b = 1; b < 256; b++)
+			offsets[b] = offsets[b - 1] + counts[b - 1];
+
+		// Scatter pairs
+		for (uint32_t i = 0; i < n; i++) {
+			uint8_t digit = (uint8_t)(cur[i].key >> shift);
+			other[offsets[digit]++] = cur[i];
+		}
+
+		// Swap buffers
+		_skr_sort_pair_t* tmp = cur;
+		cur   = other;
+		other = tmp;
+	}
+
+	// Fused final scatter + permute: scatter pairs by last_pass digit AND
+	// gather items into sorted order in one pass (one random read per item)
+	{
+		skr_render_item_t* items     = ref_list->items;
+		skr_render_item_t* items_tmp = ref_list->items_tmp;
+
+		if (last_pass >= 0) {
+			int32_t  shift   = last_pass * 8;
+			uint32_t* counts = histograms[last_pass];
+			uint32_t offsets[256];
+			offsets[0] = 0;
+			for (int32_t b = 1; b < 256; b++)
+				offsets[b] = offsets[b - 1] + counts[b - 1];
+
+			for (uint32_t i = 0; i < n; i++) {
+				uint8_t  digit = (uint8_t)(cur[i].key >> shift);
+				uint32_t dst   = offsets[digit]++;
+				items_tmp[dst] = items[cur[i].idx];
+			}
+		} else {
+			// All passes were uniform — items are already sorted, just copy
+			memcpy(items_tmp, items, n * sizeof(skr_render_item_t));
+		}
+
+		// Swap — both buffers are always 'capacity' elements
+		ref_list->items     = items_tmp;
+		ref_list->items_tmp = items;
+	}
+
+reorder_instance_data:
 	// After sorting, instance_offset values no longer match the sorted order
 	// Rebuild instance data in sorted order
 	if (ref_list->instance_data_used > 0) {

@@ -159,7 +159,7 @@ typedef struct {
 
 // All pointer members (buffers, resources, vertex_inputs) and their sub-arrays
 // (per-buffer vars and defaults) are carved from a single allocation rooted at
-// buffers. Call sksc_shader_meta_free() to release; do not free members
+// `buffers`. Call sksc_shader_meta_free() to release; do not free members
 // individually.
 typedef struct {
 	char                   name[256];

@@ -817,8 +817,8 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			};
 		}
 
-		// System data buffer (using inlined has_system_buffer)
-		if (item->has_system_buffer && system_bump.buffer) {
+		// System data buffer
+		if ((item->flags & skr_item_flag_system_buffer) && system_bump.buffer) {
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = system_bump.buffer->buffer,
 				.offset = system_bump.offset,
@@ -833,12 +833,8 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			};
 		}
 
-		// Instance data buffer (using inlined instance_buffer_stride)
-		if (item->instance_buffer_stride > 0 && instance_bump.buffer) {
-			if (item->instance_data_size != item->instance_buffer_stride) {
-				skr_log(skr_log_warning, "Instance data size mismatch: shader expects %u bytes, got %u bytes",
-					item->instance_buffer_stride, item->instance_data_size);
-			}
+		// Instance data buffer (only if shader declares one)
+		if ((item->flags & skr_item_flag_instance_buffer) && instance_bump.buffer) {
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = instance_bump.buffer->buffer,
 				.offset = instance_bump.offset + item->instance_offset,
@@ -895,12 +891,13 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		                      writes, write_ct);
 
 		// Bind vertex buffers (using inlined VkBuffer handles)
-		if (item->vertex_buffer_count > 0) {
+		{
+			uint32_t vb_count = (item->flags & skr_item_flag_vb_count_mask) >> skr_item_flag_vb_count_shift;
 			VkBuffer     buffers[SKR_MAX_VERTEX_BUFFERS];
 			VkDeviceSize offsets[SKR_MAX_VERTEX_BUFFERS];
 			uint32_t     bind_count = 0;
 
-			for (uint32_t j = 0; j < item->vertex_buffer_count; j++) {
+			for (uint32_t j = 0; j < vb_count; j++) {
 				if (item->vertex_buffers[j] != VK_NULL_HANDLE) {
 					buffers[bind_count] = item->vertex_buffers[j];
 					offsets[bind_count] = 0;
@@ -913,11 +910,10 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			}
 		}
 
-		// Draw with instancing (using inlined mesh data)
+		// Draw with instancing
 		if (item->index_buffer != VK_NULL_HANDLE) {
-			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (VkIndexType)item->index_format);
-			uint32_t draw_index_count = item->index_count > 0 ? (uint32_t)item->index_count : item->ind_count;
-			vkCmdDrawIndexed(cmd, draw_index_count, total_instances, item->first_index, item->vertex_offset, 0);
+			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (item->flags & skr_item_flag_index_32bit) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+			vkCmdDrawIndexed(cmd, (uint32_t)item->index_count, total_instances, item->first_index, item->vertex_offset, 0);
 		} else {
 			vkCmdDraw(cmd, item->vert_count, total_instances, 0, 0);
 		}

@@ -250,8 +250,17 @@ typedef struct skr_compute_t {
 	bool                   param_dirty;
 } skr_compute_t;
 
+// Flags for skr_render_item_t::flags (vertex_buffer_count stored in bits 2-3)
+typedef enum skr_item_flag_ {
+	skr_item_flag_system_buffer  = 1 << 0, // Material has a system buffer binding
+	skr_item_flag_index_32bit    = 1 << 1, // Index format is uint32 (vs uint16)
+	skr_item_flag_vb_count_shift = 2,      // Vertex buffer count (0-2) in bits 2-3
+	skr_item_flag_vb_count_mask  = 3 << 2,
+	skr_item_flag_instance_buffer= 1 << 4, // Shader declares an instance structured buffer
+} skr_item_flag_;
+
 // Render item with inlined mesh/material data - mesh/material can be destroyed after add.
-// Fields are packed by size to minimize padding (~80 bytes vs ~104 bytes unpacked).
+// Fields are packed by size to minimize padding (80 bytes).
 typedef struct skr_render_item_t {
 	// 8-byte aligned (VkBuffer = pointer = 8 bytes)
 	VkBuffer    vertex_buffers[SKR_MAX_VERTEX_BUFFERS]; // From mesh->vertex_buffers[].buffer
@@ -259,34 +268,31 @@ typedef struct skr_render_item_t {
 	uint64_t    sort_key;                               // Pre-computed sort key for fast sorting
 
 	// 4-byte aligned
-	uint32_t    vert_count;           // From mesh->vert_count
-	uint32_t    ind_count;            // From mesh->ind_count
+	uint32_t    vert_count;           // From mesh->vert_count (for non-indexed draws)
 	uint32_t    param_data_offset;    // Offset into render_list->material_data (bytes)
 	uint32_t    instance_offset;      // Offset into render_list->instance_data (bytes)
 	uint32_t    instance_count;       // Number of instances to draw
 	int32_t     first_index;          // Index buffer offset (0 = use mesh defaults)
-	int32_t     index_count;          // Number of indices (0 = use mesh ind_count)
+	int32_t     index_count;          // Number of indices to draw (resolved at add-time, never 0)
 	int32_t     vertex_offset;        // Base vertex offset
 	int32_t     bind_start;           // Index into bind pool (bind pool uses deferred destruction)
 
-	// 2-byte aligned (max 65535 is plenty for these)
+	// 2-byte aligned
 	uint16_t    pipeline_vert_idx;      // From mesh->vert_type->pipeline_idx
 	uint16_t    pipeline_material_idx;  // From material->pipeline_material_idx
 	uint16_t    param_buffer_size;      // From material->param_buffer_size
-	uint16_t    instance_buffer_stride; // From material->instance_buffer_stride
 	uint16_t    instance_data_size;     // Size per instance (bytes)
 
-	// 1-byte aligned (small values)
-	uint8_t     vertex_buffer_count;  // From mesh->vertex_buffer_count (max SKR_MAX_VERTEX_BUFFERS=2)
+	// 1-byte aligned
 	uint8_t     bind_count;           // From material->bind_count (textures+buffers, rarely >32)
-	uint8_t     index_format;         // From mesh->ind_format_vk (VkIndexType: 0=uint16, 1=uint32)
-	uint8_t     has_system_buffer;    // From material->has_system_buffer (bool)
+	uint8_t     flags;                // skr_item_flag_ bits
 } skr_render_item_t;
 
 typedef struct skr_render_list_t {
 	skr_render_item_t* items;
+	skr_render_item_t* items_tmp;               // Parallel buffer for sort permute (swapped with items)
 	uint32_t           count;
-	uint32_t           capacity;
+	uint32_t           capacity;                // Both items and items_tmp have this capacity
 	uint8_t*           instance_data;
 	uint32_t           instance_data_used;
 	uint32_t           instance_data_capacity;
@@ -295,5 +301,10 @@ typedef struct skr_render_list_t {
 	uint8_t*           material_data;
 	uint32_t           material_data_used;
 	uint32_t           material_data_capacity;
-	bool               needs_sort;  // Dirty flag for sorting
+	bool               needs_sort;              // Dirty flag for sorting
+
+	// Radix sort scratch (persistent, grown as needed)
+	void*              sort_scratch_a;           // Sort pair buffer A
+	void*              sort_scratch_b;           // Sort pair buffer B (ping-pong)
+	uint32_t           sort_scratch_capacity;    // Capacity in number of pair elements
 } skr_render_list_t;
