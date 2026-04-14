@@ -1252,7 +1252,6 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 	int32_t mip_levels = ref_tex->mip_levels;
 
 	if (mip_levels <= 1) {
-		skr_log(skr_log_info, "Texture only has 1 mip level, nothing to generate");
 		return;
 	}
 

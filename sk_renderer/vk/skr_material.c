@@ -485,7 +485,6 @@ static uint32_t _skr_shader_var_size(sksc_shader_var_ type) {
 }
 
 void skr_material_set_param(skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
-	if (!material || !material->key.shader || !material->param_buffer) return;
 
 	int32_t var_index = sksc_shader_meta_get_var_index(&material->key.shader->meta, name);
 	if (var_index < 0) {
@@ -517,7 +516,6 @@ void skr_material_set_param(skr_material_t* material, const char* name, sksc_sha
 }
 
 void skr_material_get_param(const skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
-	if (!material || !material->key.shader || !material->param_buffer) return;
 
 	int32_t var_index = sksc_shader_meta_get_var_index(&material->key.shader->meta, name);
 	if (var_index < 0) {
