@@ -682,6 +682,7 @@ SKR_API void              skr_compute_set_param            (      skr_compute_t*
 SKR_API void              skr_compute_get_param            (const skr_compute_t*     compute, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data);
 
 SKR_API skr_err_          skr_material_create              (skr_material_info_t info, skr_material_t* out_material);
+SKR_API void              skr_material_set_pipeline        (      skr_material_t* ref_material, skr_material_info_t info);
 SKR_API bool              skr_material_is_valid            (const skr_material_t*     material);
 SKR_API void              skr_material_set_tex             (      skr_material_t* ref_material, const char* name, skr_tex_t*    texture);
 SKR_API void              skr_material_set_buffer          (      skr_material_t* ref_material, const char* name, skr_buffer_t* buffer);

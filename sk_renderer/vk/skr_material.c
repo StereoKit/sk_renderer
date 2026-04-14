@@ -306,6 +306,22 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	return skr_err_success;
 }
 
+void skr_material_set_pipeline(skr_material_t* ref_material, skr_material_info_t info) {
+	_skr_pipeline_unregister_material(ref_material->pipeline_material_idx);
+
+	ref_material->key.cull              = info.cull;
+	ref_material->key.write_mask        = info.write_mask ? info.write_mask : skr_write_default;
+	ref_material->key.depth_test        = info.depth_test;
+	ref_material->key.blend_state       = info.blend_state;
+	ref_material->key.alpha_to_coverage = info.alpha_to_coverage;
+	ref_material->key.depth_clamp       = info.depth_clamp;
+	ref_material->key.wireframe         = info.wireframe;
+	ref_material->key.stencil_front     = info.stencil_front;
+	ref_material->key.stencil_back      = info.stencil_back;
+	ref_material->queue_offset          = info.queue_offset;
+	ref_material->pipeline_material_idx = _skr_pipeline_register_material(&ref_material->key);
+}
+
 bool skr_material_is_valid(const skr_material_t* material) {
 	return material && material->pipeline_material_idx >= 0;
 }
