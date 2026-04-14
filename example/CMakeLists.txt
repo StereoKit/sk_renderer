@@ -164,6 +164,7 @@ target_sources(sk_renderer_test PRIVATE
 	text/text.c
 	tools/scene_util.c
 	tools/tex_compress.c
+	tools/tex_compress_gpu.c
 	imgui_backend/imgui_impl_sk_renderer.cpp
 	${sk_app_SOURCE_DIR}/examples/imgui_example/imgui_impl_sk_app.cpp
 	${cimgui_SOURCE_DIR}/imgui/imgui.cpp
@@ -249,6 +250,8 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/msaa_resolve_wide.hlsl
 	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
+	assets/shaders/bc1_compress.hlsl
+	assets/shaders/etc2_compress.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

@@ -76,6 +76,7 @@ target_sources(sk_renderer_xr_test PRIVATE
 	# Scene utilities and tools from example/
 	${EXAMPLE_DIR}/tools/scene_util.c
 	${EXAMPLE_DIR}/tools/tex_compress.c
+	${EXAMPLE_DIR}/tools/tex_compress_gpu.c
 	${EXAMPLE_DIR}/text/text.c
 
 	# Scene implementations from example/ (linked, not copied)

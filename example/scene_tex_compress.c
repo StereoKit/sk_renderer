@@ -6,6 +6,7 @@
 #include "scene.h"
 #include "tools/scene_util.h"
 #include "tools/tex_compress.h"
+#include "tools/tex_compress_gpu.h"
 #include "app.h"
 
 #include <stdlib.h>
@@ -40,11 +41,16 @@ typedef struct {
 	int32_t        img_height;
 	int32_t        compressed_size;
 	double         compress_time_ms;
+	double         gpu_compress_time_ms;
 
 	// Format info
 	compress_fmt_  current_format;
 	bool           bc1_supported;
 	bool           etc2_supported;
+
+	// GPU compression
+	bool           use_gpu;
+	skr_tex_t      texture_source;
 
 	// File loading UI
 	char           file_path[512];
@@ -60,14 +66,9 @@ typedef struct {
 
 static void _load_image(scene_bc1_t* scene, const char* path) {
 	// Destroy existing textures if any
-	if (skr_tex_is_valid(&scene->texture_original)) {
-		skr_tex_destroy(&scene->texture_original);
-		scene->texture_original = (skr_tex_t){0};
-	}
-	if (skr_tex_is_valid(&scene->texture_compressed)) {
-		skr_tex_destroy(&scene->texture_compressed);
-		scene->texture_compressed = (skr_tex_t){0};
-	}
+	if (skr_tex_is_valid(&scene->texture_original))   { skr_tex_destroy(&scene->texture_original);   scene->texture_original   = (skr_tex_t){0}; }
+	if (skr_tex_is_valid(&scene->texture_compressed))  { skr_tex_destroy(&scene->texture_compressed);  scene->texture_compressed  = (skr_tex_t){0}; }
+	if (skr_tex_is_valid(&scene->texture_source))      { skr_tex_destroy(&scene->texture_source);      scene->texture_source      = (skr_tex_t){0}; }
 
 	// Load source image
 	int32_t      width, height;
@@ -84,7 +85,7 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	scene->img_width  = width;
 	scene->img_height = height;
 
-	// Create original texture
+	// Create original texture for display
 	skr_tex_create(skr_tex_fmt_rgba32_srgb,
 		skr_tex_flags_readable,
 		su_sampler_linear_clamp,
@@ -93,61 +94,82 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 		&scene->texture_original);
 	skr_tex_set_name(&scene->texture_original, "original");
 
-	// Choose compression format: prefer BC1, fall back to ETC2
-	uint8_t*     compressed_data = NULL;
-	skr_tex_fmt_ tex_fmt         = skr_tex_fmt_none;
-	const char*  fmt_name        = "none";
+	// Use the format selected in UI (current_format is set by the radio buttons)
+	skr_tex_fmt_ tex_fmt  = skr_tex_fmt_none;
+	const char*  fmt_name = "none";
 
-	if (scene->bc1_supported) {
-		scene->current_format = compress_fmt_bc1;
-		tex_fmt               = skr_tex_fmt_bc1_rgba_srgb;
-		fmt_name              = "BC1";
-
-		uint64_t start_ns = ska_time_get_elapsed_ns();
-		compressed_data   = bc1_compress(pixels, width, height);
-		uint64_t end_ns   = ska_time_get_elapsed_ns();
-		double   time_ms  = (end_ns - start_ns) / 1000000.0;
-
-		scene->compressed_size  = bc1_calc_size(width, height);
-		scene->compress_time_ms = time_ms;
-		su_log(su_log_info, "BC1: Compression took %.3f ms (%.1f MP/s)",
-			time_ms, (width * height) / (time_ms * 1000.0));
-	} else if (scene->etc2_supported) {
-		scene->current_format = compress_fmt_etc2;
-		tex_fmt               = skr_tex_fmt_etc1_rgb;
-		fmt_name              = "ETC2";
-
-		uint64_t start_ns = ska_time_get_elapsed_ns();
-		compressed_data   = etc2_rgb8_compress(pixels, width, height);
-		uint64_t end_ns   = ska_time_get_elapsed_ns();
-		double   time_ms  = (end_ns - start_ns) / 1000000.0;
-
-		scene->compressed_size  = etc2_rgb8_calc_size(width, height);
-		scene->compress_time_ms = time_ms;
-		su_log(su_log_info, "ETC2: Compression took %.3f ms (%.1f MP/s)",
-			time_ms, (width * height) / (time_ms * 1000.0));
+	if (scene->current_format == compress_fmt_bc1 && scene->bc1_supported) {
+		tex_fmt  = skr_tex_fmt_bc1_rgba_srgb;
+		fmt_name = "BC1";
+	} else if (scene->current_format == compress_fmt_etc2 && scene->etc2_supported) {
+		tex_fmt  = skr_tex_fmt_etc1_rgb_srgb;
+		fmt_name = "ETC2";
 	} else {
-		scene->current_format  = compress_fmt_none;
 		scene->compressed_size = 0;
-		su_log(su_log_warning, "TexCompress: No supported compression format!");
+		su_log(su_log_warning, "TexCompress: Selected format not supported!");
 		su_image_free(pixels);
 		return;
 	}
 
-	// Create compressed texture
-	skr_tex_create(tex_fmt,
-		skr_tex_flags_readable,
-		su_sampler_linear_clamp,
-		(skr_vec3i_t){width, height, 1}, 1, 0,
-		&(skr_tex_data_t){.data = compressed_data, .mip_count = 1, .layer_count = 1},
-		&scene->texture_compressed);
-	skr_tex_set_name(&scene->texture_compressed, "compressed");
+	if (scene->use_gpu) {
+		// GPU path: create source texture with mips, compress on GPU
+		skr_tex_create(skr_tex_fmt_rgba32_linear,
+			skr_tex_flags_readable | skr_tex_flags_gen_mips,
+			su_sampler_linear_clamp,
+			(skr_vec3i_t){width, height, 1}, 1, 0,
+			&(skr_tex_data_t){.data = pixels, .mip_count = 1, .layer_count = 1},
+			&scene->texture_source);
+		skr_tex_set_name(&scene->texture_source, "source_for_gpu");
+		skr_tex_generate_mips(&scene->texture_source, NULL);
+
+		uint64_t start_ns = ska_time_get_elapsed_ns();
+		if (scene->current_format == compress_fmt_bc1)
+			scene->texture_compressed = tex_compress_gpu_bc1(&scene->texture_source, true);
+		else
+			scene->texture_compressed = tex_compress_gpu_etc2(&scene->texture_source);
+		uint64_t end_ns = ska_time_get_elapsed_ns();
+
+		scene->gpu_compress_time_ms = (end_ns - start_ns) / 1000000.0;
+		scene->compressed_size      = (scene->current_format == compress_fmt_bc1)
+			? bc1_calc_size(width, height)
+			: etc2_rgb8_calc_size(width, height);
+
+		su_log(su_log_info, "GPU %s: Compression took %.3f ms (%.1f MP/s)",
+			fmt_name, scene->gpu_compress_time_ms,
+			(width * height) / (scene->gpu_compress_time_ms * 1000.0));
+	} else {
+		// CPU path
+		uint8_t* compressed_data = NULL;
+
+		uint64_t start_ns = ska_time_get_elapsed_ns();
+		if (scene->current_format == compress_fmt_bc1) {
+			compressed_data = bc1_compress(pixels, width, height);
+			scene->compressed_size = bc1_calc_size(width, height);
+		} else {
+			compressed_data = etc2_rgb8_compress(pixels, width, height);
+			scene->compressed_size = etc2_rgb8_calc_size(width, height);
+		}
+		uint64_t end_ns = ska_time_get_elapsed_ns();
+
+		scene->compress_time_ms = (end_ns - start_ns) / 1000000.0;
+		su_log(su_log_info, "CPU %s: Compression took %.3f ms (%.1f MP/s)",
+			fmt_name, scene->compress_time_ms,
+			(width * height) / (scene->compress_time_ms * 1000.0));
+
+		skr_tex_create(tex_fmt,
+			skr_tex_flags_readable,
+			su_sampler_linear_clamp,
+			(skr_vec3i_t){width, height, 1}, 1, 0,
+			&(skr_tex_data_t){.data = compressed_data, .mip_count = 1, .layer_count = 1},
+			&scene->texture_compressed);
+		skr_tex_set_name(&scene->texture_compressed, "compressed");
+		free(compressed_data);
+	}
 
 	// Update materials
 	skr_material_set_tex(&scene->material_original,   "tex", &scene->texture_original);
 	skr_material_set_tex(&scene->material_compressed, "tex", &scene->texture_compressed);
 
-	free(compressed_data);
 	su_image_free(pixels);
 
 	su_log(su_log_info, "%s: Compressed %dx%d image (%.1f KB -> %.1f KB, %.1f:1 ratio)",
@@ -168,17 +190,27 @@ static scene_t* _scene_bc1_create(void) {
 	scene->base.size    = sizeof(scene_bc1_t);
 	scene->time         = 0.0f;
 	scene->cam_distance = 5.0f;
+	scene->use_gpu      = true;
+
+	// Initialize GPU compression
+	tex_compress_gpu_init();
 
 	// Check format support
 	scene->bc1_supported  = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb, skr_tex_flags_readable, 1);
-	scene->etc2_supported = skr_tex_fmt_is_supported(skr_tex_fmt_etc1_rgb, skr_tex_flags_readable, 1);
+	scene->etc2_supported = skr_tex_fmt_is_supported(skr_tex_fmt_etc1_rgb_srgb, skr_tex_flags_readable, 1);
 
 	su_log(su_log_info, "TexCompress: BC1 %s, ETC2 %s",
 		scene->bc1_supported  ? "supported" : "not supported",
 		scene->etc2_supported ? "supported" : "not supported");
 
+	// Default format: prefer BC1, fallback to ETC2
+	scene->current_format = scene->bc1_supported  ? compress_fmt_bc1 :
+	                        scene->etc2_supported ? compress_fmt_etc2 :
+	                        compress_fmt_none;
+
 	// Default file path
 	strncpy(scene->file_path, "tree.png", sizeof(scene->file_path) - 1);
+	//strncpy(scene->file_path, "/home/koujaku/Dropbox/Photos/Wallpapers/zm4nfgq29yi91.jpg", sizeof(scene->file_path) - 1);
 
 	// Create quad mesh for displaying textures (facing +Z)
 	scene->quad_mesh = su_mesh_create_quad(2.0f, 2.0f, (skr_vec3_t){0, 0, 1}, false, (skr_vec4_t){1, 1, 1, 1});
@@ -217,7 +249,9 @@ static void _scene_bc1_destroy(scene_t* base) {
 	skr_shader_destroy  (&scene->shader);
 	if (skr_tex_is_valid(&scene->texture_original))   skr_tex_destroy(&scene->texture_original);
 	if (skr_tex_is_valid(&scene->texture_compressed)) skr_tex_destroy(&scene->texture_compressed);
+	if (skr_tex_is_valid(&scene->texture_source))     skr_tex_destroy(&scene->texture_source);
 
+	tex_compress_gpu_shutdown();
 	free(scene);
 }
 
@@ -230,6 +264,13 @@ static void _scene_bc1_update(scene_t* base, float delta_time) {
 		scene->load_requested = false;
 		_load_image(scene, scene->file_path);
 	}
+
+	// Per-frame ETC2 dispatch for GPU profiling
+	if (scene->use_gpu && skr_tex_is_valid(&scene->texture_source)) {
+		skr_tex_t etc2_result = tex_compress_gpu_etc2(&scene->texture_source);
+		if (skr_tex_is_valid(&etc2_result))
+			skr_tex_destroy(&etc2_result);
+	}
 }
 
 static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
@@ -240,7 +281,7 @@ static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
 	(void)height;
 	(void)ref_system_buffer;
 
-	if (!skr_tex_is_valid(&scene->texture_original)) return;
+	if (!skr_tex_is_valid(&scene->texture_original) || !skr_tex_is_valid(&scene->texture_compressed)) return;
 
 	// Calculate aspect ratio for proper quad sizing
 	float aspect = (float)scene->img_width / (float)scene->img_height;
@@ -298,7 +339,7 @@ static const char* _get_filename(const char* path) {
 static void _scene_bc1_render_ui(scene_t* base) {
 	scene_bc1_t* scene = (scene_bc1_t*)base;
 
-	igText("GPU Texture Compression");
+	igText("Texture Compression");
 	igSeparator();
 
 	// Format support status
@@ -307,6 +348,21 @@ static void _scene_bc1_render_ui(scene_t* base) {
 		"  BC1:  %s", scene->bc1_supported ? "Yes" : "No");
 	igTextColored(scene->etc2_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
 		"  ETC2: %s", scene->etc2_supported ? "Yes" : "No");
+
+	igSeparator();
+
+	// GPU toggle
+	if (igCheckbox("GPU Compression", &scene->use_gpu)) {
+		scene->load_requested = true;
+	}
+
+	// Format selection (only show when both are supported)
+	if (scene->bc1_supported && scene->etc2_supported) {
+		int fmt = (int)scene->current_format;
+		if (igRadioButton_IntPtr("BC1",  &fmt, compress_fmt_bc1))  { scene->current_format = compress_fmt_bc1;  scene->load_requested = true; }
+		igSameLine(0, 10);
+		if (igRadioButton_IntPtr("ETC2", &fmt, compress_fmt_etc2)) { scene->current_format = compress_fmt_etc2; scene->load_requested = true; }
+	}
 
 	igSeparator();
 
@@ -350,12 +406,19 @@ static void _scene_bc1_render_ui(scene_t* base) {
 		igText("Ratio:      %.1f:1", (float)original_size / scene->compressed_size);
 
 		igSeparator();
-		double megapix  = (scene->img_width * scene->img_height) / 1000000.0;
-		double mp_per_s = megapix / (scene->compress_time_ms / 1000.0);
-		igText("Compress:   %.2f ms (%.1f MP/s)", scene->compress_time_ms, mp_per_s);
+		if (scene->use_gpu) {
+			double megapix  = (scene->img_width * scene->img_height) / 1000000.0;
+			double mp_per_s = megapix / (scene->gpu_compress_time_ms / 1000.0);
+			igText("GPU:  %.2f ms (%.1f MP/s)", scene->gpu_compress_time_ms, mp_per_s);
+		} else {
+			double megapix  = (scene->img_width * scene->img_height) / 1000000.0;
+			double mp_per_s = megapix / (scene->compress_time_ms / 1000.0);
+			igText("CPU:  %.2f ms (%.1f MP/s)", scene->compress_time_ms, mp_per_s);
+		}
 
 		igSeparator();
-		igTextColored((ImVec4){0.7f, 0.7f, 0.7f, 1.0f}, "Left: Original  |  Right: %s", fmt_name);
+		igTextColored((ImVec4){0.7f, 0.7f, 0.7f, 1.0f}, "Left: Original  |  Right: %s%s",
+			scene->use_gpu ? "GPU " : "", fmt_name);
 	} else {
 		igTextColored((ImVec4){1.0f, 0.5f, 0.5f, 1.0f}, "No image loaded");
 	}

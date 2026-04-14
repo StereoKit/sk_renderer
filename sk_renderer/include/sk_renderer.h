@@ -165,6 +165,7 @@ typedef enum skr_tex_fmt_ {
 	skr_tex_fmt_bc7_rgba,
 
 	skr_tex_fmt_etc1_rgb,
+	skr_tex_fmt_etc1_rgb_srgb,
 	skr_tex_fmt_etc2_rgba_srgb,
 	skr_tex_fmt_etc2_rgba,
 	skr_tex_fmt_etc2_r11,
@@ -642,6 +643,7 @@ SKR_API int32_t           skr_tex_get_multisample          (const skr_tex_t*    
 SKR_API void              skr_tex_set_sampler              (      skr_tex_t* ref_tex, skr_tex_sampler_t sampler);
 SKR_API skr_tex_sampler_t skr_tex_get_sampler              (const skr_tex_t*     tex);
 SKR_API skr_err_          skr_tex_set_data                 (      skr_tex_t* ref_tex, const skr_tex_data_t* data);
+SKR_API skr_err_          skr_tex_set_buffer               (      skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint32_t base_mip, uint32_t mip_count);
 SKR_API void              skr_tex_generate_mips            (      skr_tex_t* ref_tex, const skr_shader_t* opt_compute_shader);
 SKR_API void              skr_tex_set_name                 (      skr_tex_t* ref_tex, const char* name);
 SKR_API bool              skr_tex_fmt_is_supported         (skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample);

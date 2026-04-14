@@ -683,7 +683,7 @@ static inline void _etc_pack_indices(const uint8_t* indices, uint16_t* out_msb, 
 	uint16_t msb = 0, lsb = 0;
 	for (int32_t y = 0; y < 4; y++) {
 		for (int32_t x = 0; x < 4; x++) {
-			int32_t bit_idx = 15 - (x * 4 + y);
+			int32_t bit_idx = x * 4 + y;
 			int32_t idx     = indices[y * 4 + x];
 			msb |= ((idx >> 1) & 1) << bit_idx;
 			lsb |= ((idx >> 0) & 1) << bit_idx;
@@ -716,7 +716,7 @@ static inline void _etc_pack_subblock_indices(const uint8_t* indices0, const uin
 	for (int32_t i = 0; i < 8; i++) {
 		int32_t x = flip ? (i % 4) : (i % 2);
 		int32_t y = flip ? (i / 4) : (i / 2);
-		int32_t bit_idx = 15 - (x * 4 + y);
+		int32_t bit_idx = x * 4 + y;
 		msb |= ((indices0[i] >> 1) & 1) << bit_idx;
 		lsb |= ((indices0[i] >> 0) & 1) << bit_idx;
 	}
@@ -725,7 +725,7 @@ static inline void _etc_pack_subblock_indices(const uint8_t* indices0, const uin
 	for (int32_t i = 0; i < 8; i++) {
 		int32_t x = flip ? (i % 4) : (2 + i % 2);
 		int32_t y = flip ? (2 + i / 4) : (i / 2);
-		int32_t bit_idx = 15 - (x * 4 + y);
+		int32_t bit_idx = x * 4 + y;
 		msb |= ((indices1[i] >> 1) & 1) << bit_idx;
 		lsb |= ((indices1[i] >> 0) & 1) << bit_idx;
 	}
@@ -2406,8 +2406,22 @@ uint8_t* etc2_rgb8_compress(const uint8_t* rgba, int32_t width, int32_t height) 
 				block_stride = stride;
 			}
 
+			// Premultiply alpha so semi-transparent pixels fade to black
+			uint8_t premul_rgba[4 * 4 * 4];
+			for (int32_t y = 0; y < 4; y++) {
+				for (int32_t x = 0; x < 4; x++) {
+					const uint8_t* src = block_ptr + y * block_stride + x * 4;
+					uint8_t*       dst = premul_rgba + y * 16 + x * 4;
+					uint8_t a = src[3];
+					dst[0] = (uint8_t)((src[0] * a + 127) / 255);
+					dst[1] = (uint8_t)((src[1] * a + 127) / 255);
+					dst[2] = (uint8_t)((src[2] * a + 127) / 255);
+					dst[3] = a;
+				}
+			}
+
 			uint8_t* out = etc_data + (by * blocks_x + bx) * 8;
-			_encode_etc2_block(block_ptr, block_stride, out);
+			_encode_etc2_block(premul_rgba, 16, out);
 		}
 	}
 

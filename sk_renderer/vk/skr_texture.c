@@ -1228,6 +1228,76 @@ skr_err_ skr_tex_set_data(skr_tex_t* ref_tex, const skr_tex_data_t* data) {
 	return _skr_tex_upload_data(ref_tex, data);
 }
 
+skr_err_ skr_tex_set_buffer(skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint32_t base_mip, uint32_t mip_count) {
+	if (!ref_tex || !buffer) return skr_err_invalid_parameter;
+	if (ref_tex->image == VK_NULL_HANDLE || buffer->buffer == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+	if (mip_count == 0) return skr_err_invalid_parameter;
+
+	if (base_mip + mip_count > ref_tex->mip_levels) {
+		skr_log(skr_log_warning, "skr_tex_set_buffer: mip range [%u, %u) exceeds texture mip count %u",
+			base_mip, base_mip + mip_count, ref_tex->mip_levels);
+		return skr_err_invalid_parameter;
+	}
+
+	skr_vec3i_t base_size = ref_tex->size;
+
+	// Build copy regions, one per mip level
+	VkBufferImageCopy* regions = _skr_malloc(sizeof(VkBufferImageCopy) * mip_count);
+	if (!regions) return skr_err_out_of_memory;
+
+	VkDeviceSize offset = 0;
+	for (uint32_t m = 0; m < mip_count; m++) {
+		uint32_t    mip      = base_mip + m;
+		skr_vec3i_t mip_size = skr_tex_calc_mip_dimensions(base_size, mip);
+		uint64_t    mip_data = skr_tex_calc_mip_size(ref_tex->format, base_size, mip);
+
+		regions[m] = (VkBufferImageCopy){
+			.bufferOffset      = offset,
+			.bufferRowLength   = 0,
+			.bufferImageHeight = 0,
+			.imageSubresource  = {
+				.aspectMask     = ref_tex->aspect_mask,
+				.mipLevel       = mip,
+				.baseArrayLayer = 0,
+				.layerCount     = ref_tex->layer_count,
+			},
+			.imageOffset = {0, 0, 0},
+			.imageExtent = {mip_size.x, mip_size.y, mip_size.z},
+		};
+
+		offset += mip_data * ref_tex->layer_count;
+	}
+
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+
+	// Barrier: compute shader writes → transfer reads
+	VkMemoryBarrier barrier = {
+		.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	};
+	vkCmdPipelineBarrier(ctx.cmd,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 1, &barrier, 0, NULL, 0, NULL);
+
+	_skr_tex_transition(ctx.cmd, ref_tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+	vkCmdCopyBufferToImage(ctx.cmd, buffer->buffer, ref_tex->image,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mip_count, regions);
+
+	VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	if (ref_tex->flags & skr_tex_flags_compute) {
+		shader_stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	}
+	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, shader_stages);
+
+	_skr_cmd_release(ctx.cmd);
+	_skr_free(regions);
+	return skr_err_success;
+}
+
 void skr_tex_set_name(skr_tex_t* ref_tex, const char* name) {
 	if (!ref_tex || ref_tex->image == VK_NULL_HANDLE) return;
 
@@ -1896,6 +1966,7 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 
 		// ETC formats (4x4 blocks)
 		case skr_tex_fmt_etc1_rgb:
+		case skr_tex_fmt_etc1_rgb_srgb:
 			block_w = 4; block_h = 4; block_bytes = 8; break;
 		case skr_tex_fmt_etc2_rgba:
 		case skr_tex_fmt_etc2_rgba_srgb:

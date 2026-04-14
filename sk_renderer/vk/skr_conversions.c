@@ -48,6 +48,7 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_bc7_rgba:      return VK_FORMAT_BC7_UNORM_BLOCK;
 		// Mobile compressed formats
 		case skr_tex_fmt_etc1_rgb:           return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+		case skr_tex_fmt_etc1_rgb_srgb:      return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
 		case skr_tex_fmt_etc2_rgba_srgb:     return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
 		case skr_tex_fmt_etc2_rgba:          return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
 		case skr_tex_fmt_etc2_r11:           return VK_FORMAT_EAC_R11_UNORM_BLOCK;
@@ -109,6 +110,7 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 		case VK_FORMAT_BC7_UNORM_BLOCK:            return skr_tex_fmt_bc7_rgba;
 		// Mobile compressed formats
 		case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:    return skr_tex_fmt_etc1_rgb;
+		case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:     return skr_tex_fmt_etc1_rgb_srgb;
 		case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:   return skr_tex_fmt_etc2_rgba_srgb;
 		case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:  return skr_tex_fmt_etc2_rgba;
 		case VK_FORMAT_EAC_R11_UNORM_BLOCK:        return skr_tex_fmt_etc2_r11;
@@ -406,7 +408,7 @@ VkBufferUsageFlags _skr_to_vk_buffer_usage(skr_buffer_type_ type) {
 	if (type & skr_buffer_type_vertex)   flags |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 	if (type & skr_buffer_type_index)    flags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 	if (type & skr_buffer_type_constant) flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-	if (type & skr_buffer_type_storage)  flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	if (type & skr_buffer_type_storage)  flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	return flags;
 }
 
