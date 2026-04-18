@@ -166,8 +166,9 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		ref_surface->images[i].layer_count       = 1;
 		ref_surface->images[i].aspect_mask       = VK_IMAGE_ASPECT_COLOR_BIT;  // CRITICAL: Must be set!
 		ref_surface->images[i].framebuffer       = VK_NULL_HANDLE;
-		ref_surface->images[i].framebuffer_depth = VK_NULL_HANDLE;
-		ref_surface->images[i].framebuffer_pass  = VK_NULL_HANDLE;
+		ref_surface->images[i].framebuffer_depth      = VK_NULL_HANDLE;
+		ref_surface->images[i].framebuffer_pass       = VK_NULL_HANDLE;
+		ref_surface->images[i].framebuffer_depth_pass = VK_NULL_HANDLE;
 		ref_surface->images[i].sampler           = VK_NULL_HANDLE;
 		ref_surface->images[i].memory            = VK_NULL_HANDLE;  // Swapchain owns memory
 
@@ -368,12 +369,12 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_te
 	return skr_acquire_success;
 }
 
-void skr_surface_present(skr_surface_t* ref_surface) {
-	if (!ref_surface) return;
+skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
+	if (!ref_surface) return skr_acquire_error;
 
 	// Just present - all command buffer work happened before frame_end!
 	mtx_lock(_skr_vk.present_queue_mutex);
-	vkQueuePresentKHR(_skr_vk.present_queue, &(VkPresentInfoKHR){
+	VkResult result = vkQueuePresentKHR(_skr_vk.present_queue, &(VkPresentInfoKHR){
 		.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores    = &ref_surface->semaphore_submit[ref_surface->current_image],
@@ -384,6 +385,11 @@ void skr_surface_present(skr_surface_t* ref_surface) {
 	mtx_unlock(_skr_vk.present_queue_mutex);
 
 	ref_surface->frame_idx = (ref_surface->frame_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+
+	if (result == VK_ERROR_SURFACE_LOST_KHR)                                    return skr_acquire_surface_lost;
+	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)      return skr_acquire_needs_resize;
+	if (result != VK_SUCCESS)              { skr_log(skr_log_critical, "vkQueuePresentKHR failed: 0x%X", result); return skr_acquire_error; }
+	return skr_acquire_success;
 }
 
 bool skr_surface_is_valid(const skr_surface_t* surface) {

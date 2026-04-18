@@ -65,7 +65,7 @@ static inline uint32_t _color_vec4_to_u32(skr_vec4_t color) {
 	uint8_t g = (uint8_t)(color.y * 255.0f);
 	uint8_t b = (uint8_t)(color.z * 255.0f);
 	uint8_t a = (uint8_t)(color.w * 255.0f);
-	return (a << 24) | (b << 16) | (g << 8) | r;
+	return ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
 }
 
 skr_mesh_t su_mesh_create_sphere(int32_t segments, int32_t rings, float radius, skr_vec4_t color) {
@@ -966,7 +966,7 @@ static void _su_gltf_extract_node(
 				uint8_t g = (uint8_t)(d[1] * 255.0f);
 				uint8_t b = (uint8_t)(d[2] * 255.0f);
 				uint8_t a = (uint8_t)(d[3] * 255.0f);
-				vert->color = (a << 24) | (b << 16) | (g << 8) | r;
+				vert->color = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
 			}
 
 			// Transform bounds to world space (transform all 8 corners and find new AABB)

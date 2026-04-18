@@ -21,6 +21,8 @@
 #define MAX_EPHEMERAL_MATERIALS 32
 #define MAX_THREAD_MATERIALS    8
 #define STRESS_CUBE_COUNT       25
+#define SORT_STRESS_MAT_COUNT   16
+#define SORT_STRESS_MESH_COUNT  4
 
 typedef struct {
 	skr_material_t material;
@@ -76,6 +78,12 @@ typedef struct {
 
 	// Test 7: True destroy-before-draw (validates crash behavior)
 	uint32_t       test7_count;
+
+	// Test 8: Sort stress (many draw items with diverse sort keys)
+	skr_material_t sort_stress_materials[SORT_STRESS_MAT_COUNT];
+	skr_mesh_t     sort_stress_meshes[SORT_STRESS_MESH_COUNT];
+	int32_t        sort_stress_draw_count;
+	bool           sort_stress_enabled;
 
 	// Statistics
 	uint32_t frame_count;
@@ -200,6 +208,30 @@ static scene_t* _scene_lifetime_stress_create(void) {
 	scene->thread_should_stop = false;
 	pthread_create(&scene->thread, NULL, _thread_create_resources, scene);
 
+	// Test 8: Sort stress - create diverse materials and meshes
+	scene->sort_stress_draw_count = 2000;
+	scene->sort_stress_enabled    = true;
+
+	// 4 different mesh geometries for VkBuffer diversity
+	scene->sort_stress_meshes[0] = scene->cube_mesh; // share the cube
+	scene->sort_stress_meshes[1] = su_mesh_create_sphere(8, 6, 0.4f, (skr_vec4_t){1,1,1,1});
+	scene->sort_stress_meshes[2] = su_mesh_create_pyramid(0.6f, 0.8f, (skr_vec4_t){1,1,1,1});
+	scene->sort_stress_meshes[3] = su_mesh_create_quad(0.6f, 0.6f, (skr_vec3_t){0,0,1}, false, (skr_vec4_t){1,1,1,1});
+
+	// 16 materials with varied pipeline settings for diverse sort keys
+	skr_cull_    sort_culls[]  = { skr_cull_back, skr_cull_front, skr_cull_none, skr_cull_back };
+	skr_compare_ sort_depths[] = { skr_compare_less, skr_compare_less_or_eq };
+	int16_t      sort_queues[] = { -5, 0, 5, 10 };
+	for (int32_t i = 0; i < SORT_STRESS_MAT_COUNT; i++) {
+		skr_material_create((skr_material_info_t){
+			.shader       = &scene->shader,
+			.depth_test   = sort_depths[i % 2],
+			.cull         = sort_culls[i % 4],
+			.queue_offset = sort_queues[i / 4],
+		}, &scene->sort_stress_materials[i]);
+		skr_material_set_tex(&scene->sort_stress_materials[i], "tex", &scene->base_texture);
+	}
+
 	su_log(su_log_info, "Lifetime stress test scene created");
 
 	return (scene_t*)scene;
@@ -237,6 +269,13 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 	// Destroy replaceable resources
 	skr_material_destroy(&scene->replaceable_material);
 	skr_tex_destroy(&scene->replaceable_texture);
+
+	// Destroy sort stress resources
+	for (int32_t i = 0; i < SORT_STRESS_MAT_COUNT; i++)
+		skr_material_destroy(&scene->sort_stress_materials[i]);
+	// meshes[0] is shared cube_mesh, destroyed below
+	for (int32_t i = 1; i < SORT_STRESS_MESH_COUNT; i++)
+		skr_mesh_destroy(&scene->sort_stress_meshes[i]);
 
 	// Destroy base resources
 	skr_material_destroy(&scene->base_material);
@@ -510,6 +549,26 @@ static void _scene_lifetime_stress_render(scene_t* base, int32_t width, int32_t 
 		// access doomed_material.param_buffer which is now freed -> CRASH
 	}
 
+	// === TEST 8: Sort stress - many draw items with diverse sort keys ===
+	if (scene->sort_stress_enabled && scene->sort_stress_draw_count > 0) {
+		int32_t count = scene->sort_stress_draw_count;
+		int32_t cols  = 50;
+		float   spacing = 1.2f;
+		for (int32_t i = 0; i < count; i++) {
+			float x = (float)(i % cols) * spacing - (cols * spacing * 0.5f);
+			float z = (float)(i / cols) * spacing - 10.0f;
+			float4x4 world = float4x4_trs(
+				(float3){x, -2.0f, z},
+				float4_quat_from_euler((float3){0, scene->rotation + i * 0.01f, 0}),
+				(float3){0.4f, 0.4f, 0.4f});
+			skr_render_list_add(ref_render_list,
+				&scene->sort_stress_meshes[i % SORT_STRESS_MESH_COUNT],
+				&scene->sort_stress_materials[i % SORT_STRESS_MAT_COUNT],
+				&world, sizeof(float4x4), 1);
+		}
+		scene->total_draws += count;
+	}
+
 	// Draw base cubes in a grid
 	for (int32_t i = 0; i < 5 && draw_idx < STRESS_CUBE_COUNT; i++) {
 		float x = -2.0f + i * 1.0f;
@@ -556,6 +615,14 @@ static void _scene_lifetime_stress_render_ui(scene_t* base) {
 	igText("Test 6 - Sampler changes: %u", scene->sampler_test_count);
 
 	igText("Test 7 - Destroy before draw: %u", scene->test7_count);
+
+	igSeparator();
+	igText("Test 8 - Sort stress:");
+	igCheckbox("Enabled##sort_stress", &scene->sort_stress_enabled);
+	int sort_count = scene->sort_stress_draw_count;
+	if (igSliderInt("Draw items", &sort_count, 0, 5000, "%d", 0)) {
+		scene->sort_stress_draw_count = sort_count;
+	}
 
 	igSeparator();
 	igText("Totals:");

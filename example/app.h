@@ -27,6 +27,7 @@ void   app_destroy(app_t* app);
 
 // Scene management
 void    app_set_scene  (app_t* app, int32_t scene_index);
+int32_t app_scene_index(app_t* app);
 int32_t app_scene_count(app_t* app);
 
 // Input handling

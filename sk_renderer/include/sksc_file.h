@@ -157,15 +157,18 @@ typedef struct {
 	int32_t dynamic_flow;
 } sksc_shader_ops_t;
 
+// All pointer members (buffers, resources, vertex_inputs) and their sub-arrays
+// (per-buffer vars and defaults) are carved from a single allocation rooted at
+// `buffers`. Call sksc_shader_meta_free() to release; do not free members
+// individually.
 typedef struct {
 	char                   name[256];
-	uint32_t               buffer_count;
-	sksc_shader_buffer_t   *buffers;
-	uint32_t               resource_count;
-	sksc_shader_resource_t *resources;
-	int32_t                references;
-	int32_t                global_buffer_id;
+	sksc_shader_buffer_t  *buffers;
+	sksc_shader_resource_t*resources;
 	skr_vert_component_t  *vertex_inputs;
+	uint32_t               buffer_count;
+	uint32_t               resource_count;
+	int32_t                global_buffer_id;
 	int32_t                vertex_input_count;
 	sksc_shader_ops_t      ops_vertex;
 	sksc_shader_ops_t      ops_pixel;
@@ -179,7 +182,7 @@ typedef struct {
 } sksc_shader_file_stage_t;
 
 typedef struct {
-	sksc_shader_meta_t       *meta;
+	sksc_shader_meta_t        meta;
 	uint32_t                  stage_count;
 	sksc_shader_file_stage_t *stages;
 } sksc_shader_file_t;
@@ -196,8 +199,7 @@ SKSC_API int32_t                  sksc_shader_meta_get_var_count  (const sksc_sh
 SKSC_API int32_t                  sksc_shader_meta_get_var_index  (const sksc_shader_meta_t*     meta, const char *name);
 SKSC_API int32_t                  sksc_shader_meta_get_var_index_h(const sksc_shader_meta_t*     meta, uint64_t name_hash);
 SKSC_API const sksc_shader_var_t* sksc_shader_meta_get_var_info   (const sksc_shader_meta_t*     meta, int32_t  var_index);
-SKSC_API void                     sksc_shader_meta_reference      (      sksc_shader_meta_t* ref_meta);
-SKSC_API void                     sksc_shader_meta_release        (      sksc_shader_meta_t* ref_meta);
+SKSC_API void                     sksc_shader_meta_free           (      sksc_shader_meta_t* ref_meta);
 
 #ifdef __cplusplus
 }

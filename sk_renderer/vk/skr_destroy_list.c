@@ -148,12 +148,6 @@ void _skr_destroy_list_execute(skr_destroy_list_t* ref_list) {
 	for (int32_t i = ref_list->count - 1; i >= 0; i--)
 		_skr_destroy_list_destroy(items[i].handle, items[i].type);
 
-	mtx_unlock(&ref_list->mutex);
-}
-
-void _skr_destroy_list_clear(skr_destroy_list_t* ref_list) {
-	if (!ref_list) return;
-	mtx_lock(&ref_list->mutex);
 	ref_list->count = 0;
 	mtx_unlock(&ref_list->mutex);
 }

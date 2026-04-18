@@ -16,7 +16,7 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 	// Zero out immediately
 	*out_compute = (skr_compute_t){0};
 
-	if (!shader || !skr_shader_is_valid(shader) || shader->compute_stage.shader == VK_NULL_HANDLE || !shader->meta) {
+	if (!shader || !skr_shader_is_valid(shader) || shader->compute_stage.shader == VK_NULL_HANDLE) {
 		skr_log(skr_log_critical, "Invalid shader or no compute stage");
 		return skr_err_invalid_parameter;
 	}
@@ -24,19 +24,19 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 	out_compute->shader = shader;
 
 	// Create descriptor set layout
-	if (shader->meta->buffer_count > 0 || shader->meta->resource_count > 0) {
+	if (shader->meta.buffer_count > 0 || shader->meta.resource_count > 0) {
 		VkDescriptorSetLayoutBinding bindings[32];
 		uint32_t binding_count = 0;
 
 		// Add buffer bindings
-		for (uint32_t i = 0; i < shader->meta->buffer_count; i++) {
+		for (uint32_t i = 0; i < shader->meta.buffer_count; i++) {
 			VkDescriptorType desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-			if (shader->meta->buffers[i].bind.register_type == skr_register_readwrite) {
+			if (shader->meta.buffers[i].bind.register_type == skr_register_readwrite) {
 				desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 			}
 
 			bindings[binding_count++] = (VkDescriptorSetLayoutBinding){
-				.binding            = shader->meta->buffers[i].bind.slot,
+				.binding            = shader->meta.buffers[i].bind.slot,
 				.descriptorType     = desc_type,
 				.descriptorCount    = 1,
 				.stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -45,10 +45,10 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 		}
 
 		// Add resource bindings (textures, storage buffers, and storage images)
-		for (uint32_t i = 0; i < shader->meta->resource_count; i++) {
+		for (uint32_t i = 0; i < shader->meta.resource_count; i++) {
 			VkDescriptorType desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 
-			skr_register_ reg_type = shader->meta->resources[i].bind.register_type;
+			skr_register_ reg_type = shader->meta.resources[i].bind.register_type;
 			if (reg_type == skr_register_readwrite_tex) {
 				desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 			} else if (reg_type == skr_register_texture) {
@@ -59,7 +59,7 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 			}
 
 			bindings[binding_count++] = (VkDescriptorSetLayoutBinding){
-				.binding            = shader->meta->resources[i].bind.slot,
+				.binding            = shader->meta.resources[i].bind.slot,
 				.descriptorType     = desc_type,
 				.descriptorCount    = 1,
 				.stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -119,13 +119,13 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 	}
 
 	// Allocate memory for our resource binds
-	out_compute->bind_count = shader->meta->resource_count + shader->meta->buffer_count;
+	out_compute->bind_count = shader->meta.resource_count + shader->meta.buffer_count;
 	out_compute->binds      = (skr_material_bind_t*)_skr_calloc(out_compute->bind_count, sizeof(skr_material_bind_t));
-	for (uint32_t i = 0; i < shader->meta->buffer_count;   i++) out_compute->binds[i                           ].bind = shader->meta->buffers  [i].bind;
-	for (uint32_t i = 0; i < shader->meta->resource_count; i++) out_compute->binds[i+shader->meta->buffer_count].bind = shader->meta->resources[i].bind;
+	for (uint32_t i = 0; i < shader->meta.buffer_count;   i++) out_compute->binds[i                          ].bind = shader->meta.buffers  [i].bind;
+	for (uint32_t i = 0; i < shader->meta.resource_count; i++) out_compute->binds[i+shader->meta.buffer_count].bind = shader->meta.resources[i].bind;
 
 	// Initialize parameter buffer if shader has $Global cbuffer
-	const sksc_shader_meta_t* meta = shader->meta;
+	const sksc_shader_meta_t* meta = &shader->meta;
 	if (meta->global_buffer_id >= 0) {
 		sksc_shader_buffer_t* global_buffer = &meta->buffers[meta->global_buffer_id];
 
@@ -151,11 +151,11 @@ bool skr_compute_is_valid(const skr_compute_t* compute) {
 }
 
 skr_bind_t skr_compute_get_bind(const skr_compute_t* compute, const char* bind_name) {
-	if (!compute || !compute->shader || !compute->shader->meta) {
+	if (!compute || !compute->shader) {
 		skr_bind_t empty = {0};
 		return empty;
 	}
-	return sksc_shader_meta_get_bind(compute->shader->meta, bind_name);
+	return sksc_shader_meta_get_bind(&compute->shader->meta, bind_name);
 }
 
 void skr_compute_destroy(skr_compute_t* ref_compute) {
@@ -172,7 +172,7 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 }
 
 void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_buffer_t* buffer) {
-	const sksc_shader_meta_t *meta = ref_compute->shader->meta;
+	const sksc_shader_meta_t *meta = &ref_compute->shader->meta;
 
 	int32_t  idx  = -1;
 	uint64_t hash = skr_hash(name);
@@ -205,7 +205,7 @@ void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_bu
 }
 
 void skr_compute_set_tex(skr_compute_t* ref_compute, const char* name, skr_tex_t* texture) {
-	const sksc_shader_meta_t *meta = ref_compute->shader->meta;
+	const sksc_shader_meta_t *meta = &ref_compute->shader->meta;
 
 	int32_t  idx  = -1;
 	uint64_t hash = skr_hash(name);
@@ -253,15 +253,15 @@ void skr_compute_set_params(skr_compute_t* ref_compute, const void* data, uint32
 }
 
 void skr_compute_set_param(skr_compute_t* ref_compute, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
-	if (!ref_compute || !ref_compute->shader || !ref_compute->shader->meta || !ref_compute->param_buffer) return;
+	if (!ref_compute || !ref_compute->shader || !ref_compute->param_buffer) return;
 
-	int32_t var_index = sksc_shader_meta_get_var_index(ref_compute->shader->meta, name);
+	int32_t var_index = sksc_shader_meta_get_var_index(&ref_compute->shader->meta, name);
 	if (var_index < 0) {
 		skr_log(skr_log_warning, "Compute parameter '%s' not found", name);
 		return;
 	}
 
-	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(ref_compute->shader->meta, var_index);
+	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&ref_compute->shader->meta, var_index);
 	if (!var) return;
 
 	// When type is uint8, treat count as raw byte count and skip type check
@@ -286,15 +286,15 @@ void skr_compute_set_param(skr_compute_t* ref_compute, const char* name, sksc_sh
 }
 
 void skr_compute_get_param(const skr_compute_t* compute, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
-	if (!compute || !compute->shader || !compute->shader->meta || !compute->param_buffer) return;
+	if (!compute || !compute->shader || !compute->param_buffer) return;
 
-	int32_t var_index = sksc_shader_meta_get_var_index(compute->shader->meta, name);
+	int32_t var_index = sksc_shader_meta_get_var_index(&compute->shader->meta, name);
 	if (var_index < 0) {
 		skr_log(skr_log_warning, "Compute parameter '%s' not found", name);
 		return;
 	}
 
-	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(compute->shader->meta, var_index);
+	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&compute->shader->meta, var_index);
 	if (!var) return;
 
 	// When type is uint8, treat count as raw byte count and skip type check
@@ -320,7 +320,7 @@ void skr_compute_get_param(const skr_compute_t* compute, const char* name, sksc_
 void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uint32_t z) {
 	if (!skr_compute_is_valid(ref_compute)) return;
 
-	const sksc_shader_meta_t* meta = ref_compute->shader->meta;
+	const sksc_shader_meta_t* meta = &ref_compute->shader->meta;
 
 	// Acquire command buffer first so we have a valid future
 	_skr_cmd_ctx_t  ctx = _skr_cmd_acquire();
@@ -472,7 +472,7 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indirect_args) {
 	if (!skr_compute_is_valid(ref_compute) || !indirect_args) return;
 
-	const sksc_shader_meta_t* meta = ref_compute->shader->meta;
+	const sksc_shader_meta_t* meta = &ref_compute->shader->meta;
 
 	// Acquire command buffer first so we have a valid future
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();

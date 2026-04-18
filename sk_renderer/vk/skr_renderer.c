@@ -53,12 +53,11 @@ uint64_t _skr_time_get_ns(void) {
 }
 
 static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* cache_target, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, bool has_depth) {
-	VkFramebuffer* cached_fb = has_depth
-		? &cache_target->framebuffer_depth
-		: &cache_target->framebuffer;
+	VkFramebuffer* cached_fb   = has_depth ? &cache_target->framebuffer_depth      : &cache_target->framebuffer;
+	VkRenderPass*  cached_pass = has_depth ? &cache_target->framebuffer_depth_pass : &cache_target->framebuffer_pass;
 
 	// Check if we have a cached framebuffer for this render pass
-	if (*cached_fb != VK_NULL_HANDLE && cache_target->framebuffer_pass == render_pass) {
+	if (*cached_fb != VK_NULL_HANDLE && *cached_pass == render_pass) {
 		return *cached_fb;
 	}
 
@@ -68,8 +67,8 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 	}
 
 	// Create and cache new framebuffer
-	*cached_fb = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
-	cache_target->framebuffer_pass = render_pass;
+	*cached_fb   = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
+	*cached_pass = render_pass;
 	return *cached_fb;
 }
 
@@ -566,7 +565,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	}
 
 	// Material texture and buffer binds
-	const sksc_shader_meta_t* meta = material->key.shader->meta;
+	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 	const int32_t ignore_slots[] = { SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot };
 
 	_skr_bind_pool_lock();
@@ -818,8 +817,8 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			};
 		}
 
-		// System data buffer (using inlined has_system_buffer)
-		if (item->has_system_buffer && system_bump.buffer) {
+		// System data buffer
+		if ((item->flags & skr_item_flag_system_buffer) && system_bump.buffer) {
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = system_bump.buffer->buffer,
 				.offset = system_bump.offset,
@@ -834,12 +833,8 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			};
 		}
 
-		// Instance data buffer (using inlined instance_buffer_stride)
-		if (item->instance_buffer_stride > 0 && instance_bump.buffer) {
-			if (item->instance_data_size != item->instance_buffer_stride) {
-				skr_log(skr_log_warning, "Instance data size mismatch: shader expects %u bytes, got %u bytes",
-					item->instance_buffer_stride, item->instance_data_size);
-			}
+		// Instance data buffer (only if shader declares one)
+		if ((item->flags & skr_item_flag_instance_buffer) && instance_bump.buffer) {
 			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
 				.buffer = instance_bump.buffer->buffer,
 				.offset = instance_bump.offset + item->instance_offset,
@@ -896,12 +891,13 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		                      writes, write_ct);
 
 		// Bind vertex buffers (using inlined VkBuffer handles)
-		if (item->vertex_buffer_count > 0) {
+		{
+			uint32_t vb_count = (item->flags & skr_item_flag_vb_count_mask) >> skr_item_flag_vb_count_shift;
 			VkBuffer     buffers[SKR_MAX_VERTEX_BUFFERS];
 			VkDeviceSize offsets[SKR_MAX_VERTEX_BUFFERS];
 			uint32_t     bind_count = 0;
 
-			for (uint32_t j = 0; j < item->vertex_buffer_count; j++) {
+			for (uint32_t j = 0; j < vb_count; j++) {
 				if (item->vertex_buffers[j] != VK_NULL_HANDLE) {
 					buffers[bind_count] = item->vertex_buffers[j];
 					offsets[bind_count] = 0;
@@ -914,11 +910,10 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			}
 		}
 
-		// Draw with instancing (using inlined mesh data)
+		// Draw with instancing
 		if (item->index_buffer != VK_NULL_HANDLE) {
-			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (VkIndexType)item->index_format);
-			uint32_t draw_index_count = item->index_count > 0 ? (uint32_t)item->index_count : item->ind_count;
-			vkCmdDrawIndexed(cmd, draw_index_count, total_instances, item->first_index, item->vertex_offset, 0);
+			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (item->flags & skr_item_flag_index_32bit) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+			vkCmdDrawIndexed(cmd, (uint32_t)item->index_count, total_instances, item->first_index, item->vertex_offset, 0);
 		} else {
 			vkCmdDraw(cmd, item->vert_count, total_instances, 0, 0);
 		}
@@ -979,7 +974,7 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
 
 	// Add material texture and buffer bindings
-	const sksc_shader_meta_t* meta = material->key.shader->meta;
+	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 
 	_skr_bind_pool_lock();
 	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
@@ -1318,7 +1313,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 		// With intermediates, create fresh each frame since they're transient.
 		VkFramebuffer framebuffer = VK_NULL_HANDLE;
 		bool cache_fb = (intermediate_count == 0);
-		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE && final_output->framebuffer_pass == render_pass) {
+		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE && final_output->framebuffer_depth_pass == render_pass) {
 			framebuffer = final_output->framebuffer_depth;
 		} else {
 			if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE) {
@@ -1339,8 +1334,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 				goto cleanup;
 			}
 			if (cache_fb) {
-				final_output->framebuffer_depth = framebuffer;
-				final_output->framebuffer_pass  = render_pass;
+				final_output->framebuffer_depth      = framebuffer;
+				final_output->framebuffer_depth_pass = render_pass;
 			}
 		}
 
@@ -1436,14 +1431,12 @@ void skr_pass_submit(skr_pass_t* pass) {
 			skr_material_t* resolve_mat = pass->resolve_material;
 
 			// Auto-bind input attachments by scanning shader metadata
-			const sksc_shader_meta_t* meta = resolve_mat->key.shader->meta;
-			if (meta) {
-				for (uint32_t r = 0; r < meta->resource_count; r++) {
-					if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
-					const char* name = meta->resources[r].name;
-					if (strcmp(name, "color") == 0 && color) {
-						skr_material_set_tex(resolve_mat, "color", color);
-					}
+			const sksc_shader_meta_t* meta = &resolve_mat->key.shader->meta;
+			for (uint32_t r = 0; r < meta->resource_count; r++) {
+				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
+				const char* name = meta->resources[r].name;
+				if (strcmp(name, "color") == 0 && color) {
+					skr_material_set_tex(resolve_mat, "color", color);
 				}
 			}
 
@@ -1486,16 +1479,14 @@ void skr_pass_submit(skr_pass_t* pass) {
 			bool is_last = (p == pass->postfx_count - 1);
 
 			// Auto-bind input attachments by scanning shader metadata
-			const sksc_shader_meta_t* meta = postfx_mat->key.shader->meta;
-			if (meta) {
-				for (uint32_t r = 0; r < meta->resource_count; r++) {
-					if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
-					const char* name = meta->resources[r].name;
-					if (strcmp(name, "color") == 0 && prev_color) {
-						skr_material_set_tex(postfx_mat, "color", prev_color);
-					} else if (strcmp(name, "depth") == 0 && depth) {
-						skr_material_set_tex(postfx_mat, "depth", depth);
-					}
+			const sksc_shader_meta_t* meta = &postfx_mat->key.shader->meta;
+			for (uint32_t r = 0; r < meta->resource_count; r++) {
+				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
+				const char* name = meta->resources[r].name;
+				if (strcmp(name, "color") == 0 && prev_color) {
+					skr_material_set_tex(postfx_mat, "color", prev_color);
+				} else if (strcmp(name, "depth") == 0 && depth) {
+					skr_material_set_tex(postfx_mat, "depth", depth);
 				}
 			}
 

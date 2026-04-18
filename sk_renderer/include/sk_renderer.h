@@ -658,7 +658,7 @@ SKR_API bool              skr_surface_is_valid             (const skr_surface_t*
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
 SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
 SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_tex_t** out_tex);
-SKR_API void              skr_surface_present              (      skr_surface_t* ref_surface);
+SKR_API skr_acquire_      skr_surface_present              (      skr_surface_t* ref_surface);
 SKR_API skr_vec2i_t       skr_surface_get_size             (const skr_surface_t*     surface);
 
 SKR_API skr_err_          skr_shader_create                (const void *shader_data, uint32_t data_size, skr_shader_t* out_shader);
@@ -682,6 +682,7 @@ SKR_API void              skr_compute_set_param            (      skr_compute_t*
 SKR_API void              skr_compute_get_param            (const skr_compute_t*     compute, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data);
 
 SKR_API skr_err_          skr_material_create              (skr_material_info_t info, skr_material_t* out_material);
+SKR_API void              skr_material_set_pipeline        (      skr_material_t* ref_material, skr_material_info_t info);
 SKR_API bool              skr_material_is_valid            (const skr_material_t*     material);
 SKR_API void              skr_material_set_tex             (      skr_material_t* ref_material, const char* name, skr_tex_t*    texture);
 SKR_API void              skr_material_set_buffer          (      skr_material_t* ref_material, const char* name, skr_buffer_t* buffer);

@@ -210,7 +210,6 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 
 		// Fence is done, make sure we free its assets too
 		_skr_destroy_list_execute(&slot->destroy_list);
-		_skr_destroy_list_clear  (&slot->destroy_list);
 
 		// Increment generation to invalidate old futures referencing this fence
 		slot->generation++;

@@ -247,6 +247,7 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/postfx_invert.hlsl
 	assets/shaders/msaa_resolve.hlsl
 	assets/shaders/msaa_resolve_wide.hlsl
+	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
 )
 target_skapp_assets(sk_renderer_test

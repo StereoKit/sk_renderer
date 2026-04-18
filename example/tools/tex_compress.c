@@ -331,10 +331,10 @@ static void _encode_bc1_block_simd(const uint8_t* rgba, int32_t stride, uint8_t*
 			__m128i idx = _mm_sub_epi32(_mm_setzero_si128(), sum);
 
 			// Extract and map using lookup table
-			indices |= (_idx_map_4color[_mm_extract_epi32(idx, 0)] << ((i + 0) * 2));
-			indices |= (_idx_map_4color[_mm_extract_epi32(idx, 1)] << ((i + 1) * 2));
-			indices |= (_idx_map_4color[_mm_extract_epi32(idx, 2)] << ((i + 2) * 2));
-			indices |= (_idx_map_4color[_mm_extract_epi32(idx, 3)] << ((i + 3) * 2));
+			indices |= ((uint32_t)_idx_map_4color[_mm_extract_epi32(idx, 0)] << ((i + 0) * 2));
+			indices |= ((uint32_t)_idx_map_4color[_mm_extract_epi32(idx, 1)] << ((i + 1) * 2));
+			indices |= ((uint32_t)_idx_map_4color[_mm_extract_epi32(idx, 2)] << ((i + 2) * 2));
+			indices |= ((uint32_t)_idx_map_4color[_mm_extract_epi32(idx, 3)] << ((i + 3) * 2));
 		}
 	}
 
@@ -500,7 +500,7 @@ static void _encode_bc1_block(const uint8_t* rgba, int32_t stride, uint8_t* out)
 
 				// Transparent pixel -> index 3
 				if (p[3] < BC1_ALPHA_THRESHOLD) {
-					indices |= (3 << bit_pos);
+					indices |= ((uint32_t)3 << bit_pos);
 					continue;
 				}
 
@@ -511,7 +511,7 @@ static void _encode_bc1_block(const uint8_t* rgba, int32_t stride, uint8_t* out)
 				// Determine index: 0 if proj_4 < thresh_1, 2 if < thresh_3, else 1
 				int32_t idx = (proj_4 >= thresh_1) + (proj_4 >= thresh_3);
 
-				indices |= (_idx_map_3color[idx] << bit_pos);
+				indices |= ((uint32_t)_idx_map_3color[idx] << bit_pos);
 			}
 		}
 	} else {
@@ -535,7 +535,7 @@ static void _encode_bc1_block(const uint8_t* rgba, int32_t stride, uint8_t* out)
 				// Determine index
 				int32_t idx = (proj_6 >= thresh_1) + (proj_6 >= thresh_3) + (proj_6 >= thresh_5);
 
-				indices |= (_idx_map_4color[idx] << ((y * 4 + x) * 2));
+				indices |= ((uint32_t)_idx_map_4color[idx] << ((y * 4 + x) * 2));
 			}
 		}
 	}

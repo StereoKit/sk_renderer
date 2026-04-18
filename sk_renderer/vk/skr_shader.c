@@ -49,17 +49,13 @@ static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const s
 // Shader creation
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_shader_t _skr_shader_create_manual(sksc_shader_meta_t* meta, skr_shader_stage_t v_shader,
+skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, skr_shader_stage_t v_shader,
                                        skr_shader_stage_t p_shader, skr_shader_stage_t c_shader) {
 	skr_shader_t shader  = {0};
-	shader.meta          = meta;
+	if (meta) shader.meta = *meta;
 	shader.vertex_stage  = v_shader;
 	shader.pixel_stage   = p_shader;
 	shader.compute_stage = c_shader;
-
-	if (meta) {
-		sksc_shader_meta_reference(meta);
-	}
 
 	return shader;
 }
@@ -96,14 +92,13 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 	skr_shader_stage_t p_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_pixel);
 	skr_shader_stage_t c_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_compute);
 
-	*out_shader = _skr_shader_create_manual(file.meta, v_stage, p_stage, c_stage);
+	// Move meta ownership to the shader, zero file.meta so
+	// sksc_shader_file_destroy doesn't double-free.
+	sksc_shader_meta_t meta = file.meta;
+	file.meta = (sksc_shader_meta_t){0};
+	sksc_shader_file_destroy(&file);
 
-	// Don't destroy meta here, it's now owned by the shader
-	// Just clean up the file structure
-	for (uint32_t i = 0; i < file.stage_count; i++) {
-		_skr_free(file.stages[i].code);
-	}
-	_skr_free(file.stages);
+	*out_shader = _skr_shader_create_manual(&meta, v_stage, p_stage, c_stage);
 
 	return skr_err_success;
 }
@@ -111,7 +106,6 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 bool skr_shader_is_valid(const skr_shader_t* shader) {
 	if (!shader) return false;
 	return
-		shader->meta                 == NULL           ||
 		shader->vertex_stage.shader  != VK_NULL_HANDLE ||
 		shader->pixel_stage.shader   != VK_NULL_HANDLE ||
 		shader->compute_stage.shader != VK_NULL_HANDLE;
@@ -124,31 +118,27 @@ void skr_shader_destroy(skr_shader_t* ref_shader) {
 	_skr_shader_stage_destroy(&ref_shader->pixel_stage);
 	_skr_shader_stage_destroy(&ref_shader->compute_stage);
 
-	if (ref_shader->meta) {
-		sksc_shader_meta_release(ref_shader->meta);
-		ref_shader->meta = NULL;
-	}
-
+	sksc_shader_meta_free(&ref_shader->meta);
 	*ref_shader = (skr_shader_t){0};
 }
 
 skr_bind_t skr_shader_get_bind(const skr_shader_t* shader, const char* bind_name) {
-	if (!shader || !shader->meta) {
+	if (!shader) {
 		skr_bind_t empty = {0};
 		return empty;
 	}
 
-	return sksc_shader_meta_get_bind(shader->meta, bind_name);
+	return sksc_shader_meta_get_bind(&shader->meta, bind_name);
 }
 
 bool skr_shader_get_param_info(const skr_shader_t* shader, const char* param_name, skr_shader_param_info_t* opt_out_info) {
-	if (!shader || !shader->meta) return false;
+	if (!shader) return false;
 
-	int32_t idx = sksc_shader_meta_get_var_index(shader->meta, param_name);
+	int32_t idx = sksc_shader_meta_get_var_index(&shader->meta, param_name);
 	if (idx < 0) return false;
 
 	if (opt_out_info) {
-		const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(shader->meta, idx);
+		const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&shader->meta, idx);
 		*opt_out_info = (skr_shader_param_info_t){
 			.type  = var->type,
 			.count = var->type_count,
@@ -159,14 +149,14 @@ bool skr_shader_get_param_info(const skr_shader_t* shader, const char* param_nam
 }
 
 bool skr_shader_get_tex_info(const skr_shader_t* shader, const char* tex_name, skr_shader_tex_info_t* opt_out_info) {
-	if (!shader || !shader->meta) return false;
+	if (!shader) return false;
 
 	uint64_t hash = skr_hash(tex_name);
-	for (uint32_t i = 0; i < shader->meta->resource_count; i++) {
-		if (shader->meta->resources[i].name_hash == hash) {
+	for (uint32_t i = 0; i < shader->meta.resource_count; i++) {
+		if (shader->meta.resources[i].name_hash == hash) {
 			if (opt_out_info) {
 				*opt_out_info = (skr_shader_tex_info_t){
-					.default_value = shader->meta->resources[i].value,
+					.default_value = shader->meta.resources[i].value,
 				};
 			}
 			return true;
