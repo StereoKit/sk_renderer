@@ -9,6 +9,7 @@
 #include "skr_vulkan.h"
 #include "skr_conversions.h"
 #include "skr_pipeline.h"
+#include "skr_scratch.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1015,21 +1016,11 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	}
 
-	// For mipmap generation
+	// For mipmap generation. Blit-path mipping only needs TRANSFER_SRC/DST;
+	// render-path mipping routes through a scratch image (see skr_scratch.c)
+	// so that final textures keep their compressed layout intact.
 	if (out_tex->flags & skr_tex_flags_gen_mips) {
 		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-
-		// Check if format supports STORAGE_BIT (needed for compute-based mipmap filters)
-		VkFormatProperties format_props;
-		vkGetPhysicalDeviceFormatProperties(_skr_vk.physical_device, vk_format, &format_props);
-		if (format_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
-			usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-		}
-
-		// Add color attachment usage for render-based mipmap generation
-		if (!is_depth) {
-			usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-		}
 
 		// Auto-calculate mip count if not specified or is 1
 		if (out_tex->mip_levels == 1) {
@@ -1131,6 +1122,105 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 
 	// Store texture properties
 	out_tex->sampler = _skr_sampler_cache_acquire(sampler);
+
+	return skr_err_success;
+}
+
+// Create a scratch skr_tex_t for render-based mipmap generation. Final textures
+// avoid COLOR_ATTACHMENT/STORAGE usage to preserve compression, so the render
+// mipgen path allocates one of these, filters into it, and copies back.
+//
+// Scratch skips the template's mip 0 entirely — the mipgen loop samples the
+// source's mip 0 directly on its first iteration, so scratch only needs to
+// hold mips 1..N-1 (about 25% of the full chain's memory). Scratch "mip 0"
+// therefore corresponds to the template's mip 1, scratch "mip k" corresponds
+// to template's mip k+1. Indexing shifts are handled by the caller.
+skr_err_ _skr_tex_create_scratch(const skr_tex_t* template_src, skr_tex_t* out_tex) {
+	*out_tex = (skr_tex_t){0};
+
+	if (template_src->mip_levels < 2) return skr_err_invalid_parameter;
+
+	VkFormat    vk_format    = skr_tex_fmt_to_native(template_src->format);
+	skr_vec3i_t scratch_size = skr_tex_calc_mip_dimensions(template_src->size, 1);
+
+	out_tex->size        = scratch_size;
+	out_tex->format      = template_src->format;
+	out_tex->mip_levels  = template_src->mip_levels - 1;
+	out_tex->layer_count = template_src->layer_count;
+	out_tex->samples     = VK_SAMPLE_COUNT_1_BIT;
+	out_tex->aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
+	out_tex->flags       = template_src->flags & (skr_tex_flags_cubemap | skr_tex_flags_array);
+
+	const VkImageUsageFlags usage =
+		VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+		VK_IMAGE_USAGE_TRANSFER_SRC_BIT     |
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT     |
+		VK_IMAGE_USAGE_SAMPLED_BIT;
+
+	VkImageCreateInfo image_info = {
+		.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType     = VK_IMAGE_TYPE_2D,
+		.format        = vk_format,
+		.extent        = { .width = out_tex->size.x, .height = out_tex->size.y, .depth = 1 },
+		.mipLevels     = out_tex->mip_levels,
+		.arrayLayers   = out_tex->layer_count,
+		.samples       = VK_SAMPLE_COUNT_1_BIT,
+		.tiling        = VK_IMAGE_TILING_OPTIMAL,
+		.usage         = usage,
+		.sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.flags         = (out_tex->flags & skr_tex_flags_cubemap) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+	};
+
+	VkResult vr = vkCreateImage(_skr_vk.device, &image_info, NULL, &out_tex->image);
+	if (vr != VK_SUCCESS) {
+		skr_log(skr_log_critical, "vkCreateImage (scratch) failed: 0x%X", (uint32_t)vr);
+		*out_tex = (skr_tex_t){0};
+		return skr_err_device_error;
+	}
+
+	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
+		skr_log(skr_log_critical, "Failed to allocate scratch texture memory");
+		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
+		*out_tex = (skr_tex_t){0};
+		return skr_err_out_of_memory;
+	}
+
+	vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, 0);
+
+	out_tex->current_layout       = VK_IMAGE_LAYOUT_UNDEFINED;
+	out_tex->current_queue_family = _skr_vk.graphics_queue_family;
+	out_tex->first_use            = true;
+
+	VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
+	if      (out_tex->flags & skr_tex_flags_cubemap) view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+	else if (out_tex->flags & skr_tex_flags_array  ) view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+
+	VkImageViewCreateInfo view_info = {
+		.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image    = out_tex->image,
+		.viewType = view_type,
+		.format   = vk_format,
+		.subresourceRange = {
+			.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel   = 0,
+			.levelCount     = out_tex->mip_levels,
+			.baseArrayLayer = 0,
+			.layerCount     = out_tex->layer_count,
+		},
+	};
+
+	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
+	if (vr != VK_SUCCESS) {
+		skr_log(skr_log_critical, "vkCreateImageView (scratch) failed: 0x%X", (uint32_t)vr);
+		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
+		*out_tex = (skr_tex_t){0};
+		return skr_err_device_error;
+	}
+
+	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_IMAGE,      (uint64_t)out_tex->image, "mipgen_scratch");
+	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)out_tex->view,  "mipgen_scratch_view");
 
 	return skr_err_success;
 }
@@ -1419,6 +1509,21 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		return;
 	}
 
+	// Acquire a scratch texture matching ref_tex. Mips are filtered into scratch
+	// (which has COLOR_ATTACHMENT usage), then copied back to ref_tex. This keeps
+	// ref_tex free of COLOR_ATTACHMENT_BIT so the driver can keep it compressed.
+	skr_tex_t* scratch = _skr_scratch_acquire(ref_tex);
+	if (scratch == NULL) {
+		skr_log(skr_log_warning, "Failed to acquire scratch texture for mipmap generation");
+		_skr_cmd_release(ctx.cmd);
+		_skr_pipeline_unlock();
+		skr_material_destroy(&material);
+		return;
+	}
+	// Scratch contents from any previous mipgen are discarded — treat as fresh.
+	scratch->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	scratch->first_use      = true;
+
 	// Determine view type for layer rendering
 	VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
 	if (ref_tex->flags & skr_tex_flags_cubemap) {
@@ -1431,6 +1536,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	VkPipeline pipeline = _skr_pipeline_get(material.pipeline_material_idx, renderpass_idx, vert_idx);
 	if (pipeline == VK_NULL_HANDLE) {
 		skr_log(skr_log_warning, "Failed to get pipeline for mipmap generation");
+		_skr_scratch_release(scratch);
 		_skr_cmd_release(ctx.cmd);
 		_skr_pipeline_unlock();
 		skr_material_destroy(&material);
@@ -1475,30 +1581,49 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_free(all_params);
 	}
 
-	// Ensure mip 0 data is visible — the upload may have been in a prior
-	// command buffer submission, and layout tracking alone doesn't guarantee
-	// cross-submission memory visibility.
-	_skr_tex_barrier(ctx.cmd, ref_tex,
-		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	// Ensure ref_tex mip 0 is in SHADER_READ_ONLY so the first iteration can
+	// sample it, and that cross-submission writes are visible. Only touch mip 0
+	// per-mip: other mips may be in inconsistent layouts (e.g. after skr_renderer_blit
+	// which only transitions mip 0 via its render pass). We overwrite them later
+	// using UNDEFINED as the source layout, so their actual state doesn't matter.
+	{
+		VkImageMemoryBarrier mip0_barrier = {
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask       = _layout_to_access_flags(ref_tex->current_layout),
+			.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout           = ref_tex->current_layout,
+			.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image               = ref_tex->image,
+			.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ref_tex->layer_count },
+		};
+		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &mip0_barrier);
+	}
 
-	// Generate each mip level by rendering from previous mip
+	// Generate each mip level. Iteration 1 samples ref_tex mip 0 (source data);
+	// later iterations sample the previous mip of scratch.
 	for (int32_t mip = 1; mip < mip_levels; mip++) {
 		skr_vec3i_t mip_dims   = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
 		uint32_t    mip_width  = mip_dims.x;
 		uint32_t    mip_height = mip_dims.y;
 
-		// Create source view for sampling the previous mip (always full layer count)
-		VkImageView src_view = VK_NULL_HANDLE;
+		// Source view for sampling the previous mip. Scratch skips ref_tex's mip 0,
+		// so its indexing is shifted by one: scratch mip 0 ≡ ref_tex mip 1.
+		//   mip == 1: sample ref_tex mip 0
+		//   mip >= 2: sample scratch mip (mip - 2)
+		VkImage     src_image    = (mip == 1) ? ref_tex->image : scratch->image;
+		uint32_t    src_mip_base = (mip == 1) ? 0 : (uint32_t)(mip - 2);
+		VkImageView src_view     = VK_NULL_HANDLE;
 		{
 			VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
 				.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-				.image      = ref_tex->image,
+				.image      = src_image,
 				.viewType   = view_type,
 				.format     = format,
 				.subresourceRange = {
 					.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-					.baseMipLevel   = mip - 1,
+					.baseMipLevel   = src_mip_base,
 					.levelCount     = 1,
 					.baseArrayLayer = 0,
 					.layerCount     = ref_tex->layer_count,
@@ -1576,20 +1701,21 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			VkImageView mip_view = VK_NULL_HANDLE;
 			{
 				// For framebuffer attachments, use 2D_ARRAY even for cubemaps
-				VkImageViewType fb_view_type = (ref_tex->layer_count > 1)
+				VkImageViewType fb_view_type = (scratch->layer_count > 1)
 					? VK_IMAGE_VIEW_TYPE_2D_ARRAY
 					: VK_IMAGE_VIEW_TYPE_2D;
+				// Framebuffer targets scratch — mip index shifted by 1 (scratch has no mip 0)
 				VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
 					.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-					.image      = ref_tex->image,
+					.image      = scratch->image,
 					.viewType   = fb_view_type,
 					.format     = format,
 					.subresourceRange = {
 						.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-						.baseMipLevel   = mip,
+						.baseMipLevel   = (uint32_t)(mip - 1),
 						.levelCount     = 1,
 						.baseArrayLayer = 0,
-						.layerCount     = ref_tex->layer_count,
+						.layerCount     = scratch->layer_count,
 					},
 				}, NULL, &mip_view);
 				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip target)"); continue; }
@@ -1633,7 +1759,8 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			vkCmdEndRenderPass(ctx.cmd);
 		}
 
-		// Transition current mip to shader read for next iteration
+		// Transition just-written scratch mip (shifted index) to SHADER_READ so
+		// the next iteration can sample it.
 		VkImageMemoryBarrier barrier = {
 			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1642,19 +1769,92 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image               = ref_tex->image,
+			.image               = scratch->image,
 			.subresourceRange    = {
 				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel   = mip,
+				.baseMipLevel   = (uint32_t)(mip - 1),
 				.levelCount     = 1,
 				.baseArrayLayer = 0,
-				.layerCount     = ref_tex->layer_count,
+				.layerCount     = scratch->layer_count,
 			},
 		};
 		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
 	}
 
-	_skr_cmd_release(ctx.cmd);
+	// Copy scratch → ref_tex mips 1..N-1. Mip 0 of ref_tex was not touched during
+	// the loop and retains its source contents. Scratch's mips are shifted by 1
+	// (scratch mip k ↔ ref_tex mip k+1).
+	if (mip_levels > 1) {
+		// Batch both layout transitions into one vkCmdPipelineBarrier:
+		//   scratch mips 0..N-2 (all of scratch): SHADER_READ → TRANSFER_SRC
+		//   ref_tex mips 1..N-1:                   UNDEFINED  → TRANSFER_DST (discard; overwriting)
+		// UNDEFINED as old layout lets us ignore any inconsistency from upstream
+		// render-pass transitions that touched only mip 0 (e.g. skr_renderer_blit).
+		VkImageMemoryBarrier barriers[2] = {
+			{
+				.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				.srcAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+				.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+				.oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.image               = scratch->image,
+				.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, scratch->mip_levels, 0, scratch->layer_count },
+			},
+			{
+				.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				.srcAccessMask       = 0,
+				.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+				.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+				.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.image               = ref_tex->image,
+				.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 1, (uint32_t)(mip_levels - 1), 0, ref_tex->layer_count },
+			},
+		};
+		vkCmdPipelineBarrier(ctx.cmd,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, NULL, 0, NULL, 2, barriers);
+
+		// Build one copy region per mip. Scratch mipLevel k ↔ ref_tex mipLevel k+1.
+		VkImageCopy regions[18];
+		int32_t     region_count = 0;
+		for (int32_t mip = 1; mip < mip_levels && region_count < (int32_t)(sizeof(regions)/sizeof(regions[0])); mip++) {
+			skr_vec3i_t dims = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
+			regions[region_count++] = (VkImageCopy){
+				.srcSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = (uint32_t)(mip - 1), .baseArrayLayer = 0, .layerCount = ref_tex->layer_count },
+				.dstSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = (uint32_t)mip,       .baseArrayLayer = 0, .layerCount = ref_tex->layer_count },
+				.extent         = { .width = (uint32_t)dims.x, .height = (uint32_t)dims.y, .depth = 1 },
+			};
+		}
+		vkCmdCopyImage(ctx.cmd,
+			scratch->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			ref_tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			region_count, regions);
+
+		// Final: ref_tex mips 1..N-1 → SHADER_READ_ONLY. Mip 0 is already there.
+		VkImageMemoryBarrier final_barrier = {
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image               = ref_tex->image,
+			.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 1, (uint32_t)(mip_levels - 1), 0, ref_tex->layer_count },
+		};
+		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &final_barrier);
+	}
+
+	// Tracked layout now reflects the whole image in SHADER_READ_ONLY_OPTIMAL.
+	_skr_tex_transition_notify_layout(ref_tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+	_skr_scratch_release(scratch);
+	_skr_cmd_release    (ctx.cmd);
 	_skr_pipeline_unlock();
 
 	// Destroy after unlocking - skr_material_destroy internally locks the pipeline mutex

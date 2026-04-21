@@ -10,6 +10,7 @@
 #include "_sk_renderer.h"
 #include "skr_pipeline.h"
 #include "skr_conversions.h"
+#include "skr_scratch.h"
 
 #include <stdio.h>
 #include <assert.h>
@@ -246,6 +247,8 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 		// CPU timestamps are always valid once we have enough frames
 		_skr_vk.cpu_timestamps_valid[prev_flight] = true;
 	}
+
+	_skr_scratch_pool_tick();  // Evict scratch mipgen textures idle for N frames
 
 	_skr_vk.in_frame = false;
 	_skr_vk.frame++;
