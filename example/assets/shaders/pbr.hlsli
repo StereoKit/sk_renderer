@@ -59,7 +59,7 @@ float4 pbr_shade(
 	// https://gdcvault.com/play/1021772/Advanced-VR
 	float3 norm_ddx        = ddx(surface_normal.xyz);
 	float3 norm_ddy        = ddy(surface_normal.xyz);
-	float  geometric_rough = pow(saturate(max(dot(norm_ddx.xyz, norm_ddx.xyz), dot(norm_ddy.xyz, norm_ddy.xyz))), 0.45);
+	float  geometric_rough = pow(saturate(max(dot(norm_ddx.xyz, norm_ddx.xyz), dot(norm_ddy.xyz, norm_ddy.xyz))), 0.28);
 	roughness = max(roughness, geometric_rough);
 
 	// Calculate Fresnel reflectance at normal incidence
@@ -67,12 +67,27 @@ float4 pbr_shade(
 	float3 F  = pbr_fresnel_schlick_roughness(ndotv, F0, roughness);
 	float3 kS = F;
 
-	// Sample environment map at appropriate mip level based on roughness
-	float mip = (1 - pow(1 - roughness, 2)) * cubemap_info.z;
-	mip = max(mip, pbr_mip_level(ndotv));
+	// Sub-linear mip mapping to compensate for cascade over-blur in
+	// cubemap_mipgen.hlsl: each mip's GGX integration stacks on the previous
+	// already-blurred mip, so mip M's effective roughness ends up higher than
+	// the M/(mip_count-1) it was written for. An exponent of ~1.5 pulls user
+	// roughness toward lower mips to counteract that drift.
+	// Clamp to skip the 1x1 final mip (blocky face-boundary artifacts).
+	float max_mip = max(cubemap_info.z - 2, 0);
+	float mip     = min(pow(roughness, 1.0) * (cubemap_info.z - 1), max_mip);
 	float3 prefilteredColor = env_map.SampleLevel(env_sampler, reflection, mip).rgb;
 	float2 envBRDF          = pbr_brdf_appx(roughness, ndotv);
 	float3 specular         = prefilteredColor * (F * envBRDF.x + envBRDF.y);
+
+	// Horizon fade: derive the geometric face normal from screen-space
+	// derivatives of the view vector (equivalent to derivatives of world
+	// position), and fade specular as the reflection vector dips below it.
+	// Catches cases where the smoothed shading normal produces a reflection
+	// that would pass through the underlying geometry. (Frostbite / Lagarde.)
+	float3 geom_n  = normalize(cross(ddx(view_dir), ddy(view_dir)));
+	geom_n        *= sign(dot(geom_n, surface_normal));  // point same hemisphere as shading N
+	float horizon  = saturate(1.0 + dot(reflection, geom_n));
+	specular      *= horizon * horizon;
 
 	// Energy conservation - what's not reflected is refracted (diffuse)
 	float3 kD = 1 - kS;

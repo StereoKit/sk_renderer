@@ -1215,8 +1215,17 @@ static void _su_gltf_load_sync(su_gltf_t* gltf) {
 				int32_t        width  = 0, height = 0;
 
 				if (_su_gltf_load_texture_data(data, &options, base_path, tex_idx, &pixels, &width, &height)) {
+					// glTF 2.0: baseColor and emissive are sRGB color; metallic-
+					// roughness, normal, and occlusion are LINEAR numeric data.
+					// Tagging the latter as sRGB makes the hardware decode apply
+					// a gamma curve to them, pushing values toward 0 and making
+					// materials look much shinier / darker than authored.
+					skr_tex_fmt_ tex_fmt = (tex_type == _su_gltf_tex_albedo ||
+					                        tex_type == _su_gltf_tex_emissive)
+						? skr_tex_fmt_rgba32_srgb
+						: skr_tex_fmt_rgba32_linear;
 					skr_tex_create(
-						skr_tex_fmt_rgba32_srgb,
+						tex_fmt,
 						skr_tex_flags_readable | skr_tex_flags_gen_mips,
 						su_sampler_linear_wrap,
 						(skr_vec3i_t){width, height, 1},

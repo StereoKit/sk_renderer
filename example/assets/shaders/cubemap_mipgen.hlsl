@@ -1,6 +1,8 @@
 //--name = cubemap_mipgen
-// High-quality cubemap mipmap generation for IBL
-// Uses wider kernel sampling to create proper roughness blur
+// GGX specular prefilter for IBL (Karis 2013, split-sum approximation).
+// Cascade topology: each destination mip importance-samples the previous mip.
+
+static const float PI = 3.14159265359;
 
 uint2 src_size;      // Source mip dimensions
 uint2 dst_size;      // Destination mip dimensions
@@ -52,67 +54,71 @@ psIn vs(uint id : SV_VertexID) {
 	return output;
 }
 
-// High-quality filter with multiple samples
-// The number of samples increases with mip level for better quality
+// Low-discrepancy Hammersley sequence for importance sampling.
+// See http://holger.dammertz.org/stuff/notes_HammersleyOnHemisphere.html
+float radical_inverse_vdc(uint bits) {
+	bits = (bits << 16u) | (bits >> 16u);
+	bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+	bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+	bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+	bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+	return float(bits) * 2.3283064365386963e-10;
+}
+float2 hammersley(uint i, uint n) {
+	return float2(float(i) / float(n), radical_inverse_vdc(i));
+}
+
+// Sample a half-vector from the GGX distribution around normal N.
+// Karis 2013, "Real Shading in Unreal Engine 4".
+float3 importance_sample_ggx(float2 xi, float3 n, float roughness) {
+	float  a        = roughness * roughness;
+	float  phi      = 2.0 * PI * xi.x;
+	float  cos_t    = sqrt((1.0 - xi.y) / (1.0 + (a*a - 1.0) * xi.y));
+	float  sin_t    = sqrt(1.0 - cos_t * cos_t);
+	float3 h_local  = float3(cos(phi) * sin_t, sin(phi) * sin_t, cos_t);
+
+	// Build orthonormal basis around N.
+	float3 up       = abs(n.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+	float3 tangent  = normalize(cross(up, n));
+	float3 bitang   = cross(n, tangent);
+	return normalize(tangent * h_local.x + bitang * h_local.y + n * h_local.z);
+}
+
+// GGX importance-sampled prefilter with Karis's split-sum assumption (V = R = N).
+// Mip 1 uses a single hardware-bilinear tap — GGX at roughness < ~0.15 is too
+// sharp to benefit from stochastic sampling (the lobe barely covers one texel).
 float4 ps(psIn input, uint face : SV_ViewID) : SV_Target {
-	// Get the main direction for this pixel
-	float3 main_dir = uv_to_direction(input.uv, face);
+	float3 n = uv_to_direction(input.uv, face);
 
-	// Calculate roughness based on destination mip level
-	// We're generating mip (src_mip_level + 1), so higher src means more blur needed
-	float roughness = float(src_mip_level + 1) / (mip_max-1);
-
-	// Sample count increases with each mip level for better quality blur
-	// Start with more samples to avoid aliasing artifacts
-	// Mip 1: 16 samples, Mip 2: 20 samples, Mip 3: 24 samples, etc.
-	int sample_count = 16 + src_mip_level * 4;
-	sample_count = min(sample_count, 64); // Cap at 64 samples
-
-	float4 color_sum = float4(0, 0, 0, 0);
-	float total_weight = 0.0;
-
-	// Create orthogonal basis around the main direction
-	float3 up_vec = abs(main_dir.y) < 0.999 ? float3(0, 1, 0) : float3(1, 0, 0);
-	float3 tangent = normalize(cross(up_vec, main_dir));
-	float3 bitangent = cross(main_dir, tangent);
-
-	// Sample in a cone around the main direction
-	// Use a simple spiral pattern for better distribution
-	const float PI = 3.14159265359;
-	const float GOLDEN_ANGLE = PI * 0.7639320225; // Golden angle in radians
-
-	float blur_radius = roughness * 0.5; // How wide the cone is
-
-	for (int i = 0; i < sample_count; i++) {
-		// Spiral pattern using golden angle
-		float angle  = float(i) * GOLDEN_ANGLE;
-		float radius = (float(i) / float(sample_count)) * blur_radius;
-
-		// Convert to 2D offset
-		float2 offset = float2(cos(angle), sin(angle)) * radius;
-
-		// Apply to tangent space to get sample direction
-		float3 sample_dir = normalize(
-			main_dir +
-			tangent * offset.x +
-			bitangent * offset.y
-		);
-
-		// Sample the cubemap
-		float4 sample_color = src_tex.SampleLevel(src_sampler, sample_dir, src_mip_level);
-
-		// Weight samples based on distance from center (Gaussian-like)
-		float dist = length(offset);
-		float weight = exp(-dist * dist * 2.0);
-
-		color_sum += sample_color * weight;
-		total_weight += weight;
+	// Mip 1 bypass: direct linear sample, ~16x cheaper than GGX integration.
+	if (src_mip_level == 0) {
+		return float4(src_tex.SampleLevel(src_sampler, n, 0).rgb, 1);
 	}
 
-	// Normalize
-	if (total_weight > 0.0001) {
-		color_sum /= total_weight;
+	// Destination mip's roughness. We're writing mip (src_mip_level + 1).
+	float roughness = float(src_mip_level + 1) / float(mip_max - 1);
+
+	// Sample count scales with output mip. Cascade topology doesn't let us use
+	// filtered importance sampling (LOD bias), so we compensate with brute
+	// force — variance drops as sqrt(N). Ramps from 64 → 256 top-to-bottom.
+	uint sample_count = min(32u + src_mip_level * 32u, 256u);
+
+	float3 v            = n;
+	float3 color        = 0;
+	float  total_weight = 0;
+	for (uint i = 0; i < sample_count; i++) {
+		float2 xi  = hammersley(i, sample_count);
+		float3 h   = importance_sample_ggx(xi, n, roughness);
+		float3 l   = normalize(2.0 * dot(v, h) * h - v);
+		float  ndl = saturate(dot(n, l));
+		if (ndl > 0) {
+			// Firefly clamp: prevents bright HDRI pixels (sun, specular
+			// highlights) from dominating low-probability GGX samples.
+			float3 s      = min(src_tex.SampleLevel(src_sampler, l, src_mip_level).rgb, 10.0);
+			color        += s * ndl;
+			total_weight += ndl;
+		}
 	}
 
-	return color_sum;
+	return float4(color / max(total_weight, 1e-4), 1);
 }

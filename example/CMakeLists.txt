@@ -160,6 +160,7 @@ target_sources(sk_renderer_test PRIVATE
 	scene_stars.c
 	scene_yuv_test.c
 	scene_gi.c
+	scene_pbr.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c
