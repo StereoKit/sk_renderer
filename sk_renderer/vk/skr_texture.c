@@ -1996,6 +1996,11 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_astc6x6_rgba_srgb:
 			block_w = 6; block_h = 6; block_bytes = 16; break;
 
+		// ASTC 8x8 (16 bytes per block; same VK format as LDR 8x8 — HDR
+		// signalled per-block via CEM, not by Vulkan format).
+		case skr_tex_fmt_astc8x8_rgba_hdr:
+			block_w = 8; block_h = 8; block_bytes = 16; break;
+
 		// Uncompressed formats (1x1 "blocks")
 		default:
 			block_bytes = _skr_tex_fmt_to_size(format);

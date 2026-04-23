@@ -63,6 +63,9 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_astc4x4_rgba:       return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 		case skr_tex_fmt_astc6x6_rgba_srgb:  return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
 		case skr_tex_fmt_astc6x6_rgba:       return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+		// HDR rides on the regular UNORM 8x8 format — the decoder picks
+		// LDR vs HDR per-block from the encoded CEM.
+		case skr_tex_fmt_astc8x8_rgba_hdr:   return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
 		case skr_tex_fmt_atc_rgb:            return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		case skr_tex_fmt_atc_rgba:           return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		// YUV / multi-plane formats

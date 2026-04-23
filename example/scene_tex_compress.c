@@ -27,16 +27,17 @@ typedef enum {
 	compress_fmt_etc2,
 	compress_fmt_astc4x4,
 	compress_fmt_astc6x6,
+	compress_fmt_astc8x8hdr,
 } compress_fmt_;
 
 typedef struct {
 	scene_t        base;
 	skr_mesh_t     quad_mesh;
 	skr_shader_t   shader;
-	skr_material_t material_original;
-	skr_material_t material_compressed;
+	skr_material_t material_compare;     // single quad, swipe between left/right textures
 	skr_tex_t      texture_original;
 	skr_tex_t      texture_compressed;
+	float          swipe;                // 0..1, fraction of quad showing original
 	float          time;
 
 	// Image info
@@ -52,6 +53,7 @@ typedef struct {
 	bool           etc2_supported;
 	bool           astc6x6_supported;       // Texture sampling supported (drives display)
 	bool           astc6x6_validate_only;   // Compute works but display format unsupported (AMD desktop)
+	bool           astc8x8hdr_supported;    // ASTC 8x8 HDR sampling — Adreno/Mali yes, AMD desktop no
 
 	// GPU compression
 	bool           use_gpu;
@@ -75,10 +77,11 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	if (skr_tex_is_valid(&scene->texture_compressed))  { skr_tex_destroy(&scene->texture_compressed);  scene->texture_compressed  = (skr_tex_t){0}; }
 	if (skr_tex_is_valid(&scene->texture_source))      { skr_tex_destroy(&scene->texture_source);      scene->texture_source      = (skr_tex_t){0}; }
 
-	// Load source image
+	// Load source image. su_image_load detects .hdr (Radiance) and decodes
+	// to skr_tex_fmt_rg11b10; everything else comes back as RGBA8 sRGB.
 	int32_t      width, height;
-	skr_tex_fmt_ format;
-	void*        pixels = su_image_load(path, &width, &height, &format, 4);
+	skr_tex_fmt_ src_fmt = skr_tex_fmt_none;
+	void*        pixels  = su_image_load(path, &width, &height, &src_fmt, 4);
 
 	if (!pixels) {
 		su_log(su_log_warning, "TexCompress: Failed to load image: %s", path);
@@ -90,14 +93,28 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	scene->img_width  = width;
 	scene->img_height = height;
 
-	// Create original texture for display
-	skr_tex_create(skr_tex_fmt_rgba32_srgb,
+	bool is_hdr = (src_fmt == skr_tex_fmt_rg11b10);
+
+	// Create original texture for display. HDR shows up tone-mapped via the
+	// shader; for now we just bind it raw and let the unlit shader sample it.
+	skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10 : skr_tex_fmt_rgba32_srgb,
 		skr_tex_flags_readable,
 		su_sampler_linear_clamp,
 		(skr_vec3i_t){width, height, 1}, 1, 0,
 		&(skr_tex_data_t){.data = pixels, .mip_count = 1, .layer_count = 1},
 		&scene->texture_original);
 	skr_tex_set_name(&scene->texture_original, "original");
+
+	// Auto-switch format when image type changes — HDR file forces ASTC 8x8
+	// HDR (only HDR encoder we have); non-HDR file falls back from HDR-only
+	// selection to a sensible LDR default.
+	if (is_hdr && scene->current_format != compress_fmt_astc8x8hdr) {
+		scene->current_format = compress_fmt_astc8x8hdr;
+	} else if (!is_hdr && scene->current_format == compress_fmt_astc8x8hdr) {
+		scene->current_format = scene->bc1_supported     ? compress_fmt_bc1     :
+		                        scene->etc2_supported    ? compress_fmt_etc2    :
+		                        scene->astc6x6_supported ? compress_fmt_astc6x6 : compress_fmt_none;
+	}
 
 	// Use the format selected in UI (current_format is set by the radio buttons)
 	skr_tex_fmt_ tex_fmt  = skr_tex_fmt_none;
@@ -115,6 +132,9 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	} else if (scene->current_format == compress_fmt_astc6x6 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
 		tex_fmt  = skr_tex_fmt_astc6x6_rgba_srgb;
 		fmt_name = "ASTC6x6";
+	} else if (scene->current_format == compress_fmt_astc8x8hdr) {
+		tex_fmt  = skr_tex_fmt_astc8x8_rgba_hdr;
+		fmt_name = "ASTC8x8 HDR";
 	} else {
 		scene->compressed_size = 0;
 		su_log(su_log_warning, "TexCompress: Selected format not supported!");
@@ -123,8 +143,11 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	}
 
 	if (scene->use_gpu) {
-		// GPU path: create source texture with mips, compress on GPU
-		skr_tex_create(skr_tex_fmt_rgba32_linear,
+		// GPU path: create source texture with mips, compress on GPU. HDR
+		// source uses rg11b10 (the format su_image_load decodes Radiance
+		// .hdr into); LDR source uses rgba32_linear so mip filtering stays
+		// in linear space rather than sRGB.
+		skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10 : skr_tex_fmt_rgba32_linear,
 			skr_tex_flags_readable | skr_tex_flags_gen_mips,
 			su_sampler_linear_clamp,
 			(skr_vec3i_t){width, height, 1}, 1, 0,
@@ -148,17 +171,22 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 				if (scene->astc6x6_supported)
 					scene->texture_compressed = tex_compress_gpu_astc6x6(&scene->texture_source);
 				break;
+			case compress_fmt_astc8x8hdr:
+				if (scene->astc8x8hdr_supported)
+					scene->texture_compressed = tex_compress_gpu_astc8x8hdr(&scene->texture_source);
+				break;
 			default: break;
 		}
 		uint64_t end_ns = ska_time_get_elapsed_ns();
 
 		scene->gpu_compress_time_ms = (end_ns - start_ns) / 1000000.0;
 		switch (scene->current_format) {
-			case compress_fmt_bc1:     scene->compressed_size = bc1_calc_size      (width, height); break;
-			case compress_fmt_etc2:    scene->compressed_size = etc2_rgb8_calc_size(width, height); break;
-			case compress_fmt_astc4x4: scene->compressed_size = astc4x4_calc_size  (width, height); break;
-			case compress_fmt_astc6x6: scene->compressed_size = astc6x6_calc_size  (width, height); break;
-			default:                   scene->compressed_size = 0; break;
+			case compress_fmt_bc1:        scene->compressed_size = bc1_calc_size      (width, height); break;
+			case compress_fmt_etc2:       scene->compressed_size = etc2_rgb8_calc_size(width, height); break;
+			case compress_fmt_astc4x4:    scene->compressed_size = astc4x4_calc_size  (width, height); break;
+			case compress_fmt_astc6x6:    scene->compressed_size = astc6x6_calc_size  (width, height); break;
+			case compress_fmt_astc8x8hdr: scene->compressed_size = astc8x8_calc_size  (width, height); break;
+			default:                      scene->compressed_size = 0; break;
 		}
 
 		su_log(su_log_info, "GPU %s: Compression took %.3f ms (%.1f MP/s)",
@@ -184,6 +212,10 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 				astc_data = tex_compress_gpu_astc6x6_readback(&scene->texture_source, &astc_size);
 				astc_block_w = 6; astc_block_h = 6;
 				break;
+			case compress_fmt_astc8x8hdr:
+				astc_data = tex_compress_gpu_astc8x8hdr_readback(&scene->texture_source, &astc_size);
+				astc_block_w = 8; astc_block_h = 8;
+				break;
 			default: break;
 		}
 		if (astc_data) {
@@ -194,7 +226,8 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 				su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
 			free(astc_data);
 		} else if (scene->current_format == compress_fmt_astc4x4 ||
-		           scene->current_format == compress_fmt_astc6x6) {
+		           scene->current_format == compress_fmt_astc6x6 ||
+		           scene->current_format == compress_fmt_astc8x8hdr) {
 			su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
 		}
 #endif
@@ -203,7 +236,8 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 		uint8_t* compressed_data = NULL;
 
 		if (scene->current_format == compress_fmt_astc4x4 ||
-		    scene->current_format == compress_fmt_astc6x6) {
+		    scene->current_format == compress_fmt_astc6x6 ||
+		    scene->current_format == compress_fmt_astc8x8hdr) {
 			// No CPU ASTC encoder yet — force GPU path and bail out of CPU flow.
 			su_log(su_log_warning, "TexCompress: ASTC has no CPU encoder, switching to GPU path");
 			scene->use_gpu = true;
@@ -237,13 +271,12 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 		free(compressed_data);
 	}
 
-	// Update materials. If the compressed texture couldn't be created (AMD
-	// ASTC validate-only path), bind the original to both sides so the scene
-	// still renders — the user gets clean visual feedback that no GPU preview
-	// is available, while the .astc file has already been saved for offline
-	// validation.
-	skr_material_set_tex(&scene->material_original, "tex", &scene->texture_original);
-	skr_material_set_tex(&scene->material_compressed, "tex",
+	// Update compare material: tex_left = original, tex_right = compressed.
+	// If the compressed texture couldn't be created (AMD ASTC validate-only
+	// path), bind original to both — swipe still works, both halves just
+	// show the same content.
+	skr_material_set_tex(&scene->material_compare, "tex_left",  &scene->texture_original);
+	skr_material_set_tex(&scene->material_compare, "tex_right",
 		skr_tex_is_valid(&scene->texture_compressed) ? &scene->texture_compressed : &scene->texture_original);
 
 	su_image_free(pixels);
@@ -267,24 +300,31 @@ static scene_t* _scene_bc1_create(void) {
 	scene->time         = 0.0f;
 	scene->cam_distance = 5.0f;
 	scene->use_gpu      = true;
+	scene->swipe        = 0.5f;
 
 	// Initialize GPU compression
 	tex_compress_gpu_init();
 
 	// Check format support
-	scene->bc1_supported     = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb,     skr_tex_flags_readable, 1);
-	scene->etc2_supported    = skr_tex_fmt_is_supported(skr_tex_fmt_etc1_rgb_srgb,     skr_tex_flags_readable, 1);
-	scene->astc6x6_supported = skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba_srgb, skr_tex_flags_readable, 1);
+	scene->bc1_supported        = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb,     skr_tex_flags_readable, 1);
+	scene->etc2_supported       = skr_tex_fmt_is_supported(skr_tex_fmt_etc1_rgb_srgb,     skr_tex_flags_readable, 1);
+	scene->astc6x6_supported    = skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba_srgb, skr_tex_flags_readable, 1);
+	// HDR ASTC reuses the LDR 8x8 Vulkan format (HDR signalled per-block via
+	// CEM). Sampling support is the LDR 8x8 sample feature plus the optional
+	// astcHdr device feature; here we just probe sampleability of the LDR
+	// format and accept that HDR blocks may decode to garbage on some HW.
+	scene->astc8x8hdr_supported = skr_tex_fmt_is_supported(skr_tex_fmt_astc8x8_rgba_hdr,  skr_tex_flags_readable, 1);
 	// Even without texture sampling we can still run the compute shader and
 	// read the blocks back into a .astc file for offline validation against
 	// astcenc — desktop AMD GPUs hit this path.
 	scene->astc6x6_validate_only = !scene->astc6x6_supported;
 
-	su_log(su_log_info, "TexCompress: BC1 %s, ETC2 %s, ASTC6x6 %s",
+	su_log(su_log_info, "TexCompress: BC1 %s, ETC2 %s, ASTC6x6 %s, ASTC8x8HDR %s",
 		scene->bc1_supported     ? "supported" : "not supported",
 		scene->etc2_supported    ? "supported" : "not supported",
 		scene->astc6x6_supported ? "supported" :
-		scene->astc6x6_validate_only ? "validate-only (no display)" : "not supported");
+		scene->astc6x6_validate_only ? "validate-only (no display)" : "not supported",
+		scene->astc8x8hdr_supported ? "supported" : "validate-only (no display)");
 
 	// Default format: prefer BC1, fallback to ETC2, then ASTC6x6
 	scene->current_format = scene->astc6x6_validate_only ? compress_fmt_astc6x6 : scene->bc1_supported     ? compress_fmt_bc1     :
@@ -293,30 +333,23 @@ static scene_t* _scene_bc1_create(void) {
 	                        compress_fmt_none;
 
 	// Default file path
-	strncpy(scene->file_path, "tree.png", sizeof(scene->file_path) - 1);
-	//strncpy(scene->file_path, "/home/koujaku/Dropbox/Photos/Wallpapers/zm4nfgq29yi91.jpg", sizeof(scene->file_path) - 1);
+	strncpy(scene->file_path, "monks_forest_4k.hdr", sizeof(scene->file_path) - 1);
+	//strncpy(scene->file_path, "tree.png", sizeof(scene->file_path) - 1);
 
 	// Create quad mesh for displaying textures (facing +Z)
 	scene->quad_mesh = su_mesh_create_quad(2.0f, 2.0f, (skr_vec3_t){0, 0, 1}, false, (skr_vec4_t){1, 1, 1, 1});
 	skr_mesh_set_name(&scene->quad_mesh, "tex_compress_quad");
 
-	// Load unlit shader
-	scene->shader = su_shader_load("shaders/unlit.hlsl.sks", "tex_compress_shader");
-
-	// Create materials (with alpha blending for transparency support)
-	skr_material_create((skr_material_info_t){
-		.shader      = &scene->shader,
-		.cull        = skr_cull_back,
-		.depth_test  = skr_compare_less,
-		.blend_state = skr_blend_alpha,
-	}, &scene->material_original);
+	// Compare shader does the swipe + line in one quad — replaces what was
+	// previously two unlit quads side-by-side.
+	scene->shader = su_shader_load("shaders/tex_compare.hlsl.sks", "tex_compare_shader");
 
 	skr_material_create((skr_material_info_t){
 		.shader      = &scene->shader,
 		.cull        = skr_cull_back,
 		.depth_test  = skr_compare_less,
 		.blend_state = skr_blend_alpha,
-	}, &scene->material_compressed);
+	}, &scene->material_compare);
 
 	// Load default image
 	_load_image(scene, scene->file_path);
@@ -328,8 +361,7 @@ static void _scene_bc1_destroy(scene_t* base) {
 	scene_bc1_t* scene = (scene_bc1_t*)base;
 
 	skr_mesh_destroy    (&scene->quad_mesh);
-	skr_material_destroy(&scene->material_original);
-	skr_material_destroy(&scene->material_compressed);
+	skr_material_destroy(&scene->material_compare);
 	skr_shader_destroy  (&scene->shader);
 	if (skr_tex_is_valid(&scene->texture_original))   skr_tex_destroy(&scene->texture_original);
 	if (skr_tex_is_valid(&scene->texture_compressed)) skr_tex_destroy(&scene->texture_compressed);
@@ -356,10 +388,11 @@ static void _scene_bc1_update(scene_t* base, float delta_time) {
 	// apples-to-apples shader cost comparison on the perf graph.
 	if (scene->use_gpu && skr_tex_is_valid(&scene->texture_source)) {
 		switch (scene->current_format) {
-			case compress_fmt_bc1:     tex_compress_gpu_bc1_profile    (&scene->texture_source, true); break;
-			case compress_fmt_etc2:    tex_compress_gpu_etc2_profile   (&scene->texture_source);       break;
-			case compress_fmt_astc4x4: tex_compress_gpu_astc4x4_profile(&scene->texture_source);       break;
-			case compress_fmt_astc6x6: tex_compress_gpu_astc6x6_profile(&scene->texture_source);       break;
+			case compress_fmt_bc1:        tex_compress_gpu_bc1_profile       (&scene->texture_source, true); break;
+			case compress_fmt_etc2:       tex_compress_gpu_etc2_profile      (&scene->texture_source);       break;
+			case compress_fmt_astc4x4:    tex_compress_gpu_astc4x4_profile   (&scene->texture_source);       break;
+			case compress_fmt_astc6x6:    tex_compress_gpu_astc6x6_profile   (&scene->texture_source);       break;
+			case compress_fmt_astc8x8hdr: tex_compress_gpu_astc8x8hdr_profile(&scene->texture_source);       break;
 			default: break;
 		}
 	}
@@ -375,25 +408,20 @@ static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
 
 	if (!skr_tex_is_valid(&scene->texture_original)) return;
 
-	// Calculate aspect ratio for proper quad sizing
-	float aspect = (float)scene->img_width / (float)scene->img_height;
+	// Push the swipe value to the shader each frame (cheap — material
+	// rebuilds the cbuffer only when params actually change).
+	skr_material_set_param(&scene->material_compare, "swipe", sksc_shader_var_float, 1, &scene->swipe);
+
+	// Single aspect-fitted quad showing the swipe-blended view.
+	float aspect      = (float)scene->img_width / (float)scene->img_height;
 	float quad_height = 2.0f;
 	float quad_width  = quad_height * aspect;
-
-	// Left quad: original texture at x=-1.5
-	float4x4 left_world = float4x4_trs(
-		(float3){-quad_width * 0.5f - 0.2f, 0.0f, 0.0f},
+	float4x4 world = float4x4_trs(
+		(float3){0.0f, 0.0f, 0.0f},
 		(float4){0, 0, 0, 1},
 		(float3){quad_width * 0.5f, quad_height * 0.5f, 1.0f});
 
-	// Right quad: compressed at x=+1.5
-	float4x4 right_world = float4x4_trs(
-		(float3){quad_width * 0.5f + 0.2f, 0.0f, 0.0f},
-		(float4){0, 0, 0, 1},
-		(float3){quad_width * 0.5f, quad_height * 0.5f, 1.0f});
-
-	skr_render_list_add(ref_render_list, &scene->quad_mesh, &scene->material_original,   &left_world,  sizeof(float4x4), 1);
-	skr_render_list_add(ref_render_list, &scene->quad_mesh, &scene->material_compressed, &right_world, sizeof(float4x4), 1);
+	skr_render_list_add(ref_render_list, &scene->quad_mesh, &scene->material_compare, &world, sizeof(float4x4), 1);
 }
 
 static bool _scene_bc1_get_camera(scene_t* base, scene_camera_t* out_camera) {
@@ -469,9 +497,13 @@ static void _scene_bc1_render_ui(scene_t* base) {
 			labels[count] = "ETC2 RGB8";                       values[count++] = compress_fmt_etc2;
 		}
 		if (scene->astc6x6_supported || scene->astc6x6_validate_only) {
-			labels[count] = "ASTC 4x4";  values[count++] = compress_fmt_astc4x4;
-			labels[count] = "ASTC 6x6";  values[count++] = compress_fmt_astc6x6;
+			labels[count] = "ASTC 4x4";       values[count++] = compress_fmt_astc4x4;
+			labels[count] = "ASTC 6x6";       values[count++] = compress_fmt_astc6x6;
 		}
+		// Always offer ASTC HDR: encoder runs on any GPU even when the
+		// output format isn't sampleable (validate-only path saves the .astc
+		// file, magenta on screen).
+		labels[count] = "ASTC 8x8 HDR";   values[count++] = compress_fmt_astc8x8hdr;
 
 		int selected = 0;
 		for (int i = 0; i < count; i++) {
@@ -512,10 +544,11 @@ static void _scene_bc1_render_ui(scene_t* base) {
 	if (scene->img_width > 0) {
 		const char* fmt_name = "None";
 		switch (scene->current_format) {
-			case compress_fmt_bc1:     fmt_name = "BC1 (DXT1)"; break;
-			case compress_fmt_etc2:    fmt_name = "ETC2 RGB8";  break;
-			case compress_fmt_astc4x4: fmt_name = "ASTC 4x4";   break;
-			case compress_fmt_astc6x6: fmt_name = "ASTC 6x6";   break;
+			case compress_fmt_bc1:        fmt_name = "BC1 (DXT1)";   break;
+			case compress_fmt_etc2:       fmt_name = "ETC2 RGB8";    break;
+			case compress_fmt_astc4x4:    fmt_name = "ASTC 4x4";     break;
+			case compress_fmt_astc6x6:    fmt_name = "ASTC 6x6";     break;
+			case compress_fmt_astc8x8hdr: fmt_name = "ASTC 8x8 HDR"; break;
 			default: break;
 		}
 
@@ -538,6 +571,7 @@ static void _scene_bc1_render_ui(scene_t* base) {
 		}
 
 		igSeparator();
+		igSliderFloat("Swipe", &scene->swipe, 0.0f, 1.0f, "%.2f", 0);
 		igTextColored((ImVec4){0.7f, 0.7f, 0.7f, 1.0f}, "Left: Original  |  Right: %s%s",
 			scene->use_gpu ? "GPU " : "", fmt_name);
 	} else {

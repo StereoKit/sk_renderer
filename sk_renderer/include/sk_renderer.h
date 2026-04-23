@@ -180,6 +180,11 @@ typedef enum skr_tex_fmt_ {
 	skr_tex_fmt_astc4x4_rgba,
 	skr_tex_fmt_astc6x6_rgba_srgb,
 	skr_tex_fmt_astc6x6_rgba,
+	// ASTC 8x8 HDR. Sampling produces FP16 RGB. Uses the standard
+	// VK_FORMAT_ASTC_8x8_UNORM_BLOCK on the Vulkan side; the HDR profile
+	// is signalled by the encoded block contents (CEM 11), not the format.
+	// Hardware support required — software decoders typically lack HDR.
+	skr_tex_fmt_astc8x8_rgba_hdr,
 	skr_tex_fmt_atc_rgb,
 	skr_tex_fmt_atc_rgba,
 	// YUV / multi-plane formats (require VkSamplerYcbcrConversion, read-only sampling)

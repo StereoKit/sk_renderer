@@ -57,15 +57,38 @@ if [[ -z "$ASTCENC" ]]; then
 	exit 1
 fi
 
-# Decoded PNG lands next to the original: <stem>_decoded.png.
+# Auto-detect HDR vs LDR from the first block's CEM. .astc layout is a 16-byte
+# header followed by 16-byte blocks; CEM lives at block bits 13-16, which for
+# our single-partition single-CEM encoder is:
+#   bits[13:15] = byte[1] >> 5
+#   bit  16     = byte[2] & 1
+# HDR CEMs are {2, 3, 7, 11, 14, 15}; the encoder we ship here only emits
+# CEM 11, so we just check for that exact value.
+B1=$(od -An -N1 -j17 -tu1 "$ASTC_FILE" | tr -d ' \n')
+B2=$(od -An -N1 -j18 -tu1 "$ASTC_FILE" | tr -d ' \n')
+CEM=$(( ((B1 >> 5) & 7) | ((B2 & 1) << 3) ))
+IS_HDR=0
+case "$CEM" in 2|3|7|11|14|15) IS_HDR=1 ;; esac
+
 ORIG_DIR="$(dirname  "$ORIGINAL")"
 ORIG_STEM="$(basename "$ORIGINAL")"
 ORIG_STEM="${ORIG_STEM%.*}"
-DECODED_PNG="$ORIG_DIR/${ORIG_STEM}_decoded.png"
 
-echo "--- decoding $ASTC_FILE → $DECODED_PNG"
-"$ASTCENC" -dl "$ASTC_FILE" "$DECODED_PNG" >/dev/null
+if [[ "$IS_HDR" == 1 ]]; then
+	# HDR decode → Radiance .hdr next to the original. Skip the LDR-only
+	# astc_validate PSNR/SSIM run (it uses stb_image, doesn't load .hdr) —
+	# eyeballing the round-tripped HDR file is the test for v1.
+	DECODED_HDR="$ORIG_DIR/${ORIG_STEM}_decoded.hdr"
+	echo "--- HDR decode (CEM $CEM): $ASTC_FILE → $DECODED_HDR"
+	"$ASTCENC" -dh "$ASTC_FILE" "$DECODED_HDR" >/dev/null
+	echo "decoded image: $DECODED_HDR"
+else
+	# LDR decode → PNG, plus the validate-binary comparison.
+	DECODED_PNG="$ORIG_DIR/${ORIG_STEM}_decoded.png"
+	echo "--- LDR decode (CEM $CEM): $ASTC_FILE → $DECODED_PNG"
+	"$ASTCENC" -dl "$ASTC_FILE" "$DECODED_PNG" >/dev/null
 
-echo
-"$VALIDATE_BIN" "$ORIGINAL" "$ASTC_FILE" --reference medium --astcenc "$ASTCENC"
-echo "decoded image: $DECODED_PNG"
+	echo
+	"$VALIDATE_BIN" "$ORIGINAL" "$ASTC_FILE" --reference medium --astcenc "$ASTCENC"
+	echo "decoded image: $DECODED_PNG"
+fi

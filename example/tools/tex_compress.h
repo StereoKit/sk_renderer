@@ -121,3 +121,11 @@ static inline int32_t astc4x4_calc_size(int32_t width, int32_t height) {
 	int32_t blocks_y = (height + 3) / 4;
 	return blocks_x * blocks_y * 16;
 }
+
+// Calculate ASTC 8x8 data size for given dimensions (16 bytes per 8x8 block).
+// Same byte budget as 4x4/6x6 — 8x8 is just larger spatial coverage.
+static inline int32_t astc8x8_calc_size(int32_t width, int32_t height) {
+	int32_t blocks_x = (width  + 7) / 8;
+	int32_t blocks_y = (height + 7) / 8;
+	return blocks_x * blocks_y * 16;
+}

@@ -47,17 +47,26 @@ skr_tex_t tex_compress_gpu_astc4x4 (skr_tex_t* source);
 // with varying alpha pay 3.
 skr_tex_t tex_compress_gpu_astc6x6 (skr_tex_t* source);
 
+// Compress to ASTC 8x8 HDR (CEM 11 RGB direct), single-mode v1: 4x4 weight
+// grid, 2-bit weights, 8-bit endpoints. Source must be a float-format
+// texture (rgba16/rgba32 float). Alpha is ignored. Output format is
+// skr_tex_fmt_astc8x8_rgba_hdr (decoder produces FP16). Hardware support
+// required for sampling — AMD desktop will display magenta.
+skr_tex_t tex_compress_gpu_astc8x8hdr(skr_tex_t* source);
+
 // Readback-only variants: allocate a host-visible buffer, dispatch the
 // compute shader at mip 0, wait for GPU, and return malloc'd bytes.
 // Desktop-only; stalls the GPU. Caller frees the returned pointer.
-uint8_t*  tex_compress_gpu_astc4x4_readback(skr_tex_t* source, int32_t* out_size);
-uint8_t*  tex_compress_gpu_astc6x6_readback(skr_tex_t* source, int32_t* out_size);
+uint8_t*  tex_compress_gpu_astc4x4_readback   (skr_tex_t* source, int32_t* out_size);
+uint8_t*  tex_compress_gpu_astc6x6_readback   (skr_tex_t* source, int32_t* out_size);
+uint8_t*  tex_compress_gpu_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_size);
 
 // Profile-only variants: dispatch just the compute shader at mip 0 into a
 // cached device-local throwaway buffer. No texture, no readback, no buffer
 // reallocation per call — for per-frame profiling where you want to measure
 // the encoder shader cost, not the surrounding texture-upload plumbing.
-void      tex_compress_gpu_bc1_profile     (skr_tex_t* source, bool enable_alpha);
-void      tex_compress_gpu_etc2_profile    (skr_tex_t* source);
-void      tex_compress_gpu_astc4x4_profile (skr_tex_t* source);
-void      tex_compress_gpu_astc6x6_profile (skr_tex_t* source);
+void      tex_compress_gpu_bc1_profile       (skr_tex_t* source, bool enable_alpha);
+void      tex_compress_gpu_etc2_profile      (skr_tex_t* source);
+void      tex_compress_gpu_astc4x4_profile   (skr_tex_t* source);
+void      tex_compress_gpu_astc6x6_profile   (skr_tex_t* source);
+void      tex_compress_gpu_astc8x8hdr_profile(skr_tex_t* source);

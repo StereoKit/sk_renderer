@@ -18,10 +18,12 @@ typedef struct {
 	skr_shader_t  etc2_shader;
 	skr_shader_t  astc4x4_shader;
 	skr_shader_t  astc6x6_shader;
+	skr_shader_t  astc8x8hdr_shader;
 	skr_compute_t bc1_compute;
 	skr_compute_t etc2_compute;
 	skr_compute_t astc4x4_compute;
 	skr_compute_t astc6x6_compute;
+	skr_compute_t astc8x8hdr_compute;
 	bool          initialized;
 
 	// Cached profiling buffer so per-frame dispatches don't pay the
@@ -38,29 +40,33 @@ static tex_compress_gpu_state_t g_tc = {0};
 ///////////////////////////////////////////////////////////////////////////////
 
 void tex_compress_gpu_init(void) {
-	g_tc.bc1_shader     = su_shader_load("shaders/bc1_compress.hlsl.sks",     "bc1_compress");
-	g_tc.etc2_shader    = su_shader_load("shaders/etc2_compress.hlsl.sks",    "etc2_compress");
-	g_tc.astc4x4_shader = su_shader_load("shaders/astc4x4_compress.hlsl.sks", "astc4x4_compress");
-	g_tc.astc6x6_shader = su_shader_load("shaders/astc6x6_compress.hlsl.sks", "astc6x6_compress");
+	g_tc.bc1_shader        = su_shader_load("shaders/bc1_compress.hlsl.sks",        "bc1_compress");
+	g_tc.etc2_shader       = su_shader_load("shaders/etc2_compress.hlsl.sks",       "etc2_compress");
+	g_tc.astc4x4_shader    = su_shader_load("shaders/astc4x4_compress.hlsl.sks",    "astc4x4_compress");
+	g_tc.astc6x6_shader    = su_shader_load("shaders/astc6x6_compress.hlsl.sks",    "astc6x6_compress");
+	g_tc.astc8x8hdr_shader = su_shader_load("shaders/astc8x8hdr_compress.hlsl.sks", "astc8x8hdr_compress");
 
-	if (skr_shader_is_valid(&g_tc.bc1_shader))     skr_compute_create(&g_tc.bc1_shader,     &g_tc.bc1_compute);
-	if (skr_shader_is_valid(&g_tc.etc2_shader))    skr_compute_create(&g_tc.etc2_shader,    &g_tc.etc2_compute);
-	if (skr_shader_is_valid(&g_tc.astc4x4_shader)) skr_compute_create(&g_tc.astc4x4_shader, &g_tc.astc4x4_compute);
-	if (skr_shader_is_valid(&g_tc.astc6x6_shader)) skr_compute_create(&g_tc.astc6x6_shader, &g_tc.astc6x6_compute);
+	if (skr_shader_is_valid(&g_tc.bc1_shader))        skr_compute_create(&g_tc.bc1_shader,        &g_tc.bc1_compute);
+	if (skr_shader_is_valid(&g_tc.etc2_shader))       skr_compute_create(&g_tc.etc2_shader,       &g_tc.etc2_compute);
+	if (skr_shader_is_valid(&g_tc.astc4x4_shader))    skr_compute_create(&g_tc.astc4x4_shader,    &g_tc.astc4x4_compute);
+	if (skr_shader_is_valid(&g_tc.astc6x6_shader))    skr_compute_create(&g_tc.astc6x6_shader,    &g_tc.astc6x6_compute);
+	if (skr_shader_is_valid(&g_tc.astc8x8hdr_shader)) skr_compute_create(&g_tc.astc8x8hdr_shader, &g_tc.astc8x8hdr_compute);
 
 	g_tc.initialized = true;
 }
 
 void tex_compress_gpu_shutdown(void) {
-	if (skr_buffer_is_valid (&g_tc.profile_buffer)) skr_buffer_destroy (&g_tc.profile_buffer);
-	if (skr_compute_is_valid(&g_tc.bc1_compute))     skr_compute_destroy(&g_tc.bc1_compute);
-	if (skr_compute_is_valid(&g_tc.etc2_compute))    skr_compute_destroy(&g_tc.etc2_compute);
-	if (skr_compute_is_valid(&g_tc.astc4x4_compute)) skr_compute_destroy(&g_tc.astc4x4_compute);
-	if (skr_compute_is_valid(&g_tc.astc6x6_compute)) skr_compute_destroy(&g_tc.astc6x6_compute);
-	if (skr_shader_is_valid (&g_tc.bc1_shader))      skr_shader_destroy (&g_tc.bc1_shader);
-	if (skr_shader_is_valid (&g_tc.etc2_shader))     skr_shader_destroy (&g_tc.etc2_shader);
-	if (skr_shader_is_valid (&g_tc.astc4x4_shader))  skr_shader_destroy (&g_tc.astc4x4_shader);
-	if (skr_shader_is_valid (&g_tc.astc6x6_shader))  skr_shader_destroy (&g_tc.astc6x6_shader);
+	if (skr_buffer_is_valid (&g_tc.profile_buffer))     skr_buffer_destroy (&g_tc.profile_buffer);
+	if (skr_compute_is_valid(&g_tc.bc1_compute))        skr_compute_destroy(&g_tc.bc1_compute);
+	if (skr_compute_is_valid(&g_tc.etc2_compute))       skr_compute_destroy(&g_tc.etc2_compute);
+	if (skr_compute_is_valid(&g_tc.astc4x4_compute))    skr_compute_destroy(&g_tc.astc4x4_compute);
+	if (skr_compute_is_valid(&g_tc.astc6x6_compute))    skr_compute_destroy(&g_tc.astc6x6_compute);
+	if (skr_compute_is_valid(&g_tc.astc8x8hdr_compute)) skr_compute_destroy(&g_tc.astc8x8hdr_compute);
+	if (skr_shader_is_valid (&g_tc.bc1_shader))         skr_shader_destroy (&g_tc.bc1_shader);
+	if (skr_shader_is_valid (&g_tc.etc2_shader))        skr_shader_destroy (&g_tc.etc2_shader);
+	if (skr_shader_is_valid (&g_tc.astc4x4_shader))     skr_shader_destroy (&g_tc.astc4x4_shader);
+	if (skr_shader_is_valid (&g_tc.astc6x6_shader))     skr_shader_destroy (&g_tc.astc6x6_shader);
+	if (skr_shader_is_valid (&g_tc.astc8x8hdr_shader))  skr_shader_destroy (&g_tc.astc8x8hdr_shader);
 	g_tc = (tex_compress_gpu_state_t){0};
 }
 
@@ -165,6 +171,10 @@ skr_tex_t tex_compress_gpu_astc6x6(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.astc6x6_compute, source, skr_tex_fmt_astc6x6_rgba_srgb, 6, 6, 16);
 }
 
+skr_tex_t tex_compress_gpu_astc8x8hdr(skr_tex_t* source) {
+	return _compress_gpu(&g_tc.astc8x8hdr_compute, source, skr_tex_fmt_astc8x8_rgba_hdr, 8, 8, 16);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Readback (desktop only — stalls GPU)
 ///////////////////////////////////////////////////////////////////////////////
@@ -236,6 +246,10 @@ uint8_t* tex_compress_gpu_astc6x6_readback(skr_tex_t* source, int32_t* out_size)
 	return _compress_readback(&g_tc.astc6x6_compute, source, 6, 6, 16, out_size);
 }
 
+uint8_t* tex_compress_gpu_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_size) {
+	return _compress_readback(&g_tc.astc8x8hdr_compute, source, 8, 8, 16, out_size);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Profile-only dispatch (single mip, cached output buffer)
 ///////////////////////////////////////////////////////////////////////////////
@@ -296,4 +310,8 @@ void tex_compress_gpu_astc4x4_profile(skr_tex_t* source) {
 
 void tex_compress_gpu_astc6x6_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.astc6x6_compute, source, 6, 6, 16);
+}
+
+void tex_compress_gpu_astc8x8hdr_profile(skr_tex_t* source) {
+	_profile_dispatch(&g_tc.astc8x8hdr_compute, source, 8, 8, 16);
 }

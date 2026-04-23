@@ -56,6 +56,11 @@ static const uint ASTC_BLOCK_MODE_3x3_R3      = 0x1BFu; // 3x3 grid, 3-bit weigh
 static const uint ASTC_BLOCK_MODE_4x4_R2      = 0x042u; // 4x4 grid, 2-bit weights
 static const uint ASTC_BLOCK_MODE_4x4_R3      = 0x053u; // 4x4 grid, 3-bit weights
 static const uint ASTC_BLOCK_MODE_5x5_R2      = 0x0E2u; // 5x5 grid, 2-bit weights
+// 6x5 grid, 2-bit weights. Same sub-mode 00 as 5x5 (wt_h = a+2 = 5 → a=3),
+// just bumps b from 1 to 2 to get wt_w = b+4 = 6 — i.e. flip bit 7 (off)
+// and set bit 8 (on) relative to 5x5_R2. Used by the 8x8 HDR encoder for
+// asymmetric horizontal detail.
+static const uint ASTC_BLOCK_MODE_6x5_R2      = 0x162u; // 6x5 grid, 2-bit weights
 static const uint ASTC_BLOCK_MODE_6x6_R2      = 0x108u; // 6x6 grid, 2-bit weights
 // Dual-plane variant of 3x3+R2 (D=1 in bit 10). Decoder reads 2 weight values
 // per grid point (primary for the main color channels, secondary for the
@@ -63,6 +68,10 @@ static const uint ASTC_BLOCK_MODE_6x6_R2      = 0x108u; // 6x6 grid, 2-bit weigh
 static const uint ASTC_BLOCK_MODE_3x3_R2_DUAL = 0x5AEu; // 3x3 grid, 2-bit weights, dual-plane
 static const uint ASTC_CEM_LDR_RGB            = 8u;
 static const uint ASTC_CEM_LDR_RGBA           = 12u;
+// HDR RGB direct, 6 endpoint values. Decoder reconstructs the 6 bytes as
+// (a, c, b0, b1, d0, d1) — a custom log-FP encoding, NOT direct RGB. See
+// astc_quantize_hdr_rgb / astc_pack_hdr_rgb_endpoints below.
+static const uint ASTC_CEM_HDR_RGB            = 11u;
 // Color component selector: which channel uses the secondary weight plane.
 // 0=R, 1=G, 2=B, 3=A. For RGBA-with-alpha-cutout we want alpha as secondary.
 static const uint ASTC_CCS_ALPHA              = 3u;
@@ -446,6 +455,14 @@ void astc_write_trit_group_partial3(inout uint4 block, uint base_bit, uint T_pat
 	astc_block_write_bits(block, base_bit + 22u, 1u, (T_pattern >> 4u) & 1u);
 }
 
+// Pack a partial 1-trit group (1 binary + 2 T-bits, total 8 bits). LUT index
+// covers only t0 ∈ [0, 2], so T_pattern uses only bits 0-1; bits 2+ stay 0.
+void astc_write_trit_group_partial1(inout uint4 block, uint base_bit, uint T_pattern, uint m0) {
+	astc_block_write_bits(block, base_bit + 0u, 6u, m0);
+	astc_block_write_bits(block, base_bit + 6u, 1u,  T_pattern        & 1u);
+	astc_block_write_bits(block, base_bit + 7u, 1u, (T_pattern >> 1u) & 1u);
+}
+
 // CEM 12 endpoints at range 192 (trit + 6-bit BISE) — 8 values in 61 bits,
 // the configuration the decoder selects when 5x5 weight grid + 2-bit weights
 // leaves 61 endpoint bits. Same value order as RGBA8: (R0, R1, G0, G1, B0,
@@ -477,4 +494,361 @@ void astc_write_endpoints_rgba6trit(inout uint4 block, uint3 e0_rgb, uint3 e1_rg
 	// guarantees the returned T pattern has bits 5, 6, 7 equal to 0.
 	uint T_part = astc_trit_pack_lut[t5 + 3u*t6 + 9u*t7];
 	astc_write_trit_group_partial3(block, 55u, T_part, m5, m6, m7);
+}
+
+// Top-bit-preserving range-192 inverse quant LUTs. Same shape as
+// astc_r192_quant_lut (target 8-bit value → encoded value 0..191), but
+// constrained so the dequantized value has the same top 2 (or 4) bits as
+// the input. Required for HDR endpoints (CEM 11) — the top bits of v[1..5]
+// carry mode/majcomp info that the HDR decoder reads to interpret the rest
+// of the bits, so a naive range-192 quant scrambles the decode.
+//
+// Generated offline by enumerating astc_dequant_r192(q) for q ∈ [0, 191],
+// then for each input v picking the q whose dequantized form has matching
+// top bits AND minimum |dequant(q) - v|. Both LUTs were verified to require
+// no fallback (every 8-bit input has a top-bit-preserving range-192
+// candidate) with max_err = 1, avg_err = 0.25 — basically lossless.
+
+static const uint astc_r192_quant_lut_preserve_top2[256] = {
+	  0u,  64u, 128u,   2u,   2u,  66u, 130u,   4u,   4u,  68u, 132u,   6u,   6u,  70u, 134u,   8u,
+	  8u,  72u, 136u,  10u,  10u,  74u, 138u,  12u,  12u,  76u, 140u,  14u,  14u,  78u, 142u,  16u,
+	 16u,  80u, 144u,  18u,  18u,  82u, 146u,  20u,  20u,  84u, 148u,  22u,  22u,  86u, 150u,  24u,
+	 24u,  88u, 152u,  26u,  26u,  90u, 154u,  28u,  28u,  92u, 156u,  30u,  30u,  94u, 158u, 158u,
+	 32u,  96u, 160u,  34u,  34u,  98u, 162u,  36u,  36u, 100u, 164u,  38u,  38u, 102u, 166u,  40u,
+	 40u, 104u, 168u,  42u,  42u, 106u, 170u,  44u,  44u, 108u, 172u,  46u,  46u, 110u, 174u,  48u,
+	 48u, 112u, 176u,  50u,  50u, 114u, 178u,  52u,  52u, 116u, 180u,  54u,  54u, 118u, 182u,  56u,
+	 56u, 120u, 184u,  58u,  58u, 122u, 186u,  60u,  60u, 124u, 188u,  62u,  62u, 126u, 190u, 190u,
+	191u, 191u, 127u,  63u,  63u, 189u, 125u,  61u,  61u, 187u, 123u,  59u,  59u, 185u, 121u,  57u,
+	 57u, 183u, 119u,  55u,  55u, 181u, 117u,  53u,  53u, 179u, 115u,  51u,  51u, 177u, 113u,  49u,
+	 49u, 175u, 111u,  47u,  47u, 173u, 109u,  45u,  45u, 171u, 107u,  43u,  43u, 169u, 105u,  41u,
+	 41u, 167u, 103u,  39u,  39u, 165u, 101u,  37u,  37u, 163u,  99u,  35u,  35u, 161u,  97u,  33u,
+	159u, 159u,  95u,  31u,  31u, 157u,  93u,  29u,  29u, 155u,  91u,  27u,  27u, 153u,  89u,  25u,
+	 25u, 151u,  87u,  23u,  23u, 149u,  85u,  21u,  21u, 147u,  83u,  19u,  19u, 145u,  81u,  17u,
+	 17u, 143u,  79u,  15u,  15u, 141u,  77u,  13u,  13u, 139u,  75u,  11u,  11u, 137u,  73u,   9u,
+	  9u, 135u,  71u,   7u,   7u, 133u,  69u,   5u,   5u, 131u,  67u,   3u,   3u, 129u,  65u,   1u,
+};
+
+static const uint astc_r192_quant_lut_preserve_top4[256] = {
+	  0u,  64u, 128u,   2u,   2u,  66u, 130u,   4u,   4u,  68u, 132u,   6u,   6u,  70u, 134u, 134u,
+	  8u,  72u, 136u,  10u,  10u,  74u, 138u,  12u,  12u,  76u, 140u,  14u,  14u,  78u, 142u, 142u,
+	 16u,  80u, 144u,  18u,  18u,  82u, 146u,  20u,  20u,  84u, 148u,  22u,  22u,  86u, 150u, 150u,
+	 24u,  88u, 152u,  26u,  26u,  90u, 154u,  28u,  28u,  92u, 156u,  30u,  30u,  94u, 158u, 158u,
+	 32u,  96u, 160u,  34u,  34u,  98u, 162u,  36u,  36u, 100u, 164u,  38u,  38u, 102u, 166u, 166u,
+	 40u, 104u, 168u,  42u,  42u, 106u, 170u,  44u,  44u, 108u, 172u,  46u,  46u, 110u, 174u, 174u,
+	 48u, 112u, 176u,  50u,  50u, 114u, 178u,  52u,  52u, 116u, 180u,  54u,  54u, 118u, 182u, 182u,
+	 56u, 120u, 184u,  58u,  58u, 122u, 186u,  60u,  60u, 124u, 188u,  62u,  62u, 126u, 190u, 190u,
+	191u, 191u, 127u,  63u,  63u, 189u, 125u,  61u,  61u, 187u, 123u,  59u,  59u, 185u, 121u,  57u,
+	183u, 183u, 119u,  55u,  55u, 181u, 117u,  53u,  53u, 179u, 115u,  51u,  51u, 177u, 113u,  49u,
+	175u, 175u, 111u,  47u,  47u, 173u, 109u,  45u,  45u, 171u, 107u,  43u,  43u, 169u, 105u,  41u,
+	167u, 167u, 103u,  39u,  39u, 165u, 101u,  37u,  37u, 163u,  99u,  35u,  35u, 161u,  97u,  33u,
+	159u, 159u,  95u,  31u,  31u, 157u,  93u,  29u,  29u, 155u,  91u,  27u,  27u, 153u,  89u,  25u,
+	151u, 151u,  87u,  23u,  23u, 149u,  85u,  21u,  21u, 147u,  83u,  19u,  19u, 145u,  81u,  17u,
+	143u, 143u,  79u,  15u,  15u, 141u,  77u,  13u,  13u, 139u,  75u,  11u,  11u, 137u,  73u,   9u,
+	135u, 135u,  71u,   7u,   7u, 133u,  69u,   5u,   5u, 131u,  67u,   3u,   3u, 129u,  65u,   1u,
+};
+
+// HDR endpoints (CEM 11) at range 192. Same packing layout as range-256 v6
+// — six bytes (a, c, b0, b1, d0, d1) — but quantized through the bit-
+// preserving LUTs so the mode/majcomp bits in v[1..5] high positions survive
+// the dequant roundtrip. Used by 8x4 weight grid in 8x8 blocks (60 wt bits
+// + 17 hdr + 46 ep = 123 used). v0 (a) uses no preservation since a's bits
+// are entirely value bits in all HDR modes.
+//
+// Bit layout: 1 full 5-trit group (38 bits at bit 17) + 1 partial 1-trit
+// group (8 bits at bit 55).
+void astc_write_endpoints_v6_r192_hdr(inout uint4 block, uint v0, uint v1, uint v2, uint v3, uint v4, uint v5) {
+	uint q0 = astc_r192_quant_lut              [v0];   // a — pure value
+	uint q1 = astc_r192_quant_lut_preserve_top2[v1];   // c  — top 2 = mode + a_bit_8
+	uint q2 = astc_r192_quant_lut_preserve_top2[v2];   // b0 — top 2 = mode + scattered
+	uint q3 = astc_r192_quant_lut_preserve_top2[v3];   // b1 — top 2 = mode + scattered
+	uint q4 = astc_r192_quant_lut_preserve_top4[v4];   // d0 — top 4 = majcomp + scattered + d0 high bit
+	uint q5 = astc_r192_quant_lut_preserve_top4[v5];   // d1 — top 4 = majcomp + scattered + d1 high bit
+
+	// Each value = (trit_digit << 6) | binary_6bit.
+	uint t0 = q0 >> 6, t1 = q1 >> 6, t2 = q2 >> 6, t3 = q3 >> 6, t4 = q4 >> 6, t5 = q5 >> 6;
+	uint m0 = q0 & 63u, m1 = q1 & 63u, m2 = q2 & 63u, m3 = q3 & 63u, m4 = q4 & 63u, m5 = q5 & 63u;
+
+	// Group 0: 5 values (a, c, b0, b1, d0).
+	uint T_full = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
+	astc_write_trit_group_full(block, 17u, T_full, m0, m1, m2, m3, m4);
+
+	// Group 1 (partial): 1 value (d1). LUT index covers t0 ∈ [0, 2] only,
+	// so the T pattern uses just bits 0-1 — exactly the partial1 layout.
+	uint T_part = astc_trit_pack_lut[t5];
+	astc_write_trit_group_partial1(block, 55u, T_part, m5);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// HDR RGB direct (CEM 11) — 8x8 block with 4x4 weight grid
+//
+// Operates in LNS (Logarithmic Number System) space: a 16-bit code (0..65535)
+// representing a log-FP encoding of an FP16 value. Linear FP source → LNS via
+// astc_float_to_lns. The encoder picks the highest-precision of 8 bit-layout
+// modes that fits the bbox; each mode trades range for precision in different
+// places (a/b/c/d field widths). All 8 produce CEM 11 endpoints, decoded by
+// hardware to FP16 RGB pairs.
+//
+// Header writers for the 8x8 HDR encoder's two block modes. Both use CEM 11
+// (HDR RGB direct), single partition, no dual plane. Endpoints fit 6 bytes
+// at range 256 (8-bit binary, no BISE) in both modes; only the weight grid
+// + precision differ.
+//
+// Mode A — 6x5 + 2-bit:  17 hdr + 48 ep + 60 wts = 125 bits (3 wasted)
+//   Best for detail/edges/textured content (more spatial points).
+// Mode B — 4x4 + 3-bit:  17 hdr + 48 ep + 48 wts = 113 bits (15 wasted)
+//   Best for smooth gradients (8 weight levels = finer along-axis steps).
+// Mode C — 8x4 + 2-bit:  17 hdr + 46 ep + 64 wts = 127 bits (1 wasted)
+//   Best for horizontal-detail content (8 X-points per row). Endpoints drop
+//   to range 192 (BISE trit+6) — needs the bit-preserving HDR endpoint
+//   writer above (astc_write_endpoints_v6_r192_hdr) to keep mode bits intact.
+///////////////////////////////////////////////////////////////////////////////
+
+// Block mode for 8x4 weight grid + 2-bit weights. Sub-mode 01 (wt_w = b+8,
+// wt_h = a+2): for wt_w=8 → b=0, for wt_h=4 → a=2, R=2 (2-bit weights).
+//   bits set: 1 (R[1]), 2 (sub[0]), 6 (A[1]) → 0x46
+static const uint ASTC_BLOCK_MODE_8x4_R2 = 0x046u;
+
+void astc_write_header_8x8_hdr_rgb_6x5(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_6x5_R2);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
+}
+
+void astc_write_header_8x8_hdr_rgb_4x4(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_4x4_R3);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
+}
+
+void astc_write_header_8x8_hdr_rgb_8x4(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_8x4_R2);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
+}
+
+// Write 6 raw endpoint bytes at the standard CEM 8/11 positions (8-bit binary,
+// range 256). For CEM 11 the bytes are (a, c, b0, b1, d0, d1) — order is
+// CEM-specific so the caller passes already-packed values from
+// astc_quantize_hdr_rgb. No interleaving like CEM 8 RGB; just six raw bytes.
+void astc_write_endpoints_v6(inout uint4 block, uint v0, uint v1, uint v2, uint v3, uint v4, uint v5) {
+	astc_block_write_bits(block, 17u, 8u, v0);
+	astc_block_write_bits(block, 25u, 8u, v1);
+	astc_block_write_bits(block, 33u, 8u, v2);
+	astc_block_write_bits(block, 41u, 8u, v3);
+	astc_block_write_bits(block, 49u, 8u, v4);
+	astc_block_write_bits(block, 57u, 8u, v5);
+}
+
+// frexp equivalent: split a positive float into mantissa in [0.5, 1) and
+// integer exponent. Mirrors astcenc's frexp() in vecmathlib (bit-fiddles the
+// IEEE encoding rather than calling math intrinsics).
+float astc_frexp(float a, out int exp_out) {
+	uint ai = asuint(a);
+	exp_out = int((ai >> 23u) & 0xFFu) - 126;
+	uint manti = (ai & 0x807FFFFFu) | 0x3F000000u;
+	return asfloat(manti);
+}
+
+// Convert a positive float to the 16-bit LNS code used by HDR ASTC encoding.
+// Direct port of astcenc's float_to_lns. Output range [0, 65535] represents
+// the log-FP value that the HDR endpoint encoder operates on.
+//
+// Roughly: piecewise-linear approximation of log2 with mantissa-based
+// remapping, plus exponent contribution at 2048 LNS units per FP exponent.
+float astc_float_to_lns(float a) {
+	int exp_v;
+	float mant = astc_frexp(a, exp_v);
+
+	bool mask_underflow_nan = !(a > (1.0 / 67108864.0));
+	bool mask_infinity      = a >= 65536.0;
+
+	// For very small values (exp < -13) skip the mantissa remap and just
+	// scale by 2^25 — keeps the LNS code monotonic near zero.
+	bool exp_lt_m13 = exp_v < -13;
+	float a1a = a * 33554432.0;
+	float a1b = (mant - 0.5) * 4096.0;
+	int   expb = exp_v + 14;
+	a     = exp_lt_m13 ? a1a : a1b;
+	exp_v = exp_lt_m13 ? 0   : expb;
+
+	// 3-piece linear approximation in [0, 2048]: matches log2 to ~3 LSBs.
+	bool a_lt_384  = a <  384.0;
+	bool a_lt_1408 = a <= 1408.0;
+	float a2a = a * (4.0 / 3.0);
+	float a2b = a + 128.0;
+	float a2c = (a + 512.0) * (4.0 / 5.0);
+	a = a_lt_384 ? a2a : (a_lt_1408 ? a2b : a2c);
+
+	a = a + (float(exp_v) * 2048.0) + 1.0;
+	if (mask_infinity)      a = 65535.0;
+	if (mask_underflow_nan) a = 0.0;
+	return a;
+}
+
+// Round-to-nearest float→int. Matches astcenc's flt2int_rtn (with HLSL's int()
+// cast handling negatives toward zero, we add 0.5 with sign).
+int astc_flt2int_rtn(float v) {
+	return int(v >= 0.0 ? (v + 0.5) : (v - 0.5));
+}
+
+// HDR endpoint encoding (CEM 11). Direct port of astcenc's quantize_hdr_rgb.
+// Tries 8 bit-allocation modes from highest precision (mode 7) to lowest
+// (mode 0), picking the first that accommodates the (color0, color1) span.
+// Falls back to a flat 8-bit-per-channel layout if none fit, indicated by
+// (majcomp = 3) in the output. Output is 6 raw bytes ready to write at
+// endpoint positions v0..v5 with QUANT_256 (no BISE, pure 8-bit binary).
+//
+// Inputs are LNS-encoded color endpoints (0..65535 each channel).
+void astc_quantize_hdr_rgb(float3 color0_in, float3 color1_in, out uint v0, out uint v1, out uint v2, out uint v3, out uint v4, out uint v5) {
+	float3 color0 = clamp(color0_in, 0.0, 65535.0);
+	float3 color1 = clamp(color1_in, 0.0, 65535.0);
+	float3 color0_bak = color0;
+	float3 color1_bak = color1;
+
+	// Majority component: which of R/G/B is largest in color1. Encoder
+	// reorganizes channels so the majority is "red", then signals the swap
+	// via the majcomp bits in d0/d1.
+	int majcomp;
+	if (color1.r > color1.g && color1.r > color1.b) majcomp = 0;
+	else if (color1.g > color1.b)                   majcomp = 1;
+	else                                            majcomp = 2;
+
+	if (majcomp == 1) {
+		// Red↔Green swap: encoder will write the green channel as "a" and
+		// signal the swap so the decoder undoes it before sampling.
+		color0 = float3(color0_bak.g, color0_bak.r, color0_bak.b);
+		color1 = float3(color1_bak.g, color1_bak.r, color1_bak.b);
+	} else if (majcomp == 2) {
+		// Red↔Blue swap.
+		color0 = float3(color0_bak.b, color0_bak.g, color0_bak.r);
+		color1 = float3(color1_bak.b, color1_bak.g, color1_bak.r);
+	}
+
+	float a_base  = clamp(color1.r, 0.0, 65535.0);
+	float b0_base = a_base - color1.g;
+	float b1_base = a_base - color1.b;
+	float c_base  = a_base - color0.r;
+	float d0_base = a_base - b0_base - c_base - color0.g;
+	float d1_base = a_base - b1_base - c_base - color0.b;
+
+	// mode_bits[mode] = (a_bits, b_bits, c_bits, d_bits)
+	// mode_cutoffs[mode] = (b_cutoff, c_cutoff, d_cutoff, fits_marker)
+	// mode_scales[mode] = LNS-to-mode scale; mode_rscales = inverse.
+	// Higher modes = more a-bits but tighter cutoffs.
+	static const float mode_cutoffs_b[8] = { 16384, 32768,  4096,  8192,  8192,  2048,  2048,  1024 };
+	static const float mode_cutoffs_c[8] = {  8192,  8192,  8192,  8192,  2048,  8192,  2048,  2048 };
+	static const float mode_cutoffs_d[8] = {  8192,  4096,  4096,  2048,   512,  1024,   256,   512 };
+	static const float mode_scales [8] = {
+		1.0/128.0, 1.0/128.0, 1.0/64.0, 1.0/64.0, 1.0/32.0, 1.0/32.0, 1.0/16.0, 1.0/16.0
+	};
+	static const float mode_rscales[8] = { 128.0, 128.0, 64.0, 64.0, 32.0, 32.0, 16.0, 16.0 };
+	static const int   mode_b_bits [8] = { 7, 8, 6, 7, 8, 6, 7, 6 };
+	static const int   mode_c_bits [8] = { 6, 6, 7, 7, 6, 8, 7, 7 };
+	static const int   mode_d_bits [8] = { 7, 6, 7, 6, 5, 6, 5, 6 };
+
+	// At QUANT_256 the quant/unquant calls in the reference encoder are
+	// identity — we just keep the lower bits of each *_intval and merge in
+	// the mode/majcomp bits. The recompute steps then collapse to feeding
+	// the same intval back through, so we can write outputs directly without
+	// rerunning the math.
+	[unroll] for (int mode = 7; mode >= 0; mode--) {
+		float b_cut = mode_cutoffs_b[mode];
+		float c_cut = mode_cutoffs_c[mode];
+		float d_cut = mode_cutoffs_d[mode];
+		if (b0_base > b_cut || b1_base > b_cut || c_base > c_cut ||
+		    abs(d0_base) > d_cut || abs(d1_base) > d_cut)
+			continue;
+
+		float ms  = mode_scales [mode];
+		float mrs = mode_rscales[mode];
+		int b_intcut = 1 << mode_b_bits[mode];
+		int c_intcut = 1 << mode_c_bits[mode];
+		int d_intcut = 1 << (mode_d_bits[mode] - 1);
+
+		int   a_intval = astc_flt2int_rtn(a_base * ms);
+		float a_fval   = float(a_intval) * mrs;
+
+		float c_fval = clamp(a_fval - color0.r, 0.0, 65535.0);
+		int   c_intval = astc_flt2int_rtn(c_fval * ms);
+		if (c_intval >= c_intcut) continue;
+		c_fval = float(c_intval) * mrs;
+
+		float b0_fval = clamp(a_fval - color1.g, 0.0, 65535.0);
+		float b1_fval = clamp(a_fval - color1.b, 0.0, 65535.0);
+		int   b0_intval = astc_flt2int_rtn(b0_fval * ms);
+		int   b1_intval = astc_flt2int_rtn(b1_fval * ms);
+		if (b0_intval >= b_intcut || b1_intval >= b_intcut) continue;
+		b0_fval = float(b0_intval) * mrs;
+		b1_fval = float(b1_intval) * mrs;
+
+		float d0_fval = clamp(a_fval - b0_fval - c_fval - color0.g, -65535.0, 65535.0);
+		float d1_fval = clamp(a_fval - b1_fval - c_fval - color0.b, -65535.0, 65535.0);
+		int   d0_intval = astc_flt2int_rtn(d0_fval * ms);
+		int   d1_intval = astc_flt2int_rtn(d1_fval * ms);
+		if (abs(d0_intval) >= d_intcut || abs(d1_intval) >= d_intcut) continue;
+
+		// Pack the mode/majcomp bits into the unused upper bits of c, b0,
+		// b1, d0, d1. Each mode uses a different scattering — see astcenc's
+		// quantize_hdr_rgb for the reference table.
+		int bit0 = 0, bit1 = 0, bit2 = 0, bit3 = 0, bit4 = 0, bit5 = 0;
+		if (mode == 0 || mode == 1 || mode == 3 || mode == 4 || mode == 6)
+			bit0 = (b0_intval >> 6) & 1;
+		else
+			bit0 = (a_intval  >> 9) & 1;
+
+		if (mode == 0 || mode == 1 || mode == 3 || mode == 4 || mode == 6)
+			bit1 = (b1_intval >> 6) & 1;
+		else if (mode == 2)
+			bit1 = (c_intval  >> 6) & 1;
+		else
+			bit1 = (a_intval  >> 10) & 1;
+
+		if (mode == 0 || mode == 2)      bit2 = (d0_intval >> 6) & 1;
+		else if (mode == 1 || mode == 4) bit2 = (b0_intval >> 7) & 1;
+		else if (mode == 3)              bit2 = (a_intval  >> 9) & 1;
+		else if (mode == 5)              bit2 = (c_intval  >> 7) & 1;
+		else                             bit2 = (a_intval  >> 11) & 1;
+
+		if (mode == 0 || mode == 2)      bit3 = (d1_intval >> 6) & 1;
+		else if (mode == 1 || mode == 4) bit3 = (b1_intval >> 7) & 1;
+		else                             bit3 = (c_intval  >> 6) & 1;
+
+		if (mode == 4 || mode == 6) {
+			bit4 = (a_intval  >> 9) & 1;
+			bit5 = (a_intval  >> 10) & 1;
+		} else {
+			bit4 = (d0_intval >> 5) & 1;
+			bit5 = (d1_intval >> 5) & 1;
+		}
+
+		uint a_lo  = uint(a_intval  & 0xFF);
+		uint c_lo  = uint(c_intval  & 0x3F) | (uint(mode & 1) << 7) | (uint((a_intval >> 8) & 1) << 6);
+		uint b0_lo = uint(b0_intval & 0x3F) | (uint(bit0) << 6) | (uint((mode >> 1) & 1) << 7);
+		uint b1_lo = uint(b1_intval & 0x3F) | (uint(bit1) << 6) | (uint((mode >> 2) & 1) << 7);
+		uint d0_lo = uint(d0_intval & 0x1F) | (uint(bit2) << 6) | (uint(bit4) << 5) | (uint(majcomp & 1) << 7);
+		uint d1_lo = uint(d1_intval & 0x1F) | (uint(bit3) << 6) | (uint(bit5) << 5) | (uint((majcomp >> 1) & 1) << 7);
+
+		v0 = a_lo;  v1 = c_lo;  v2 = b0_lo;  v3 = b1_lo;  v4 = d0_lo;  v5 = d1_lo;
+		return;
+	}
+
+	// Fallback — flat representation: 8-bit R0/R1/G0/G1, 7-bit B0/B1 + majcomp=3
+	// signal in the high bits of v4/v5. Lower precision but accommodates any
+	// bbox the modes couldn't fit (typically light/dark ratio > 4×).
+	float vals[6] = {
+		clamp(color0_bak.r, 0.0, 65020.0),
+		clamp(color1_bak.r, 0.0, 65020.0),
+		clamp(color0_bak.g, 0.0, 65020.0),
+		clamp(color1_bak.g, 0.0, 65020.0),
+		clamp(color0_bak.b, 0.0, 65020.0),
+		clamp(color1_bak.b, 0.0, 65020.0)
+	};
+	v0 = uint(astc_flt2int_rtn(vals[0] / 256.0)) & 0xFFu;
+	v1 = uint(astc_flt2int_rtn(vals[1] / 256.0)) & 0xFFu;
+	v2 = uint(astc_flt2int_rtn(vals[2] / 256.0)) & 0xFFu;
+	v3 = uint(astc_flt2int_rtn(vals[3] / 256.0)) & 0xFFu;
+	// vals[4..5] in [0, 65020]; /512 + 128 lands in [128, 254], bit 7 always
+	// set. Decoder reads majcomp = v4_bit7 | (v5_bit7 << 1) — both set →
+	// majcomp = 3 → blue fallback path. The low 7 bits carry the blue value
+	// (decoder uses (v4 & 0x7F) << 9 to scale to fp16). At QUANT_256 the
+	// reference encoder's retain_top_two_bits is identity.
+	v4 = uint(astc_flt2int_rtn(vals[4] / 512.0) + 128) & 0xFFu;
+	v5 = uint(astc_flt2int_rtn(vals[5] / 512.0) + 128) & 0xFFu;
 }
