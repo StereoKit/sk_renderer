@@ -87,11 +87,18 @@ static void _load_skybox(scene_gltf_t* scene, const char* path) {
 	skr_tex_set_name(&scene->equirect_texture, "equirect_source");
 	su_image_free(equirect_data);
 
-	// Create empty cubemap texture (matches source format for HDR preservation)
-	const int32_t cube_size = equirect_height / 2;
+	// Create empty cubemap texture. rg11b10 is HDR-capable and half the bandwidth
+	// of rgba64f — cache-friendly for prefilter passes. Fall back to rgba64f if
+	// rg11b10 isn't supported as a color attachment on this device.
+	const int32_t       cube_size  = equirect_height / 2;
+	const skr_tex_flags_ cube_flags = skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_cubemap | skr_tex_flags_gen_mips;
+	skr_tex_fmt_         cube_fmt   = skr_tex_fmt_rg11b10;
+	if (!skr_tex_fmt_is_supported(cube_fmt, cube_flags, 1)) {
+		su_log(su_log_warning, "rg11b10 cubemap unsupported, falling back to rgba64f");
+		cube_fmt = skr_tex_fmt_rgba64f;
+	}
 	skr_tex_create(
-		equirect_format,
-		skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_cubemap | skr_tex_flags_gen_mips,
+		cube_fmt, cube_flags,
 		su_sampler_linear_clamp,
 		(skr_vec3i_t){cube_size, cube_size, 6},
 		1, 0, NULL, &scene->cubemap_texture

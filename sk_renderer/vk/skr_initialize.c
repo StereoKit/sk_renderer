@@ -6,6 +6,7 @@
 #include "_sk_renderer.h"
 #include "skr_pipeline.h"
 #include "skr_conversions.h"
+#include "skr_scratch.h"
 
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
@@ -128,6 +129,7 @@ bool skr_init(skr_settings_t settings) {
 
 	_skr_bind_pool_init();
 	_skr_sampler_cache_init();
+	_skr_scratch_pool_init();
 
 	// Set up bind slot configuration (use defaults if not provided)
 	if (settings.bind_settings) {
@@ -865,6 +867,8 @@ void skr_shutdown(void) {
 	skr_tex_destroy(&_skr_vk.default_tex_white);
 	skr_tex_destroy(&_skr_vk.default_tex_gray);
 	skr_tex_destroy(&_skr_vk.default_tex_black);
+
+	_skr_scratch_pool_shutdown();  // Free pooled mipgen scratch textures before command shutdown
 
 	_skr_cmd_shutdown      ();  // Executes per-command destroy lists (may free bind pool slots)
 	_skr_pipeline_shutdown ();
