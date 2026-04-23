@@ -38,6 +38,7 @@ typedef struct {
 	skr_tex_t      texture_original;
 	skr_tex_t      texture_compressed;
 	float          swipe;                // 0..1, fraction of quad showing original
+	float          brightness;           // multiplier on sampled color, default 1
 	float          time;
 
 	// Image info
@@ -301,6 +302,7 @@ static scene_t* _scene_bc1_create(void) {
 	scene->cam_distance = 5.0f;
 	scene->use_gpu      = true;
 	scene->swipe        = 0.5f;
+	scene->brightness   = 1.0f;
 
 	// Initialize GPU compression
 	tex_compress_gpu_init();
@@ -334,6 +336,7 @@ static scene_t* _scene_bc1_create(void) {
 
 	// Default file path
 	strncpy(scene->file_path, "monks_forest_4k.hdr", sizeof(scene->file_path) - 1);
+	//strncpy(scene->file_path, "kloppenheim_06_puresky_4k.hdr", sizeof(scene->file_path) - 1);
 	//strncpy(scene->file_path, "tree.png", sizeof(scene->file_path) - 1);
 
 	// Create quad mesh for displaying textures (facing +Z)
@@ -408,9 +411,10 @@ static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
 
 	if (!skr_tex_is_valid(&scene->texture_original)) return;
 
-	// Push the swipe value to the shader each frame (cheap — material
-	// rebuilds the cbuffer only when params actually change).
-	skr_material_set_param(&scene->material_compare, "swipe", sksc_shader_var_float, 1, &scene->swipe);
+	// Push the swipe + brightness values to the shader each frame (cheap —
+	// material rebuilds the cbuffer only when params actually change).
+	skr_material_set_param(&scene->material_compare, "swipe",      sksc_shader_var_float, 1, &scene->swipe);
+	skr_material_set_param(&scene->material_compare, "brightness", sksc_shader_var_float, 1, &scene->brightness);
 
 	// Single aspect-fitted quad showing the swipe-blended view.
 	float aspect      = (float)scene->img_width / (float)scene->img_height;
@@ -435,7 +439,7 @@ static bool _scene_bc1_get_camera(scene_t* base, scene_camera_t* out_camera) {
 		if (io->MouseDown[0]) {
 			scene->cam_distance += io->MouseDelta.y * 0.02f;
 		}
-		if (scene->cam_distance < 1.0f)  scene->cam_distance = 1.0f;
+		if (scene->cam_distance < 0.2f)  scene->cam_distance = 0.2f;
 		if (scene->cam_distance > 20.0f) scene->cam_distance = 20.0f;
 	}
 
@@ -571,7 +575,11 @@ static void _scene_bc1_render_ui(scene_t* base) {
 		}
 
 		igSeparator();
-		igSliderFloat("Swipe", &scene->swipe, 0.0f, 1.0f, "%.2f", 0);
+		igSliderFloat("Swipe",      &scene->swipe,      0.0f, 1.0f,  "%.2f",  0);
+		// Logarithmic slider — HDR content may want brightness ≈ 0.01 to see
+		// detail, LDR content may want brightness = 1 to 4 to brighten dark
+		// areas. Log scale gives both fine control at the low end and reach.
+		igSliderFloat("Brightness", &scene->brightness, 0.01f, 8.0f, "×%.2f", ImGuiSliderFlags_Logarithmic);
 		igTextColored((ImVec4){0.7f, 0.7f, 0.7f, 1.0f}, "Left: Original  |  Right: %s%s",
 			scene->use_gpu ? "GPU " : "", fmt_name);
 	} else {
