@@ -61,6 +61,8 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_pvrtc2_rgba:        return VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG;
 		case skr_tex_fmt_astc4x4_rgba_srgb:  return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
 		case skr_tex_fmt_astc4x4_rgba:       return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+		case skr_tex_fmt_astc6x6_rgba_srgb:  return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+		case skr_tex_fmt_astc6x6_rgba:       return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
 		case skr_tex_fmt_atc_rgb:            return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		case skr_tex_fmt_atc_rgba:           return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		// YUV / multi-plane formats
@@ -123,6 +125,8 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 		case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:return skr_tex_fmt_pvrtc2_rgba;
 		case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:        return skr_tex_fmt_astc4x4_rgba_srgb;
 		case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:       return skr_tex_fmt_astc4x4_rgba;
+		case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:        return skr_tex_fmt_astc6x6_rgba_srgb;
+		case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:       return skr_tex_fmt_astc6x6_rgba;
 		// YUV / multi-plane formats
 		case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:                       return skr_tex_fmt_nv12;
 		case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:     return skr_tex_fmt_p010;

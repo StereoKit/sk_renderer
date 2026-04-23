@@ -178,6 +178,8 @@ typedef enum skr_tex_fmt_ {
 	skr_tex_fmt_pvrtc2_rgba,
 	skr_tex_fmt_astc4x4_rgba_srgb,
 	skr_tex_fmt_astc4x4_rgba,
+	skr_tex_fmt_astc6x6_rgba_srgb,
+	skr_tex_fmt_astc6x6_rgba,
 	skr_tex_fmt_atc_rgb,
 	skr_tex_fmt_atc_rgba,
 	// YUV / multi-plane formats (require VkSamplerYcbcrConversion, read-only sampling)

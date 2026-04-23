@@ -7,6 +7,7 @@
 #include "tools/scene_util.h"
 #include "tools/tex_compress.h"
 #include "tools/tex_compress_gpu.h"
+#include "tools/compress/astc_io.h"
 #include "app.h"
 
 #include <stdlib.h>
@@ -24,6 +25,8 @@ typedef enum {
 	compress_fmt_none,
 	compress_fmt_bc1,
 	compress_fmt_etc2,
+	compress_fmt_astc4x4,
+	compress_fmt_astc6x6,
 } compress_fmt_;
 
 typedef struct {
@@ -47,6 +50,8 @@ typedef struct {
 	compress_fmt_  current_format;
 	bool           bc1_supported;
 	bool           etc2_supported;
+	bool           astc6x6_supported;       // Texture sampling supported (drives display)
+	bool           astc6x6_validate_only;   // Compute works but display format unsupported (AMD desktop)
 
 	// GPU compression
 	bool           use_gpu;
@@ -104,6 +109,12 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	} else if (scene->current_format == compress_fmt_etc2 && scene->etc2_supported) {
 		tex_fmt  = skr_tex_fmt_etc1_rgb_srgb;
 		fmt_name = "ETC2";
+	} else if (scene->current_format == compress_fmt_astc4x4 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
+		tex_fmt  = skr_tex_fmt_astc4x4_rgba_srgb;
+		fmt_name = "ASTC4x4";
+	} else if (scene->current_format == compress_fmt_astc6x6 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
+		tex_fmt  = skr_tex_fmt_astc6x6_rgba_srgb;
+		fmt_name = "ASTC6x6";
 	} else {
 		scene->compressed_size = 0;
 		su_log(su_log_warning, "TexCompress: Selected format not supported!");
@@ -123,23 +134,83 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 		skr_tex_generate_mips(&scene->texture_source, NULL);
 
 		uint64_t start_ns = ska_time_get_elapsed_ns();
-		if (scene->current_format == compress_fmt_bc1)
-			scene->texture_compressed = tex_compress_gpu_bc1(&scene->texture_source, true);
-		else
-			scene->texture_compressed = tex_compress_gpu_etc2(&scene->texture_source);
+		switch (scene->current_format) {
+			case compress_fmt_bc1:     scene->texture_compressed = tex_compress_gpu_bc1    (&scene->texture_source, true); break;
+			case compress_fmt_etc2:    scene->texture_compressed = tex_compress_gpu_etc2   (&scene->texture_source); break;
+			// Skip the displayable-texture path on GPUs that can't sample
+			// ASTC (AMD desktop) — it'd spam the validation layer. The
+			// auto-save below exercises the encoder via buffer readback.
+			case compress_fmt_astc4x4:
+				if (scene->astc6x6_supported)
+					scene->texture_compressed = tex_compress_gpu_astc4x4(&scene->texture_source);
+				break;
+			case compress_fmt_astc6x6:
+				if (scene->astc6x6_supported)
+					scene->texture_compressed = tex_compress_gpu_astc6x6(&scene->texture_source);
+				break;
+			default: break;
+		}
 		uint64_t end_ns = ska_time_get_elapsed_ns();
 
 		scene->gpu_compress_time_ms = (end_ns - start_ns) / 1000000.0;
-		scene->compressed_size      = (scene->current_format == compress_fmt_bc1)
-			? bc1_calc_size(width, height)
-			: etc2_rgb8_calc_size(width, height);
+		switch (scene->current_format) {
+			case compress_fmt_bc1:     scene->compressed_size = bc1_calc_size      (width, height); break;
+			case compress_fmt_etc2:    scene->compressed_size = etc2_rgb8_calc_size(width, height); break;
+			case compress_fmt_astc4x4: scene->compressed_size = astc4x4_calc_size  (width, height); break;
+			case compress_fmt_astc6x6: scene->compressed_size = astc6x6_calc_size  (width, height); break;
+			default:                   scene->compressed_size = 0; break;
+		}
 
 		su_log(su_log_info, "GPU %s: Compression took %.3f ms (%.1f MP/s)",
 			fmt_name, scene->gpu_compress_time_ms,
 			(width * height) / (scene->gpu_compress_time_ms * 1000.0));
+
+		// Auto-save ASTC output for validation against astcenc reference.
+		// Uses a dedicated readback-only dispatch so this works even on GPUs
+		// that can't sample ASTC (AMD desktop), since no destination texture
+		// is involved — just a host-visible compute output buffer.
+		// Desktop only; no writable CWD on Android, and the validator is
+		// desktop-only anyway.
+#if !defined(__ANDROID__)
+		int32_t  astc_size = 0;
+		uint8_t* astc_data = NULL;
+		int32_t  astc_block_w = 0, astc_block_h = 0;
+		switch (scene->current_format) {
+			case compress_fmt_astc4x4:
+				astc_data = tex_compress_gpu_astc4x4_readback(&scene->texture_source, &astc_size);
+				astc_block_w = 4; astc_block_h = 4;
+				break;
+			case compress_fmt_astc6x6:
+				astc_data = tex_compress_gpu_astc6x6_readback(&scene->texture_source, &astc_size);
+				astc_block_w = 6; astc_block_h = 6;
+				break;
+			default: break;
+		}
+		if (astc_data) {
+			const char* out_path = "astc_output.astc";
+			if (astc_write_file(out_path, width, height, astc_block_w, astc_block_h, astc_data, (size_t)astc_size))
+				su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, astc_size, path);
+			else
+				su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
+			free(astc_data);
+		} else if (scene->current_format == compress_fmt_astc4x4 ||
+		           scene->current_format == compress_fmt_astc6x6) {
+			su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
+		}
+#endif
 	} else {
 		// CPU path
 		uint8_t* compressed_data = NULL;
+
+		if (scene->current_format == compress_fmt_astc4x4 ||
+		    scene->current_format == compress_fmt_astc6x6) {
+			// No CPU ASTC encoder yet — force GPU path and bail out of CPU flow.
+			su_log(su_log_warning, "TexCompress: ASTC has no CPU encoder, switching to GPU path");
+			scene->use_gpu = true;
+			su_image_free(pixels);
+			_load_image(scene, path);
+			return;
+		}
 
 		uint64_t start_ns = ska_time_get_elapsed_ns();
 		if (scene->current_format == compress_fmt_bc1) {
@@ -166,9 +237,14 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 		free(compressed_data);
 	}
 
-	// Update materials
-	skr_material_set_tex(&scene->material_original,   "tex", &scene->texture_original);
-	skr_material_set_tex(&scene->material_compressed, "tex", &scene->texture_compressed);
+	// Update materials. If the compressed texture couldn't be created (AMD
+	// ASTC validate-only path), bind the original to both sides so the scene
+	// still renders — the user gets clean visual feedback that no GPU preview
+	// is available, while the .astc file has already been saved for offline
+	// validation.
+	skr_material_set_tex(&scene->material_original, "tex", &scene->texture_original);
+	skr_material_set_tex(&scene->material_compressed, "tex",
+		skr_tex_is_valid(&scene->texture_compressed) ? &scene->texture_compressed : &scene->texture_original);
 
 	su_image_free(pixels);
 
@@ -196,16 +272,24 @@ static scene_t* _scene_bc1_create(void) {
 	tex_compress_gpu_init();
 
 	// Check format support
-	scene->bc1_supported  = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb, skr_tex_flags_readable, 1);
-	scene->etc2_supported = skr_tex_fmt_is_supported(skr_tex_fmt_etc1_rgb_srgb, skr_tex_flags_readable, 1);
+	scene->bc1_supported     = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb,     skr_tex_flags_readable, 1);
+	scene->etc2_supported    = skr_tex_fmt_is_supported(skr_tex_fmt_etc1_rgb_srgb,     skr_tex_flags_readable, 1);
+	scene->astc6x6_supported = skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba_srgb, skr_tex_flags_readable, 1);
+	// Even without texture sampling we can still run the compute shader and
+	// read the blocks back into a .astc file for offline validation against
+	// astcenc — desktop AMD GPUs hit this path.
+	scene->astc6x6_validate_only = !scene->astc6x6_supported;
 
-	su_log(su_log_info, "TexCompress: BC1 %s, ETC2 %s",
-		scene->bc1_supported  ? "supported" : "not supported",
-		scene->etc2_supported ? "supported" : "not supported");
+	su_log(su_log_info, "TexCompress: BC1 %s, ETC2 %s, ASTC6x6 %s",
+		scene->bc1_supported     ? "supported" : "not supported",
+		scene->etc2_supported    ? "supported" : "not supported",
+		scene->astc6x6_supported ? "supported" :
+		scene->astc6x6_validate_only ? "validate-only (no display)" : "not supported");
 
-	// Default format: prefer BC1, fallback to ETC2
-	scene->current_format = scene->bc1_supported  ? compress_fmt_bc1 :
-	                        scene->etc2_supported ? compress_fmt_etc2 :
+	// Default format: prefer BC1, fallback to ETC2, then ASTC6x6
+	scene->current_format = scene->astc6x6_validate_only ? compress_fmt_astc6x6 : scene->bc1_supported     ? compress_fmt_bc1     :
+	                        scene->etc2_supported    ? compress_fmt_etc2    :
+	                        (scene->astc6x6_supported || scene->astc6x6_validate_only) ? compress_fmt_astc6x6 :
 	                        compress_fmt_none;
 
 	// Default file path
@@ -265,11 +349,19 @@ static void _scene_bc1_update(scene_t* base, float delta_time) {
 		_load_image(scene, scene->file_path);
 	}
 
-	// Per-frame ETC2 dispatch for GPU profiling
+	// TEMPORARY profiling: dispatch the currently-selected encoder every
+	// frame via the profile-only path. All three variants share a cached
+	// output buffer and do just the compute dispatch at mip 0 — no texture
+	// creation, no buffer copy, no per-frame allocation. This gives an
+	// apples-to-apples shader cost comparison on the perf graph.
 	if (scene->use_gpu && skr_tex_is_valid(&scene->texture_source)) {
-		skr_tex_t etc2_result = tex_compress_gpu_etc2(&scene->texture_source);
-		if (skr_tex_is_valid(&etc2_result))
-			skr_tex_destroy(&etc2_result);
+		switch (scene->current_format) {
+			case compress_fmt_bc1:     tex_compress_gpu_bc1_profile    (&scene->texture_source, true); break;
+			case compress_fmt_etc2:    tex_compress_gpu_etc2_profile   (&scene->texture_source);       break;
+			case compress_fmt_astc4x4: tex_compress_gpu_astc4x4_profile(&scene->texture_source);       break;
+			case compress_fmt_astc6x6: tex_compress_gpu_astc6x6_profile(&scene->texture_source);       break;
+			default: break;
+		}
 	}
 }
 
@@ -281,7 +373,7 @@ static void _scene_bc1_render(scene_t* base, int32_t width, int32_t height,
 	(void)height;
 	(void)ref_system_buffer;
 
-	if (!skr_tex_is_valid(&scene->texture_original) || !skr_tex_is_valid(&scene->texture_compressed)) return;
+	if (!skr_tex_is_valid(&scene->texture_original)) return;
 
 	// Calculate aspect ratio for proper quad sizing
 	float aspect = (float)scene->img_width / (float)scene->img_height;
@@ -344,10 +436,16 @@ static void _scene_bc1_render_ui(scene_t* base) {
 
 	// Format support status
 	igText("Format Support:");
-	igTextColored(scene->bc1_supported  ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
-		"  BC1:  %s", scene->bc1_supported ? "Yes" : "No");
-	igTextColored(scene->etc2_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
-		"  ETC2: %s", scene->etc2_supported ? "Yes" : "No");
+	igTextColored(scene->bc1_supported     ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
+		"  BC1:     %s", scene->bc1_supported     ? "Yes" : "No");
+	igTextColored(scene->etc2_supported    ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
+		"  ETC2:    %s", scene->etc2_supported    ? "Yes" : "No");
+	igTextColored(
+		scene->astc6x6_supported     ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} :
+		scene->astc6x6_validate_only ? (ImVec4){1.0f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
+		"  ASTC6x6: %s",
+		scene->astc6x6_supported     ? "Yes" :
+		scene->astc6x6_validate_only ? "Validate only (no display)" : "No");
 
 	igSeparator();
 
@@ -356,12 +454,33 @@ static void _scene_bc1_render_ui(scene_t* base) {
 		scene->load_requested = true;
 	}
 
-	// Format selection (only show when both are supported)
-	if (scene->bc1_supported && scene->etc2_supported) {
-		int fmt = (int)scene->current_format;
-		if (igRadioButton_IntPtr("BC1",  &fmt, compress_fmt_bc1))  { scene->current_format = compress_fmt_bc1;  scene->load_requested = true; }
-		igSameLine(0, 10);
-		if (igRadioButton_IntPtr("ETC2", &fmt, compress_fmt_etc2)) { scene->current_format = compress_fmt_etc2; scene->load_requested = true; }
+	// Format selection — dropdown of supported formats only. We build a
+	// parallel array of (label, enum_value) so skipped formats don't push
+	// later entries onto the wrong index.
+	{
+		const char* labels [16] = {0};
+		int         values [16] = {0};
+		int         count       = 0;
+
+		if (scene->bc1_supported) {
+			labels[count] = "BC1 (DXT1)";                      values[count++] = compress_fmt_bc1;
+		}
+		if (scene->etc2_supported) {
+			labels[count] = "ETC2 RGB8";                       values[count++] = compress_fmt_etc2;
+		}
+		if (scene->astc6x6_supported || scene->astc6x6_validate_only) {
+			labels[count] = "ASTC 4x4";  values[count++] = compress_fmt_astc4x4;
+			labels[count] = "ASTC 6x6";  values[count++] = compress_fmt_astc6x6;
+		}
+
+		int selected = 0;
+		for (int i = 0; i < count; i++) {
+			if (values[i] == (int)scene->current_format) { selected = i; break; }
+		}
+		if (igCombo_Str_arr("Format", &selected, labels, count, -1)) {
+			scene->current_format = (compress_fmt_)values[selected];
+			scene->load_requested = true;
+		}
 	}
 
 	igSeparator();
@@ -393,8 +512,10 @@ static void _scene_bc1_render_ui(scene_t* base) {
 	if (scene->img_width > 0) {
 		const char* fmt_name = "None";
 		switch (scene->current_format) {
-			case compress_fmt_bc1:  fmt_name = "BC1 (DXT1)"; break;
-			case compress_fmt_etc2: fmt_name = "ETC2 RGB8"; break;
+			case compress_fmt_bc1:     fmt_name = "BC1 (DXT1)"; break;
+			case compress_fmt_etc2:    fmt_name = "ETC2 RGB8";  break;
+			case compress_fmt_astc4x4: fmt_name = "ASTC 4x4";   break;
+			case compress_fmt_astc6x6: fmt_name = "ASTC 6x6";   break;
 			default: break;
 		}
 

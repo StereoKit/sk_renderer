@@ -105,3 +105,19 @@ static inline int32_t etc2_rgb8_calc_size(int32_t width, int32_t height) {
 	int32_t blocks_y = (height + 3) / 4;
 	return blocks_x * blocks_y * 8;
 }
+
+// Calculate ASTC 6x6 data size for given dimensions
+// Returns size in bytes (16 bytes per 6x6 block)
+static inline int32_t astc6x6_calc_size(int32_t width, int32_t height) {
+	int32_t blocks_x = (width  + 5) / 6;
+	int32_t blocks_y = (height + 5) / 6;
+	return blocks_x * blocks_y * 16;
+}
+
+// Calculate ASTC 4x4 data size for given dimensions
+// Returns size in bytes (16 bytes per 4x4 block)
+static inline int32_t astc4x4_calc_size(int32_t width, int32_t height) {
+	int32_t blocks_x = (width  + 3) / 4;
+	int32_t blocks_y = (height + 3) / 4;
+	return blocks_x * blocks_y * 16;
+}
