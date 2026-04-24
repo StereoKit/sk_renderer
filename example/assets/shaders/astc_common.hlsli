@@ -53,8 +53,12 @@
 //     bits → 0 0 1 0 0 0 0 1 0 0 0  =  0x108
 
 static const uint ASTC_BLOCK_MODE_3x3_R3      = 0x1BFu; // 3x3 grid, 3-bit weights
+static const uint ASTC_BLOCK_MODE_3x3_R5      = 0x3BFu; // 3x3 grid, 5-bit weights (32 lvl, H=1 + same R as R3)
 static const uint ASTC_BLOCK_MODE_4x4_R2      = 0x042u; // 4x4 grid, 2-bit weights
 static const uint ASTC_BLOCK_MODE_4x4_R3      = 0x053u; // 4x4 grid, 3-bit weights
+static const uint ASTC_BLOCK_MODE_4x4_R6_TRIT = 0x043u; // 4x4 grid, trit+1bit (6 lvl)
+static const uint ASTC_BLOCK_MODE_4x4_R12_TRIT= 0x251u; // 4x4 grid, trit+2bit (12 lvl, H=1)
+static const uint ASTC_BLOCK_MODE_5x4_R3      = 0x0D3u; // 5x4 grid, 3-bit weights
 static const uint ASTC_BLOCK_MODE_5x5_R2      = 0x0E2u; // 5x5 grid, 2-bit weights
 // 6x5 grid, 2-bit weights. Same sub-mode 00 as 5x5 (wt_h = a+2 = 5 → a=3),
 // just bumps b from 1 to 2 to get wt_w = b+4 = 6 — i.e. flip bit 7 (off)
@@ -103,6 +107,12 @@ uint astc_reverse2(uint v) {
 	return ((v & 1u) << 1) | ((v >> 1) & 1u);
 }
 
+// Reverse the low 5 bits: abcde → edcba. Used for 5-bit weight placement
+// (32 weight levels, range index 13 with H=1 + R=7).
+uint astc_reverse5(uint v) {
+	return ((v & 1u) << 4) | ((v & 2u) << 2) | (v & 4u) | ((v & 8u) >> 2) | ((v & 16u) >> 4);
+}
+
 // Write a 3-bit weight into its bit-reversed slot at the top of the block.
 // For weight index i (in a 16-weight grid), natural bits 3i..3i+2 land at
 // block bits (125-3i)..(127-3i) after the reversal. Placing astc_reverse3(w)
@@ -119,6 +129,15 @@ void astc_write_weight_3bit(inout uint4 block, uint weight_index, uint weight_va
 void astc_write_weight_2bit(inout uint4 block, uint weight_index, uint weight_value) {
 	uint pos = 126u - 2u * weight_index;
 	astc_block_write_bits(block, pos, 2u, astc_reverse2(weight_value));
+}
+
+// Write a 5-bit weight (32 levels, range index 13) into its bit-reversed
+// slot at the top of the block. For weight index i, natural bits 5i..5i+4
+// land at block bits (123-5i)..(127-5i). Used by 3x3 + 5-bit weight modes
+// (e.g. HDR 8x8 Mode B smooth-gradient).
+void astc_write_weight_5bit(inout uint4 block, uint weight_index, uint weight_value) {
+	uint pos = 123u - 5u * weight_index;
+	astc_block_write_bits(block, pos, 5u, astc_reverse5(weight_value));
 }
 
 // Write an interleaved primary/secondary 2-bit weight pair for dual-plane
@@ -330,6 +349,22 @@ void astc_write_header_5x5_rgba(inout uint4 block) {
 // 256 pure binary) = 113 bits used, 15 wasted.
 void astc_write_header_4x4_rgba(inout uint4 block) {
 	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_4x4_R2);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_LDR_RGBA);
+}
+
+// 4x4 grid + trit+2bit weights (12 lvl) for CEM 8. Upgrades the R3 3-bit
+// weight mode by 50% axial precision, keeping the same per-pixel grid and
+// range-256 endpoints. Bit budget: 17 + 58 (weights) + 48 = 123 / 128.
+void astc_write_header_4x4_rgb_r12(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_4x4_R12_TRIT);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_LDR_RGB);
+}
+
+// 4x4 grid + trit+1bit weights (6 lvl) for CEM 12. Upgrades the R2 2-bit
+// weight mode by 50% axial precision, keeping per-pixel grid + range-256
+// endpoints. Bit budget: 17 + 42 + 64 = 123 / 128.
+void astc_write_header_4x4_rgba_r6(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_4x4_R6_TRIT);
 	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_LDR_RGBA);
 }
 
@@ -618,6 +653,24 @@ void astc_write_header_8x8_hdr_rgb_4x4(inout uint4 block) {
 	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
 }
 
+// 4x4 grid + trit+2bit (12 lvl) weights, CEM 11 HDR RGB. +50% axial
+// precision over the 3-bit (8 lvl) version at the same 4x4 grid +
+// range-256 endpoints. Bit budget: 17 + 58 + 48 = 123 / 128 used.
+void astc_write_header_8x8_hdr_rgb_4x4_r12(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_4x4_R12_TRIT);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
+}
+
+void astc_write_header_8x8_hdr_rgb_5x4(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_5x4_R3);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
+}
+
+void astc_write_header_8x8_hdr_rgb_3x3(inout uint4 block) {
+	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_3x3_R5);
+	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
+}
+
 void astc_write_header_8x8_hdr_rgb_8x4(inout uint4 block) {
 	astc_block_write_bits(block,  0u, 11u, ASTC_BLOCK_MODE_8x4_R2);
 	astc_block_write_bits(block, 13u,  4u, ASTC_CEM_HDR_RGB);
@@ -851,4 +904,132 @@ void astc_quantize_hdr_rgb(float3 color0_in, float3 color1_in, out uint v0, out 
 	// reference encoder's retain_top_two_bits is identity.
 	v4 = uint(astc_flt2int_rtn(vals[4] / 512.0) + 128) & 0xFFu;
 	v5 = uint(astc_flt2int_rtn(vals[5] / 512.0) + 128) & 0xFFu;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// BISE-encoded weights
+//
+// ASTC supports non-power-of-2 weight ranges via BISE (trits + binary bits).
+// Useful configurations for squeezing extra axial precision out of the
+// weight budget:
+//
+//   wt_range 6 (H=0): trit + 1-bit binary → 6 levels per weight
+//   wt_range 3 (H=1): trit + 2-bit binary → 12 levels per weight
+//
+// Weights are packed in groups: 5 weights per full trit group (8 T-bits +
+// 5·B binary bits), plus a partial tail group for the remainder. Unlike
+// endpoints (which live at bit 17 growing up), weights live at the TOP of
+// the block bit-reversed — so we count natural offsets DOWN from bit 127
+// and write each bit/field at (127 - natural_offset).
+//
+// Block mode constants (standard sub-mode 00 with wt_range via
+// (bits[1:0] << 1) | bit[4], + H bit at bit 9):
+///////////////////////////////////////////////////////////////////////////////
+
+// (Block mode constants for 4x4_R6_TRIT, 4x4_R12_TRIT, 5x4_R3, 3x3_R5 are
+// declared at the top of this file alongside the other ASTC_BLOCK_MODE_*
+// constants, so the header writers above can reference them.)
+
+// Quantize a normalized weight target in [0, 1] to trit+1bit (6 levels) and
+// return the encoded value v ∈ [0, 5]. Thresholds and LEVEL_TO_V derived
+// from mesa's unquantise_weights for (wt_trits=1, wt_bits=1): unquantized
+// levels land at {0, 12, 25, 38, 51, 63} / 63, and the trit encoding
+// scrambles v-to-level (v∈[0,5] maps to level indices {0, 5, 2, 4, 1, 3}).
+uint astc_quantize_weight_trit_1bit(float target) {
+	uint level =
+		uint(target >=  6.0 / 63.0) +
+		uint(target >= 18.5 / 63.0) +
+		uint(target >= 31.5 / 63.0) +
+		uint(target >= 44.5 / 63.0) +
+		uint(target >= 57.0 / 63.0);
+	static const uint LEVEL_TO_V[6] = { 0u, 2u, 4u, 5u, 3u, 1u };
+	return LEVEL_TO_V[level];
+}
+
+// Quantize a normalized weight target in [0, 1] to trit+2bit (12 levels)
+// and return the encoded value v ∈ [0, 11]. Levels {0, 5, 11, 18, 24, 30,
+// 33, 39, 45, 52, 58, 63} / 63.
+uint astc_quantize_weight_trit_2bit(float target) {
+	uint level =
+		uint(target >=  2.5 / 63.0) +
+		uint(target >=  8.0 / 63.0) +
+		uint(target >= 14.5 / 63.0) +
+		uint(target >= 21.0 / 63.0) +
+		uint(target >= 27.0 / 63.0) +
+		uint(target >= 31.5 / 63.0) +
+		uint(target >= 36.0 / 63.0) +
+		uint(target >= 42.0 / 63.0) +
+		uint(target >= 48.5 / 63.0) +
+		uint(target >= 55.0 / 63.0) +
+		uint(target >= 60.5 / 63.0);
+	static const uint LEVEL_TO_V[12] = { 0u, 4u, 8u, 2u, 6u, 10u, 11u, 7u, 3u, 9u, 5u, 1u };
+	return LEVEL_TO_V[level];
+}
+
+// Full 5-weight trit+1bit group (13 bits total: 5·1 binary + 8 T-bits)
+// written at weight-stream natural offset `base`. `T_pattern` comes from
+// astc_trit_pack_lut indexed by (t0 + 3·t1 + 9·t2 + 27·t3 + 81·t4); m0..m4
+// are the 1-bit binary parts (value bit 0 of each encoded weight).
+void astc_write_weight_trit_1bit_full(inout uint4 block, uint base, uint T_pattern,
+                                      uint m0, uint m1, uint m2, uint m3, uint m4) {
+	// Layout (natural offsets from `base`):
+	//   m0 @ 0, T0 @ 1, T1 @ 2, m1 @ 3, T2 @ 4, T3 @ 5, m2 @ 6, T4 @ 7,
+	//   m3 @ 8, T5 @ 9, T6 @ 10, m4 @ 11, T7 @ 12
+	astc_block_write_bits(block, 127u - base -  0u, 1u, m0 & 1u);
+	astc_block_write_bits(block, 127u - base -  1u, 1u,  T_pattern        & 1u);
+	astc_block_write_bits(block, 127u - base -  2u, 1u, (T_pattern >> 1u) & 1u);
+	astc_block_write_bits(block, 127u - base -  3u, 1u, m1 & 1u);
+	astc_block_write_bits(block, 127u - base -  4u, 1u, (T_pattern >> 2u) & 1u);
+	astc_block_write_bits(block, 127u - base -  5u, 1u, (T_pattern >> 3u) & 1u);
+	astc_block_write_bits(block, 127u - base -  6u, 1u, m2 & 1u);
+	astc_block_write_bits(block, 127u - base -  7u, 1u, (T_pattern >> 4u) & 1u);
+	astc_block_write_bits(block, 127u - base -  8u, 1u, m3 & 1u);
+	astc_block_write_bits(block, 127u - base -  9u, 1u, (T_pattern >> 5u) & 1u);
+	astc_block_write_bits(block, 127u - base - 10u, 1u, (T_pattern >> 6u) & 1u);
+	astc_block_write_bits(block, 127u - base - 11u, 1u, m4 & 1u);
+	astc_block_write_bits(block, 127u - base - 12u, 1u, (T_pattern >> 7u) & 1u);
+}
+
+// Partial 1-weight trit+1bit group (3 bits: m0 + T0 + T1) at natural offset
+// `base`. Used for the 16th weight in a 16-weight grid after 3 full groups.
+// LUT indexed by (t0) gives T pattern with bits 2-7 == 0, so only T0/T1
+// matter for reconstruction.
+void astc_write_weight_trit_1bit_partial1(inout uint4 block, uint base, uint T_pattern, uint m0) {
+	astc_block_write_bits(block, 127u - base - 0u, 1u, m0 & 1u);
+	astc_block_write_bits(block, 127u - base - 1u, 1u,  T_pattern        & 1u);
+	astc_block_write_bits(block, 127u - base - 2u, 1u, (T_pattern >> 1u) & 1u);
+}
+
+// Full 5-weight trit+2bit group (18 bits total: 5·2 binary + 8 T-bits).
+// Same T-bit positions as the trit+1bit case but m_i are 2-bit binary
+// values, bit-reversed into their natural slot.
+void astc_write_weight_trit_2bit_full(inout uint4 block, uint base, uint T_pattern,
+                                      uint m0, uint m1, uint m2, uint m3, uint m4) {
+	// Natural offsets (from `base`):
+	//   m0 @ [0,1], T0 @ 2, T1 @ 3, m1 @ [4,5], T2 @ 6, T3 @ 7,
+	//   m2 @ [8,9], T4 @ 10, m3 @ [11,12], T5 @ 13, T6 @ 14,
+	//   m4 @ [15,16], T7 @ 17.
+	// 2-bit values go at (127-base-offset-1) via astc_reverse2 so that bit 0
+	// lands at the lower natural offset.
+	astc_block_write_bits(block, 127u - base -  1u, 2u, astc_reverse2(m0));
+	astc_block_write_bits(block, 127u - base -  2u, 1u,  T_pattern        & 1u);
+	astc_block_write_bits(block, 127u - base -  3u, 1u, (T_pattern >> 1u) & 1u);
+	astc_block_write_bits(block, 127u - base -  5u, 2u, astc_reverse2(m1));
+	astc_block_write_bits(block, 127u - base -  6u, 1u, (T_pattern >> 2u) & 1u);
+	astc_block_write_bits(block, 127u - base -  7u, 1u, (T_pattern >> 3u) & 1u);
+	astc_block_write_bits(block, 127u - base -  9u, 2u, astc_reverse2(m2));
+	astc_block_write_bits(block, 127u - base - 10u, 1u, (T_pattern >> 4u) & 1u);
+	astc_block_write_bits(block, 127u - base - 12u, 2u, astc_reverse2(m3));
+	astc_block_write_bits(block, 127u - base - 13u, 1u, (T_pattern >> 5u) & 1u);
+	astc_block_write_bits(block, 127u - base - 14u, 1u, (T_pattern >> 6u) & 1u);
+	astc_block_write_bits(block, 127u - base - 16u, 2u, astc_reverse2(m4));
+	astc_block_write_bits(block, 127u - base - 17u, 1u, (T_pattern >> 7u) & 1u);
+}
+
+// Partial 1-weight trit+2bit group (4 bits: m0 [2 bits] + T0 + T1) at
+// natural offset `base`.
+void astc_write_weight_trit_2bit_partial1(inout uint4 block, uint base, uint T_pattern, uint m0) {
+	astc_block_write_bits(block, 127u - base - 1u, 2u, astc_reverse2(m0));
+	astc_block_write_bits(block, 127u - base - 2u, 1u,  T_pattern        & 1u);
+	astc_block_write_bits(block, 127u - base - 3u, 1u, (T_pattern >> 1u) & 1u);
 }

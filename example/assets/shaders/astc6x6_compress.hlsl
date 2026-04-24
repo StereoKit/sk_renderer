@@ -60,6 +60,17 @@ static const float UNQ_R8[8] = {
 };
 static const float UNQ_R4[4] = { 0.0, 21.0 / 64.0, 43.0 / 64.0, 1.0 };
 
+// trit+2bit (12 lvl) BISE weights, indexed by ENCODED v ∈ [0, 11]. Used by
+// Mode A (the CEM 8 smooth-mode upgrade from 3-bit to trit+2bit: +50%
+// axial precision, same 4x4 grid + range-256 endpoints). Trit-encoded
+// unquant is non-monotonic in v, paired as (v, v^1) mirror across 0.5 —
+// same shape as our LDR 4x4 Mode A table.
+static const float UNQ_R12_V[12] = {
+	 0.0/63.0,  1.0,       18.0/63.0, 45.0/63.0,
+	 5.0/63.0, 58.0/63.0,  24.0/63.0, 39.0/63.0,
+	11.0/63.0, 52.0/63.0,  30.0/63.0, 33.0/63.0,
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // Mode A: 3x3 weight grid, 3-bit weights, 8-bit RGBA endpoints
 ///////////////////////////////////////////////////////////////////////////////
@@ -334,35 +345,75 @@ void encode_mode_5x5_rgba(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Mode A: CEM 8 (RGB-only), 4x4 weight grid, 3-bit weights, 8-bit endpoints
-//         Decoder writes alpha = 1.0 unconditionally, so SSE includes
-//         alpha error against the source — opaque blocks (α=1.0 everywhere)
-//         get zero alpha penalty AND benefit from not spending bits on α.
+// Mode A: CEM 8 (RGB-only), 4x4 weight grid, trit+2bit (12 lvl) weights,
+//         range-256 endpoints. Decoder writes alpha = 1.0 unconditionally,
+//         so SSE includes alpha error against the source — opaque blocks
+//         (α=1.0 everywhere) get zero alpha penalty AND benefit from not
+//         spending bits on α. weights[] stores ENCODED v directly; unquant
+//         via UNQ_R12_V[v], mirror via v^1 on endpoint swap.
+//
+//         Endpoints come from farthest-point-sampling (FPS) iteration, not
+//         the block's bbox — FPS picks two actual source pixels that span
+//         the real data axis. This handles "anti-correlated" content (R and
+//         G varying in opposite directions, common in dark saturated foliage
+//         blocks) where the bbox picks fictional corner colors no pixel
+//         occupies and reconstruction collapses to a muddy mid-axis color.
+//         Outer-computed axis/proj params are ignored — Mode A recomputes
+//         them against its FPS-derived endpoints.
 ///////////////////////////////////////////////////////////////////////////////
 
 void encode_mode_4x4_rgb_only(
 	in  float4 pixels[36],
-	in  float3 faxis,     in  float faxis_len_sq, in float fc0_proj,
-	in  float  pproj[36], in  uint3 imin_rgb,     in uint3 imax_rgb,
-	out uint4  out_block, out float out_sse)
+	in  float3 faxis_outer,     in  float faxis_len_sq_outer, in float fc0_proj_outer,
+	in  float  pproj_outer[36], in  uint3 imin_rgb,           in uint3 imax_rgb,
+	out uint4  out_block,       out float out_sse)
 {
-	uint3 e0 = imin_rgb;
-	uint3 e1 = imax_rgb;
+	// FPS: 2 passes of "find pixel most distant from current anchor,
+	// anchor = that pixel." Converges to approximately the block's diametric
+	// pixel pair — two real pixels defining the principal axis of variation.
+	// ~360 ops/block; fixes anti-correlated-gradient collapse.
+	uint3 fps_a = uint3(pixels[0].rgb * 255.0 + 0.5);
+	uint3 fps_b = fps_a;
+	[unroll] for (uint iter = 0; iter < 2u; iter++) {
+		float max_d2 = -1.0;
+		uint3 far_p  = fps_a;
+		[unroll] for (uint fi = 0; fi < 36; fi++) {
+			uint3 pi   = uint3(pixels[fi].rgb * 255.0 + 0.5);
+			int3  diff = int3(pi) - int3(fps_a);
+			float d2   = dot(float3(diff), float3(diff));
+			far_p  = d2 > max_d2 ? pi : far_p;
+			max_d2 = max(max_d2, d2);
+		}
+		fps_b = fps_a;
+		fps_a = far_p;
+	}
+	// Order so e0 has smaller RGB sum (matches LS-swap convention downstream).
+	uint3 e0 = fps_b;
+	uint3 e1 = fps_a;
+	if (e0.r + e0.g + e0.b > e1.r + e1.g + e1.b) {
+		uint3 tmp = e0; e0 = e1; e1 = tmp;
+	}
 
-	float T[7];
-	T[0] = faxis_len_sq * 0.0703125 + fc0_proj;
-	T[1] = faxis_len_sq * 0.2109375 + fc0_proj;
-	T[2] = faxis_len_sq * 0.3515625 + fc0_proj;
-	T[3] = faxis_len_sq * 0.5000000 + fc0_proj;
-	T[4] = faxis_len_sq * 0.6484375 + fc0_proj;
-	T[5] = faxis_len_sq * 0.7890625 + fc0_proj;
-	T[6] = faxis_len_sq * 0.9296875 + fc0_proj;
+	// Recompute axis + per-pixel projection against FPS endpoints. Same
+	// perceptually-weighted formula as main() used — just with (e0, e1)
+	// from FPS instead of bbox.
+	float3 faxis = float3(
+		float(int(e1.r) - int(e0.r)) * 2.0,
+		float(int(e1.g) - int(e0.g)) * 4.0,
+		float(int(e1.b) - int(e0.b)));
+	float faxis_len_sq = (faxis.r * faxis.r * 0.5 + faxis.g * faxis.g * 0.25 + faxis.b * faxis.b) / 255.0;
+	float fc0_proj     = dot(float3(e0) / 255.0, faxis);
+	float pproj[36];
+	[unroll] for (uint pi = 0; pi < 36; pi++) {
+		pproj[pi] = dot(pixels[pi].rgb, faxis);
+	}
 
 	static const float wcoord[4] = { 0.0, 5.0/3.0, 10.0/3.0, 5.0 };
 	uint weights[16];
 	if (faxis_len_sq < 1e-6) {
 		[unroll] for (uint i = 0; i < 16; i++) weights[i] = 0;
 	} else {
+		float inv_axis_len_sq = 1.0 / faxis_len_sq;
 		[unroll] for (uint wy = 0; wy < 4; wy++) {
 			[unroll] for (uint wx = 0; wx < 4; wx++) {
 				float fx = wcoord[wx], fy = wcoord[wy];
@@ -375,17 +426,15 @@ void encode_mode_4x4_rgb_only(
 				float p01 = pproj[iy1 * 6 + ix0];
 				float p11 = pproj[iy1 * 6 + ix1];
 				float p   = lerp(lerp(p00, p10, tx), lerp(p01, p11, tx), ty);
-				uint  q = uint(p >= T[0]) + uint(p >= T[1]) + uint(p >= T[2])
-				        + uint(p >= T[3]) + uint(p >= T[4]) + uint(p >= T[5])
-				        + uint(p >= T[6]);
-				weights[wy * 4 + wx] = q;
+				float target = saturate((p - fc0_proj) * inv_axis_len_sq);
+				weights[wy * 4 + wx] = astc_quantize_weight_trit_2bit(target);
 			}
 		}
 	}
 
 	if (faxis_len_sq >= 1e-6) {
 		float gw[16];
-		[unroll] for (uint i = 0; i < 16; i++) gw[i] = UNQ_R8[weights[i]];
+		[unroll] for (uint i = 0; i < 16; i++) gw[i] = UNQ_R12_V[weights[i]];
 
 		float  A = 0, B = 0, C = 0;
 		float3 D = float3(0, 0, 0), E = float3(0, 0, 0);
@@ -418,25 +467,45 @@ void encode_mode_4x4_rgb_only(
 			uint3  n1      = uint3(e1_ref * 255.0 + 0.5);
 			if (n0.r + n0.g + n0.b > n1.r + n1.g + n1.b) {
 				uint3 tmp = n0; n0 = n1; n1 = tmp;
-				[unroll] for (uint i = 0; i < 16; i++) weights[i] = 7u - weights[i];
+				[unroll] for (uint i = 0; i < 16; i++) weights[i] = weights[i] ^ 1u;
 			}
 			e0 = n0; e1 = n1;
 		}
 	}
 
 	uint4 block = uint4(0, 0, 0, 0);
-	astc_write_header_4x4_rgb(block);
+	astc_write_header_4x4_rgb_r12(block);
 	astc_write_endpoints_rgb8(block, e0, e1);
-	[unroll] for (uint wi = 0; wi < 16; wi++) {
-		astc_write_weight_3bit(block, wi, weights[wi]);
+
+	// 16 weights = 3 full 5-trit groups + 1 partial-1 group (same BISE
+	// layout as LDR 4x4 Mode A).
+	uint base = 0u;
+	[unroll] for (uint g = 0; g < 3; g++) {
+		uint v0 = weights[g * 5u + 0u];
+		uint v1 = weights[g * 5u + 1u];
+		uint v2 = weights[g * 5u + 2u];
+		uint v3 = weights[g * 5u + 3u];
+		uint v4 = weights[g * 5u + 4u];
+		uint t0 = v0 >> 2, m0 = v0 & 3u;
+		uint t1 = v1 >> 2, m1 = v1 & 3u;
+		uint t2 = v2 >> 2, m2 = v2 & 3u;
+		uint t3 = v3 >> 2, m3 = v3 & 3u;
+		uint t4 = v4 >> 2, m4 = v4 & 3u;
+		uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
+		astc_write_weight_trit_2bit_full(block, base, T, m0, m1, m2, m3, m4);
+		base += 18u;
 	}
+	uint v15 = weights[15];
+	uint T_p = astc_trit_pack_lut[v15 >> 2];
+	astc_write_weight_trit_2bit_partial1(block, base, T_p, v15 & 3u);
+
 	out_block = block;
 
 	// SSE — RGB reconstruction + alpha-against-1.0 penalty.
 	float3 e0_f = float3(e0) / 255.0;
 	float3 e1_f = float3(e1) / 255.0;
 	float  gw2[16];
-	[unroll] for (uint i = 0; i < 16; i++) gw2[i] = UNQ_R8[weights[i]];
+	[unroll] for (uint i = 0; i < 16; i++) gw2[i] = UNQ_R12_V[weights[i]];
 	float sse = 0.0;
 	[unroll] for (uint py = 0; py < 6; py++) {
 		[unroll] for (uint px = 0; px < 6; px++) {
