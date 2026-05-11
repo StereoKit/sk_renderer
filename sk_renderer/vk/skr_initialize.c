@@ -646,6 +646,7 @@ bool skr_init(skr_settings_t settings) {
 		.fillModeNonSolid               = available_features.fillModeNonSolid,
 		.depthClamp                     = available_features.depthClamp,
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
+		.fragmentStoresAndAtomics       = available_features.fragmentStoresAndAtomics,
 	};
 
 	// Multiview is Vulkan 1.1 core - always enable for multi-view rendering

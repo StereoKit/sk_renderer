@@ -296,6 +296,16 @@ static const char* _layout_to_string(VkImageLayout layout) {
 // Automatic Layout Transition System
 ///////////////////////////////////////////////////////////////////////////////
 
+// Canonical "ready to be sampled" layout for a texture. Single source of
+// truth shared by the descriptor-write path and the transition helpers, so
+// the two can't drift. Caller must ensure the texture is owned by sk_renderer
+// (not external) — external textures keep whatever layout the producer set.
+VkImageLayout _skr_tex_sample_layout(const skr_tex_t* tex) {
+	if (tex->flags & skr_tex_flags_compute)             return VK_IMAGE_LAYOUT_GENERAL;
+	if (tex->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)   return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+	return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
 // Check if texture needs transition for given type (without requiring command buffer)
 bool _skr_tex_needs_transition(const skr_tex_t* tex, uint8_t type) {
 	if (!tex || !tex->image) return false;
@@ -304,15 +314,9 @@ bool _skr_tex_needs_transition(const skr_tex_t* tex, uint8_t type) {
 	if (tex->is_transient_discard) return true;
 
 	// Determine target layout based on type
-	VkImageLayout target_layout;
-	if (type == 1) {  // storage
-		target_layout = VK_IMAGE_LAYOUT_GENERAL;
-	} else {  // shader_read (type == 0)
-		// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
-		target_layout = (tex->flags & skr_tex_flags_compute)
-			? VK_IMAGE_LAYOUT_GENERAL
-			: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	}
+	VkImageLayout target_layout = (type == 1)
+		? VK_IMAGE_LAYOUT_GENERAL
+		: _skr_tex_sample_layout(tex);
 
 	// Check if already in target layout
 	return tex->current_layout != target_layout;
@@ -382,12 +386,7 @@ void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFl
 
 // Specialized: Transition for shader read (most common case)
 void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage) {
-	// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
-	VkImageLayout target_layout = (ref_tex->flags & skr_tex_flags_compute)
-		? VK_IMAGE_LAYOUT_GENERAL
-		: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-	_skr_tex_transition(cmd, ref_tex, target_layout, dst_stage, VK_ACCESS_SHADER_READ_BIT);
+	_skr_tex_transition(cmd, ref_tex, _skr_tex_sample_layout(ref_tex), dst_stage, VK_ACCESS_SHADER_READ_BIT);
 }
 
 // Specialized: Transition for storage image (compute RWTexture)

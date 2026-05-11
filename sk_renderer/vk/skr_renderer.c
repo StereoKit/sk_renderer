@@ -135,11 +135,8 @@ static void _skr_flush_texture_transitions(VkCommandBuffer cmd) {
 				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 		} else {  // shader_read
-			VkImageLayout target = (tex->flags & skr_tex_flags_compute)
-				? VK_IMAGE_LAYOUT_GENERAL
-				: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			// _skr_barrier_batch_add skips if already in target layout
-			_skr_barrier_batch_add(&batch, cmd, tex, target,
+			_skr_barrier_batch_add(&batch, cmd, tex, _skr_tex_sample_layout(tex),
 				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 				VK_ACCESS_SHADER_READ_BIT);
 		}
@@ -573,19 +570,11 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 
 	_skr_bind_pool_lock();
 	skr_material_bind_t* mat_binds = _skr_bind_pool_get(material->bind_start);
-	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-		writes,       sizeof(writes      )/sizeof(writes      [0]),
-		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-		&write_ct, &buffer_ct, &image_ct);
-	if (fail_idx >= 0) {
-		_skr_bind_pool_unlock();
-		_skr_pipeline_unlock();
-		skr_log(skr_log_critical, "Blit missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
-		return;
-	}
 
-	// Batch source + target transitions into a single barrier
+	// Batch source + target transitions into a single barrier. Transition
+	// before building descriptor writes — matches the convention in the
+	// compute path and ensures textures are in their sampling layout by the
+	// time the draw runs.
 	{
 		_skr_barrier_batch_t batch;
 		_skr_barrier_batch_init(&batch);
@@ -594,9 +583,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		for (uint32_t i = 0; i < meta->resource_count; i++) {
 			skr_material_bind_t* res = &mat_binds[meta->buffer_count + i];
 			if (res->texture) {
-				VkImageLayout target = (res->texture->flags & skr_tex_flags_compute)
-					? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-				_skr_barrier_batch_add(&batch, ctx.cmd, res->texture, target,
+				_skr_barrier_batch_add(&batch, ctx.cmd, res->texture, _skr_tex_sample_layout(res->texture),
 					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 			}
 		}
@@ -609,7 +596,18 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 
 		_skr_barrier_batch_flush(&batch, ctx.cmd);
 	}
+
+	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+		writes,       sizeof(writes      )/sizeof(writes      [0]),
+		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
+		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
+		&write_ct, &buffer_ct, &image_ct);
 	_skr_bind_pool_unlock();
+	if (fail_idx >= 0) {
+		_skr_pipeline_unlock();
+		skr_log(skr_log_critical, "Blit missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
+		return;
+	}
 
 	// Create framebuffer - layered for cubemaps/arrays, cached for 2D
 	VkFramebuffer framebuffer   = VK_NULL_HANDLE;

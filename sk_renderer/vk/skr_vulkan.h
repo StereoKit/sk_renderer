@@ -196,22 +196,42 @@ typedef struct  {
 
 // Internal key struct for pipeline-affecting material parameters only.
 // Excludes queue_offset which affects render list sorting but not pipeline state.
-typedef struct {
-	const skr_shader_t*  shader;
-	skr_cull_            cull;
-	skr_write_           write_mask;
-	skr_compare_         depth_test;
-	skr_blend_state_t    blend_state;
-	bool                 alpha_to_coverage;
-	bool                 depth_clamp;
-	bool                 wireframe;
-	skr_stencil_state_t  stencil_front;
-	skr_stencil_state_t  stencil_back;
+//
+// Layout is hand-tuned so every byte corresponds to a named field — there are
+// no implicit alignment holes. _pad0/_pad1 are explicit so designated
+// initializers zero them via the C99 "unspecified members → zero" rule, and
+// memcmp-based dedup in _skr_pipeline_register_material is byte-deterministic
+// regardless of compiler or C standard version.
 #define SKR_MAX_IMMUTABLE_SAMPLERS 2
-	VkSampler            immutable_samplers[SKR_MAX_IMMUTABLE_SAMPLERS];      // Immutable samplers for YCbCr textures (VK_NULL_HANDLE = unused)
-	int32_t              immutable_sampler_slots[SKR_MAX_IMMUTABLE_SAMPLERS];  // Descriptor binding slots (sorted by slot for deterministic memcmp)
-	int32_t              immutable_sampler_count;                              // Number of active immutable samplers
+typedef struct {
+	// 8-byte aligned block
+	const skr_shader_t*  shader;                                              // @0   (8)
+	VkSampler            immutable_samplers[SKR_MAX_IMMUTABLE_SAMPLERS];      // @8   (16) Immutable samplers for YCbCr textures (VK_NULL_HANDLE = unused)
+
+	// 4-byte aligned sub-structs (no internal padding: all 4-byte fields)
+	skr_blend_state_t    blend_state;                                         // @24  (24)
+	skr_stencil_state_t  stencil_front;                                       // @48  (28)
+	skr_stencil_state_t  stencil_back;                                        // @76  (28)
+
+	// 4-byte aligned scalars
+	skr_cull_            cull;                                                // @104 (4)
+	skr_write_           write_mask;                                          // @108 (4)
+	skr_compare_         depth_test;                                          // @112 (4)
+	int32_t              immutable_sampler_count;                             // @116 (4)  Number of active immutable samplers
+	int32_t              immutable_sampler_slots[SKR_MAX_IMMUTABLE_SAMPLERS]; // @120 (8)  Descriptor binding slots (sorted by slot for deterministic memcmp)
+
+	// 1-byte fields packed at the end with explicit padding to fill the
+	// alignment tail. _pad0/_pad1 must remain zero — initializer rules above
+	// keep this true without any extra code at the call sites.
+	bool                 alpha_to_coverage;                                   // @128 (1)
+	bool                 depth_clamp;                                         // @129 (1)
+	bool                 wireframe;                                           // @130 (1)
+	uint8_t              _pad0;                                               // @131 (1)  must be 0
+	uint32_t             _pad1;                                               // @132 (4)  must be 0
 } _skr_pipeline_material_key_t;
+
+_Static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
+	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
 
 typedef struct skr_material_t {
 	int32_t                      pipeline_material_idx; // Index into pipeline cache

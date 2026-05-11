@@ -11,6 +11,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Cross-platform prefetch hint. No-op where the compiler doesn't support it.
+// Used by the radix scatter loops below to hide the latency of writing into
+// random-access destination buckets.
+#if defined(__GNUC__) || defined(__clang__)
+	#define _SKR_PREFETCH(p) __builtin_prefetch((const void*)(p))
+#elif defined(_MSC_VER)
+	#include <intrin.h>
+	#if defined(_M_ARM) || defined(_M_ARM64)
+		#define _SKR_PREFETCH(p) __prefetch((const void*)(p))
+	#else
+		#define _SKR_PREFETCH(p) _mm_prefetch((const char*)(p), _MM_HINT_T0)
+	#endif
+#else
+	#define _SKR_PREFETCH(p) ((void)0)
+#endif
+
 _Static_assert(sizeof(skr_render_item_t) <= 80, "skr_render_item_t grew beyond 80 bytes!");
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -66,10 +82,17 @@ void skr_render_list_clear(skr_render_list_t* ref_list) {
 }
 
 // Sort key layout (64 bits, ascending sort):
-// Bits 63-50 (14): queue — alpha_mode * 1000 + (queue_offset + 100)
-// Bits 49-36 (14): pipeline_material_idx (up to 16384)
-// Bits 35-22 (14): mesh pointer hash (up to 16384)
-// Bits 21-0  (22): hash(first_index, index_count, vertex_offset) — sub-mesh collision reducer
+// Bits 63-54 (10): queue          — (alpha_mode << 8) | (queue_offset + 128), queue_offset ∈ [-128, 127]
+// Bits 53-40 (14): pipeline_idx   — pipeline cache index (up to 16384)
+// Bits 39-22 (18): material_id    — low bits of bind_start; unique per material instance
+// Bits 21-10 (12): mesh_id        — hash of first vertex buffer pointer (up to 4096)
+// Bits 9-0   (10): sub_hash       — hash(first_index, index_count, vertex_offset) sub-mesh disambiguator
+//
+// material_id uses bind_start directly rather than a hash. bind_start values come from a sequential
+// pool allocator so they're dense small integers — for any realistic scene the low 18 bits are
+// already unique per material. Hashing into a narrower field would introduce birthday-paradox
+// collisions that interleave unrelated materials in the sorted list, which is exactly the
+// spread-out-draws symptom we're trying to avoid. 18 bits covers ~50K materials with 5 binds each.
 static inline uint64_t _skr_render_sort_key(skr_material_t* material, VkBuffer first_vertex_buffer, int32_t first_index, int32_t index_count, int32_t vertex_offset) {
 	// Derive alpha mode: 0 = opaque, 1 = alpha-to-coverage, 2 = transparent
 	uint32_t alpha_mode = 0;
@@ -78,16 +101,19 @@ static inline uint64_t _skr_render_sort_key(skr_material_t* material, VkBuffer f
 	} else if (material->key.blend_state.dst_color_factor != skr_blend_zero) {
 		alpha_mode = 2;
 	}
-	// Bias queue_offset by +100 so negative offsets stay positive
-	uint64_t queue   = (uint64_t)(alpha_mode * 1000 + (material->queue_offset + 100)) & 0x3FFF;
-	uint64_t mat_idx = (uint64_t)(material->pipeline_material_idx)                    & 0x3FFF;
-	uint64_t mesh_id = (uint64_t)((uintptr_t)first_vertex_buffer >> 4)                & 0x3FFF;
+	// Bit-pack alpha_mode and queue_offset into 10 bits: 2 bits alpha_mode (high) + 8 bits biased offset.
+	// queue_offset is biased by +128 so negative values stay positive in a uint8.
+	uint64_t queue       = ((uint64_t)alpha_mode << 8) | (uint64_t)((material->queue_offset + 128) & 0xFF);
+	uint64_t pipeline_id = (uint64_t)(material->pipeline_material_idx)                    & 0x3FFF;
+	uint64_t material_id = (uint64_t)(material->bind_start)                               & 0x3FFFF;
 
-	// Hash draw params into 22 bits to reduce collisions between different draw ranges
+	uint64_t mesh_id = (uint64_t)((uintptr_t)first_vertex_buffer >> 4) & 0xFFF;
+
+	// Hash draw params into 10 bits to disambiguate different draw ranges of the same mesh.
 	uint32_t sub = (uint32_t)first_index ^ ((uint32_t)index_count * 2654435761u) ^ ((uint32_t)vertex_offset * 2246822519u);
-	uint64_t sub_hash = (uint64_t)((sub ^ (sub >> 22)) & 0x3FFFFF);
+	uint64_t sub_hash = (uint64_t)((sub ^ (sub >> 10)) & 0x3FF);
 
-	return (queue << 50) | (mat_idx << 36) | (mesh_id << 22) | sub_hash;
+	return (queue << 54) | (pipeline_id << 40) | (material_id << 22) | (mesh_id << 10) | sub_hash;
 }
 
 void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, const void* opt_instance_data, uint32_t single_instance_data_size, uint32_t instance_count) {
@@ -312,10 +338,13 @@ void _skr_render_list_sort(skr_render_list_t* ref_list) {
 		for (int32_t b = 1; b < 256; b++)
 			offsets[b] = offsets[b - 1] + counts[b - 1];
 
-		// Scatter pairs
+		// Scatter pairs. Prefetching the next slot we'll write to in this
+		// digit bucket hides the latency of the random destination access —
+		// the hardware prefetcher can't see through scatter patterns.
 		for (uint32_t i = 0; i < n; i++) {
 			uint8_t digit = (uint8_t)(cur[i].key >> shift);
 			other[offsets[digit]++] = cur[i];
+			_SKR_PREFETCH(&other[offsets[digit]]);
 		}
 
 		// Swap buffers
@@ -338,10 +367,15 @@ void _skr_render_list_sort(skr_render_list_t* ref_list) {
 			for (int32_t b = 1; b < 256; b++)
 				offsets[b] = offsets[b - 1] + counts[b - 1];
 
+			// Final fused scatter+permute. Two prefetch hints: the next slot
+			// in the destination digit bucket (scatter target) and the source
+			// item for the next iteration (the random gather read).
 			for (uint32_t i = 0; i < n; i++) {
 				uint8_t  digit = (uint8_t)(cur[i].key >> shift);
 				uint32_t dst   = offsets[digit]++;
 				items_tmp[dst] = items[cur[i].idx];
+				_SKR_PREFETCH(&items_tmp[offsets[digit]]);
+				if (i + 1 < n) _SKR_PREFETCH(&items[cur[i + 1].idx]);
 			}
 		} else {
 			// All passes were uniform — items are already sorted, just copy

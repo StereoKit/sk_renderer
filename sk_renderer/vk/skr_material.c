@@ -646,12 +646,24 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			if (!tex)  tex = binds[i].texture;
 			if (!tex) return (int32_t)i;
 
+			// imageLayout must match the layout the GPU sees when the descriptor
+			// is accessed (VUID-VkDescriptorImageInfo-imageLayout-00344). We
+			// can't safely read tex->current_layout for owned textures: it's
+			// a CPU-side trajectory mutated by every transition, so a
+			// concurrent upload or an intermediate state (e.g. TRANSFER_DST
+			// mid-upload) would get snapshotted into the descriptor and
+			// mismatch the actual layout at draw time. Instead, _skr_tex_sample_layout
+			// derives the destination sampling layout from texture properties,
+			// and the transition helpers use the same function — so the GPU
+			// state and the descriptor agree by construction.
+			//
+			// External textures (FFmpeg video, etc.) are the exception: the
+			// producer owns their lifecycle and the caller-provided layout
+			// describes the destination state, so we trust current_layout.
 			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
 				.sampler     = tex->sampler,
 				.imageView   = tex->view,
-				.imageLayout = (tex->flags & skr_tex_flags_compute)
-					? VK_IMAGE_LAYOUT_GENERAL
-					: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				.imageLayout = tex->is_external ? tex->current_layout : _skr_tex_sample_layout(tex),
 			};
 			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
 				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
