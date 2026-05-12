@@ -230,8 +230,13 @@ typedef struct {
 	uint32_t             _pad1;                                               // @132 (4)  must be 0
 } _skr_pipeline_material_key_t;
 
+#ifdef __cplusplus
+static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
+	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
+#else
 _Static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
 	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
+#endif
 
 typedef struct skr_material_t {
 	int32_t                      pipeline_material_idx; // Index into pipeline cache
