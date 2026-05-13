@@ -298,12 +298,22 @@ static const char* _layout_to_string(VkImageLayout layout) {
 
 // Canonical "ready to be sampled" layout for a texture. Single source of
 // truth shared by the descriptor-write path and the transition helpers, so
-// the two can't drift. Caller must ensure the texture is owned by sk_renderer
-// (not external) — external textures keep whatever layout the producer set.
+// the two can't drift. Producers of external textures are responsible for
+// ensuring the image is in this layout before any draw that samples it.
 VkImageLayout _skr_tex_sample_layout(const skr_tex_t* tex) {
 	if (tex->flags & skr_tex_flags_compute)             return VK_IMAGE_LAYOUT_GENERAL;
 	if (tex->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)   return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 	return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+// Canonical attachment layout for a texture used as a render-pass attachment.
+// Sibling to _skr_tex_sample_layout — picks DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+// for depth-aspect textures and COLOR_ATTACHMENT_OPTIMAL for color, so callers
+// can't mistakenly transition a depth target into a color layout (VUID-01208).
+VkImageLayout _skr_tex_attachment_layout(const skr_tex_t* tex) {
+	return (tex->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
+		? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+		: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 }
 
 // Check if texture needs transition for given type (without requiring command buffer)
@@ -389,9 +399,11 @@ void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex
 	_skr_tex_transition(cmd, ref_tex, _skr_tex_sample_layout(ref_tex), dst_stage, VK_ACCESS_SHADER_READ_BIT);
 }
 
-// Specialized: Transition for storage image (compute RWTexture)
+// Specialized: Transition for storage image (compute RWTexture). Routes through
+// _skr_tex_sample_layout (returns GENERAL for compute-flagged textures) for
+// consistency with the sampling path — same value, single source of truth.
 void _skr_tex_transition_for_storage(VkCommandBuffer cmd, skr_tex_t* ref_tex) {
-	_skr_tex_transition(cmd, ref_tex, VK_IMAGE_LAYOUT_GENERAL,
+	_skr_tex_transition(cmd, ref_tex, _skr_tex_sample_layout(ref_tex),
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
@@ -637,9 +649,10 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 	}
 	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, shader_stages);
 
-	// Defer cleanup
-	_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
+	// Defer cleanup. Destroy list is LIFO — push memory before buffer so
+	// vkFreeMemory runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
 	_skr_cmd_destroy_memory(ctx.destroy_list, staging.memory);
+	_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
 	_skr_cmd_release(ctx.cmd);
 
 	_skr_free(regions);
@@ -850,8 +863,10 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 			out_tex->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			out_tex->first_use      = false;
 
-			_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
+			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
+			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
 			_skr_cmd_destroy_memory(ctx.destroy_list, staging.memory);
+			_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
 			_skr_cmd_release(ctx.cmd);
 		}
 	}
@@ -1242,10 +1257,13 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 	}
 	_skr_cmd_destroy_image_view (NULL, ref_tex->view);
 
-	// Only destroy image/memory if we own them (not external)
+	// Only destroy image/memory if we own them (not external).
+	// Destroy list executes LIFO, so push memory FIRST and image SECOND —
+	// vkFreeMemory must run after vkDestroyImage, otherwise the validation
+	// layer reports the memory as still bound to the image (VUID-vkFreeMemory-memory-00677).
 	if (!ref_tex->is_external) {
-		_skr_cmd_destroy_image (NULL, ref_tex->image);
 		_skr_cmd_destroy_memory(NULL, ref_tex->memory);
+		_skr_cmd_destroy_image (NULL, ref_tex->image);
 	}
 
 	// Deferred destroy YCbCr resources. The destroy list executes in LIFO order,
@@ -1586,6 +1604,11 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	// which only transitions mip 0 via its render pass). We overwrite them later
 	// using UNDEFINED as the source layout, so their actual state doesn't matter.
 	{
+		// Scratch's intermediate mips live in SHADER_READ_ONLY_OPTIMAL (see the
+		// per-mip transition below), so we land ref_tex's mip 0 in the same
+		// layout for descriptor consistency, even if ref_tex's canonical sample
+		// layout is GENERAL (compute). The final transition at end-of-function
+		// moves the whole image to its canonical layout.
 		VkImageMemoryBarrier mip0_barrier = {
 			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask       = _layout_to_access_flags(ref_tex->current_layout),
@@ -1657,7 +1680,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			};
 		}
 
-		// Manually add source texture binding (since we create it per-mip)
+		// Manually add source texture binding (since we create it per-mip).
+		// Both ref_tex mip 0 and scratch mips sit in SHADER_READ_ONLY_OPTIMAL
+		// during the mip loop regardless of ref_tex's canonical sample layout.
 		image_infos[image_ct] = (VkDescriptorImageInfo){
 			.sampler     = ref_tex->sampler,
 			.imageView   = src_view,
@@ -1850,7 +1875,11 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	}
 
 	// Tracked layout now reflects the whole image in SHADER_READ_ONLY_OPTIMAL.
+	// For compute-flagged ref_tex, transition once more to GENERAL (the
+	// canonical sample layout). No-ops for regular sampled textures since
+	// current_layout already equals _skr_tex_sample_layout(ref_tex).
 	_skr_tex_transition_notify_layout(ref_tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	_skr_scratch_release(scratch);
 	_skr_cmd_release    (ctx.cmd);

@@ -84,7 +84,10 @@ typedef struct skr_tex_t {
 	uint32_t               layer_count;      // Number of array layers (1 for regular, N for arrays, 6 for cubemaps)
 	VkImageAspectFlags     aspect_mask;      // Depth bit for depth textures, color bit for color textures
 
-	// Automatic layout transition tracking
+	// Automatic layout transition tracking. current_layout is the actual GPU
+	// layout right now — used as oldLayout for the next barrier and to skip
+	// no-op transitions. Not consulted for descriptor writes (those derive
+	// from _skr_tex_sample_layout) or renderpass attachment layouts.
 	VkImageLayout          current_layout;       // Current image layout (tracked automatically)
 	uint32_t               current_queue_family; // Current queue family owner
 	bool                   first_use;            // True until first transition (allows UNDEFINED optimization)
@@ -109,7 +112,11 @@ typedef struct skr_tex_external_info_t {
 	skr_tex_fmt_      format;         // Texture format
 	skr_tex_flags_    flags;          // Usage flags (readable/writeable/etc.) - 0 = infer from format
 	skr_vec3i_t       size;           // Dimensions (for array textures, z = layer count)
-	VkImageLayout     current_layout; // Current layout of the image
+	VkImageLayout     current_layout; // Layout the image is in *right now* — used as
+	                                  // the oldLayout of sk_renderer's next transition.
+	                                  // sk_renderer will move the image to its canonical
+	                                  // sample layout before sampling (SHADER_READ_ONLY,
+	                                  // DEPTH_STENCIL_READ_ONLY, or GENERAL based on flags).
 	skr_tex_sampler_t sampler;        // Sampler settings
 	int32_t           multisample;    // MSAA sample count (1, 2, 4, 8, etc.), 0 or 1 = no MSAA
 	int32_t           array_layers;   // Array layer count (0 or 1 = single texture, >1 = array texture)
@@ -120,7 +127,8 @@ typedef struct skr_tex_external_info_t {
 typedef struct skr_tex_external_update_t {
 	VkImage       image;          // New VkImage to reference
 	VkImageView   view;           // Optional new view (VK_NULL_HANDLE = recreate from image)
-	VkImageLayout current_layout; // Current layout of new image
+	VkImageLayout current_layout; // Layout the new image is in right now — see
+	                              // skr_tex_external_info_t::current_layout for details.
 } skr_tex_external_update_t;
 
 // GL external texture import via external memory (FD on Linux/Android, Win32 HANDLE on Windows)

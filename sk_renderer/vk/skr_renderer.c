@@ -130,8 +130,11 @@ static void _skr_flush_texture_transitions(VkCommandBuffer cmd) {
 		skr_tex_t* tex  = _skr_vk.pending_transitions[i];
 		uint8_t    type = _skr_vk.pending_transition_types[i];
 
+		// Both paths route through _skr_tex_sample_layout (returns GENERAL for
+		// compute-flagged textures, SHADER_READ_ONLY otherwise). The type only
+		// affects stage/access flags.
 		if (type == 1) {  // storage
-			_skr_barrier_batch_add(&batch, cmd, tex, VK_IMAGE_LAYOUT_GENERAL,
+			_skr_barrier_batch_add(&batch, cmd, tex, _skr_tex_sample_layout(tex),
 				VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 		} else {  // shader_read
@@ -288,11 +291,11 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		.view_mask        = view_mask,
 		.correlation_mask = correlation_mask,
 		.final_color_layout   = (color && (color->flags & skr_tex_flags_readable))
-			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+			? _skr_tex_sample_layout(color) : 0,
 		.final_resolve_layout = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT && (opt_resolve->flags & skr_tex_flags_readable))
-			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+			? _skr_tex_sample_layout(opt_resolve) : 0,
 		.final_depth_layout   = (depth && (depth->flags & skr_tex_flags_readable) && !(depth->samples > VK_SAMPLE_COUNT_1_BIT))
-			? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : 0,
+			? _skr_tex_sample_layout(depth) : 0,
 	};
 	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 
@@ -324,7 +327,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		// via initialLayout=UNDEFINED with LOAD_OP_CLEAR.
 		if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
 			_skr_barrier_batch_add(&batch, cmd, depth,
-				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				_skr_tex_attachment_layout(depth),
 				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
 				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
 		}
@@ -333,7 +336,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		// Clear passes use initialLayout=UNDEFINED (no prior data needed).
 		if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
 			_skr_barrier_batch_add(&batch, cmd, color,
-				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				_skr_tex_attachment_layout(color),
 				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 		}
@@ -382,17 +385,14 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	}, VK_SUBPASS_CONTENTS_INLINE);
 
 	// Notify automatic system about render pass implicit layout transitions
-	// Render pass transitions color to COLOR_ATTACHMENT_OPTIMAL
 	if (color) {
-		_skr_tex_transition_notify_layout(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		_skr_tex_transition_notify_layout(color, _skr_tex_attachment_layout(color));
 	}
-	// Resolve target (if used) goes to COLOR_ATTACHMENT_OPTIMAL
 	if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
-		_skr_tex_transition_notify_layout(opt_resolve, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		_skr_tex_transition_notify_layout(opt_resolve, _skr_tex_attachment_layout(opt_resolve));
 	}
-	// Depth remains in DEPTH_STENCIL_ATTACHMENT_OPTIMAL (render pass preserves it)
 	if (depth) {
-		_skr_tex_transition_notify_layout(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+		_skr_tex_transition_notify_layout(depth, _skr_tex_attachment_layout(depth));
 	}
 
 	// Store current textures for end_pass layout transitions
@@ -407,23 +407,27 @@ void skr_renderer_end_pass() {
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 	vkCmdEndRenderPass(cmd);
 
-	// Render pass finalLayout handles the transition to shader-read for readable
-	// attachments (free on tilers via the subpass→EXTERNAL dependency). We just
-	// need to update the tracked layout to match what the render pass did.
+	// Render pass finalLayout handles the transition to the sample layout for
+	// readable attachments (free on tilers via the subpass→EXTERNAL dependency).
+	// We just need to update the tracked layout to match what the render pass did.
+	// Mirrors the rp_key construction in skr_renderer_begin_pass.
 	if (_skr_vk.current_color_texture && (_skr_vk.current_color_texture->flags & skr_tex_flags_readable)) {
-		_skr_tex_transition_notify_layout(_skr_vk.current_color_texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		_skr_tex_transition_notify_layout(_skr_vk.current_color_texture, _skr_tex_sample_layout(_skr_vk.current_color_texture));
 	}
 
 	if (_skr_vk.current_depth_texture && (_skr_vk.current_depth_texture->flags & skr_tex_flags_readable)) {
+		// MSAA depth can't be resolved in vanilla Vulkan 1.1, so the rp_key
+		// leaves final_depth_layout = 0 (driver keeps it in attachment-optimal,
+		// which begin_pass already tracked). Only notify when we actually moved.
 		bool is_msaa_depth = _skr_vk.current_depth_texture->samples > VK_SAMPLE_COUNT_1_BIT &&
 		                     (_skr_vk.current_depth_texture->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT);
 		if (!is_msaa_depth) {
-			_skr_tex_transition_notify_layout(_skr_vk.current_depth_texture, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+			_skr_tex_transition_notify_layout(_skr_vk.current_depth_texture, _skr_tex_sample_layout(_skr_vk.current_depth_texture));
 		}
 	}
 
 	if (_skr_vk.current_resolve_texture && (_skr_vk.current_resolve_texture->flags & skr_tex_flags_readable)) {
-		_skr_tex_transition_notify_layout(_skr_vk.current_resolve_texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		_skr_tex_transition_notify_layout(_skr_vk.current_resolve_texture, _skr_tex_sample_layout(_skr_vk.current_resolve_texture));
 	}
 
 	_skr_vk.current_color_texture   = NULL;
@@ -522,7 +526,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		.samples            = to->samples,
 		.depth_store_op     = VK_ATTACHMENT_STORE_OP_DONT_CARE,  // No depth in blit
 		.color_load_op      = is_full_blit ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
-		.final_color_layout = (to->flags & skr_tex_flags_readable) ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+		.final_color_layout = (to->flags & skr_tex_flags_readable) ? _skr_tex_sample_layout(to) : 0,
 	};
 	int32_t renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	int32_t vert_idx       = _skr_pipeline_register_vertformat_unlocked((skr_vert_type_t){0});
@@ -588,9 +592,9 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			}
 		}
 
-		// Transition target texture to color attachment layout
+		// Transition target texture to attachment layout
 		_skr_barrier_batch_add(&batch, ctx.cmd, to,
-			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			_skr_tex_attachment_layout(to),
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
@@ -722,13 +726,10 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		vkCmdEndRenderPass(ctx.cmd);
 	}
 
-	// Render pass finalLayout handles the transition for readable targets.
-	// Just update tracking to match what the render pass did.
-	if (to->flags & skr_tex_flags_readable) {
-		_skr_tex_transition_notify_layout(to, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-	} else {
-		_skr_tex_transition_notify_layout(to, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	}
+	// Render pass finalLayout handles the transition. Update tracking to match.
+	_skr_tex_transition_notify_layout(to, (to->flags & skr_tex_flags_readable)
+		? _skr_tex_sample_layout    (to)
+		: _skr_tex_attachment_layout(to));
 
 	_skr_cmd_release(ctx.cmd);
 
@@ -1200,11 +1201,11 @@ void skr_pass_submit(skr_pass_t* pass) {
 		.has_resolve_subpass      = has_resolve,
 		.use_custom_resolve_flags = has_resolve && pass->postfx_count == 0 && _skr_vk.has_custom_resolve,
 		.final_color_layout       = (final_output->flags & skr_tex_flags_readable)
-			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+			? _skr_tex_sample_layout(final_output) : 0,
 		.final_resolve_layout     = (use_msaa && has_resolve && pass->postfx_count == 0 && (resolve->flags & skr_tex_flags_readable))
-			? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : 0,
+			? _skr_tex_sample_layout(resolve) : 0,
 		.final_depth_layout       = (has_depth && (depth->flags & skr_tex_flags_readable) && !(depth->samples > VK_SAMPLE_COUNT_1_BIT))
-			? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : 0,
+			? _skr_tex_sample_layout(depth) : 0,
 	};
 
 	// Register geometry subpass
@@ -1347,13 +1348,13 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 			if (depth && (depth->flags & skr_tex_flags_writeable) && !depth->is_transient_discard) {
 				_skr_barrier_batch_add(&batch, ctx.cmd, depth,
-					VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+					_skr_tex_attachment_layout(depth),
 					VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
 					VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
 			}
 			if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
 				_skr_barrier_batch_add(&batch, ctx.cmd, color,
-					VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					_skr_tex_attachment_layout(color),
 					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 					VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 			}
@@ -1392,9 +1393,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 		}, VK_SUBPASS_CONTENTS_INLINE);
 
 		// Notify layout tracking
-		if (color)                       _skr_tex_transition_notify_layout(color,   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-		if (use_msaa)                    _skr_tex_transition_notify_layout(resolve, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-		if (depth)                       _skr_tex_transition_notify_layout(depth,   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+		if (color)    _skr_tex_transition_notify_layout(color,   _skr_tex_attachment_layout(color));
+		if (use_msaa) _skr_tex_transition_notify_layout(resolve, _skr_tex_attachment_layout(resolve));
+		if (depth)    _skr_tex_transition_notify_layout(depth,   _skr_tex_attachment_layout(depth));
 
 		// Store current renderpass for skr_renderer_draw pipeline lookup
 		_skr_vk.current_renderpass_idx = rp_idx_geometry;
@@ -1527,19 +1528,21 @@ void skr_pass_submit(skr_pass_t* pass) {
 		vkCmdEndRenderPass(ctx.cmd);
 
 		// Render pass finalLayout handles the transition. Just update tracking.
-		if (final_output->flags & skr_tex_flags_readable) {
-			_skr_tex_transition_notify_layout(final_output, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-		} else {
-			_skr_tex_transition_notify_layout(final_output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-		}
+		_skr_tex_transition_notify_layout(final_output, (final_output->flags & skr_tex_flags_readable)
+			? _skr_tex_sample_layout    (final_output)
+			: _skr_tex_attachment_layout(final_output));
 
 		// Defer-destroy transient resources (cached framebuffer is not destroyed here)
 		if (!cache_fb)
 			_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
+		// Destroy list is LIFO — push memory, then image, then view, so the
+		// resources retire in dependency order (view → image → memory). The
+		// memory must outlive the image (VUID-vkFreeMemory-memory-00677), and
+		// the image must outlive the view that references it.
 		for (uint32_t i = 0; i < intermediate_count; i++) {
-			_skr_cmd_destroy_image_view(ctx.destroy_list, intermediates[i].view);
-			_skr_cmd_destroy_image     (ctx.destroy_list, intermediates[i].image);
 			_skr_cmd_destroy_memory    (ctx.destroy_list, intermediates[i].memory);
+			_skr_cmd_destroy_image     (ctx.destroy_list, intermediates[i].image);
+			_skr_cmd_destroy_image_view(ctx.destroy_list, intermediates[i].view);
 		}
 	}
 
