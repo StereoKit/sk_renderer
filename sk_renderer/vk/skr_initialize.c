@@ -631,7 +631,31 @@ bool skr_init(skr_settings_t settings) {
 		.fragmentStoresAndAtomics       = available_features.fragmentStoresAndAtomics,
 	};
 
-	// Multiview is Vulkan 1.1 core - always enable for multi-view rendering
+	// Query availability of the chained pNext features we want to enable.
+	// vkGetPhysicalDeviceFeatures only covers VkPhysicalDeviceFeatures (the basic set);
+	// Vulkan 1.1+ features live in separate structs queried via vkGetPhysicalDeviceFeatures2.
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+	};
+	VkPhysicalDeviceMultiviewFeatures multiview_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+		.pNext = &ycbcr_query,
+	};
+	VkPhysicalDeviceFeatures2 features2_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+		.pNext = &multiview_query,
+	};
+	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
+
+	_skr_vk.has_ycbcr_conversion = ycbcr_query.samplerYcbcrConversion != 0;
+
+	// Multiview is a hard requirement for stereo/XR rendering. It's part of
+	// Vulkan 1.1 core but is still a feature flag, so an implementation can
+	// advertise 1.1 support yet report multiview as unsupported.
+	if (!multiview_query.multiview) {
+		skr_log(skr_log_critical, "Multiview feature is required but not supported by the selected GPU");
+		return false;
+	}
 	VkPhysicalDeviceMultiviewFeatures multiview_features = {
 		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
 		.multiview = VK_TRUE,
@@ -648,22 +672,20 @@ bool skr_init(skr_settings_t settings) {
 	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
 	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
 
-	// YCbCr conversion is Vulkan 1.1 core - always enable for YUV texture support
+	// YCbCr conversion is needed for YUV/NV12 textures and Android Hardware Buffer
+	// external memory. Conditionally enable — not all drivers expose it (notably
+	// older Mesa lavapipe versions).
 	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
 		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
 		.pNext                  = &multiview_features,
-		.samplerYcbcrConversion = VK_TRUE,
+		.samplerYcbcrConversion = _skr_vk.has_ycbcr_conversion ? VK_TRUE : VK_FALSE,
 	};
 
-	// Chain video decode feature structs if enabled
-	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {
-		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-		.pNext            = &ycbcr_features,
-		.timelineSemaphore = VK_TRUE,
-	};
+	// Synchronization2 is required by the video decode path; chained only when
+	// video decode is enabled.
 	VkPhysicalDeviceSynchronization2Features sync2_features = {
 		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-		.pNext            = &timeline_features,
+		.pNext            = &ycbcr_features,
 		.synchronization2 = VK_TRUE,
 	};
 
@@ -837,7 +859,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.capabilities[skr_capability_external_gl ] = _skr_vk.has_external_memory_fd || _skr_vk.has_external_memory_win32;
 	_skr_vk.capabilities[skr_capability_external_ahb] = _skr_vk.has_android_hardware_buffer;
 	_skr_vk.capabilities[skr_capability_external_dma] = _skr_vk.has_external_memory_dma_buf && _skr_vk.has_drm_format_modifier && has_image_format_list;
-	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode;
+	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode && _skr_vk.has_ycbcr_conversion;
 	_skr_vk.capabilities[skr_capability_presentation] = has_surface && has_swapchain;
 
 	// Log optional extension status
