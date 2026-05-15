@@ -306,6 +306,7 @@ typedef enum skr_capability_ {
 	skr_capability_external_ahb,          // Android Hardware Buffer
 	skr_capability_external_dma,          // DMA-BUF via VK_EXT_external_memory_dma_buf
 	skr_capability_vk_video,              // Vulkan video decode (VK_KHR_video_decode_queue)
+	skr_capability_presentation,          // Window-system presentation (VK_KHR_surface + VK_KHR_swapchain). False on headless ICDs.
 	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
