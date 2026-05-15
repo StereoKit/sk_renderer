@@ -531,8 +531,8 @@ void _skr_barrier_batch_flush(_skr_barrier_batch_t* batch, VkCommandBuffer cmd) 
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static void _skr_tex_generate_mips_blit  (VkPhysicalDevice phys_device, skr_tex_t* tex, int32_t mip_levels);
-static void _skr_tex_generate_mips_render(VkDevice         device,      skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* fragment_shader);
+static void _skr_tex_generate_mips_blit  (skr_tex_t* tex, int32_t mip_levels, VkFilter filter_mode);
+static void _skr_tex_generate_mips_render(VkDevice  device,    skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* fragment_shader);
 
 // Upload texture data from skr_tex_data_t descriptor
 // Handles multiple mips and layers in mip-major layout
@@ -1348,6 +1348,26 @@ void skr_tex_set_name(skr_tex_t* ref_tex, const char* name) {
 	}
 }
 
+// Last-ditch transition when neither blit nor render mipgen can run: drives all
+// mips to a samplable layout using UNDEFINED as the source so the actual state
+// (which may be inconsistent across mips) doesn't matter. Discards mip 0
+// contents — callers of an unsupported format would have a broken texture
+// either way, but this prevents the cascade of layout-mismatch validation
+// errors that follows when downstream code samples the texture.
+static void _skr_tex_safe_transition_all_mips(skr_tex_t* ref_tex) {
+	VkImageLayout final_layout = _skr_tex_sample_layout(ref_tex);
+
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+	_skr_transition_image_layout(ctx.cmd, ref_tex->image, ref_tex->aspect_mask,
+		0, ref_tex->mip_levels, ref_tex->layer_count,
+		VK_IMAGE_LAYOUT_UNDEFINED, final_layout,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, VK_ACCESS_SHADER_READ_BIT);
+	_skr_tex_transition_notify_layout(ref_tex, final_layout);
+	_skr_cmd_release(ctx.cmd);
+}
+
 void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 	if (!skr_tex_is_valid(ref_tex)) {
 		skr_log(skr_log_warning, "Cannot generate mipmaps for invalid texture");
@@ -1362,35 +1382,59 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 		return;
 	}
 
-	// Route to appropriate implementation
-	// If a custom shader is provided, use render-based mipmap generation (fragment shader)
-	// Otherwise fall back to simple blit
-	if (opt_shader == NULL) {
-		_skr_tex_generate_mips_blit  (_skr_vk.physical_device, ref_tex, mip_levels);
-	} else {
+	// Caller-supplied shader: trust them, use the render path.
+	if (opt_shader != NULL) {
 		_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, opt_shader);
-	}
-}
-
-static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t* ref_tex, int32_t mip_levels) {
-	// Check format support for blit operations
-	VkFormatProperties format_properties;
-	VkFormat           vk_format = skr_tex_fmt_to_native(ref_tex->format);
-	vkGetPhysicalDeviceFormatProperties(phys_device, vk_format, &format_properties);
-
-	if (!(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
-	    !(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
-		skr_log(skr_log_critical, "Texture format doesn't support blit operations for mipmap generation");
 		return;
 	}
 
-	// Check if format supports linear filtering during blit
-	VkFilter filter_mode = VK_FILTER_LINEAR;
-	if (!(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
-		skr_log(skr_log_info, "Format doesn't support linear filtering, using nearest");
-		filter_mode = VK_FILTER_NEAREST;
+	// No shader: prefer the blit path when the format supports it (fast and
+	// driver-native). Otherwise fall back to a render pass with a built-in
+	// mipgen shader — needed for formats like B10G11R11_UFLOAT_PACK32 on
+	// Mesa llvmpipe, which advertise COLOR_ATTACHMENT but not BLIT.
+	VkFormat           vk_format = skr_tex_fmt_to_native(ref_tex->format);
+	VkFormatProperties props;
+	vkGetPhysicalDeviceFormatProperties(_skr_vk.physical_device, vk_format, &props);
+	VkFormatFeatureFlags feats = props.optimalTilingFeatures;
+
+	bool has_blit  = (feats & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+	              && (feats & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+	bool has_color = (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+
+	if (has_blit) {
+		VkFilter filter_mode = (feats & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+			? VK_FILTER_LINEAR
+			: VK_FILTER_NEAREST;
+		_skr_tex_generate_mips_blit(ref_tex, mip_levels, filter_mode);
+		return;
 	}
 
+	// Layered non-cubemap (texture arrays) has no built-in shader variant;
+	// fall through to safe-transition. Cubemap and 2D have built-ins created
+	// at init time.
+	if (has_color) {
+		const skr_shader_t* builtin =
+			(ref_tex->flags & skr_tex_flags_cubemap) ? &_skr_vk.builtin_mipgen_cube :
+			(ref_tex->layer_count > 1)               ? NULL                         :
+			                                           &_skr_vk.builtin_mipgen_2d;
+		if (builtin && skr_shader_is_valid(builtin)) {
+			_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, builtin);
+			return;
+		}
+	}
+
+	// Format supports neither path (or layered non-cubemap with no built-in):
+	// leave the texture in a samplable layout so the caller's subsequent
+	// sampling doesn't trip layout-mismatch validation errors.
+	skr_log(skr_log_critical,
+		"Texture format doesn't support blit or color-attachment mipgen (skr_tex_fmt=%d, VkFormat=%d); pass a custom shader to skr_tex_generate_mips",
+		(int)ref_tex->format, (int)vk_format);
+	_skr_tex_safe_transition_all_mips(ref_tex);
+}
+
+// Caller (skr_tex_generate_mips) has already verified the format supports
+// BLIT_SRC/BLIT_DST and picked filter_mode based on SAMPLED_IMAGE_FILTER_LINEAR.
+static void _skr_tex_generate_mips_blit(skr_tex_t* ref_tex, int32_t mip_levels, VkFilter filter_mode) {
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
 	// Transition only mip 0 to TRANSFER_SRC — it has valid data that needs

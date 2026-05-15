@@ -267,6 +267,11 @@ typedef struct {
 	skr_tex_t                default_tex_black;
 	skr_tex_t                default_tex_gray;
 
+	// Built-in mipgen fallbacks. Used by skr_tex_generate_mips when no shader
+	// is passed and the texture format doesn't support blit.
+	skr_shader_t             builtin_mipgen_2d;
+	skr_shader_t             builtin_mipgen_cube;
+
 	// Deferred destruction
 	skr_destroy_list_t       destroy_list;
 

@@ -149,6 +149,14 @@ target_sources(sk_renderer PRIVATE
 	sk_renderer/vk/skr_destroy_list.c
 )
 
+# Built-in shaders: compiled to embedded byte-array headers so they ship inside
+# the library binary. Used as fallbacks when blit-based mipgen isn't supported
+# for a given texture format (see skr_texture.c skr_tex_generate_mips).
+skshaderc_compile_headers(sk_renderer ${CMAKE_BINARY_DIR}/sk_renderer_generated/builtin_shaders "-o3 -e -t s"
+	sk_renderer/vk/builtin_shaders/skr_mipgen_2d.hlsl
+	sk_renderer/vk/builtin_shaders/skr_mipgen_cube.hlsl
+)
+
 ###############################################################################
 # Example application
 ###############################################################################

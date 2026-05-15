@@ -8,6 +8,9 @@
 #include "skr_conversions.h"
 #include "skr_scratch.h"
 
+#include "skr_mipgen_2d.hlsl.h"
+#include "skr_mipgen_cube.hlsl.h"
+
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
 
@@ -823,6 +826,12 @@ bool skr_init(skr_settings_t settings) {
 	color = 0xFF000000;
 	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
 
+	// Built-in fallback mipgen shaders. Used by skr_tex_generate_mips when the
+	// caller passes no shader and the texture format doesn't support blit
+	// (e.g. B10G11R11_UFLOAT on Mesa llvmpipe).
+	if (skr_shader_create(sks_skr_mipgen_2d_hlsl,   sizeof(sks_skr_mipgen_2d_hlsl),   &_skr_vk.builtin_mipgen_2d  ) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_2d,   "skr_builtin_mipgen_2d");
+	if (skr_shader_create(sks_skr_mipgen_cube_hlsl, sizeof(sks_skr_mipgen_cube_hlsl), &_skr_vk.builtin_mipgen_cube) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_cube, "skr_builtin_mipgen_cube");
+
 	// Populate capability array
 	_skr_vk.capabilities[skr_capability_external_vk ] = true;
 	_skr_vk.capabilities[skr_capability_external_gl ] = _skr_vk.has_external_memory_fd || _skr_vk.has_external_memory_win32;
@@ -848,6 +857,9 @@ void skr_shutdown(void) {
 	skr_tex_destroy(&_skr_vk.default_tex_white);
 	skr_tex_destroy(&_skr_vk.default_tex_gray);
 	skr_tex_destroy(&_skr_vk.default_tex_black);
+
+	skr_shader_destroy(&_skr_vk.builtin_mipgen_2d);
+	skr_shader_destroy(&_skr_vk.builtin_mipgen_cube);
 
 	_skr_scratch_pool_shutdown();  // Free pooled mipgen scratch textures before command shutdown
 
