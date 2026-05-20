@@ -95,11 +95,32 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 		return skr_err_device_error;
 	}
 
+	// Optionally pin the compute subgroup/wave size. Driven by `//--wave_size = N`
+	// in the shader; requires VK_EXT_subgroup_size_control. Mismatched values
+	// fall back to the implementation default and emit a warning.
+	VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+	};
+	void* stage_pNext = NULL;
+	if (shader->meta.wave_size != 0) {
+		if (!_skr_vk.has_subgroup_size_control) {
+			skr_log(skr_log_warning, "Shader requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.wave_size);
+		} else if (shader->meta.wave_size < _skr_vk.min_subgroup_size || shader->meta.wave_size > _skr_vk.max_subgroup_size) {
+			skr_log(skr_log_warning, "Shader requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
+		} else if ((_skr_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+			skr_log(skr_log_warning, "Shader requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.wave_size);
+		} else {
+			required_subgroup_size.requiredSubgroupSize = shader->meta.wave_size;
+			stage_pNext = &required_subgroup_size;
+		}
+	}
+
 	// Create compute pipeline
 	VkComputePipelineCreateInfo pipeline_info = {
 		.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
 		.stage  = (VkPipelineShaderStageCreateInfo){
 			.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.pNext  = stage_pNext,
 			.stage  = VK_SHADER_STAGE_COMPUTE_BIT,
 			.module = shader->compute_stage.shader,
 			.pName  = "cs",

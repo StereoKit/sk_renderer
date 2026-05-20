@@ -180,6 +180,7 @@ bool skr_init(skr_settings_t settings) {
 		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
 		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 		VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
+		VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,       // Required-subgroup-size for compute (HLSL [WaveSize]/`//--wave_size`)
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -574,6 +575,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_external_memory_dma_buf = false;
 	_skr_vk.has_drm_format_modifier     = false;
 	_skr_vk.has_custom_resolve          = false;
+	_skr_vk.has_subgroup_size_control   = false;
 	bool has_image_format_list          = false;
 	bool has_swapchain                  = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
@@ -586,6 +588,7 @@ bool skr_init(skr_settings_t settings) {
 			if (strcmp(optional_device_exts[i], VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME    ) == 0) _skr_vk.has_external_memory_dma_buf  = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME  ) == 0) _skr_vk.has_drm_format_modifier      = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME          ) == 0) has_image_format_list                = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME     ) == 0) _skr_vk.has_subgroup_size_control    = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
@@ -634,8 +637,12 @@ bool skr_init(skr_settings_t settings) {
 	// Query availability of the chained pNext features we want to enable.
 	// vkGetPhysicalDeviceFeatures only covers VkPhysicalDeviceFeatures (the basic set);
 	// Vulkan 1.1+ features live in separate structs queried via vkGetPhysicalDeviceFeatures2.
+	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+	};
 	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_size_query : NULL,
 	};
 	VkPhysicalDeviceMultiviewFeatures multiview_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
@@ -648,6 +655,8 @@ bool skr_init(skr_settings_t settings) {
 	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
 
 	_skr_vk.has_ycbcr_conversion = ycbcr_query.samplerYcbcrConversion != 0;
+	// Only consider subgroup size control supported if the feature flag is set, not just the extension.
+	_skr_vk.has_subgroup_size_control = _skr_vk.has_subgroup_size_control && subgroup_size_query.subgroupSizeControl;
 
 	// Multiview is a hard requirement for stereo/XR rendering. It's part of
 	// Vulkan 1.1 core but is still a feature flag, so an implementation can
@@ -661,9 +670,30 @@ bool skr_init(skr_settings_t settings) {
 		.multiview = VK_TRUE,
 	};
 
-	// Query multiview properties
+	// Subgroup size control lets compute pipelines request a specific subgroup
+	// size at pipeline creation time (the Vulkan analog of HLSL [WaveSize(N)]).
+	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_features = {
+		.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+		.pNext                = &multiview_features,
+		.subgroupSizeControl  = VK_TRUE,
+	};
+
+	// YCbCr conversion is needed for YUV/NV12 textures and Android Hardware Buffer
+	// external memory. Conditionally enable — not all drivers expose it (notably
+	// older Mesa lavapipe versions).
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
+		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext                  = _skr_vk.has_subgroup_size_control ? (void*)&subgroup_size_features : (void*)&multiview_features,
+		.samplerYcbcrConversion = _skr_vk.has_ycbcr_conversion ? VK_TRUE : VK_FALSE,
+	};
+
+	// Query multiview properties (and subgroup size limits if supported)
+	VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT,
+	};
 	VkPhysicalDeviceMultiviewProperties multiview_props = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES,
+		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_props : NULL,
 	};
 	VkPhysicalDeviceProperties2 props2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -671,15 +701,11 @@ bool skr_init(skr_settings_t settings) {
 	};
 	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
 	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
-
-	// YCbCr conversion is needed for YUV/NV12 textures and Android Hardware Buffer
-	// external memory. Conditionally enable — not all drivers expose it (notably
-	// older Mesa lavapipe versions).
-	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
-		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
-		.pNext                  = &multiview_features,
-		.samplerYcbcrConversion = _skr_vk.has_ycbcr_conversion ? VK_TRUE : VK_FALSE,
-	};
+	if (_skr_vk.has_subgroup_size_control) {
+		_skr_vk.min_subgroup_size             = subgroup_props.minSubgroupSize;
+		_skr_vk.max_subgroup_size             = subgroup_props.maxSubgroupSize;
+		_skr_vk.required_subgroup_size_stages = subgroup_props.requiredSubgroupSizeStages;
+	}
 
 	// Synchronization2 is required by the video decode path; chained only when
 	// video decode is enabled.

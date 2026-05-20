@@ -204,6 +204,10 @@ typedef struct {
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
 	bool                     has_ycbcr_conversion;        // VkPhysicalDeviceSamplerYcbcrConversionFeatures::samplerYcbcrConversion
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
+	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
+	uint32_t                 min_subgroup_size;           // From VkPhysicalDeviceSubgroupSizeControlPropertiesEXT
+	uint32_t                 max_subgroup_size;
+	VkShaderStageFlags       required_subgroup_size_stages; // Stages that allow VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
 	bool                     initialized;
 	uint32_t                 max_multiview_view_count;    // From VkPhysicalDeviceMultiviewProperties
 
