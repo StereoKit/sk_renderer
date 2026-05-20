@@ -868,11 +868,11 @@ bool skr_init(skr_settings_t settings) {
 		.address = skr_tex_address_clamp
 	};
 	uint32_t color = 0xFFFFFFFF;
-	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_white);
+	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_white);
 	color = 0xFF808080;
-	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_gray);
+	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_gray);
 	color = 0xFF000000;
-	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
+	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
 
 	// Built-in fallback mipgen shaders. Used by skr_tex_generate_mips when the
 	// caller passes no shader and the texture format doesn't support blit

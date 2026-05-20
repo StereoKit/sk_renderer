@@ -532,7 +532,7 @@ void* su_image_load_from_memory(const void* data, size_t size, int32_t* opt_out_
 			width  = img.width;
 			height = img.height;
 			pixels = img.pixels;
-			if (opt_out_format) *opt_out_format = skr_tex_fmt_rg11b10;
+			if (opt_out_format) *opt_out_format = skr_tex_fmt_rg11b10uf;
 		}
 	} else {
 		pixels = stbi_load_from_memory((const unsigned char*)data, (int)size, &width, &height, &channels, force_channels);

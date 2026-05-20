@@ -12,21 +12,29 @@
 uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 	switch (format) {
 		case skr_tex_fmt_rgba32_srgb:   return VK_FORMAT_R8G8B8A8_SRGB;
-		case skr_tex_fmt_rgba32_linear: return VK_FORMAT_R8G8B8A8_UNORM;
+		case skr_tex_fmt_rgba32:        return VK_FORMAT_R8G8B8A8_UNORM;
 		case skr_tex_fmt_bgra32_srgb:   return VK_FORMAT_B8G8R8A8_SRGB;
-		case skr_tex_fmt_bgra32_linear: return VK_FORMAT_B8G8R8A8_UNORM;
-		case skr_tex_fmt_rg11b10:       return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+		case skr_tex_fmt_bgra32:        return VK_FORMAT_B8G8R8A8_UNORM;
+		case skr_tex_fmt_rg11b10uf:     return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
 		case skr_tex_fmt_rgb10a2:       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-		case skr_tex_fmt_rgba64u:       return VK_FORMAT_R16G16B16A16_UINT;
-		case skr_tex_fmt_rgba64s:       return VK_FORMAT_R16G16B16A16_SINT;
+		case skr_tex_fmt_rgba64un:      return VK_FORMAT_R16G16B16A16_UNORM;
+		case skr_tex_fmt_rgba64sn:      return VK_FORMAT_R16G16B16A16_SNORM;
+		case skr_tex_fmt_rgba64ui:      return VK_FORMAT_R16G16B16A16_UINT;
+		case skr_tex_fmt_rgba64si:      return VK_FORMAT_R16G16B16A16_SINT;
 		case skr_tex_fmt_rgba64f:       return VK_FORMAT_R16G16B16A16_SFLOAT;
-		case skr_tex_fmt_rgba128:       return VK_FORMAT_R32G32B32A32_SFLOAT;
+		case skr_tex_fmt_rgba128f:      return VK_FORMAT_R32G32B32A32_SFLOAT;
 		case skr_tex_fmt_r8:            return VK_FORMAT_R8_UNORM;
-		case skr_tex_fmt_r16un:         return VK_FORMAT_R16_UNORM;
+		case skr_tex_fmt_r8sn:          return VK_FORMAT_R8_SNORM;
+		case skr_tex_fmt_r8ui:          return VK_FORMAT_R8_UINT;
+		case skr_tex_fmt_r8si:          return VK_FORMAT_R8_SINT;
+		case skr_tex_fmt_r8_srgb:       return VK_FORMAT_R8_SRGB;
+		case skr_tex_fmt_r16:           return VK_FORMAT_R16_UNORM;
 		case skr_tex_fmt_r16sn:         return VK_FORMAT_R16_SNORM;
 		case skr_tex_fmt_r16ui:         return VK_FORMAT_R16_UINT;
 		case skr_tex_fmt_r16si:         return VK_FORMAT_R16_SINT;
 		case skr_tex_fmt_r16f:          return VK_FORMAT_R16_SFLOAT;
+		case skr_tex_fmt_r32ui:         return VK_FORMAT_R32_UINT;
+		case skr_tex_fmt_r32si:         return VK_FORMAT_R32_SINT;
 		case skr_tex_fmt_r32f:          return VK_FORMAT_R32_SFLOAT;
 		case skr_tex_fmt_depth32s8:     return VK_FORMAT_D32_SFLOAT_S8_UINT;
 		case skr_tex_fmt_depth24s8:     return VK_FORMAT_D24_UNORM_S8_UINT;
@@ -34,16 +42,22 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_depth32:       return VK_FORMAT_D32_SFLOAT;
 		case skr_tex_fmt_depth16:       return VK_FORMAT_D16_UNORM;
 		case skr_tex_fmt_r8g8:          return VK_FORMAT_R8G8_UNORM;
-		case skr_tex_fmt_rgb9e5:        return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+		case skr_tex_fmt_rgb9e5uf:      return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
 		// Compressed formats
 		case skr_tex_fmt_bc1_rgb_srgb:  return VK_FORMAT_BC1_RGB_SRGB_BLOCK;
 		case skr_tex_fmt_bc1_rgb:       return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
 		case skr_tex_fmt_bc1_rgba_srgb: return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
 		case skr_tex_fmt_bc1_rgba:      return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+		case skr_tex_fmt_bc2_rgba_srgb: return VK_FORMAT_BC2_SRGB_BLOCK;
+		case skr_tex_fmt_bc2_rgba:      return VK_FORMAT_BC2_UNORM_BLOCK;
 		case skr_tex_fmt_bc3_rgba_srgb: return VK_FORMAT_BC3_SRGB_BLOCK;
 		case skr_tex_fmt_bc3_rgba:      return VK_FORMAT_BC3_UNORM_BLOCK;
 		case skr_tex_fmt_bc4_r:         return VK_FORMAT_BC4_UNORM_BLOCK;
+		case skr_tex_fmt_bc4_rsn:       return VK_FORMAT_BC4_SNORM_BLOCK;
 		case skr_tex_fmt_bc5_rg:        return VK_FORMAT_BC5_UNORM_BLOCK;
+		case skr_tex_fmt_bc5_rgsn:      return VK_FORMAT_BC5_SNORM_BLOCK;
+		case skr_tex_fmt_bc6h_rgbuf:    return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+		case skr_tex_fmt_bc6h_rgbf:     return VK_FORMAT_BC6H_SFLOAT_BLOCK;
 		case skr_tex_fmt_bc7_rgba_srgb: return VK_FORMAT_BC7_SRGB_BLOCK;
 		case skr_tex_fmt_bc7_rgba:      return VK_FORMAT_BC7_UNORM_BLOCK;
 		// Mobile compressed formats
@@ -73,21 +87,29 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 	switch (format) {
 		case VK_FORMAT_R8G8B8A8_SRGB:              return skr_tex_fmt_rgba32_srgb;
-		case VK_FORMAT_R8G8B8A8_UNORM:             return skr_tex_fmt_rgba32_linear;
+		case VK_FORMAT_R8G8B8A8_UNORM:             return skr_tex_fmt_rgba32;
 		case VK_FORMAT_B8G8R8A8_SRGB:              return skr_tex_fmt_bgra32_srgb;
-		case VK_FORMAT_B8G8R8A8_UNORM:             return skr_tex_fmt_bgra32_linear;
-		case VK_FORMAT_B10G11R11_UFLOAT_PACK32:    return skr_tex_fmt_rg11b10;
+		case VK_FORMAT_B8G8R8A8_UNORM:             return skr_tex_fmt_bgra32;
+		case VK_FORMAT_B10G11R11_UFLOAT_PACK32:    return skr_tex_fmt_rg11b10uf;
 		case VK_FORMAT_A2B10G10R10_UNORM_PACK32:   return skr_tex_fmt_rgb10a2;
-		case VK_FORMAT_R16G16B16A16_UINT:          return skr_tex_fmt_rgba64u;
-		case VK_FORMAT_R16G16B16A16_SINT:          return skr_tex_fmt_rgba64s;
+		case VK_FORMAT_R16G16B16A16_UNORM:         return skr_tex_fmt_rgba64un;
+		case VK_FORMAT_R16G16B16A16_SNORM:         return skr_tex_fmt_rgba64sn;
+		case VK_FORMAT_R16G16B16A16_UINT:          return skr_tex_fmt_rgba64ui;
+		case VK_FORMAT_R16G16B16A16_SINT:          return skr_tex_fmt_rgba64si;
 		case VK_FORMAT_R16G16B16A16_SFLOAT:        return skr_tex_fmt_rgba64f;
-		case VK_FORMAT_R32G32B32A32_SFLOAT:        return skr_tex_fmt_rgba128;
+		case VK_FORMAT_R32G32B32A32_SFLOAT:        return skr_tex_fmt_rgba128f;
 		case VK_FORMAT_R8_UNORM:                   return skr_tex_fmt_r8;
-		case VK_FORMAT_R16_UNORM:                  return skr_tex_fmt_r16un;
+		case VK_FORMAT_R8_SNORM:                   return skr_tex_fmt_r8sn;
+		case VK_FORMAT_R8_UINT:                    return skr_tex_fmt_r8ui;
+		case VK_FORMAT_R8_SINT:                    return skr_tex_fmt_r8si;
+		case VK_FORMAT_R8_SRGB:                    return skr_tex_fmt_r8_srgb;
+		case VK_FORMAT_R16_UNORM:                  return skr_tex_fmt_r16;
 		case VK_FORMAT_R16_SNORM:                  return skr_tex_fmt_r16sn;
 		case VK_FORMAT_R16_UINT:                   return skr_tex_fmt_r16ui;
 		case VK_FORMAT_R16_SINT:                   return skr_tex_fmt_r16si;
 		case VK_FORMAT_R16_SFLOAT:                 return skr_tex_fmt_r16f;
+		case VK_FORMAT_R32_UINT:                   return skr_tex_fmt_r32ui;
+		case VK_FORMAT_R32_SINT:                   return skr_tex_fmt_r32si;
 		case VK_FORMAT_R32_SFLOAT:                 return skr_tex_fmt_r32f;
 		case VK_FORMAT_D32_SFLOAT_S8_UINT:         return skr_tex_fmt_depth32s8;
 		case VK_FORMAT_D24_UNORM_S8_UINT:          return skr_tex_fmt_depth24s8;
@@ -95,16 +117,22 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 		case VK_FORMAT_D32_SFLOAT:                 return skr_tex_fmt_depth32;
 		case VK_FORMAT_D16_UNORM:                  return skr_tex_fmt_depth16;
 		case VK_FORMAT_R8G8_UNORM:                 return skr_tex_fmt_r8g8;
-		case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:     return skr_tex_fmt_rgb9e5;
+		case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:     return skr_tex_fmt_rgb9e5uf;
 		// Compressed formats
 		case VK_FORMAT_BC1_RGB_SRGB_BLOCK:         return skr_tex_fmt_bc1_rgb_srgb;
 		case VK_FORMAT_BC1_RGB_UNORM_BLOCK:        return skr_tex_fmt_bc1_rgb;
 		case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:        return skr_tex_fmt_bc1_rgba_srgb;
 		case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:       return skr_tex_fmt_bc1_rgba;
+		case VK_FORMAT_BC2_SRGB_BLOCK:             return skr_tex_fmt_bc2_rgba_srgb;
+		case VK_FORMAT_BC2_UNORM_BLOCK:            return skr_tex_fmt_bc2_rgba;
 		case VK_FORMAT_BC3_SRGB_BLOCK:             return skr_tex_fmt_bc3_rgba_srgb;
 		case VK_FORMAT_BC3_UNORM_BLOCK:            return skr_tex_fmt_bc3_rgba;
 		case VK_FORMAT_BC4_UNORM_BLOCK:            return skr_tex_fmt_bc4_r;
+		case VK_FORMAT_BC4_SNORM_BLOCK:            return skr_tex_fmt_bc4_rsn;
 		case VK_FORMAT_BC5_UNORM_BLOCK:            return skr_tex_fmt_bc5_rg;
+		case VK_FORMAT_BC5_SNORM_BLOCK:            return skr_tex_fmt_bc5_rgsn;
+		case VK_FORMAT_BC6H_UFLOAT_BLOCK:          return skr_tex_fmt_bc6h_rgbuf;
+		case VK_FORMAT_BC6H_SFLOAT_BLOCK:          return skr_tex_fmt_bc6h_rgbf;
 		case VK_FORMAT_BC7_SRGB_BLOCK:             return skr_tex_fmt_bc7_rgba_srgb;
 		case VK_FORMAT_BC7_UNORM_BLOCK:            return skr_tex_fmt_bc7_rgba;
 		// Mobile compressed formats
@@ -132,36 +160,6 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 ///////////////////////////////////////////////////////////////////////////////
 // Format size queries (API-independent)
 ///////////////////////////////////////////////////////////////////////////////
-
-uint32_t _skr_tex_fmt_to_size(skr_tex_fmt_ format) {
-	switch (format) {
-		case skr_tex_fmt_rgba32_srgb:
-		case skr_tex_fmt_rgba32_linear:
-		case skr_tex_fmt_bgra32_srgb:
-		case skr_tex_fmt_bgra32_linear:
-		case skr_tex_fmt_rg11b10:
-		case skr_tex_fmt_rgb10a2:       return 4;
-		case skr_tex_fmt_rgba64u:
-		case skr_tex_fmt_rgba64s:
-		case skr_tex_fmt_rgba64f:       return 8;
-		case skr_tex_fmt_rgba128:       return 16;
-		case skr_tex_fmt_r8:            return 1;
-		case skr_tex_fmt_r16un:
-		case skr_tex_fmt_r16sn:
-		case skr_tex_fmt_r16ui:
-		case skr_tex_fmt_r16si:
-		case skr_tex_fmt_r16f:          return 2;
-		case skr_tex_fmt_r32f:          return 4;
-		case skr_tex_fmt_depth32s8:     return 5;
-		case skr_tex_fmt_depth24s8:     return 4;
-		case skr_tex_fmt_depth16s8:     return 3;
-		case skr_tex_fmt_depth32:       return 4;
-		case skr_tex_fmt_depth16:       return 2;
-		case skr_tex_fmt_r8g8:          return 2;
-		case skr_tex_fmt_rgb9e5:        return 4;
-		default:                        return 0;
-	}
-}
 
 uint32_t _skr_vert_fmt_to_size(skr_vertex_fmt_ format) {
 	switch (format) {

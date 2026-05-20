@@ -24,7 +24,6 @@ VkStencilOp          _skr_to_vk_stencil_op  (skr_stencil_op_   op);
 bool                 _skr_tex_fmt_is_yuv(skr_tex_fmt_ format);
 
 // Format size queries (API-independent)
-uint32_t             _skr_tex_fmt_to_size  (skr_tex_fmt_    format);
 uint32_t             _skr_vert_fmt_to_size (skr_vertex_fmt_ format);
 uint32_t             _skr_index_fmt_to_size(skr_index_fmt_  format);
 

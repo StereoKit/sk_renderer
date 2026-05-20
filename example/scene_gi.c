@@ -473,11 +473,11 @@ static scene_t* _scene_gi_create(void) {
 
 	// Create 3D SH textures (single buffer, continuous temporal accumulation)
 	skr_tex_sampler_t gi_sampler = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
-	skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
+	skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
 		gi_sampler, (skr_vec3i_t){GI_GRID_SIZE, GI_GRID_SIZE, GI_GRID_SIZE}, 1, 1, NULL, &scene->gi_sh_r);
-	skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
+	skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
 		gi_sampler, (skr_vec3i_t){GI_GRID_SIZE, GI_GRID_SIZE, GI_GRID_SIZE}, 1, 1, NULL, &scene->gi_sh_g);
-	skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
+	skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
 		gi_sampler, (skr_vec3i_t){GI_GRID_SIZE, GI_GRID_SIZE, GI_GRID_SIZE}, 1, 1, NULL, &scene->gi_sh_b);
 	skr_tex_set_name(&scene->gi_sh_r, "gi_sh_r");
 	skr_tex_set_name(&scene->gi_sh_g, "gi_sh_g");
@@ -501,7 +501,7 @@ static scene_t* _scene_gi_create(void) {
 	// Voxel radiance textures (double-buffered)
 	scene->gi_voxel_write = 0;
 	for (int32_t i = 0; i < 2; i++) {
-		skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
+		skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_3d | skr_tex_flags_readable | skr_tex_flags_compute,
 			gi_sampler, (skr_vec3i_t){GI_GRID_SIZE, GI_GRID_SIZE, GI_GRID_SIZE}, 1, 1, NULL, &scene->gi_voxel[i]);
 		char name[32];
 		snprintf(name, sizeof(name), "gi_voxel_%d", i);

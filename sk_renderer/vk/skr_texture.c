@@ -2157,10 +2157,16 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_bc1_rgba:
 		case skr_tex_fmt_bc1_rgba_srgb:
 		case skr_tex_fmt_bc4_r:
+		case skr_tex_fmt_bc4_rsn:
 			block_w = 4; block_h = 4; block_bytes = 8; break;
+		case skr_tex_fmt_bc2_rgba:
+		case skr_tex_fmt_bc2_rgba_srgb:
 		case skr_tex_fmt_bc3_rgba:
 		case skr_tex_fmt_bc3_rgba_srgb:
 		case skr_tex_fmt_bc5_rg:
+		case skr_tex_fmt_bc5_rgsn:
+		case skr_tex_fmt_bc6h_rgbuf:
+		case skr_tex_fmt_bc6h_rgbf:
 		case skr_tex_fmt_bc7_rgba:
 		case skr_tex_fmt_bc7_rgba_srgb:
 			block_w = 4; block_h = 4; block_bytes = 16; break;
@@ -2192,9 +2198,40 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 			block_w = 4; block_h = 4; block_bytes = 16; break;
 
 		// Uncompressed formats (1x1 "blocks")
-		default:
-			block_bytes = _skr_tex_fmt_to_size(format);
-			break;
+		case skr_tex_fmt_r8:
+		case skr_tex_fmt_r8sn:
+		case skr_tex_fmt_r8ui:
+		case skr_tex_fmt_r8si:
+		case skr_tex_fmt_r8_srgb:       block_bytes = 1;  break;
+		case skr_tex_fmt_r8g8:
+		case skr_tex_fmt_r16:
+		case skr_tex_fmt_r16sn:
+		case skr_tex_fmt_r16ui:
+		case skr_tex_fmt_r16si:
+		case skr_tex_fmt_r16f:
+		case skr_tex_fmt_depth16:       block_bytes = 2;  break;
+		case skr_tex_fmt_depth16s8:     block_bytes = 3;  break;
+		case skr_tex_fmt_rgba32_srgb:
+		case skr_tex_fmt_rgba32:
+		case skr_tex_fmt_bgra32_srgb:
+		case skr_tex_fmt_bgra32:
+		case skr_tex_fmt_rg11b10uf:
+		case skr_tex_fmt_rgb10a2:
+		case skr_tex_fmt_r32ui:
+		case skr_tex_fmt_r32si:
+		case skr_tex_fmt_r32f:
+		case skr_tex_fmt_depth32:
+		case skr_tex_fmt_depth24s8:
+		case skr_tex_fmt_rgb9e5uf:      block_bytes = 4;  break;
+		case skr_tex_fmt_depth32s8:     block_bytes = 5;  break;
+		case skr_tex_fmt_rgba64un:
+		case skr_tex_fmt_rgba64sn:
+		case skr_tex_fmt_rgba64ui:
+		case skr_tex_fmt_rgba64si:
+		case skr_tex_fmt_rgba64f:       block_bytes = 8;  break;
+		case skr_tex_fmt_rgba128f:      block_bytes = 16; break;
+
+		default:                        block_bytes = 0;  break;
 	}
 
 	if (opt_out_block_width)      *opt_out_block_width      = block_w;

@@ -127,62 +127,106 @@ typedef enum skr_use_ {
 
 typedef enum skr_tex_fmt_ {
 	skr_tex_fmt_none = 0,
-	skr_tex_fmt_rgba32_srgb = 1,
-	skr_tex_fmt_rgba32_linear = 2,
-	skr_tex_fmt_bgra32_srgb = 3,
-	skr_tex_fmt_bgra32_linear = 4,
-	skr_tex_fmt_rg11b10 = 5,
-	skr_tex_fmt_rgb10a2 = 6,
-	skr_tex_fmt_rgba64u = 7,
-	skr_tex_fmt_rgba64s = 8,
-	skr_tex_fmt_rgba64f = 9,
-	skr_tex_fmt_rgba128 = 10,
-	skr_tex_fmt_r8 = 11,
-	skr_tex_fmt_r16un = 12,
-	skr_tex_fmt_r16sn = 13,
-	skr_tex_fmt_r16ui = 14,
-	skr_tex_fmt_r16si = 15,
-	skr_tex_fmt_r16f = 16,
-	skr_tex_fmt_r32f = 17,
-	skr_tex_fmt_depth24s8 = 18,
-	skr_tex_fmt_depth32 = 19,
-	skr_tex_fmt_depth16 = 20,
-	skr_tex_fmt_r8g8 = 21,
-	skr_tex_fmt_rgb9e5 = 22,
 
-	skr_tex_fmt_depth32s8,
+	// 4-channel 8-bit color
+	skr_tex_fmt_rgba32_srgb,
+	skr_tex_fmt_rgba32,
+	skr_tex_fmt_bgra32_srgb,
+	skr_tex_fmt_bgra32,
+
+	// 4-channel 16-bit color
+	skr_tex_fmt_rgba64un,
+	skr_tex_fmt_rgba64sn,
+	skr_tex_fmt_rgba64ui,
+	skr_tex_fmt_rgba64si,
+	skr_tex_fmt_rgba64f,
+
+	// 4-channel 32-bit color
+	skr_tex_fmt_rgba128f,
+
+	// Packed 32-bit color
+	skr_tex_fmt_rg11b10uf,
+	skr_tex_fmt_rgb10a2,
+	skr_tex_fmt_rgb9e5uf,
+
+	// 1-channel 8-bit
+	skr_tex_fmt_r8,
+	skr_tex_fmt_r8sn,
+	skr_tex_fmt_r8ui,
+	skr_tex_fmt_r8si,
+	skr_tex_fmt_r8_srgb,
+
+	// 2-channel 8-bit
+	skr_tex_fmt_r8g8,
+
+	// 1-channel 16-bit
+	skr_tex_fmt_r16,
+	skr_tex_fmt_r16sn,
+	skr_tex_fmt_r16ui,
+	skr_tex_fmt_r16si,
+	skr_tex_fmt_r16f,
+
+	// 1-channel 32-bit
+	skr_tex_fmt_r32ui,
+	skr_tex_fmt_r32si,
+	skr_tex_fmt_r32f,
+
+	// Depth / stencil
+	skr_tex_fmt_depth16,
 	skr_tex_fmt_depth16s8,
+	skr_tex_fmt_depth24s8,
+	skr_tex_fmt_depth32,
+	skr_tex_fmt_depth32s8,
 
+	// BC compressed (desktop / console)
 	skr_tex_fmt_bc1_rgb_srgb,
 	skr_tex_fmt_bc1_rgb,
 	skr_tex_fmt_bc1_rgba_srgb,
 	skr_tex_fmt_bc1_rgba,
+	skr_tex_fmt_bc2_rgba_srgb,
+	skr_tex_fmt_bc2_rgba,
 	skr_tex_fmt_bc3_rgba_srgb,
 	skr_tex_fmt_bc3_rgba,
 	skr_tex_fmt_bc4_r,
+	skr_tex_fmt_bc4_rsn,
 	skr_tex_fmt_bc5_rg,
+	skr_tex_fmt_bc5_rgsn,
+	skr_tex_fmt_bc6h_rgbuf,
+	skr_tex_fmt_bc6h_rgbf,
 	skr_tex_fmt_bc7_rgba_srgb,
 	skr_tex_fmt_bc7_rgba,
 
+	// ETC / EAC compressed (mobile)
 	skr_tex_fmt_etc1_rgb,
 	skr_tex_fmt_etc2_rgba_srgb,
 	skr_tex_fmt_etc2_rgba,
 	skr_tex_fmt_etc2_r11,
 	skr_tex_fmt_etc2_rg11,
+
+	// PVRTC compressed (PowerVR)
 	skr_tex_fmt_pvrtc1_rgb_srgb,
 	skr_tex_fmt_pvrtc1_rgb,
 	skr_tex_fmt_pvrtc1_rgba_srgb,
 	skr_tex_fmt_pvrtc1_rgba,
 	skr_tex_fmt_pvrtc2_rgba_srgb,
 	skr_tex_fmt_pvrtc2_rgba,
+
+	// ASTC compressed
 	skr_tex_fmt_astc4x4_rgba_srgb,
 	skr_tex_fmt_astc4x4_rgba,
+
+	// ATC compressed (Adreno)
 	skr_tex_fmt_atc_rgb,
 	skr_tex_fmt_atc_rgba,
+
 	// YUV / multi-plane formats (require VkSamplerYcbcrConversion, read-only sampling)
 	skr_tex_fmt_nv12,    // 2-plane 4:2:0: Y (8-bit) + interleaved UV (8-bit). Most common HW video decoder output.
 	skr_tex_fmt_p010,    // 2-plane 4:2:0: Y (10-bit) + interleaved UV (10-bit). 10-bit HDR video.
 	skr_tex_fmt_yuv420p, // 3-plane 4:2:0: Y + U + V (all 8-bit). Planar YUV, less common in HW paths.
+
+	// Compatibility aliases
+	skr_tex_fmt_rgba32_linear = skr_tex_fmt_rgba32,
+	skr_tex_fmt_bgra32_linear = skr_tex_fmt_bgra32,
 } skr_tex_fmt_;
 
 typedef enum skr_tex_flags_ {

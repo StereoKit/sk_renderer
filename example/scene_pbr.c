@@ -127,7 +127,7 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 	// the device can't use it as a color attachment.
 	const int32_t        cube_size  = equirect_height / 2;
 	const skr_tex_flags_ cube_flags = skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_cubemap | skr_tex_flags_gen_mips;
-	skr_tex_fmt_         cube_fmt   = skr_tex_fmt_rg11b10;
+	skr_tex_fmt_         cube_fmt   = skr_tex_fmt_rg11b10uf;
 	if (!skr_tex_fmt_is_supported(cube_fmt, cube_flags, 1)) {
 		su_log(su_log_warning, "rg11b10 cubemap unsupported, falling back to rgba64f");
 		cube_fmt = skr_tex_fmt_rgba64f;
