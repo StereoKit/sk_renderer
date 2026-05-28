@@ -10,6 +10,14 @@
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 #define SKR_MAX_SURFACES 2  // Maximum surfaces for VR stereo rendering
 
+// Number of copies in a dynamic buffer's flipbook ring. This is one more than
+// the in-flight frame count: callers write the new frame's data before the
+// oldest in-flight frame is retired (the per-frame fence wait happens at
+// present/acquire, after dynamic buffers are updated), so up to
+// SKR_MAX_FRAMES_IN_FLIGHT frames can still be reading older slots when we
+// write. We need a free slot beyond those to avoid stomping in-flight data.
+#define SKR_DYNAMIC_BUFFER_COPIES (SKR_MAX_FRAMES_IN_FLIGHT + 1)
+
 // Future type for tracking command buffer completion (must be before skr_surface_t)
 typedef struct skr_future_t {
 	void*    slot;          // Pointer to _skr_cmd_ring_slot_t
@@ -38,7 +46,7 @@ typedef struct skr_buffer_t {
 		VkBuffer       buffer;
 		VkDeviceMemory memory;
 		void*          mapped;
-	}                   _ring[SKR_MAX_FRAMES_IN_FLIGHT];
+	}                   _ring[SKR_DYNAMIC_BUFFER_COPIES];
 	uint8_t             _ring_count;  // Slots allocated so far (0 = no ring, use top-level fields)
 	uint8_t             _ring_index;  // Current active slot for reading
 } skr_buffer_t;

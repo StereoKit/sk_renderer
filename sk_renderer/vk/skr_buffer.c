@@ -236,7 +236,7 @@ void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_by
 	}
 
 	// Subsequent updates: advance to next slot in ring
-	uint8_t next_idx = (ref_buffer->_ring_index + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+	uint8_t next_idx = (ref_buffer->_ring_index + 1) % SKR_DYNAMIC_BUFFER_COPIES;
 
 	// Allocate slot if not yet allocated
 	if (next_idx >= ref_buffer->_ring_count) {
