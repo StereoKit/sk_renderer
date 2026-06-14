@@ -202,7 +202,12 @@ typedef struct {
 	bool                     has_external_memory_dma_buf; // VK_EXT_external_memory_dma_buf
 	bool                     has_drm_format_modifier;     // VK_EXT_image_drm_format_modifier
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
+	bool                     has_ycbcr_conversion;        // VkPhysicalDeviceSamplerYcbcrConversionFeatures::samplerYcbcrConversion
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
+	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
+	uint32_t                 min_subgroup_size;           // From VkPhysicalDeviceSubgroupSizeControlPropertiesEXT
+	uint32_t                 max_subgroup_size;
+	VkShaderStageFlags       required_subgroup_size_stages; // Stages that allow VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
 	bool                     initialized;
 	uint32_t                 max_multiview_view_count;    // From VkPhysicalDeviceMultiviewProperties
 
@@ -266,6 +271,11 @@ typedef struct {
 	skr_tex_t                default_tex_white;
 	skr_tex_t                default_tex_black;
 	skr_tex_t                default_tex_gray;
+
+	// Built-in mipgen fallbacks. Used by skr_tex_generate_mips when no shader
+	// is passed and the texture format doesn't support blit.
+	skr_shader_t             builtin_mipgen_2d;
+	skr_shader_t             builtin_mipgen_cube;
 
 	// Deferred destruction
 	skr_destroy_list_t       destroy_list;
@@ -355,6 +365,8 @@ void                  _skr_tex_transition_for_storage       (VkCommandBuffer cmd
 void                  _skr_tex_transition_queue_family      (VkCommandBuffer cmd, skr_tex_t* ref_tex, uint32_t src_queue_family, uint32_t dst_queue_family, VkImageLayout layout);
 void                  _skr_tex_transition_notify_layout     (      skr_tex_t* ref_tex, VkImageLayout new_layout);  // Called after render pass implicit transitions
 bool                  _skr_tex_needs_transition             (const skr_tex_t*     tex, uint8_t type); // Check if texture needs transition for given type (0=shader_read, 1=storage)
+VkImageLayout         _skr_tex_sample_layout                (const skr_tex_t*     tex); // Canonical layout for sampling a sk_renderer-owned texture (matches descriptor imageLayout)
+VkImageLayout         _skr_tex_attachment_layout            (const skr_tex_t*     tex); // Canonical layout for using a texture as a render-pass attachment (color vs depth, picked from aspect_mask)
 void                  _skr_tex_transition_enqueue           (      skr_tex_t* ref_tex, uint8_t type); // Deferred texture transition queue (to avoid in-renderpass barriers) type: 0=shader_read, 1=storage
 void                  _skr_tex_transition_dequeue           (      skr_tex_t* ref_tex);               // Remove from deferred queue (called on texture destroy)
 

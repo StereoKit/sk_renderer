@@ -8,6 +8,9 @@
 #include "skr_conversions.h"
 #include "skr_scratch.h"
 
+#include "skr_mipgen_2d.hlsl.h"
+#include "skr_mipgen_cube.hlsl.h"
+
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
 
@@ -159,26 +162,25 @@ bool skr_init(skr_settings_t settings) {
 	// Extension definitions
 	///////////////////////////////////////////////////////////////////////////
 
-	// Instance extensions
-	const char* required_instance_exts[] = {
-		VK_KHR_SURFACE_EXTENSION_NAME,
-	};
+	// Instance extensions. VK_KHR_surface is optional so headless/offscreen
+	// environments (CI runners, render baking) can init without a surface;
+	// presentation capability is surfaced via skr_capability_presentation.
 	const char* optional_instance_exts[] = {
-		VK_EXT_DEBUG_UTILS_EXTENSION_NAME
+		VK_KHR_SURFACE_EXTENSION_NAME,
+		VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
 	};
-	const uint32_t required_instance_ext_count = sizeof(required_instance_exts) / sizeof(required_instance_exts[0]);
 	const uint32_t optional_instance_ext_count = sizeof(optional_instance_exts) / sizeof(optional_instance_exts[0]);
 
-	// Device extensions
-	const char* required_device_exts[] = {
-		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-	};
+	// Device extensions. VK_KHR_swapchain is optional for the same reason as
+	// VK_KHR_surface above.
 	const char* optional_device_exts[] = {
+		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,          // External memory extensions for GL interop and Android Hardware Buffer
 		VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,     // DMA-BUF import extensions
 		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
 		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 		VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
+		VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,       // Required-subgroup-size for compute (HLSL [WaveSize]/`//--wave_size`)
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -190,7 +192,6 @@ bool skr_init(skr_settings_t settings) {
 		VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
 #endif
 	};
-	const uint32_t required_device_ext_count = sizeof(required_device_exts) / sizeof(required_device_exts[0]);
 	const uint32_t optional_device_ext_count = sizeof(optional_device_exts) / sizeof(optional_device_exts[0]);
 
 	// Video decode extensions (all required together for video support)
@@ -237,18 +238,8 @@ bool skr_init(skr_settings_t settings) {
 		}
 	}
 
-	// Add sk_renderer required extensions
-	for (uint32_t i = 0; i < required_instance_ext_count && instance_ext_count < 64; i++) {
-		if (_skr_ext_available(required_instance_exts[i], available_inst_exts, available_inst_ext_count)) {
-			instance_exts[instance_ext_count++] = required_instance_exts[i];
-		} else {
-			skr_log(skr_log_critical, "Required instance extension '%s' not available", required_instance_exts[i]);
-			_skr_free(available_inst_exts);
-			return false;
-		}
-	}
-
 	// Add optional extensions if available
+	bool has_surface = false;
 	for (uint32_t i = 0; i < optional_instance_ext_count && instance_ext_count < 64; i++) {
 		// Skip debug utils if validation not enabled
 		if (strcmp(optional_instance_exts[i], VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0 && !_skr_vk.validation_enabled) {
@@ -256,6 +247,7 @@ bool skr_init(skr_settings_t settings) {
 		}
 		if (_skr_ext_available(optional_instance_exts[i], available_inst_exts, available_inst_ext_count)) {
 			instance_exts[instance_ext_count++] = optional_instance_exts[i];
+			if (strcmp(optional_instance_exts[i], VK_KHR_SURFACE_EXTENSION_NAME) == 0) has_surface = true;
 		}
 	}
 
@@ -564,17 +556,6 @@ bool skr_init(skr_settings_t settings) {
 	const char* device_exts[64];
 	uint32_t    device_ext_count = 0;
 
-	// Add required device extensions
-	for (uint32_t i = 0; i < required_device_ext_count && device_ext_count < 64; i++) {
-		if (_skr_ext_available(required_device_exts[i], available_device_exts, available_device_ext_count)) {
-			device_exts[device_ext_count++] = required_device_exts[i];
-		} else {
-			skr_log(skr_log_critical, "Required device extension '%s' not available", required_device_exts[i]);
-			_skr_free(available_device_exts);
-			return false;
-		}
-	}
-
 	// Add device extensions from callback (e.g., from OpenXR)
 	for (uint32_t i = 0; i < device_request.required_device_extension_count && device_ext_count < 64; i++) {
 		if (_skr_ext_available(device_request.required_device_extensions[i], available_device_exts, available_device_ext_count)) {
@@ -587,23 +568,27 @@ bool skr_init(skr_settings_t settings) {
 	}
 
 	// Add optional device extensions if available
-	_skr_vk.has_push_descriptors       = false;
+	_skr_vk.has_push_descriptors        = false;
 	_skr_vk.has_external_memory_fd      = false;
 	_skr_vk.has_external_memory_win32   = false;
 	_skr_vk.has_android_hardware_buffer = false;
 	_skr_vk.has_external_memory_dma_buf = false;
 	_skr_vk.has_drm_format_modifier     = false;
 	_skr_vk.has_custom_resolve          = false;
+	_skr_vk.has_subgroup_size_control   = false;
 	bool has_image_format_list          = false;
+	bool has_swapchain                  = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
 		if (_skr_ext_available(optional_device_exts[i], available_device_exts, available_device_ext_count)) {
 			device_exts[device_ext_count++] = optional_device_exts[i];
+			if (strcmp(optional_device_exts[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME                  ) == 0) has_swapchain                        = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME            ) == 0) _skr_vk.has_push_descriptors         = true;
 			if (strcmp(optional_device_exts[i], VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME) == 0) _skr_vk.has_custom_resolve           = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME         ) == 0) _skr_vk.has_external_memory_fd       = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME    ) == 0) _skr_vk.has_external_memory_dma_buf  = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME  ) == 0) _skr_vk.has_drm_format_modifier      = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME          ) == 0) has_image_format_list                = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME     ) == 0) _skr_vk.has_subgroup_size_control    = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
@@ -646,17 +631,69 @@ bool skr_init(skr_settings_t settings) {
 		.fillModeNonSolid               = available_features.fillModeNonSolid,
 		.depthClamp                     = available_features.depthClamp,
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
+		.fragmentStoresAndAtomics       = available_features.fragmentStoresAndAtomics,
 	};
 
-	// Multiview is Vulkan 1.1 core - always enable for multi-view rendering
+	// Query availability of the chained pNext features we want to enable.
+	// vkGetPhysicalDeviceFeatures only covers VkPhysicalDeviceFeatures (the basic set);
+	// Vulkan 1.1+ features live in separate structs queried via vkGetPhysicalDeviceFeatures2.
+	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+	};
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_size_query : NULL,
+	};
+	VkPhysicalDeviceMultiviewFeatures multiview_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+		.pNext = &ycbcr_query,
+	};
+	VkPhysicalDeviceFeatures2 features2_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+		.pNext = &multiview_query,
+	};
+	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
+
+	_skr_vk.has_ycbcr_conversion = ycbcr_query.samplerYcbcrConversion != 0;
+	// Only consider subgroup size control supported if the feature flag is set, not just the extension.
+	_skr_vk.has_subgroup_size_control = _skr_vk.has_subgroup_size_control && subgroup_size_query.subgroupSizeControl;
+
+	// Multiview is a hard requirement for stereo/XR rendering. It's part of
+	// Vulkan 1.1 core but is still a feature flag, so an implementation can
+	// advertise 1.1 support yet report multiview as unsupported.
+	if (!multiview_query.multiview) {
+		skr_log(skr_log_critical, "Multiview feature is required but not supported by the selected GPU");
+		return false;
+	}
 	VkPhysicalDeviceMultiviewFeatures multiview_features = {
 		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
 		.multiview = VK_TRUE,
 	};
 
-	// Query multiview properties
+	// Subgroup size control lets compute pipelines request a specific subgroup
+	// size at pipeline creation time (the Vulkan analog of HLSL [WaveSize(N)]).
+	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_features = {
+		.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+		.pNext                = &multiview_features,
+		.subgroupSizeControl  = VK_TRUE,
+	};
+
+	// YCbCr conversion is needed for YUV/NV12 textures and Android Hardware Buffer
+	// external memory. Conditionally enable — not all drivers expose it (notably
+	// older Mesa lavapipe versions).
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
+		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext                  = _skr_vk.has_subgroup_size_control ? (void*)&subgroup_size_features : (void*)&multiview_features,
+		.samplerYcbcrConversion = _skr_vk.has_ycbcr_conversion ? VK_TRUE : VK_FALSE,
+	};
+
+	// Query multiview properties (and subgroup size limits if supported)
+	VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT,
+	};
 	VkPhysicalDeviceMultiviewProperties multiview_props = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES,
+		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_props : NULL,
 	};
 	VkPhysicalDeviceProperties2 props2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -664,23 +701,17 @@ bool skr_init(skr_settings_t settings) {
 	};
 	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
 	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
+	if (_skr_vk.has_subgroup_size_control) {
+		_skr_vk.min_subgroup_size             = subgroup_props.minSubgroupSize;
+		_skr_vk.max_subgroup_size             = subgroup_props.maxSubgroupSize;
+		_skr_vk.required_subgroup_size_stages = subgroup_props.requiredSubgroupSizeStages;
+	}
 
-	// YCbCr conversion is Vulkan 1.1 core - always enable for YUV texture support
-	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
-		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
-		.pNext                  = &multiview_features,
-		.samplerYcbcrConversion = VK_TRUE,
-	};
-
-	// Chain video decode feature structs if enabled
-	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {
-		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-		.pNext            = &ycbcr_features,
-		.timelineSemaphore = VK_TRUE,
-	};
+	// Synchronization2 is required by the video decode path; chained only when
+	// video decode is enabled.
 	VkPhysicalDeviceSynchronization2Features sync2_features = {
 		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-		.pNext            = &timeline_features,
+		.pNext            = &ycbcr_features,
 		.synchronization2 = VK_TRUE,
 	};
 
@@ -837,18 +868,25 @@ bool skr_init(skr_settings_t settings) {
 		.address = skr_tex_address_clamp
 	};
 	uint32_t color = 0xFFFFFFFF;
-	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_white);
+	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_white);
 	color = 0xFF808080;
-	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_gray);
+	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_gray);
 	color = 0xFF000000;
-	skr_tex_create( skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
+	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
+
+	// Built-in fallback mipgen shaders. Used by skr_tex_generate_mips when the
+	// caller passes no shader and the texture format doesn't support blit
+	// (e.g. B10G11R11_UFLOAT on Mesa llvmpipe).
+	if (skr_shader_create(sks_skr_mipgen_2d_hlsl,   sizeof(sks_skr_mipgen_2d_hlsl),   &_skr_vk.builtin_mipgen_2d  ) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_2d,   "skr_builtin_mipgen_2d");
+	if (skr_shader_create(sks_skr_mipgen_cube_hlsl, sizeof(sks_skr_mipgen_cube_hlsl), &_skr_vk.builtin_mipgen_cube) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_cube, "skr_builtin_mipgen_cube");
 
 	// Populate capability array
 	_skr_vk.capabilities[skr_capability_external_vk ] = true;
 	_skr_vk.capabilities[skr_capability_external_gl ] = _skr_vk.has_external_memory_fd || _skr_vk.has_external_memory_win32;
 	_skr_vk.capabilities[skr_capability_external_ahb] = _skr_vk.has_android_hardware_buffer;
 	_skr_vk.capabilities[skr_capability_external_dma] = _skr_vk.has_external_memory_dma_buf && _skr_vk.has_drm_format_modifier && has_image_format_list;
-	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode;
+	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode && _skr_vk.has_ycbcr_conversion;
+	_skr_vk.capabilities[skr_capability_presentation] = has_surface && has_swapchain;
 
 	// Log optional extension status
 	skr_log(skr_log_info, "[%s] %s",           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,             _skr_vk.has_push_descriptors ? "true" : "false");
@@ -867,6 +905,9 @@ void skr_shutdown(void) {
 	skr_tex_destroy(&_skr_vk.default_tex_white);
 	skr_tex_destroy(&_skr_vk.default_tex_gray);
 	skr_tex_destroy(&_skr_vk.default_tex_black);
+
+	skr_shader_destroy(&_skr_vk.builtin_mipgen_2d);
+	skr_shader_destroy(&_skr_vk.builtin_mipgen_cube);
 
 	_skr_scratch_pool_shutdown();  // Free pooled mipgen scratch textures before command shutdown
 

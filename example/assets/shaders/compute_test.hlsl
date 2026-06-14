@@ -1,6 +1,8 @@
 // Reference and numbers are from here:
 // http://mrob.com/pub/comp/xmorphia/
 
+//--wave_size = 32
+
 float feed;
 float kill;
 float diffuseA;

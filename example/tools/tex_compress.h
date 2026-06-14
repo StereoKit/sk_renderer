@@ -38,7 +38,10 @@
 // SIMD acceleration (x64 only):
 //   0 = Scalar code (portable)
 //   1 = SSE4.1 intrinsics (faster on x64)
-#if defined(__x86_64__) || defined(_M_X64)
+// MSVC accepts SSE4.1 intrinsics on any x64 target without a flag and doesn't
+// set __SSE4_1__. GCC/Clang only define __SSE4_1__ when -msse4.1 (or higher
+// -march) is passed; the example CMakeLists adds it for x64 MinGW builds.
+#if (defined(_MSC_VER) && defined(_M_X64)) || defined(__SSE4_1__)
 	#define BC1_USE_SIMD 1
 #else
 	#define BC1_USE_SIMD 0

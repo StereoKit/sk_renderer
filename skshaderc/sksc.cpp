@@ -384,7 +384,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 6;
+	uint16_t version = 7;
 	data.write(tag);
 	data.write(version);
 
@@ -400,6 +400,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	data.write(file->meta.ops_pixel.total);
 	data.write(file->meta.ops_pixel.tex_read);
 	data.write(file->meta.ops_pixel.dynamic_flow);
+	data.write(file->meta.wave_size);
 
 	for (uint32_t i = 0; i < file->meta.buffer_count; i++) {
 		sksc_shader_buffer_t *buff = &file->meta.buffers[i];

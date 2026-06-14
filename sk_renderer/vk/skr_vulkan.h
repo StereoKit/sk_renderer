@@ -10,6 +10,14 @@
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 #define SKR_MAX_SURFACES 2  // Maximum surfaces for VR stereo rendering
 
+// Number of copies in a dynamic buffer's flipbook ring. This is one more than
+// the in-flight frame count: callers write the new frame's data before the
+// oldest in-flight frame is retired (the per-frame fence wait happens at
+// present/acquire, after dynamic buffers are updated), so up to
+// SKR_MAX_FRAMES_IN_FLIGHT frames can still be reading older slots when we
+// write. We need a free slot beyond those to avoid stomping in-flight data.
+#define SKR_DYNAMIC_BUFFER_COPIES (SKR_MAX_FRAMES_IN_FLIGHT + 1)
+
 // Future type for tracking command buffer completion (must be before skr_surface_t)
 typedef struct skr_future_t {
 	void*    slot;          // Pointer to _skr_cmd_ring_slot_t
@@ -38,7 +46,7 @@ typedef struct skr_buffer_t {
 		VkBuffer       buffer;
 		VkDeviceMemory memory;
 		void*          mapped;
-	}                   _ring[SKR_MAX_FRAMES_IN_FLIGHT];
+	}                   _ring[SKR_DYNAMIC_BUFFER_COPIES];
 	uint8_t             _ring_count;  // Slots allocated so far (0 = no ring, use top-level fields)
 	uint8_t             _ring_index;  // Current active slot for reading
 } skr_buffer_t;
@@ -84,7 +92,10 @@ typedef struct skr_tex_t {
 	uint32_t               layer_count;      // Number of array layers (1 for regular, N for arrays, 6 for cubemaps)
 	VkImageAspectFlags     aspect_mask;      // Depth bit for depth textures, color bit for color textures
 
-	// Automatic layout transition tracking
+	// Automatic layout transition tracking. current_layout is the actual GPU
+	// layout right now — used as oldLayout for the next barrier and to skip
+	// no-op transitions. Not consulted for descriptor writes (those derive
+	// from _skr_tex_sample_layout) or renderpass attachment layouts.
 	VkImageLayout          current_layout;       // Current image layout (tracked automatically)
 	uint32_t               current_queue_family; // Current queue family owner
 	bool                   first_use;            // True until first transition (allows UNDEFINED optimization)
@@ -109,7 +120,11 @@ typedef struct skr_tex_external_info_t {
 	skr_tex_fmt_      format;         // Texture format
 	skr_tex_flags_    flags;          // Usage flags (readable/writeable/etc.) - 0 = infer from format
 	skr_vec3i_t       size;           // Dimensions (for array textures, z = layer count)
-	VkImageLayout     current_layout; // Current layout of the image
+	VkImageLayout     current_layout; // Layout the image is in *right now* — used as
+	                                  // the oldLayout of sk_renderer's next transition.
+	                                  // sk_renderer will move the image to its canonical
+	                                  // sample layout before sampling (SHADER_READ_ONLY,
+	                                  // DEPTH_STENCIL_READ_ONLY, or GENERAL based on flags).
 	skr_tex_sampler_t sampler;        // Sampler settings
 	int32_t           multisample;    // MSAA sample count (1, 2, 4, 8, etc.), 0 or 1 = no MSAA
 	int32_t           array_layers;   // Array layer count (0 or 1 = single texture, >1 = array texture)
@@ -120,7 +135,8 @@ typedef struct skr_tex_external_info_t {
 typedef struct skr_tex_external_update_t {
 	VkImage       image;          // New VkImage to reference
 	VkImageView   view;           // Optional new view (VK_NULL_HANDLE = recreate from image)
-	VkImageLayout current_layout; // Current layout of new image
+	VkImageLayout current_layout; // Layout the new image is in right now — see
+	                              // skr_tex_external_info_t::current_layout for details.
 } skr_tex_external_update_t;
 
 // GL external texture import via external memory (FD on Linux/Android, Win32 HANDLE on Windows)
@@ -196,22 +212,47 @@ typedef struct  {
 
 // Internal key struct for pipeline-affecting material parameters only.
 // Excludes queue_offset which affects render list sorting but not pipeline state.
-typedef struct {
-	const skr_shader_t*  shader;
-	skr_cull_            cull;
-	skr_write_           write_mask;
-	skr_compare_         depth_test;
-	skr_blend_state_t    blend_state;
-	bool                 alpha_to_coverage;
-	bool                 depth_clamp;
-	bool                 wireframe;
-	skr_stencil_state_t  stencil_front;
-	skr_stencil_state_t  stencil_back;
+//
+// Layout is hand-tuned so every byte corresponds to a named field — there are
+// no implicit alignment holes. _pad0/_pad1 are explicit so designated
+// initializers zero them via the C99 "unspecified members → zero" rule, and
+// memcmp-based dedup in _skr_pipeline_register_material is byte-deterministic
+// regardless of compiler or C standard version.
 #define SKR_MAX_IMMUTABLE_SAMPLERS 2
-	VkSampler            immutable_samplers[SKR_MAX_IMMUTABLE_SAMPLERS];      // Immutable samplers for YCbCr textures (VK_NULL_HANDLE = unused)
-	int32_t              immutable_sampler_slots[SKR_MAX_IMMUTABLE_SAMPLERS];  // Descriptor binding slots (sorted by slot for deterministic memcmp)
-	int32_t              immutable_sampler_count;                              // Number of active immutable samplers
+typedef struct {
+	// 8-byte aligned block
+	const skr_shader_t*  shader;                                              // @0   (8)
+	VkSampler            immutable_samplers[SKR_MAX_IMMUTABLE_SAMPLERS];      // @8   (16) Immutable samplers for YCbCr textures (VK_NULL_HANDLE = unused)
+
+	// 4-byte aligned sub-structs (no internal padding: all 4-byte fields)
+	skr_blend_state_t    blend_state;                                         // @24  (24)
+	skr_stencil_state_t  stencil_front;                                       // @48  (28)
+	skr_stencil_state_t  stencil_back;                                        // @76  (28)
+
+	// 4-byte aligned scalars
+	skr_cull_            cull;                                                // @104 (4)
+	skr_write_           write_mask;                                          // @108 (4)
+	skr_compare_         depth_test;                                          // @112 (4)
+	int32_t              immutable_sampler_count;                             // @116 (4)  Number of active immutable samplers
+	int32_t              immutable_sampler_slots[SKR_MAX_IMMUTABLE_SAMPLERS]; // @120 (8)  Descriptor binding slots (sorted by slot for deterministic memcmp)
+
+	// 1-byte fields packed at the end with explicit padding to fill the
+	// alignment tail. _pad0/_pad1 must remain zero — initializer rules above
+	// keep this true without any extra code at the call sites.
+	bool                 alpha_to_coverage;                                   // @128 (1)
+	bool                 depth_clamp;                                         // @129 (1)
+	bool                 wireframe;                                           // @130 (1)
+	uint8_t              _pad0;                                               // @131 (1)  must be 0
+	uint32_t             _pad1;                                               // @132 (4)  must be 0
 } _skr_pipeline_material_key_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
+	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
+#else
+_Static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
+	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
+#endif
 
 typedef struct skr_material_t {
 	int32_t                      pipeline_material_idx; // Index into pipeline cache

@@ -207,6 +207,11 @@ skr_err_ skr_surface_create(void* vk_surface_khr, skr_surface_t* out_surface) {
 	// Zero out immediately
 	*out_surface = (skr_surface_t){0};
 
+	if (!skr_is_capable(skr_capability_presentation)) {
+		skr_log(skr_log_critical, "skr_surface_create: VK_KHR_surface/VK_KHR_swapchain not available (headless?)");
+		return skr_err_unsupported;
+	}
+
 	VkSurfaceKHR vk_surface = (VkSurfaceKHR)vk_surface_khr;
 	if (!vk_surface) return skr_err_invalid_parameter;
 

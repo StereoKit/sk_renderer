@@ -142,8 +142,10 @@ skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t s
 				.size = out_buffer->size,
 			});
 
-			_skr_cmd_destroy_buffer(ctx.destroy_list, staging_buffer);
+			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
+			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
 			_skr_cmd_destroy_memory(ctx.destroy_list, staging_memory);
+			_skr_cmd_destroy_buffer(ctx.destroy_list, staging_buffer);
 			_skr_cmd_release       (ctx.cmd);
 		}
 	}
@@ -234,7 +236,7 @@ void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_by
 	}
 
 	// Subsequent updates: advance to next slot in ring
-	uint8_t next_idx = (ref_buffer->_ring_index + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+	uint8_t next_idx = (ref_buffer->_ring_index + 1) % SKR_DYNAMIC_BUFFER_COPIES;
 
 	// Allocate slot if not yet allocated
 	if (next_idx >= ref_buffer->_ring_count) {
@@ -284,22 +286,24 @@ void skr_buffer_set_name(skr_buffer_t* ref_buffer, const char* name) {
 void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
 	if (!ref_buffer || ref_buffer->buffer == VK_NULL_HANDLE) return;
 
+	// Destroy list is LIFO — push memory before buffer so vkFreeMemory runs
+	// after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
 	if (ref_buffer->_ring_count > 0) {
 		// Ring buffer mode: destroy all allocated ring slots
 		for (uint8_t i = 0; i < ref_buffer->_ring_count; i++) {
 			if (ref_buffer->_ring[i].mapped) {
 				vkUnmapMemory(_skr_vk.device, ref_buffer->_ring[i].memory);
 			}
-			_skr_cmd_destroy_buffer(NULL, ref_buffer->_ring[i].buffer);
 			_skr_cmd_destroy_memory(NULL, ref_buffer->_ring[i].memory);
+			_skr_cmd_destroy_buffer(NULL, ref_buffer->_ring[i].buffer);
 		}
 	} else {
 		// Single buffer mode: destroy top-level fields
 		if (ref_buffer->mapped) {
 			vkUnmapMemory(_skr_vk.device, ref_buffer->memory);
 		}
-		_skr_cmd_destroy_buffer(NULL, ref_buffer->buffer);
 		_skr_cmd_destroy_memory(NULL, ref_buffer->memory);
+		_skr_cmd_destroy_buffer(NULL, ref_buffer->buffer);
 	}
 
 	*ref_buffer = (skr_buffer_t){0};

@@ -121,6 +121,11 @@ if(MINGW)
 	target_link_options       (sk_renderer_test PRIVATE -static-libgcc -static-libstdc++ -static)
 	target_link_libraries     (sk_renderer_test PRIVATE pthread)
 	target_include_directories(sk_renderer_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	# MSVC enables SSE4.1 intrinsics on x64 unconditionally; mingw-w64 GCC needs
+	# -msse4.1 explicitly so BC1/ETC SIMD paths can compile.
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+		target_compile_options(sk_renderer_test PRIVATE -msse4.1)
+	endif()
 endif()
 
 # macOS needs pthread fallback for C11 threads (no static linking)

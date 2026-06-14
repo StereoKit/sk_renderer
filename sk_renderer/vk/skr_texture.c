@@ -296,6 +296,26 @@ static const char* _layout_to_string(VkImageLayout layout) {
 // Automatic Layout Transition System
 ///////////////////////////////////////////////////////////////////////////////
 
+// Canonical "ready to be sampled" layout for a texture. Single source of
+// truth shared by the descriptor-write path and the transition helpers, so
+// the two can't drift. Producers of external textures are responsible for
+// ensuring the image is in this layout before any draw that samples it.
+VkImageLayout _skr_tex_sample_layout(const skr_tex_t* tex) {
+	if (tex->flags & skr_tex_flags_compute)             return VK_IMAGE_LAYOUT_GENERAL;
+	if (tex->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)   return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+	return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+// Canonical attachment layout for a texture used as a render-pass attachment.
+// Sibling to _skr_tex_sample_layout — picks DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+// for depth-aspect textures and COLOR_ATTACHMENT_OPTIMAL for color, so callers
+// can't mistakenly transition a depth target into a color layout (VUID-01208).
+VkImageLayout _skr_tex_attachment_layout(const skr_tex_t* tex) {
+	return (tex->aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
+		? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+		: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
+
 // Check if texture needs transition for given type (without requiring command buffer)
 bool _skr_tex_needs_transition(const skr_tex_t* tex, uint8_t type) {
 	if (!tex || !tex->image) return false;
@@ -304,15 +324,9 @@ bool _skr_tex_needs_transition(const skr_tex_t* tex, uint8_t type) {
 	if (tex->is_transient_discard) return true;
 
 	// Determine target layout based on type
-	VkImageLayout target_layout;
-	if (type == 1) {  // storage
-		target_layout = VK_IMAGE_LAYOUT_GENERAL;
-	} else {  // shader_read (type == 0)
-		// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
-		target_layout = (tex->flags & skr_tex_flags_compute)
-			? VK_IMAGE_LAYOUT_GENERAL
-			: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	}
+	VkImageLayout target_layout = (type == 1)
+		? VK_IMAGE_LAYOUT_GENERAL
+		: _skr_tex_sample_layout(tex);
 
 	// Check if already in target layout
 	return tex->current_layout != target_layout;
@@ -382,17 +396,14 @@ void _skr_tex_barrier(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFl
 
 // Specialized: Transition for shader read (most common case)
 void _skr_tex_transition_for_shader_read(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkPipelineStageFlags dst_stage) {
-	// Storage images use GENERAL layout, regular textures use SHADER_READ_ONLY_OPTIMAL
-	VkImageLayout target_layout = (ref_tex->flags & skr_tex_flags_compute)
-		? VK_IMAGE_LAYOUT_GENERAL
-		: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-	_skr_tex_transition(cmd, ref_tex, target_layout, dst_stage, VK_ACCESS_SHADER_READ_BIT);
+	_skr_tex_transition(cmd, ref_tex, _skr_tex_sample_layout(ref_tex), dst_stage, VK_ACCESS_SHADER_READ_BIT);
 }
 
-// Specialized: Transition for storage image (compute RWTexture)
+// Specialized: Transition for storage image (compute RWTexture). Routes through
+// _skr_tex_sample_layout (returns GENERAL for compute-flagged textures) for
+// consistency with the sampling path — same value, single source of truth.
 void _skr_tex_transition_for_storage(VkCommandBuffer cmd, skr_tex_t* ref_tex) {
-	_skr_tex_transition(cmd, ref_tex, VK_IMAGE_LAYOUT_GENERAL,
+	_skr_tex_transition(cmd, ref_tex, _skr_tex_sample_layout(ref_tex),
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
@@ -520,8 +531,8 @@ void _skr_barrier_batch_flush(_skr_barrier_batch_t* batch, VkCommandBuffer cmd) 
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static void _skr_tex_generate_mips_blit  (VkPhysicalDevice phys_device, skr_tex_t* tex, int32_t mip_levels);
-static void _skr_tex_generate_mips_render(VkDevice         device,      skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* fragment_shader);
+static void _skr_tex_generate_mips_blit  (skr_tex_t* tex, int32_t mip_levels, VkFilter filter_mode);
+static void _skr_tex_generate_mips_render(VkDevice  device,    skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* fragment_shader);
 
 // Upload texture data from skr_tex_data_t descriptor
 // Handles multiple mips and layers in mip-major layout
@@ -638,9 +649,10 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 	}
 	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, shader_stages);
 
-	// Defer cleanup
-	_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
+	// Defer cleanup. Destroy list is LIFO — push memory before buffer so
+	// vkFreeMemory runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
 	_skr_cmd_destroy_memory(ctx.destroy_list, staging.memory);
+	_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
 	_skr_cmd_release(ctx.cmd);
 
 	_skr_free(regions);
@@ -851,8 +863,10 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 			out_tex->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			out_tex->first_use      = false;
 
-			_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
+			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
+			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
 			_skr_cmd_destroy_memory(ctx.destroy_list, staging.memory);
+			_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
 			_skr_cmd_release(ctx.cmd);
 		}
 	}
@@ -1243,10 +1257,13 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 	}
 	_skr_cmd_destroy_image_view (NULL, ref_tex->view);
 
-	// Only destroy image/memory if we own them (not external)
+	// Only destroy image/memory if we own them (not external).
+	// Destroy list executes LIFO, so push memory FIRST and image SECOND —
+	// vkFreeMemory must run after vkDestroyImage, otherwise the validation
+	// layer reports the memory as still bound to the image (VUID-vkFreeMemory-memory-00677).
 	if (!ref_tex->is_external) {
-		_skr_cmd_destroy_image (NULL, ref_tex->image);
 		_skr_cmd_destroy_memory(NULL, ref_tex->memory);
+		_skr_cmd_destroy_image (NULL, ref_tex->image);
 	}
 
 	// Deferred destroy YCbCr resources. The destroy list executes in LIFO order,
@@ -1401,6 +1418,26 @@ void skr_tex_set_name(skr_tex_t* ref_tex, const char* name) {
 	}
 }
 
+// Last-ditch transition when neither blit nor render mipgen can run: drives all
+// mips to a samplable layout using UNDEFINED as the source so the actual state
+// (which may be inconsistent across mips) doesn't matter. Discards mip 0
+// contents — callers of an unsupported format would have a broken texture
+// either way, but this prevents the cascade of layout-mismatch validation
+// errors that follows when downstream code samples the texture.
+static void _skr_tex_safe_transition_all_mips(skr_tex_t* ref_tex) {
+	VkImageLayout final_layout = _skr_tex_sample_layout(ref_tex);
+
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+	_skr_transition_image_layout(ctx.cmd, ref_tex->image, ref_tex->aspect_mask,
+		0, ref_tex->mip_levels, ref_tex->layer_count,
+		VK_IMAGE_LAYOUT_UNDEFINED, final_layout,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		0, VK_ACCESS_SHADER_READ_BIT);
+	_skr_tex_transition_notify_layout(ref_tex, final_layout);
+	_skr_cmd_release(ctx.cmd);
+}
+
 void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 	if (!skr_tex_is_valid(ref_tex)) {
 		skr_log(skr_log_warning, "Cannot generate mipmaps for invalid texture");
@@ -1415,35 +1452,59 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 		return;
 	}
 
-	// Route to appropriate implementation
-	// If a custom shader is provided, use render-based mipmap generation (fragment shader)
-	// Otherwise fall back to simple blit
-	if (opt_shader == NULL) {
-		_skr_tex_generate_mips_blit  (_skr_vk.physical_device, ref_tex, mip_levels);
-	} else {
+	// Caller-supplied shader: trust them, use the render path.
+	if (opt_shader != NULL) {
 		_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, opt_shader);
-	}
-}
-
-static void _skr_tex_generate_mips_blit(VkPhysicalDevice phys_device, skr_tex_t* ref_tex, int32_t mip_levels) {
-	// Check format support for blit operations
-	VkFormatProperties format_properties;
-	VkFormat           vk_format = skr_tex_fmt_to_native(ref_tex->format);
-	vkGetPhysicalDeviceFormatProperties(phys_device, vk_format, &format_properties);
-
-	if (!(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
-	    !(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
-		skr_log(skr_log_critical, "Texture format doesn't support blit operations for mipmap generation");
 		return;
 	}
 
-	// Check if format supports linear filtering during blit
-	VkFilter filter_mode = VK_FILTER_LINEAR;
-	if (!(format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
-		skr_log(skr_log_info, "Format doesn't support linear filtering, using nearest");
-		filter_mode = VK_FILTER_NEAREST;
+	// No shader: prefer the blit path when the format supports it (fast and
+	// driver-native). Otherwise fall back to a render pass with a built-in
+	// mipgen shader — needed for formats like B10G11R11_UFLOAT_PACK32 on
+	// Mesa llvmpipe, which advertise COLOR_ATTACHMENT but not BLIT.
+	VkFormat           vk_format = skr_tex_fmt_to_native(ref_tex->format);
+	VkFormatProperties props;
+	vkGetPhysicalDeviceFormatProperties(_skr_vk.physical_device, vk_format, &props);
+	VkFormatFeatureFlags feats = props.optimalTilingFeatures;
+
+	bool has_blit  = (feats & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+	              && (feats & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+	bool has_color = (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+
+	if (has_blit) {
+		VkFilter filter_mode = (feats & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+			? VK_FILTER_LINEAR
+			: VK_FILTER_NEAREST;
+		_skr_tex_generate_mips_blit(ref_tex, mip_levels, filter_mode);
+		return;
 	}
 
+	// Layered non-cubemap (texture arrays) has no built-in shader variant;
+	// fall through to safe-transition. Cubemap and 2D have built-ins created
+	// at init time.
+	if (has_color) {
+		const skr_shader_t* builtin =
+			(ref_tex->flags & skr_tex_flags_cubemap) ? &_skr_vk.builtin_mipgen_cube :
+			(ref_tex->layer_count > 1)               ? NULL                         :
+			                                           &_skr_vk.builtin_mipgen_2d;
+		if (builtin && skr_shader_is_valid(builtin)) {
+			_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, builtin);
+			return;
+		}
+	}
+
+	// Format supports neither path (or layered non-cubemap with no built-in):
+	// leave the texture in a samplable layout so the caller's subsequent
+	// sampling doesn't trip layout-mismatch validation errors.
+	skr_log(skr_log_critical,
+		"Texture format doesn't support blit or color-attachment mipgen (skr_tex_fmt=%d, VkFormat=%d); pass a custom shader to skr_tex_generate_mips",
+		(int)ref_tex->format, (int)vk_format);
+	_skr_tex_safe_transition_all_mips(ref_tex);
+}
+
+// Caller (skr_tex_generate_mips) has already verified the format supports
+// BLIT_SRC/BLIT_DST and picked filter_mode based on SAMPLED_IMAGE_FILTER_LINEAR.
+static void _skr_tex_generate_mips_blit(skr_tex_t* ref_tex, int32_t mip_levels, VkFilter filter_mode) {
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
 	// Transition only mip 0 to TRANSFER_SRC — it has valid data that needs
@@ -1657,6 +1718,11 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	// which only transitions mip 0 via its render pass). We overwrite them later
 	// using UNDEFINED as the source layout, so their actual state doesn't matter.
 	{
+		// Scratch's intermediate mips live in SHADER_READ_ONLY_OPTIMAL (see the
+		// per-mip transition below), so we land ref_tex's mip 0 in the same
+		// layout for descriptor consistency, even if ref_tex's canonical sample
+		// layout is GENERAL (compute). The final transition at end-of-function
+		// moves the whole image to its canonical layout.
 		VkImageMemoryBarrier mip0_barrier = {
 			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask       = _layout_to_access_flags(ref_tex->current_layout),
@@ -1728,7 +1794,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			};
 		}
 
-		// Manually add source texture binding (since we create it per-mip)
+		// Manually add source texture binding (since we create it per-mip).
+		// Both ref_tex mip 0 and scratch mips sit in SHADER_READ_ONLY_OPTIMAL
+		// during the mip loop regardless of ref_tex's canonical sample layout.
 		image_infos[image_ct] = (VkDescriptorImageInfo){
 			.sampler     = ref_tex->sampler,
 			.imageView   = src_view,
@@ -1921,7 +1989,11 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	}
 
 	// Tracked layout now reflects the whole image in SHADER_READ_ONLY_OPTIMAL.
+	// For compute-flagged ref_tex, transition once more to GENERAL (the
+	// canonical sample layout). No-ops for regular sampled textures since
+	// current_layout already equals _skr_tex_sample_layout(ref_tex).
 	_skr_tex_transition_notify_layout(ref_tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	_skr_scratch_release(scratch);
 	_skr_cmd_release    (ctx.cmd);
@@ -2155,10 +2227,16 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_bc1_rgba:
 		case skr_tex_fmt_bc1_rgba_srgb:
 		case skr_tex_fmt_bc4_r:
+		case skr_tex_fmt_bc4_rsn:
 			block_w = 4; block_h = 4; block_bytes = 8; break;
+		case skr_tex_fmt_bc2_rgba:
+		case skr_tex_fmt_bc2_rgba_srgb:
 		case skr_tex_fmt_bc3_rgba:
 		case skr_tex_fmt_bc3_rgba_srgb:
 		case skr_tex_fmt_bc5_rg:
+		case skr_tex_fmt_bc5_rgsn:
+		case skr_tex_fmt_bc6h_rgbuf:
+		case skr_tex_fmt_bc6h_rgbf:
 		case skr_tex_fmt_bc7_rgba:
 		case skr_tex_fmt_bc7_rgba_srgb:
 			block_w = 4; block_h = 4; block_bytes = 16; break;
@@ -2201,9 +2279,40 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 			block_w = 8; block_h = 8; block_bytes = 16; break;
 
 		// Uncompressed formats (1x1 "blocks")
-		default:
-			block_bytes = _skr_tex_fmt_to_size(format);
-			break;
+		case skr_tex_fmt_r8:
+		case skr_tex_fmt_r8sn:
+		case skr_tex_fmt_r8ui:
+		case skr_tex_fmt_r8si:
+		case skr_tex_fmt_r8_srgb:       block_bytes = 1;  break;
+		case skr_tex_fmt_r8g8:
+		case skr_tex_fmt_r16:
+		case skr_tex_fmt_r16sn:
+		case skr_tex_fmt_r16ui:
+		case skr_tex_fmt_r16si:
+		case skr_tex_fmt_r16f:
+		case skr_tex_fmt_depth16:       block_bytes = 2;  break;
+		case skr_tex_fmt_depth16s8:     block_bytes = 3;  break;
+		case skr_tex_fmt_rgba32_srgb:
+		case skr_tex_fmt_rgba32:
+		case skr_tex_fmt_bgra32_srgb:
+		case skr_tex_fmt_bgra32:
+		case skr_tex_fmt_rg11b10uf:
+		case skr_tex_fmt_rgb10a2:
+		case skr_tex_fmt_r32ui:
+		case skr_tex_fmt_r32si:
+		case skr_tex_fmt_r32f:
+		case skr_tex_fmt_depth32:
+		case skr_tex_fmt_depth24s8:
+		case skr_tex_fmt_rgb9e5uf:      block_bytes = 4;  break;
+		case skr_tex_fmt_depth32s8:     block_bytes = 5;  break;
+		case skr_tex_fmt_rgba64un:
+		case skr_tex_fmt_rgba64sn:
+		case skr_tex_fmt_rgba64ui:
+		case skr_tex_fmt_rgba64si:
+		case skr_tex_fmt_rgba64f:       block_bytes = 8;  break;
+		case skr_tex_fmt_rgba128f:      block_bytes = 16; break;
+
+		default:                        block_bytes = 0;  break;
 	}
 
 	if (opt_out_block_width)      *opt_out_block_width      = block_w;

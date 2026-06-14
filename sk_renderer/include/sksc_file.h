@@ -172,6 +172,7 @@ typedef struct {
 	int32_t                vertex_input_count;
 	sksc_shader_ops_t      ops_vertex;
 	sksc_shader_ops_t      ops_pixel;
+	uint32_t               wave_size;
 } sksc_shader_meta_t;
 
 typedef struct {

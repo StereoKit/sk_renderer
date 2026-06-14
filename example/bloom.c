@@ -34,8 +34,8 @@ void bloom_create(int32_t width, int32_t height, int32_t mip_count) {
 	int32_t           mip_width    = width  / 2;
 	int32_t           mip_height   = height / 2;
 	for (int32_t i = 0; i < mip_count; i++) {
-		skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_chain[i]);
-		skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_upsample[i]);
+		skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_chain[i]);
+		skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_upsample[i]);
 		su_log(su_log_info, "  Bloom mip %d: %dx%d (valid=%d)", i, mip_width, mip_height, skr_tex_is_valid(&g_bloom.bloom_chain[i]));
 		mip_width  /= 2;
 		mip_height /= 2;
@@ -194,8 +194,8 @@ void bloom_resize(int32_t width, int32_t height) {
 	int32_t           mip_width    = width  / 2;
 	int32_t           mip_height   = height / 2;
 	for (int32_t i = 0; i < g_bloom.bloom_mips; i++) {
-		skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_chain[i]);
-		skr_tex_create(skr_tex_fmt_rgba128, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_upsample[i]);
+		skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_chain[i]);
+		skr_tex_create(skr_tex_fmt_rgba128f, skr_tex_flags_readable | skr_tex_flags_compute, linear_clamp, (skr_vec3i_t){mip_width, mip_height, 1}, 1, 1, NULL, &g_bloom.bloom_upsample[i]);
 
 		bloom_params_t params = {
 			.texel_size  = { 1.0f / mip_width, 1.0f / mip_height },

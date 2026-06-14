@@ -973,6 +973,16 @@ void sksc_meta_assign_defaults(array_t<sksc_ast_default_t> ast_defaults, array_t
 			strncpy(ref_meta->name, item->value, sizeof(ref_meta->name));
 		}
 
+		if (strcmp(item->name, "wave_size") == 0) {
+			found += 1;
+			int32_t size = atoi(item->value);
+			if (size < 4 || size > 128 || (size & (size - 1)) != 0) {
+				sksc_log_at(sksc_log_level_warn, item->row, item->col, "wave_size must be a power of two between 4 and 128, got %d", size);
+			} else {
+				ref_meta->wave_size = (uint32_t)size;
+			}
+		}
+
 		if (found != 1) {
 			sksc_log_at(sksc_log_level_warn, item->row, item->col, "Can't find shader var named '%s'", item->name);
 		}

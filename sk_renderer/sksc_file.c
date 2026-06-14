@@ -58,6 +58,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->ops_pixel.total,         &bytes[at], sizeof(meta->ops_pixel.total));         at += sizeof(meta->ops_pixel.total);
 	memcpy(&meta->ops_pixel.tex_read,      &bytes[at], sizeof(meta->ops_pixel.tex_read));      at += sizeof(meta->ops_pixel.tex_read);
 	memcpy(&meta->ops_pixel.dynamic_flow,  &bytes[at], sizeof(meta->ops_pixel.dynamic_flow));  at += sizeof(meta->ops_pixel.dynamic_flow);
+	memcpy(&meta->wave_size,               &bytes[at], sizeof(meta->wave_size));               at += sizeof(meta->wave_size);
 
 	// --- Pass 1: scan buffer section to accumulate var/defaults totals ---
 	uint32_t buffer_section_start = at;
@@ -178,7 +179,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_shader_file_t *out_file) {
 	uint16_t file_version = 0;
 	if (!sksc_shader_file_verify(data, size, &file_version, NULL, 0)) return sksc_result_bad_format;
-	if (file_version != 6)                                            return sksc_result_old_version;
+	if (file_version != 7)                                            return sksc_result_old_version;
 
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;
