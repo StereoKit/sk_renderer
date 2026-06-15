@@ -54,6 +54,22 @@ skr_tex_t tex_compress_gpu_astc6x6 (skr_tex_t* source);
 // required for sampling — AMD desktop will display magenta.
 skr_tex_t tex_compress_gpu_astc8x8hdr(skr_tex_t* source);
 
+///////////////////////////////////////////////////////////////////////////////
+// Cubemap compression
+//
+// Compress a 6-layer cubemap by running the 2D encoder on each face and
+// assembling the results into a compressed cubemap (sampled as a normal
+// TextureCube). The source must be a cubemap with a full mip chain in a format
+// the chosen encoder accepts (rgba32 / rgba32_linear for the LDR encoders,
+// float for the HDR encoder). The returned texture has skr_tex_flags_cubemap
+// and the same mip count as the source.
+///////////////////////////////////////////////////////////////////////////////
+
+skr_tex_t tex_compress_gpu_cube_bc1       (skr_tex_t* cube_source);  // BC1 (linear, opaque)
+skr_tex_t tex_compress_gpu_cube_astc4x4   (skr_tex_t* cube_source);  // ASTC 4x4 (linear)
+skr_tex_t tex_compress_gpu_cube_astc6x6   (skr_tex_t* cube_source);  // ASTC 6x6 (linear)
+skr_tex_t tex_compress_gpu_cube_astc8x8hdr(skr_tex_t* cube_source);  // ASTC 8x8 HDR (float source)
+
 // Readback-only variants: allocate a host-visible buffer, dispatch the
 // compute shader at mip 0, wait for GPU, and return malloc'd bytes.
 // Desktop-only; stalls the GPU. Caller frees the returned pointer.

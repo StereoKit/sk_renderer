@@ -94,11 +94,11 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 	scene->img_width  = width;
 	scene->img_height = height;
 
-	bool is_hdr = (src_fmt == skr_tex_fmt_rg11b10);
+	bool is_hdr = (src_fmt == skr_tex_fmt_rg11b10uf);
 
 	// Create original texture for display. HDR shows up tone-mapped via the
 	// shader; for now we just bind it raw and let the unlit shader sample it.
-	skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10 : skr_tex_fmt_rgba32_srgb,
+	skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10uf : skr_tex_fmt_rgba32_srgb,
 		skr_tex_flags_readable,
 		su_sampler_linear_clamp,
 		(skr_vec3i_t){width, height, 1}, 1, 0,
@@ -148,7 +148,7 @@ static void _load_image(scene_bc1_t* scene, const char* path) {
 		// source uses rg11b10 (the format su_image_load decodes Radiance
 		// .hdr into); LDR source uses rgba32_linear so mip filtering stays
 		// in linear space rather than sRGB.
-		skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10 : skr_tex_fmt_rgba32_linear,
+		skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10uf : skr_tex_fmt_rgba32_linear,
 			skr_tex_flags_readable | skr_tex_flags_gen_mips,
 			su_sampler_linear_clamp,
 			(skr_vec3i_t){width, height, 1}, 1, 0,

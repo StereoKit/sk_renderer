@@ -87,7 +87,8 @@ static skr_tex_t _compress_gpu(skr_compute_t* compute, skr_tex_t* source, skr_te
 	}
 
 	skr_vec3i_t base_size = skr_tex_get_size(source);
-	uint32_t    mip_count = skr_tex_calc_mip_count(base_size);
+	// Honor the source's actual mip chain (it may have only mip 0).
+	uint32_t    mip_count = source->mip_levels ? source->mip_levels : skr_tex_calc_mip_count(base_size);
 
 	// Calculate total buffer size across all mips
 	uint32_t total_blocks = 0;
@@ -173,6 +174,87 @@ skr_tex_t tex_compress_gpu_astc6x6(skr_tex_t* source) {
 
 skr_tex_t tex_compress_gpu_astc8x8hdr(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.astc8x8hdr_compute, source, skr_tex_fmt_astc8x8_rgba_hdr, 8, 8, 16);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Cubemap compression
+//
+// The 2D encoder samples a Texture2D, so we can't feed it a cube view directly.
+// Instead we copy each face (all mips) into a temporary 2D texture, compress
+// that with the existing 2D path, and copy the compressed result into the
+// matching layer of a compressed cubemap. All copies are GPU-side image copies
+// (skr_tex_copy); no readback.
+///////////////////////////////////////////////////////////////////////////////
+
+static skr_tex_t _compress_gpu_cube(skr_compute_t* compute, skr_tex_t* cube_source, skr_tex_fmt_ compressed_fmt, uint32_t block_w, uint32_t block_h, uint32_t block_bytes) {
+	skr_tex_t result = {0};
+
+	if (!g_tc.initialized || !skr_compute_is_valid(compute)) {
+		su_log(su_log_warning, "tex_compress_gpu_cube: not initialized or compute invalid");
+		return result;
+	}
+	if (!skr_tex_is_valid(cube_source)) {
+		su_log(su_log_warning, "tex_compress_gpu_cube: source texture invalid");
+		return result;
+	}
+
+	skr_vec3i_t  size      = skr_tex_get_size(cube_source);
+	skr_tex_fmt_ src_fmt   = skr_tex_get_format(cube_source);
+	uint32_t     mip_count = cube_source->mip_levels ? cube_source->mip_levels : skr_tex_calc_mip_count((skr_vec3i_t){size.x, size.y, 1});
+
+	// Compressed output cubemap (empty; we copy faces into it).
+	skr_tex_create(compressed_fmt, skr_tex_flags_readable | skr_tex_flags_dynamic | skr_tex_flags_cubemap,
+		su_sampler_linear_clamp, (skr_vec3i_t){size.x, size.y, 6}, 1, mip_count, NULL, &result);
+	if (!skr_tex_is_valid(&result)) {
+		su_log(su_log_warning, "tex_compress_gpu_cube: failed to create compressed cubemap");
+		return result;
+	}
+	skr_tex_set_name(&result, "tc_gpu_compressed_cube");
+
+	// Scratch 2D face matching the source format, full mip chain.
+	skr_tex_t face = {0};
+	skr_tex_create(src_fmt, skr_tex_flags_readable | skr_tex_flags_dynamic,
+		su_sampler_linear_clamp, (skr_vec3i_t){size.x, size.y, 1}, 1, mip_count, NULL, &face);
+	if (!skr_tex_is_valid(&face)) {
+		su_log(su_log_warning, "tex_compress_gpu_cube: failed to create scratch face");
+		skr_tex_destroy(&result);
+		return (skr_tex_t){0};
+	}
+
+	for (uint32_t layer = 0; layer < 6; layer++) {
+		// Copy this face's mips out of the cube into the 2D scratch texture.
+		for (uint32_t m = 0; m < mip_count; m++)
+			skr_tex_copy(cube_source, &face, m, layer, m, 0, 1);
+
+		// Compress the scratch face (2D path, all mips).
+		skr_tex_t comp = _compress_gpu(compute, &face, compressed_fmt, block_w, block_h, block_bytes);
+		if (skr_tex_is_valid(&comp)) {
+			for (uint32_t m = 0; m < mip_count; m++)
+				skr_tex_copy(&comp, &result, m, 0, m, layer, 1);
+			skr_tex_destroy(&comp);
+		}
+	}
+
+	skr_tex_destroy(&face);
+	return result;
+}
+
+skr_tex_t tex_compress_gpu_cube_bc1(skr_tex_t* cube_source) {
+	uint32_t alpha = 0;
+	skr_compute_set_param(&g_tc.bc1_compute, "enable_alpha", sksc_shader_var_uint, 1, &alpha);
+	return _compress_gpu_cube(&g_tc.bc1_compute, cube_source, skr_tex_fmt_bc1_rgb, 4, 4, 8);
+}
+
+skr_tex_t tex_compress_gpu_cube_astc4x4(skr_tex_t* cube_source) {
+	return _compress_gpu_cube(&g_tc.astc4x4_compute, cube_source, skr_tex_fmt_astc4x4_rgba, 4, 4, 16);
+}
+
+skr_tex_t tex_compress_gpu_cube_astc6x6(skr_tex_t* cube_source) {
+	return _compress_gpu_cube(&g_tc.astc6x6_compute, cube_source, skr_tex_fmt_astc6x6_rgba, 6, 6, 16);
+}
+
+skr_tex_t tex_compress_gpu_cube_astc8x8hdr(skr_tex_t* cube_source) {
+	return _compress_gpu_cube(&g_tc.astc8x8hdr_compute, cube_source, skr_tex_fmt_astc8x8_rgba_hdr, 8, 8, 16);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

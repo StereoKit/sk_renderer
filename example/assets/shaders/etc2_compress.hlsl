@@ -386,7 +386,7 @@ uint2 encode_planar(int3 pixels[16]) {
 // 5-class mode family prediction from 16 pixel colors.
 // Returns: 0=diff, 1=individual, 2=planar, 3=T, 4=H
 int nn_predict_mode(int3 pixels[16]) {
-	// ---- Compute 25 derived features ----
+	// Compute 25 derived features
 	float3 sum_c   = 0;
 	float3 min_c   = 255, max_c = 0;
 	float3 sum_l   = 0, sum_r = 0, sum_t = 0, sum_b = 0;
@@ -498,7 +498,7 @@ int nn_predict_mode(int3 pixels[16]) {
 	float smooth     = max(0.0, 1.0 - max_adj);
 	float grad_smth  = sub_diff_v * smooth + sub_diff_h * smooth;
 
-	// ---- Assemble feature vector ----
+	// Assemble feature vector
 	float feat[25] = {
 		max_range, sub_diff_h, max_adj, hz / 36.0, vt / 36.0,
 		diff_val_v, diff_val_h,
@@ -508,11 +508,11 @@ int nn_predict_mode(int3 pixels[16]) {
 		tight_cpd, resid_vr, range_vr, bimod_cpd, lum_tight, grad_smth,
 	};
 
-	// ---- Standardize ----
+	// Standardize
 	[unroll] for (int fi = 0; fi < 25; fi++)
 		feat[fi] = (feat[fi] - nn_feat_mean[fi]) / nn_feat_std[fi];
 
-	// ---- Layer 1: 25 -> 16, ReLU ----
+	// Layer 1: 25 -> 16, ReLU
 	float hidden[16];
 	[unroll] for (int j = 0; j < 16; j++) {
 		float s = nn_b1[j];
@@ -521,7 +521,7 @@ int nn_predict_mode(int3 pixels[16]) {
 		hidden[j] = max(0.0, s);
 	}
 
-	// ---- Layer 2: 16 -> 5 (argmax, no softmax needed) ----
+	// Layer 2: 16 -> 5 (argmax, no softmax needed)
 	int   best_class = 0;
 	float best_score = nn_b2[0];
 	[unroll] for (int j2 = 0; j2 < 16; j2++)
