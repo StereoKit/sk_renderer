@@ -631,7 +631,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	skr_tex_t* imgui_target = upscale_src ? render_target
 		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel) ? render_target
 		: (resolve_target ? resolve_target : color_target);
-	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1);
+	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1, 0);
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
 	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
 	ImGui_ImplSkRenderer_RenderDrawData(width, height);

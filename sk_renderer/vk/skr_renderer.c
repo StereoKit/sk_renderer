@@ -255,9 +255,19 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 	_skr_vk.flight_idx = _skr_vk.frame % SKR_MAX_FRAMES_IN_FLIGHT;
 }
 
-void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask) {
+void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask, int32_t multisample) {
 	// Require at least one attachment (color or depth)
 	if (!color && !depth) return;
+
+	// If the color attachment is single-sample but a higher sample count is requested, render
+	// multisampled-to-single-sampled: rasterize at `multisample` and resolve in-tile, so there's
+	// no separate MSAA color or resolve attachment. When the color attachment already carries the
+	// samples (normal MSAA), or the device can't do MSRTSS, this is a no-op.
+	int32_t               color_samples  = color ? (int32_t)color->samples : 1;
+	bool                  use_msrtss     = multisample > 1 && color_samples == 1 && _skr_vk.capabilities[skr_capability_msrtss];
+	VkSampleCountFlagBits raster_samples = use_msrtss
+		? (VkSampleCountFlagBits)multisample
+		: (color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT));
 
 	// Validate multiview view count against device limits
 	if (view_mask) {
@@ -284,18 +294,22 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	skr_pipeline_renderpass_key_t rp_key = {
 		.color_format    = color                                           ? skr_tex_fmt_to_native(color->format)         : VK_FORMAT_UNDEFINED,
 		.depth_format    = depth                                           ? skr_tex_fmt_to_native(depth->format)         : VK_FORMAT_UNDEFINED,
-		.resolve_format  = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT) ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
-		.samples         = color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
+		.resolve_format  = (!use_msrtss && opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT) ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
+		.samples         = raster_samples,
 		.depth_store_op  = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op   = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
 		.view_mask        = view_mask,
 		.correlation_mask = correlation_mask,
 		.final_color_layout   = (color && (color->flags & skr_tex_flags_readable))
 			? _skr_tex_sample_layout(color) : 0,
-		.final_resolve_layout = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT && (opt_resolve->flags & skr_tex_flags_readable))
+		.final_resolve_layout = (!use_msrtss && opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT && (opt_resolve->flags & skr_tex_flags_readable))
 			? _skr_tex_sample_layout(opt_resolve) : 0,
 		.final_depth_layout   = (depth && (depth->flags & skr_tex_flags_readable) && !(depth->samples > VK_SAMPLE_COUNT_1_BIT))
 			? _skr_tex_sample_layout(depth) : 0,
+		// Foveation: with MSRTSS the swapchain is the color target; otherwise it's the resolve
+		// target. The density map rides on whichever holds it.
+		.fragment_density_map = (color && color->fdm != NULL) || (!use_msrtss && opt_resolve && opt_resolve->fdm != NULL),
+		.msrtss               = use_msrtss,
 	};
 	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 
@@ -303,17 +317,20 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(_skr_vk.current_renderpass_idx);
 	if (render_pass == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
+	// Under MSRTSS there's no resolve attachment - the (single-sample) color IS the target.
+	skr_tex_t* fb_resolve = use_msrtss ? NULL : opt_resolve;
+
 	// Determine which texture to use for framebuffer caching
-	// Priority: resolve target (for MSAA) > color > depth
+	// Priority: resolve target (for separate-attachment MSAA) > color > depth
 	skr_tex_t* fb_cache_target = color;
-	if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
-		fb_cache_target = opt_resolve;  // Use resolve target for MSAA
+	if (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
+		fb_cache_target = fb_resolve;  // Use resolve target for MSAA
 	} else if (!color) {
 		fb_cache_target = depth;  // Depth-only pass
 	}
 
 	// Get or create cached framebuffer
-	VkFramebuffer framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, fb_cache_target, render_pass, color, depth, opt_resolve, depth != NULL);
+	VkFramebuffer framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, fb_cache_target, render_pass, color, depth, fb_resolve, depth != NULL);
 
 	if (framebuffer == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
@@ -355,7 +372,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		}
 		clear_value_count++; // Color attachment needs an entry
 
-		if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
+		if (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
 			// Resolve has loadOp = DONT_CARE, but still needs an entry
 			clear_value_count++;
 		}
@@ -388,7 +405,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	if (color) {
 		_skr_tex_transition_notify_layout(color, _skr_tex_attachment_layout(color));
 	}
-	if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
+	if (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
 		_skr_tex_transition_notify_layout(opt_resolve, _skr_tex_attachment_layout(opt_resolve));
 	}
 	if (depth) {
@@ -398,7 +415,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	// Store current textures for end_pass layout transitions
 	_skr_vk.current_color_texture   = color;
 	_skr_vk.current_depth_texture   = depth;
-	_skr_vk.current_resolve_texture = (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) ? opt_resolve : NULL;
+	_skr_vk.current_resolve_texture = (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) ? fb_resolve : NULL;
 
 	_skr_cmd_release(cmd);
 }
@@ -1156,7 +1173,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 	// --- Single-subpass path (no postfx, no manual resolve) ---
 	if (pass->postfx_count == 0 && !pass->resolve_material) {
-		skr_renderer_begin_pass(pass->color, pass->depth, pass->resolve, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil, view_mask, correlation);
+		skr_renderer_begin_pass(pass->color, pass->depth, pass->resolve, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil, view_mask, correlation, pass->multisample);
 		skr_renderer_set_viewport(pass->viewport);
 		skr_renderer_set_scissor (pass->scissor);
 		for (uint32_t i = 0; i < pass->draw_count; i++)

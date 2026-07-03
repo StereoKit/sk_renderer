@@ -860,12 +860,488 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	return render_pass;
 }
 
-static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpass_key_t* key) {
-	// Multi-subpass path for postfx and/or manual resolve
-	if (key->postfx_count > 0 || key->has_resolve_subpass)
-		return _skr_pipeline_create_multisubpass_renderpass(key);
+// Render pass 2 variant of the multi-subpass (postfx / manual-resolve) path. Mirrors the v1
+// function above with VkRenderPassCreateInfo2 structs and a per-subpass viewMask (instead of
+// the chained VkRenderPassMultiviewCreateInfo), so both paths stay feature-equivalent.
+static VkRenderPass _skr_pipeline_create_multisubpass_renderpass_v2(const skr_pipeline_renderpass_key_t* key) {
+	VkAttachmentDescription2 attachments[SKR_POSTFX_MAX_ATTACHMENTS];
+	uint32_t                 attachment_count = 0;
 
-	VkAttachmentDescription attachments[3];
+	bool use_msaa  = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
+	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
+	bool has_depth = key->depth_format != VK_FORMAT_UNDEFINED;
+
+	int32_t color_idx   = -1;
+	int32_t resolve_idx = -1;
+	int32_t depth_idx   = -1;
+	int32_t output_idx  = -1;
+	int32_t intermediate_start = -1;
+
+	// [0] Color attachment (MSAA or direct) — geometry subpass output
+	if (has_color) {
+		color_idx = (int32_t)attachment_count;
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->color_format,
+			.samples        = key->samples,
+			.loadOp         = key->color_load_op,
+			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		};
+	}
+
+	// [1] Resolve attachment (for MSAA)
+	bool resolve_is_final = use_msaa && key->has_resolve_subpass && key->postfx_count == 0;
+	if (use_msaa) {
+		resolve_idx = (int32_t)attachment_count;
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->resolve_format,
+			.samples        = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.storeOp        = resolve_is_final ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		};
+	}
+
+	// [2] Depth attachment
+	VkImageLayout depth_final       = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	bool          depth_has_stencil = has_depth && _skr_format_has_stencil(key->depth_format);
+	if (has_depth) {
+		depth_idx = (int32_t)attachment_count;
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->depth_format,
+			.samples        = key->samples,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
+			.storeOp        = key->depth_store_op,
+			.stencilLoadOp  = depth_has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = depth_has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = depth_final,
+		};
+	}
+
+	// [3..] Intermediate transient color attachments for postfx chaining
+	VkFormat intermediate_format = use_msaa ? key->resolve_format : key->color_format;
+	if (key->postfx_output_format != VK_FORMAT_UNDEFINED)
+		intermediate_format = key->postfx_output_format;
+	uint32_t intermediate_count = key->postfx_count > 1 ? key->postfx_count - 1 : 0;
+	if (intermediate_count > 0) {
+		intermediate_start = (int32_t)attachment_count;
+		for (uint32_t i = 0; i < intermediate_count; i++) {
+			attachments[attachment_count++] = (VkAttachmentDescription2){
+				.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+				.format         = intermediate_format,
+				.samples        = VK_SAMPLE_COUNT_1_BIT,
+				.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+				.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			};
+		}
+	}
+
+	// [last] Final postfx output attachment (skip when resolve-only)
+	VkImageLayout final_output_layout = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	if (!resolve_is_final) {
+		VkFormat output_format = key->postfx_output_format != VK_FORMAT_UNDEFINED ? key->postfx_output_format : (use_msaa ? key->resolve_format : key->color_format);
+		output_idx = (int32_t)attachment_count;
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = output_format,
+			.samples        = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = final_output_layout,
+		};
+	} else if (resolve_idx >= 0 && key->final_resolve_layout) {
+		attachments[resolve_idx].finalLayout = key->final_resolve_layout;
+	}
+
+	// --- Subpasses ---
+	uint32_t resolve_subpass_count = key->has_resolve_subpass ? 1 : 0;
+	uint32_t subpass_count         = 1 + resolve_subpass_count + key->postfx_count;
+
+	VkAttachmentReference2 color_refs  [SKR_POSTFX_MAX_SUBPASSES];
+	VkAttachmentReference2 resolve_refs[SKR_POSTFX_MAX_SUBPASSES];
+	VkAttachmentReference2 input_refs  [SKR_POSTFX_MAX_SUBPASSES];
+	VkAttachmentReference2 depth_ref   = {
+		.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+		.attachment = VK_ATTACHMENT_UNUSED,
+		.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		.aspectMask = (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)),
+	};
+	if (depth_idx >= 0) depth_ref.attachment = (uint32_t)depth_idx;
+
+	VkSubpassDescription2 subpasses[SKR_POSTFX_MAX_SUBPASSES];
+	memset(subpasses, 0, sizeof(subpasses));
+
+	// Subpass 0: Geometry
+	color_refs[0] = (VkAttachmentReference2){
+		.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+		.attachment = has_color ? (uint32_t)color_idx : VK_ATTACHMENT_UNUSED,
+		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	};
+	resolve_refs[0] = (VkAttachmentReference2){
+		.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+		.attachment = use_msaa ? (uint32_t)resolve_idx : VK_ATTACHMENT_UNUSED,
+		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	};
+	bool use_auto_resolve = use_msaa && !key->has_resolve_subpass;
+	subpasses[0] = (VkSubpassDescription2){
+		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
+		.viewMask                = key->view_mask,
+		.colorAttachmentCount    = has_color ? 1 : 0,
+		.pColorAttachments       = has_color ? &color_refs[0] : NULL,
+		.pResolveAttachments     = use_auto_resolve ? &resolve_refs[0] : NULL,
+		.pDepthStencilAttachment = has_depth ? &depth_ref : NULL,
+	};
+
+	// Subpass 1 (optional): Manual MSAA resolve
+	uint32_t next_sp = 1;
+	if (key->has_resolve_subpass) {
+		input_refs[0] = (VkAttachmentReference2){
+			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+			.attachment = (uint32_t)color_idx, .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		};
+		color_refs[1] = (VkAttachmentReference2){
+			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+			.attachment = (uint32_t)resolve_idx, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		};
+		subpasses[1] = (VkSubpassDescription2){
+			.sType                = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+			.flags                = key->use_custom_resolve_flags ? (VK_SUBPASS_DESCRIPTION_FRAGMENT_REGION_BIT_QCOM | VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM) : 0,
+			.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
+			.viewMask             = key->view_mask,
+			.inputAttachmentCount = 1,
+			.pInputAttachments    = &input_refs[0],
+			.colorAttachmentCount = 1,
+			.pColorAttachments    = &color_refs[1],
+		};
+		next_sp = 2;
+	}
+
+	// PostFX subpasses
+	int32_t prev_color_attachment = (use_msaa || key->has_resolve_subpass) ? resolve_idx : color_idx;
+	for (uint32_t p = 0; p < key->postfx_count; p++) {
+		uint32_t sp      = next_sp + p;
+		bool     is_last = (p == key->postfx_count - 1);
+		uint32_t iref    = resolve_subpass_count + p;
+		input_refs[iref] = (VkAttachmentReference2){
+			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+			.attachment = (uint32_t)prev_color_attachment, .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		};
+		int32_t this_output = is_last ? output_idx : intermediate_start + (int32_t)p;
+		color_refs[sp] = (VkAttachmentReference2){
+			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+			.attachment = (uint32_t)this_output, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		};
+		subpasses[sp] = (VkSubpassDescription2){
+			.sType                = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+			.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
+			.viewMask             = key->view_mask,
+			.inputAttachmentCount = 1,
+			.pInputAttachments    = &input_refs[iref],
+			.colorAttachmentCount = 1,
+			.pColorAttachments    = &color_refs[sp],
+		};
+		prev_color_attachment = this_output;
+	}
+
+	// --- Dependencies ---
+	VkSubpassDependency2 dependencies[SKR_POSTFX_MAX_SUBPASSES + 4];
+	uint32_t dep_count = 0;
+	dependencies[dep_count++] = (VkSubpassDependency2){
+		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+		.srcSubpass    = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	};
+	if (has_depth) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+			.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.srcAccessMask = 0, .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		};
+	}
+	for (uint32_t s = 0; s + 1 < subpass_count; s++) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass      = s, .dstSubpass = s + 1,
+			.srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			.dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			.srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask   = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+			.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+		};
+	}
+	if (final_output_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+	    (resolve_is_final && key->final_resolve_layout && key->final_resolve_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
+	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = 0, .dstSubpass = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
+
+	VkRenderPassCreateInfo2 render_pass_info = {
+		.sType                   = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
+		.attachmentCount         = attachment_count,
+		.pAttachments            = attachments,
+		.subpassCount            = subpass_count,
+		.pSubpasses              = subpasses,
+		.dependencyCount         = dep_count,
+		.pDependencies           = dependencies,
+		.correlatedViewMaskCount = key->correlation_mask ? 1 : 0,
+		.pCorrelatedViewMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
+	};
+
+	VkRenderPass render_pass;
+	VkResult vr = vkCreateRenderPass2KHR(_skr_vk.device, &render_pass_info, NULL, &render_pass);
+	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass2KHR (postfx)", VK_NULL_HANDLE);
+
+	char name[256];
+	snprintf(name, sizeof(name), "rpass2_%s%s%u_", key->has_resolve_subpass ? "resolve_" : "", key->use_custom_resolve_flags ? "cr_" : "", key->postfx_count);
+	_skr_append_renderpass_config(name, sizeof(name), key);
+	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
+	return render_pass;
+}
+
+// Render pass 2 variant of the single-subpass path. Behavior-identical to the v1 function
+// below — same attachments, refs, dependencies — but built with VkRenderPassCreateInfo2
+// (multiview via the built-in viewMask instead of a chained struct). This is the prerequisite
+// for MSRTSS, so it's used whenever the device supports VK_KHR_create_renderpass2.
+static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_renderpass_key_t* key) {
+	VkAttachmentDescription2 attachments[4];
+	uint32_t attachment_count = 0;
+
+	bool use_msaa  = !key->msrtss && key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
+	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
+	// MSRTSS renders into single-sample attachments at `samples` and resolves in-tile on store,
+	// so there's no separate resolve attachment and the attachments themselves are 1-sample.
+	VkSampleCountFlagBits attach_samples = key->msrtss ? VK_SAMPLE_COUNT_1_BIT : key->samples;
+
+	VkAttachmentReference2 color_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 };
+	if (has_color) {
+		VkImageLayout color_initial = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD)
+			? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			: VK_IMAGE_LAYOUT_UNDEFINED;
+		attachments[attachment_count] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->color_format,
+			.samples        = attach_samples,
+			.loadOp         = key->color_load_op,
+			.storeOp        = use_msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = color_initial,
+			.finalLayout    = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		};
+		color_ref.attachment = attachment_count;
+		color_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		color_ref.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		attachment_count++;
+	}
+
+	VkAttachmentReference2 resolve_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 };
+	if (use_msaa) {
+		attachments[attachment_count] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->resolve_format,
+			.samples        = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = key->final_resolve_layout ? key->final_resolve_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		};
+		resolve_ref.attachment = attachment_count;
+		resolve_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		resolve_ref.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		attachment_count++;
+	}
+
+	VkAttachmentReference2 depth_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 };
+	VkImageLayout depth_final = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	if (key->depth_format != VK_FORMAT_UNDEFINED) {
+		bool has_stencil = _skr_format_has_stencil(key->depth_format);
+		attachments[attachment_count] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->depth_format,
+			.samples        = attach_samples,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
+			.storeOp        = key->depth_store_op,
+			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
+				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+				: VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = depth_final,
+		};
+		depth_ref.attachment = attachment_count;
+		depth_ref.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		depth_ref.aspectMask = (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
+		attachment_count++;
+	}
+
+	uint32_t fdm_attachment_index = VK_ATTACHMENT_UNUSED;
+	if (key->fragment_density_map) {
+		attachments[attachment_count] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = VK_FORMAT_R8G8_UNORM,
+			.samples        = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+			.finalLayout    = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+		};
+		fdm_attachment_index = attachment_count;
+		attachment_count++;
+	}
+
+	// MSRTSS: rasterize at `samples` into the single-sample attachments and resolve on store. A
+	// stored depth attachment is resolved in-place (no separate resolve attachment), so when
+	// there's depth we specify resolve modes; SAMPLE_ZERO is always supported.
+	bool has_stencil_fmt = key->depth_format != VK_FORMAT_UNDEFINED && _skr_format_has_stencil(key->depth_format);
+	VkSubpassDescriptionDepthStencilResolve depth_resolve = {
+		.sType              = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+		.depthResolveMode   = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+		.stencilResolveMode = has_stencil_fmt ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
+	};
+	VkMultisampledRenderToSingleSampledInfoEXT msrtss_info = {
+		.sType                                   = VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT,
+		.pNext                                   = key->depth_format != VK_FORMAT_UNDEFINED ? &depth_resolve : NULL,
+		.multisampledRenderToSingleSampledEnable = VK_TRUE,
+		.rasterizationSamples                    = key->samples,
+	};
+	VkSubpassDescription2 subpass = {
+		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+		.pNext                   = key->msrtss ? &msrtss_info : NULL,
+		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
+		.viewMask                = key->view_mask,
+		.colorAttachmentCount    = has_color ? 1 : 0,
+		.pColorAttachments       = has_color ? &color_ref : NULL,
+		.pResolveAttachments     = use_msaa ? &resolve_ref : NULL,
+		.pDepthStencilAttachment = key->depth_format != VK_FORMAT_UNDEFINED ? &depth_ref : NULL,
+	};
+
+	VkSubpassDependency2 dependencies[4];
+	uint32_t dep_count = 0;
+	dependencies[dep_count++] = (VkSubpassDependency2){
+		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+		.srcSubpass    = VK_SUBPASS_EXTERNAL,
+		.dstSubpass    = 0,
+		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	};
+	dependencies[dep_count++] = (VkSubpassDependency2){
+		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+		.srcSubpass    = VK_SUBPASS_EXTERNAL,
+		.dstSubpass    = 0,
+		.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+	};
+	VkImageLayout color_final   = key->final_color_layout   ? key->final_color_layout   : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	VkImageLayout resolve_final = key->final_resolve_layout ? key->final_resolve_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	if ((has_color && color_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ||
+	    (use_msaa  && resolve_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = 0,
+			.dstSubpass    = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
+	if (key->depth_format != VK_FORMAT_UNDEFINED && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = 0,
+			.dstSubpass    = VK_SUBPASS_EXTERNAL,
+			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+	}
+
+	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = {
+		.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
+		.fragmentDensityMapAttachment = { .attachment = fdm_attachment_index, .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT },
+	};
+
+	VkRenderPassCreateInfo2 render_pass_info = {
+		.sType                   = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
+		.pNext                   = key->fragment_density_map ? (const void*)&fdm_info : NULL,
+		.attachmentCount         = attachment_count,
+		.pAttachments            = attachments,
+		.subpassCount            = 1,
+		.pSubpasses              = &subpass,
+		.dependencyCount         = dep_count,
+		.pDependencies           = dependencies,
+		.correlatedViewMaskCount = key->correlation_mask ? 1 : 0,
+		.pCorrelatedViewMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
+	};
+
+	VkRenderPass render_pass;
+	VkResult vr = vkCreateRenderPass2KHR(_skr_vk.device, &render_pass_info, NULL, &render_pass);
+	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass2KHR", VK_NULL_HANDLE);
+
+	char name[256];
+	snprintf(name, sizeof(name), "rpass2_");
+	_skr_append_renderpass_config(name, sizeof(name), key);
+	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
+	return render_pass;
+}
+
+static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpass_key_t* key) {
+	// Multi-subpass path for postfx and/or manual resolve. Prefer render pass 2 when available.
+	if (key->postfx_count > 0 || key->has_resolve_subpass)
+		return _skr_vk.has_renderpass2
+			? _skr_pipeline_create_multisubpass_renderpass_v2(key)
+			: _skr_pipeline_create_multisubpass_renderpass(key);
+
+	// Single-subpass: prefer render pass 2 when available (required for MSRTSS); v1 below is the fallback.
+	if (_skr_vk.has_renderpass2)
+		return _skr_pipeline_create_renderpass_v2(key);
+
+	VkAttachmentDescription attachments[4];
 	uint32_t attachment_count = 0;
 
 	bool use_msaa  = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
@@ -934,6 +1410,25 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 
 		depth_ref.attachment = attachment_count;
 		depth_ref.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		attachment_count++;
+	}
+
+	// Fragment density map attachment (foveation). Not referenced by the subpass like
+	// color/depth — only by VkRenderPassFragmentDensityMapCreateInfoEXT below. The runtime
+	// fills its contents (LOAD), and it stays in FDM-optimal layout (no transition).
+	uint32_t fdm_attachment_index = VK_ATTACHMENT_UNUSED;
+	if (key->fragment_density_map) {
+		attachments[attachment_count] = (VkAttachmentDescription){
+			.format         = VK_FORMAT_R8G8_UNORM,  // FDM images are always R8G8_UNORM
+			.samples        = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+			.finalLayout    = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+		};
+		fdm_attachment_index = attachment_count;
 		attachment_count++;
 	}
 
@@ -1008,9 +1503,23 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		.pCorrelationMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
 	};
 
+	// Build the render pass pNext chain: [fdm] -> [multiview] -> NULL, including only what's set.
+	const void* rp_next = key->view_mask != 0 ? (const void*)&multiview_info : NULL;
+	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = {
+		.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
+		.fragmentDensityMapAttachment = {
+			.attachment = fdm_attachment_index,
+			.layout     = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+		},
+	};
+	if (key->fragment_density_map) {
+		fdm_info.pNext = rp_next;
+		rp_next        = &fdm_info;
+	}
+
 	VkRenderPassCreateInfo render_pass_info = {
 		.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.pNext           = key->view_mask != 0 ? &multiview_info : NULL,
+		.pNext           = rp_next,
 		.attachmentCount = attachment_count,
 		.pAttachments    = attachments,
 		.subpassCount    = 1,
@@ -1257,7 +1766,7 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 ///////////////////////////////////////////////////////////////////////////////
 
 VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve) {
-	VkImageView attachments[3];
+	VkImageView attachments[4];
 	uint32_t    attachment_count = 0;
 	uint32_t    width            = 1;
 	uint32_t    height           = 1;
@@ -1285,6 +1794,12 @@ VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass,
 		}
 		// Multiview handles array layers via view_mask, so layers stays 1
 	}
+
+	// Fragment density map comes last, matching the render pass attachment order. It rides
+	// on the swapchain image: the resolve target under MSAA, otherwise the color target.
+	skr_tex_t* fdm_host = (opt_resolve && opt_resolve->fdm) ? opt_resolve : color;
+	if (fdm_host && fdm_host->fdm)
+		attachments[attachment_count++] = fdm_host->fdm->view;
 
 	VkFramebufferCreateInfo framebuffer_info = {
 		.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,

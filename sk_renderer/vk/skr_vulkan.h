@@ -82,6 +82,7 @@ typedef struct skr_tex_t {
 	VkFramebuffer          framebuffer_depth;      // Cached framebuffer (color + depth, if last used with depth)
 	VkRenderPass           framebuffer_pass;       // Render pass the color-only framebuffer was created for
 	VkRenderPass           framebuffer_depth_pass; // Render pass the depth framebuffer was created for
+	skr_tex_t*             fdm;                    // Foveation density map attached to this render target (not owned). NULL = no foveation.
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;

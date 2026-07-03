@@ -47,6 +47,8 @@ typedef struct {
 	VkImageLayout         final_color_layout;       // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_resolve_layout;     // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_depth_layout;       // 0 or DEPTH_STENCIL_ATTACHMENT_OPTIMAL = default; DEPTH_STENCIL_READ_ONLY = readable
+	bool                  fragment_density_map;     // Render pass attaches a fragment density map (foveation). Forks the cache from non-foveated passes.
+	bool                  msrtss;                   // Multisampled-render-to-single-sampled: attachments are single-sample but rasterized at `samples` and resolved in-tile on store. Requires render pass 2.
 } skr_pipeline_renderpass_key_t;
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
@@ -204,6 +206,10 @@ typedef struct {
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
 	bool                     has_ycbcr_conversion;        // VkPhysicalDeviceSamplerYcbcrConversionFeatures::samplerYcbcrConversion
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
+	bool                     has_fragment_density_map;    // VK_EXT_fragment_density_map + fragmentDensityMap feature (foveation)
+	bool                     has_fdm_non_subsampled;      // fragmentDensityMapNonSubsampledImages: FDM passes can use normal (non-subsampled) attachments
+	bool                     has_renderpass2;             // VK_KHR_create_renderpass2 (vkCreateRenderPass2KHR). Instance is 1.1, so this is always an extension.
+	bool                     has_msrtss;                  // VK_EXT_multisampled_render_to_single_sampled (+ renderpass2 + depth_stencil_resolve + feature): in-tile MSAA into a single-sample image
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
 	uint32_t                 min_subgroup_size;           // From VkPhysicalDeviceSubgroupSizeControlPropertiesEXT
 	uint32_t                 max_subgroup_size;

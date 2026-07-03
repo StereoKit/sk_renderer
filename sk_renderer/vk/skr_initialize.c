@@ -181,6 +181,10 @@ bool skr_init(skr_settings_t settings) {
 		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 		VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
 		VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,       // Required-subgroup-size for compute (HLSL [WaveSize]/`//--wave_size`)
+		VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME,        // Foveated rendering via fragment density map (tile-based GPUs: Steam Frame/Quest)
+		VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,         // Render pass 2 (vkCreateRenderPass2KHR) - prerequisite for MSRTSS
+		VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,       // Depth/stencil resolve - required by MSRTSS
+		VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME, // In-tile MSAA into a single-sample image (foveation + MSAA, and general MSAA)
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -575,10 +579,22 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_external_memory_dma_buf = false;
 	_skr_vk.has_drm_format_modifier     = false;
 	_skr_vk.has_custom_resolve          = false;
+	_skr_vk.has_fragment_density_map    = false;
+	_skr_vk.has_fdm_non_subsampled      = false;
+	_skr_vk.has_renderpass2             = false;
+	_skr_vk.has_msrtss                  = false;
 	_skr_vk.has_subgroup_size_control   = false;
 	bool has_image_format_list          = false;
 	bool has_swapchain                  = false;
+	bool has_depth_stencil_resolve      = false;
+	bool has_msrtss_ext                 = false;
+	// TEMP DIAGNOSTIC (MSRTSS vs foveation-layer): skip enabling the fragment-density-map
+	// extension so the system foveation Vulkan layer has no FDM context. Lets us test whether
+	// MSRTSS framebuffers crash because of that layer. Set to false to restore foveation.
+	const bool diagnostic_disable_fdm = true;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
+		if (diagnostic_disable_fdm && strcmp(optional_device_exts[i], VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) == 0)
+			continue;
 		if (_skr_ext_available(optional_device_exts[i], available_device_exts, available_device_ext_count)) {
 			device_exts[device_ext_count++] = optional_device_exts[i];
 			if (strcmp(optional_device_exts[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME                  ) == 0) has_swapchain                        = true;
@@ -589,6 +605,10 @@ bool skr_init(skr_settings_t settings) {
 			if (strcmp(optional_device_exts[i], VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME  ) == 0) _skr_vk.has_drm_format_modifier      = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME          ) == 0) has_image_format_list                = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME     ) == 0) _skr_vk.has_subgroup_size_control    = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME     ) == 0) _skr_vk.has_fragment_density_map     = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME    ) == 0) _skr_vk.has_renderpass2              = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME  ) == 0) has_depth_stencil_resolve            = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME) == 0) has_msrtss_ext         = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
@@ -648,15 +668,31 @@ bool skr_init(skr_settings_t settings) {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
 		.pNext = &ycbcr_query,
 	};
+	VkPhysicalDeviceFragmentDensityMapFeaturesEXT fdm_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT,
+		.pNext = &multiview_query,
+	};
+	VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT msrtss_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT,
+		.pNext = _skr_vk.has_fragment_density_map ? (void*)&fdm_query : (void*)&multiview_query,
+	};
 	VkPhysicalDeviceFeatures2 features2_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-		.pNext = &multiview_query,
+		.pNext = has_msrtss_ext ? (void*)&msrtss_query : (_skr_vk.has_fragment_density_map ? (void*)&fdm_query : (void*)&multiview_query),
 	};
 	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
 
 	_skr_vk.has_ycbcr_conversion = ycbcr_query.samplerYcbcrConversion != 0;
 	// Only consider subgroup size control supported if the feature flag is set, not just the extension.
 	_skr_vk.has_subgroup_size_control = _skr_vk.has_subgroup_size_control && subgroup_size_query.subgroupSizeControl;
+	// Likewise gate FDM on the feature flag, not just the extension. nonSubsampledImages lets
+	// FDM render passes use ordinary attachments (no VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT needed).
+	_skr_vk.has_fragment_density_map = _skr_vk.has_fragment_density_map && fdm_query.fragmentDensityMap;
+	_skr_vk.has_fdm_non_subsampled   = _skr_vk.has_fragment_density_map && fdm_query.fragmentDensityMapNonSubsampledImages;
+	// MSRTSS lets us render multisampled directly into a single-sample image (the swapchain),
+	// resolving in-tile - the foundation for foveation + MSAA. Needs render pass 2 + depth
+	// resolve (both prerequisites of the extension) plus the feature flag.
+	_skr_vk.has_msrtss = _skr_vk.has_renderpass2 && has_depth_stencil_resolve && has_msrtss_ext && msrtss_query.multisampledRenderToSingleSampled;
 
 	// Multiview is a hard requirement for stereo/XR rendering. It's part of
 	// Vulkan 1.1 core but is still a feature flag, so an implementation can
@@ -715,9 +751,31 @@ bool skr_init(skr_settings_t settings) {
 		.synchronization2 = VK_TRUE,
 	};
 
+	// Foveation. Chained onto the head of the feature list only when supported.
+	VkPhysicalDeviceFragmentDensityMapFeaturesEXT fdm_features = {
+		.sType                                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT,
+		.fragmentDensityMap                    = VK_TRUE,
+		.fragmentDensityMapNonSubsampledImages = _skr_vk.has_fdm_non_subsampled ? VK_TRUE : VK_FALSE,
+	};
+	void* feature_chain_head = _skr_vk.has_video_decode ? (void*)&sync2_features : (void*)&ycbcr_features;
+	if (_skr_vk.has_fragment_density_map) {
+		fdm_features.pNext = feature_chain_head;
+		feature_chain_head = &fdm_features;
+	}
+
+	// MSRTSS feature must be enabled to render multisampled into single-sample images.
+	VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT msrtss_features = {
+		.sType                            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT,
+		.multisampledRenderToSingleSampled = VK_TRUE,
+	};
+	if (_skr_vk.has_msrtss) {
+		msrtss_features.pNext = feature_chain_head;
+		feature_chain_head    = &msrtss_features;
+	}
+
 	VkDeviceCreateInfo device_info = {
 		.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-		.pNext                   = _skr_vk.has_video_decode ? (void*)&sync2_features : (void*)&ycbcr_features,
+		.pNext                   = feature_chain_head,
 		.queueCreateInfoCount    = queue_info_count,
 		.pQueueCreateInfos       = queue_infos,
 		.enabledExtensionCount   = device_ext_count,
@@ -887,11 +945,23 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.capabilities[skr_capability_external_dma] = _skr_vk.has_external_memory_dma_buf && _skr_vk.has_drm_format_modifier && has_image_format_list;
 	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode && _skr_vk.has_ycbcr_conversion;
 	_skr_vk.capabilities[skr_capability_presentation] = has_surface && has_swapchain;
+	// Foveation requires MSRTSS so we can render multisampled directly into the single-sample
+	// foveated swapchain (the foveated image must be the color attachment, not a resolve
+	// target). It also currently requires the non-subsampled-images feature, since the FDM
+	// render pass uses ordinary (non-subsampled) attachments until subsampling lands. Missing
+	// either -> no foveation; MSAA still works via the standard intermediate+resolve path.
+	_skr_vk.capabilities[skr_capability_msrtss              ] = _skr_vk.has_msrtss;
+	_skr_vk.capabilities[skr_capability_fragment_density_map] = _skr_vk.has_fragment_density_map && _skr_vk.has_fdm_non_subsampled && _skr_vk.has_msrtss;
+	if (_skr_vk.has_fragment_density_map && !_skr_vk.capabilities[skr_capability_fragment_density_map])
+		skr_log(skr_log_info, "Fragment density map present but missing MSRTSS or non-subsampled-images support - foveation disabled");
 
 	// Log optional extension status
 	skr_log(skr_log_info, "[%s] %s",           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,             _skr_vk.has_push_descriptors ? "true" : "false");
 	skr_log(skr_log_info, "[%s] %s",           VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME, _skr_vk.has_custom_resolve   ? "true" : "false");
 	skr_log(skr_log_info, "[%s] max %u views", VK_KHR_MULTIVIEW_EXTENSION_NAME,                   _skr_vk.max_multiview_view_count);
+	// Render pass path + foveation/MSAA capability.
+	skr_log(skr_log_info, "Render pass path: %s",      _skr_vk.has_renderpass2 ? "render pass 2 (vkCreateRenderPass2)" : "render pass 1 (fallback)");
+	skr_log(skr_log_info, "[%s] %s",                   VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME, _skr_vk.has_msrtss ? "true" : "false");
 
 	_skr_vk.initialized = true;
 	return true;

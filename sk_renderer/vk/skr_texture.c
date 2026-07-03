@@ -2359,11 +2359,42 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 		}
 	}
 
+	// A fragment density map is only ever read as a render pass FDM attachment, never
+	// sampled, so it needs no sampler. The runtime owns its layout; don't track/transition it.
+	if (info.flags & skr_tex_flags_fragment_density_map) {
+		return skr_err_success;
+	}
+
 	// Acquire sampler from cache
 	out_tex->sampler_settings = info.sampler;
 	out_tex->sampler          = _skr_sampler_cache_acquire(info.sampler);
 
 	return skr_err_success;
+}
+
+void skr_tex_set_fragment_density_map(skr_tex_t* ref_tex, skr_tex_t* fdm) {
+	if (ref_tex == NULL) return;
+
+	// If the device can't do FDM, ignore the association so the target renders normally.
+	if (fdm != NULL && !_skr_vk.capabilities[skr_capability_fragment_density_map])
+		fdm = NULL;
+	if (ref_tex->fdm == fdm) return;
+
+	ref_tex->fdm = fdm;
+
+	// Attaching/detaching/swapping the FDM changes both the render pass (the key carries
+	// a fragment_density_map bit) and the framebuffer attachment set, so any cached
+	// framebuffer is stale. Drop it; the next pass rebuilds against the correct render pass.
+	if (ref_tex->framebuffer != VK_NULL_HANDLE) {
+		_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
+		ref_tex->framebuffer      = VK_NULL_HANDLE;
+		ref_tex->framebuffer_pass = VK_NULL_HANDLE;
+	}
+	if (ref_tex->framebuffer_depth != VK_NULL_HANDLE) {
+		_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
+		ref_tex->framebuffer_depth      = VK_NULL_HANDLE;
+		ref_tex->framebuffer_depth_pass = VK_NULL_HANDLE;
+	}
 }
 
 skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t update) {

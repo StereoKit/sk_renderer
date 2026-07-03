@@ -241,6 +241,7 @@ typedef enum skr_tex_flags_ {
 	skr_tex_flags_compute          = 1 << 7,  // For compute shader RWTexture (storage image)
 	skr_tex_flags_cubemap          = 1 << 8,  // Cubemap texture (requires 6 array layers)
 	skr_tex_flags_input_attachment = 1 << 9,  // Used as input attachment in subpass (SubpassInput)
+	skr_tex_flags_fragment_density_map = 1 << 10, // Foveation density map. For external wrap: R8G8 image read as the FDM attachment (not sampled). See skr_tex_set_fragment_density_map.
 } skr_tex_flags_;
 
 typedef enum skr_tex_sample_ {
@@ -351,6 +352,8 @@ typedef enum skr_capability_ {
 	skr_capability_external_dma,          // DMA-BUF via VK_EXT_external_memory_dma_buf
 	skr_capability_vk_video,              // Vulkan video decode (VK_KHR_video_decode_queue)
 	skr_capability_presentation,          // Window-system presentation (VK_KHR_surface + VK_KHR_swapchain). False on headless ICDs.
+	skr_capability_fragment_density_map,  // Foveated rendering via VK_EXT_fragment_density_map. Typically tile-based GPUs only (Steam Frame/Quest).
+	skr_capability_msrtss,                // Multisampled-render-to-single-sampled: render MSAA directly into a single-sample image, resolving in-tile (no separate MSAA attachment). Lets a render target be both single-sample and MSAA'd - the foundation for foveation + MSAA.
 	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
@@ -587,6 +590,11 @@ typedef struct skr_pass_t {
 	int32_t     view_count;         // Number of views to render (1 = single, 2 = stereo, etc.)
 	bool        views_correlated;  // True if views see the same geometry from different viewpoints
 	                                // (VR stereo). False for cubemap faces or independent layers.
+	int32_t     multisample;       // Desired rasterization sample count. 0 = use the color attachment's
+	                                // own sample count (today's behavior). If the color attachment is
+	                                // single-sample but this is >1 and the device supports it, the pass
+	                                // is rendered multisampled-to-single-sampled (resolved in-tile, no
+	                                // separate MSAA/resolve attachment).
 
 	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
 	uint32_t        draw_count;
@@ -685,6 +693,7 @@ SKR_API skr_tex_fmt_      skr_tex_get_format               (const skr_tex_t*    
 SKR_API skr_tex_flags_    skr_tex_get_flags                (const skr_tex_t*     tex);
 SKR_API int32_t           skr_tex_get_multisample          (const skr_tex_t*     tex);
 SKR_API void              skr_tex_set_sampler              (      skr_tex_t* ref_tex, skr_tex_sampler_t sampler);
+SKR_API void              skr_tex_set_fragment_density_map (      skr_tex_t* ref_tex, skr_tex_t* fdm);
 SKR_API skr_tex_sampler_t skr_tex_get_sampler              (const skr_tex_t*     tex);
 SKR_API skr_err_          skr_tex_set_data                 (      skr_tex_t* ref_tex, const skr_tex_data_t* data);
 SKR_API void              skr_tex_generate_mips            (      skr_tex_t* ref_tex, const skr_shader_t* opt_compute_shader);
@@ -746,7 +755,7 @@ SKR_API void              skr_render_list_add_indexed      (skr_render_list_t* r
 
 SKR_API void              skr_renderer_frame_begin         (void);
 SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_surfaces, uint32_t count);  // Submit frame with surface synchronization
-SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
+SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask, int32_t multisample);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);
 SKR_API void              skr_renderer_set_global_texture  (int32_t bind, const skr_tex_t* tex);
