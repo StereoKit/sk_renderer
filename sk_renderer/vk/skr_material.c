@@ -228,6 +228,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		.stencil_front     = info.stencil_front,
 		.stencil_back      = info.stencil_back,
 	};
+	_skr_shader_resolve_spec_constants(&info.shader->meta, info.spec_constants, info.spec_constant_count, out_material->key.spec_constant_values);
 	out_material->queue_offset = info.queue_offset;
 
 	const sksc_shader_meta_t* meta = &out_material->key.shader->meta;
@@ -318,6 +319,7 @@ void skr_material_set_pipeline(skr_material_t* ref_material, skr_material_info_t
 	ref_material->key.wireframe         = info.wireframe;
 	ref_material->key.stencil_front     = info.stencil_front;
 	ref_material->key.stencil_back      = info.stencil_back;
+	_skr_shader_resolve_spec_constants(&ref_material->key.shader->meta, info.spec_constants, info.spec_constant_count, ref_material->key.spec_constant_values);
 	ref_material->queue_offset          = info.queue_offset;
 	ref_material->pipeline_material_idx = _skr_pipeline_register_material(&ref_material->key);
 }

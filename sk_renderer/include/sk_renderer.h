@@ -543,6 +543,13 @@ typedef struct skr_shader_tex_info_t {
 	const char* default_value;
 } skr_shader_tex_info_t;
 
+// A value for a shader spec constant ([[vk::constant_id(N)]] in HLSL). Values
+// are converted to the constant's declared type; bools are 0/1.
+typedef struct skr_spec_constant_t {
+	const char* name;   // Variable name from the HLSL declaration
+	double      value;
+} skr_spec_constant_t;
+
 typedef struct skr_material_info_t {
 	const skr_shader_t*  shader;
 	skr_cull_            cull;
@@ -555,6 +562,11 @@ typedef struct skr_material_info_t {
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)
+
+	// Spec constant overrides; unlisted constants keep their HLSL defaults.
+	// Values are copied out, the array doesn't need to outlive this call.
+	const skr_spec_constant_t* spec_constants;
+	uint32_t                   spec_constant_count;
 } skr_material_info_t;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -715,6 +727,7 @@ SKR_API bool              skr_shader_get_tex_info          (const skr_shader_t* 
 SKR_API void              skr_shader_set_name              (      skr_shader_t* ref_shader, const char* name);
 
 SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_t* out_compute);
+SKR_API skr_err_          skr_compute_create_specialized   (const skr_shader_t* shader, const skr_spec_constant_t* opt_spec_constants, uint32_t spec_constant_count, skr_compute_t* out_compute);
 SKR_API bool              skr_compute_is_valid             (const skr_compute_t*     compute);
 SKR_API void              skr_compute_destroy              (      skr_compute_t* ref_compute);
 SKR_API skr_bind_t        skr_compute_get_bind             (const skr_compute_t*     compute, const char* bind_name);

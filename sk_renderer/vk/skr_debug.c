@@ -92,6 +92,27 @@ void _skr_append_material_config(char* ref_str, size_t str_size, const _skr_pipe
 
 	size_t pos = strlen(ref_str);
 	snprintf(ref_str + pos, str_size - pos, "%s%s%s%s-%s", cull_str, depth_str, blend_str, mat_key->wireframe ? "W" : "", write_str);
+
+	// Spec constant values, so pipelines differing only by specialization are
+	// distinguishable in captures and validation messages.
+	if (!mat_key->shader) return;
+	const sksc_shader_meta_t* meta       = &mat_key->shader->meta;
+	uint32_t                  spec_count = meta->spec_constant_count < SKR_MAX_SPEC_CONSTANTS ? meta->spec_constant_count : SKR_MAX_SPEC_CONSTANTS;
+	if (spec_count == 0) return;
+
+	pos = strlen(ref_str);
+	snprintf(ref_str + pos, str_size - pos, "_spec[");
+	for (uint32_t i = 0; i < spec_count; i++) {
+		pos = strlen(ref_str);
+		uint32_t bits = mat_key->spec_constant_values[i];
+		switch (meta->spec_constants[i].type) {
+			case sksc_shader_var_float: { float   v; memcpy(&v, &bits, sizeof(v)); snprintf(ref_str + pos, str_size - pos, "%s%g", i ? "," : "", v); } break;
+			case sksc_shader_var_uint:  {                                          snprintf(ref_str + pos, str_size - pos, "%s%u", i ? "," : "", bits); } break;
+			default:                    { int32_t v; memcpy(&v, &bits, sizeof(v)); snprintf(ref_str + pos, str_size - pos, "%s%d", i ? "," : "", v); } break;
+		}
+	}
+	pos = strlen(ref_str);
+	snprintf(ref_str + pos, str_size - pos, "]");
 }
 
 void _skr_append_renderpass_config(char* ref_str, size_t str_size, const skr_pipeline_renderpass_key_t* rp_key) {

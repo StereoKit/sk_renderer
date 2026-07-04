@@ -184,6 +184,40 @@ void skr_shader_set_name(skr_shader_t* ref_shader, const char* name) {
 	}
 }
 
+// Shader defaults with user overrides applied by name. out_values is indexed
+// by meta order, matching the map entries built at pipeline creation.
+void _skr_shader_resolve_spec_constants(const sksc_shader_meta_t* meta, const skr_spec_constant_t* specs, uint32_t spec_count, uint32_t out_values[SKR_MAX_SPEC_CONSTANTS]) {
+	memset(out_values, 0, sizeof(uint32_t) * SKR_MAX_SPEC_CONSTANTS);
+
+	uint32_t count = meta->spec_constant_count;
+	if (count > SKR_MAX_SPEC_CONSTANTS) {
+		skr_log(skr_log_warning, "Shader '%s' has %u spec constants, max is %d; extras keep their defaults", meta->name, count, SKR_MAX_SPEC_CONSTANTS);
+		count = SKR_MAX_SPEC_CONSTANTS;
+	}
+	for (uint32_t i = 0; i < count; i++)
+		out_values[i] = meta->spec_constants[i].default_value;
+
+	for (uint32_t s = 0; s < spec_count; s++) {
+		if (!specs[s].name) continue;
+
+		uint64_t hash  = skr_hash(specs[s].name);
+		int32_t  found = -1;
+		for (uint32_t i = 0; i < count; i++) {
+			if (meta->spec_constants[i].name_hash == hash) { found = (int32_t)i; break; }
+		}
+		if (found < 0) {
+			skr_log(skr_log_warning, "Spec constant '%s' not found in shader '%s'", specs[s].name, meta->name);
+			continue;
+		}
+
+		switch (meta->spec_constants[found].type) {
+			case sksc_shader_var_uint:  { uint32_t v = (uint32_t)specs[s].value; memcpy(&out_values[found], &v, sizeof(v)); } break;
+			case sksc_shader_var_float: { float    v = (float   )specs[s].value; memcpy(&out_values[found], &v, sizeof(v)); } break;
+			default:                    { int32_t  v = (int32_t )specs[s].value; memcpy(&out_values[found], &v, sizeof(v)); } break;
+		}
+	}
+}
+
 // Returns pointer to the immutable sampler for a given binding slot, or NULL if none.
 // The returned pointer is stable (points into the caller's array) for use in pImmutableSamplers.
 static const VkSampler* _skr_find_immutable_sampler(int32_t slot, const VkSampler* samplers, const int32_t* slots, int32_t count) {

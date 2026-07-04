@@ -11,6 +11,10 @@
 #include <string.h>
 
 skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compute) {
+	return skr_compute_create_specialized(shader, NULL, 0, out_compute);
+}
+
+skr_err_ skr_compute_create_specialized(const skr_shader_t* shader, const skr_spec_constant_t* opt_spec_constants, uint32_t spec_constant_count, skr_compute_t* out_compute) {
 	if (!out_compute) return skr_err_invalid_parameter;
 
 	// Zero out immediately
@@ -115,15 +119,41 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 		}
 	}
 
+	uint32_t                 spec_values[SKR_MAX_SPEC_CONSTANTS];
+	VkSpecializationMapEntry spec_entries[SKR_MAX_SPEC_CONSTANTS];
+	VkSpecializationInfo     spec_info;
+	const VkSpecializationInfo* spec = NULL;
+	uint32_t spec_count = shader->meta.spec_constant_count < SKR_MAX_SPEC_CONSTANTS ? shader->meta.spec_constant_count : SKR_MAX_SPEC_CONSTANTS;
+	if (spec_count > 0) {
+		_skr_shader_resolve_spec_constants(&shader->meta, opt_spec_constants, spec_constant_count, spec_values);
+		for (uint32_t i = 0; i < spec_count; i++) {
+			spec_entries[i] = (VkSpecializationMapEntry){
+				.constantID = shader->meta.spec_constants[i].constant_id,
+				.offset     = i * (uint32_t)sizeof(uint32_t),
+				.size       = sizeof(uint32_t),
+			};
+		}
+		spec_info = (VkSpecializationInfo){
+			.mapEntryCount = spec_count,
+			.pMapEntries   = spec_entries,
+			.dataSize      = spec_count * sizeof(uint32_t),
+			.pData         = spec_values,
+		};
+		spec = &spec_info;
+	} else if (spec_constant_count > 0) {
+		skr_log(skr_log_warning, "Shader '%s' has no spec constants, but %u were provided", shader->meta.name, spec_constant_count);
+	}
+
 	// Create compute pipeline
 	VkComputePipelineCreateInfo pipeline_info = {
 		.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
 		.stage  = (VkPipelineShaderStageCreateInfo){
-			.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			.pNext  = stage_pNext,
-			.stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-			.module = shader->compute_stage.shader,
-			.pName  = "cs",
+			.sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.pNext               = stage_pNext,
+			.stage               = VK_SHADER_STAGE_COMPUTE_BIT,
+			.module              = shader->compute_stage.shader,
+			.pName               = "cs",
+			.pSpecializationInfo = spec,
 		},
 		.layout = out_compute->layout,
 	};

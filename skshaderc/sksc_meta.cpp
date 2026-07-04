@@ -293,6 +293,115 @@ array_t<sksc_ast_default_t> sksc_hlsl_find_initializers(const char *hlsl_text) {
 }
 
 ///////////////////////////////////////////
+// SPIRV Specialization Constant Scanner  //
+///////////////////////////////////////////
+
+// SPIRV-Reflect doesn't expose spec constant types or defaults, so walk the
+// words directly. Valid SPIRV puts OpName/OpDecorate before the constants
+// section, so a single forward pass sees everything it needs.
+static void _sksc_spirv_scan_spec_constants(const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *ref_meta) {
+	const uint32_t *words      = (const uint32_t *)spirv_stage->code;
+	size_t          word_count = spirv_stage->code_size / sizeof(uint32_t);
+	const size_t    SPIRV_HEADER_SIZE = 5;
+	if (word_count <= SPIRV_HEADER_SIZE) return;
+
+	// Per-id lookup tables, sized from the module's id bound (header word 3)
+	uint32_t id_bound = words[3];
+	if (id_bound == 0 || id_bound > 0x400000) return;
+
+	enum type_kind_ { type_kind_none, type_kind_bool, type_kind_int, type_kind_uint, type_kind_float };
+	uint8_t     *type_kinds = (uint8_t    *)calloc(id_bound, sizeof(uint8_t));
+	int64_t     *spec_ids   = (int64_t    *)malloc(id_bound * sizeof(int64_t)); // -1 = not decorated with SpecId
+	const char **names      = (const char**)calloc(id_bound, sizeof(const char*));
+	for (uint32_t i = 0; i < id_bound; i++) spec_ids[i] = -1;
+
+	array_t<sksc_shader_spec_constant_t> spec_list = {};
+	spec_list.data     = ref_meta->spec_constants;
+	spec_list.capacity = ref_meta->spec_constant_count;
+	spec_list.count    = ref_meta->spec_constant_count;
+
+	for (size_t i = SPIRV_HEADER_SIZE; i < word_count; ) {
+		uint32_t op_words = words[i] >> 16;
+		uint32_t opcode   = words[i] & 0xFFFF;
+		if (op_words == 0 || i + op_words > word_count) break; // Malformed SPIRV
+
+		switch (opcode) {
+			case 5: // OpName: [target id, literal string...]
+				if (op_words >= 3 && words[i+1] < id_bound)
+					names[words[i+1]] = (const char *)&words[i+2];
+				break;
+			case 71: // OpDecorate: [target id, decoration, extra...] — SpecId is decoration 1
+				if (op_words >= 4 && words[i+2] == 1 && words[i+1] < id_bound)
+					spec_ids[words[i+1]] = (int64_t)words[i+3];
+				break;
+			case 20: // OpTypeBool: [result id]
+				if (op_words >= 2 && words[i+1] < id_bound)
+					type_kinds[words[i+1]] = type_kind_bool;
+				break;
+			case 21: // OpTypeInt: [result id, width, signedness] — only 32-bit supported
+				if (op_words >= 4 && words[i+1] < id_bound && words[i+2] == 32)
+					type_kinds[words[i+1]] = words[i+3] ? type_kind_int : type_kind_uint;
+				break;
+			case 22: // OpTypeFloat: [result id, width] — only 32-bit supported
+				if (op_words >= 3 && words[i+1] < id_bound && words[i+2] == 32)
+					type_kinds[words[i+1]] = type_kind_float;
+				break;
+			case 48:   // OpSpecConstantTrue:  [result type, result id]
+			case 49:   // OpSpecConstantFalse: [result type, result id]
+			case 50: { // OpSpecConstant:      [result type, result id, value literal...]
+				if (op_words < 3) break;
+				uint32_t type_id   = words[i+1];
+				uint32_t result_id = words[i+2];
+				if (type_id >= id_bound || result_id >= id_bound)  break;
+				if (spec_ids  [result_id] < 0)                     break; // Not user-specializable (no SpecId)
+				if (type_kinds[type_id  ] == type_kind_none)       break; // Unsupported (non-32-bit) type
+
+				sksc_shader_spec_constant_t spec = {};
+				spec.constant_id = (uint32_t)spec_ids[result_id];
+				switch (opcode) {
+					case 48: spec.default_value = 1;          break;
+					case 49: spec.default_value = 0;          break;
+					case 50: spec.default_value = words[i+3]; break;
+				}
+				switch (type_kinds[type_id]) {
+					case type_kind_bool:  spec.type = sksc_shader_var_int;   break; // VkBool32
+					case type_kind_int:   spec.type = sksc_shader_var_int;   break;
+					case type_kind_uint:  spec.type = sksc_shader_var_uint;  break;
+					case type_kind_float: spec.type = sksc_shader_var_float; break;
+				}
+				spec.stage_bits = spirv_stage->stage;
+				if (names[result_id]) strncpy(spec.name, names[result_id], sizeof(spec.name) - 1);
+				else                  snprintf(spec.name, sizeof(spec.name), "spec%u", spec.constant_id);
+
+				// Merge with the same constant across other stages
+				int64_t existing = spec_list.index_where([](const sksc_shader_spec_constant_t &s, void *data) {
+					return s.constant_id == *(uint32_t *)data;
+				}, &spec.constant_id);
+				if (existing >= 0) {
+					sksc_shader_spec_constant_t *prev = &spec_list[existing];
+					if (prev->type != spec.type || strcmp(prev->name, spec.name) != 0) {
+						sksc_log(sksc_log_level_warn, "Specialization constant id %u is declared differently across stages ('%s' vs '%s')", spec.constant_id, prev->name, spec.name);
+					}
+					prev->stage_bits |= spec.stage_bits;
+				} else {
+					spec_list.add(spec);
+				}
+			} break;
+			default: break;
+		}
+
+		i += op_words;
+	}
+
+	ref_meta->spec_constants      = spec_list.data;
+	ref_meta->spec_constant_count = (uint32_t)spec_list.count;
+
+	free(type_kinds);
+	free(spec_ids);
+	free((void*)names);
+}
+
+///////////////////////////////////////////
 
 bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *ref_meta) {
 	// Create reflection data
@@ -691,6 +800,8 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 	} else if (spirv_stage->stage == skr_stage_pixel) {
 		ref_meta->ops_pixel = ops;
 	}
+
+	_sksc_spirv_scan_spec_constants(spirv_stage, ref_meta);
 
 	spvReflectDestroyShaderModule(&module);
 	return true;

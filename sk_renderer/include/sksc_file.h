@@ -151,28 +151,43 @@ typedef struct {
 	uint32_t   element_size; // For StructuredBuffer<T>, the size of T in bytes
 } sksc_shader_resource_t;
 
+// A specialization constant: [[vk::constant_id(1)]] const int LIGHT_COUNT = 4;
+// Values are 32-bit scalars; bools are reflected as int holding VkBool32.
+typedef struct {
+	char     name[32];
+	uint64_t name_hash;
+	uint32_t constant_id;   // The [[vk::constant_id(N)]] value
+	uint32_t default_value; // Bit pattern of the default; interpret via `type`
+	// of type sksc_shader_var_
+	uint16_t type;
+	// of type skr_stage_
+	uint8_t  stage_bits;
+} sksc_shader_spec_constant_t;
+
 typedef struct {
 	int32_t total;
 	int32_t tex_read;
 	int32_t dynamic_flow;
 } sksc_shader_ops_t;
 
-// All pointer members (buffers, resources, vertex_inputs) and their sub-arrays
-// (per-buffer vars and defaults) are carved from a single allocation rooted at
-// `buffers`. Call sksc_shader_meta_free() to release; do not free members
-// individually.
+// All pointer members (buffers, resources, vertex_inputs, spec_constants) and
+// their sub-arrays (per-buffer vars and defaults) are carved from a single
+// allocation rooted at `buffers`. Call sksc_shader_meta_free() to release; do
+// not free members individually.
 typedef struct {
-	char                   name[256];
-	sksc_shader_buffer_t  *buffers;
-	sksc_shader_resource_t*resources;
-	skr_vert_component_t  *vertex_inputs;
-	uint32_t               buffer_count;
-	uint32_t               resource_count;
-	int32_t                global_buffer_id;
-	int32_t                vertex_input_count;
-	sksc_shader_ops_t      ops_vertex;
-	sksc_shader_ops_t      ops_pixel;
-	uint32_t               wave_size;
+	char                        name[256];
+	sksc_shader_buffer_t       *buffers;
+	sksc_shader_resource_t     *resources;
+	skr_vert_component_t       *vertex_inputs;
+	sksc_shader_spec_constant_t*spec_constants;
+	uint32_t                    buffer_count;
+	uint32_t                    resource_count;
+	int32_t                     global_buffer_id;
+	int32_t                     vertex_input_count;
+	uint32_t                    spec_constant_count;
+	sksc_shader_ops_t           ops_vertex;
+	sksc_shader_ops_t           ops_pixel;
+	uint32_t                    wave_size;
 } sksc_shader_meta_t;
 
 typedef struct {
