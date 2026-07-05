@@ -569,6 +569,15 @@ typedef struct skr_material_info_t {
 	uint32_t                   spec_constant_count;
 } skr_material_info_t;
 
+// The mutable pipeline state of a compute; the shader is locked separately at
+// create. Compute has no cull/blend/depth/stencil state, so this is spec-only.
+typedef struct skr_compute_info_t {
+	// Spec constant overrides; unlisted constants keep their HLSL defaults.
+	// Values are copied out, the array doesn't need to outlive this call.
+	const skr_spec_constant_t* spec_constants;
+	uint32_t                   spec_constant_count;
+} skr_compute_info_t;
+
 ///////////////////////////////////////////////////////////////////////////////
 // Deferred pass assembly
 
@@ -726,8 +735,8 @@ SKR_API bool              skr_shader_get_param_info        (const skr_shader_t* 
 SKR_API bool              skr_shader_get_tex_info          (const skr_shader_t*     shader, const char* tex_name,   skr_shader_tex_info_t*   opt_out_info);
 SKR_API void              skr_shader_set_name              (      skr_shader_t* ref_shader, const char* name);
 
-SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_t* out_compute);
-SKR_API skr_err_          skr_compute_create_specialized   (const skr_shader_t* shader, const skr_spec_constant_t* opt_spec_constants, uint32_t spec_constant_count, skr_compute_t* out_compute);
+SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_info_t info, skr_compute_t* out_compute);
+SKR_API void              skr_compute_set_pipeline         (      skr_compute_t* ref_compute, skr_compute_info_t info);
 SKR_API bool              skr_compute_is_valid             (const skr_compute_t*     compute);
 SKR_API void              skr_compute_destroy              (      skr_compute_t* ref_compute);
 SKR_API skr_bind_t        skr_compute_get_bind             (const skr_compute_t*     compute, const char* bind_name);

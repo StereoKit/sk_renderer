@@ -218,6 +218,28 @@ void _skr_shader_resolve_spec_constants(const sksc_shader_meta_t* meta, const sk
 	}
 }
 
+const VkSpecializationInfo* _skr_shader_make_spec_info(const sksc_shader_meta_t* meta, const uint32_t* spec_values, VkSpecializationMapEntry out_entries[SKR_MAX_SPEC_CONSTANTS], VkSpecializationInfo* out_info) {
+	uint32_t spec_count = meta->spec_constant_count < SKR_MAX_SPEC_CONSTANTS ? meta->spec_constant_count : SKR_MAX_SPEC_CONSTANTS;
+	if (spec_count == 0) return NULL;
+
+	// Each 32-bit value is packed contiguously; offset i*4 matches the layout
+	// _skr_shader_resolve_spec_constants writes into spec_values.
+	for (uint32_t i = 0; i < spec_count; i++) {
+		out_entries[i] = (VkSpecializationMapEntry){
+			.constantID = meta->spec_constants[i].constant_id,
+			.offset     = i * (uint32_t)sizeof(uint32_t),
+			.size       = sizeof(uint32_t),
+		};
+	}
+	*out_info = (VkSpecializationInfo){
+		.mapEntryCount = spec_count,
+		.pMapEntries   = out_entries,
+		.dataSize      = spec_count * sizeof(uint32_t),
+		.pData         = spec_values,
+	};
+	return out_info;
+}
+
 // Returns pointer to the immutable sampler for a given binding slot, or NULL if none.
 // The returned pointer is stable (points into the caller's array) for use in pImmutableSamplers.
 static const VkSampler* _skr_find_immutable_sampler(int32_t slot, const VkSampler* samplers, const int32_t* slots, int32_t count) {

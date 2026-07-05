@@ -299,6 +299,7 @@ VkSampler             _skr_sampler_create_vk                (VkDevice device, sk
 skr_err_              _skr_tex_create_scratch               (const skr_tex_t* template_src, skr_tex_t* out_tex);
 VkDescriptorSetLayout _skr_shader_make_layout               (VkDevice device, bool has_push_descriptors, const sksc_shader_meta_t* meta, skr_stage_ stage_mask, const VkSampler* immutable_samplers, const int32_t* immutable_sampler_slots, int32_t immutable_sampler_count);
 void                  _skr_shader_resolve_spec_constants    (const sksc_shader_meta_t* meta, const skr_spec_constant_t* specs, uint32_t spec_count, uint32_t out_values[SKR_MAX_SPEC_CONSTANTS]);
+const VkSpecializationInfo* _skr_shader_make_spec_info      (const sksc_shader_meta_t* meta, const uint32_t* spec_values, VkSpecializationMapEntry out_entries[SKR_MAX_SPEC_CONSTANTS], VkSpecializationInfo* out_info);
 
 // Format helpers
 bool                  _skr_format_has_stencil               (VkFormat format);

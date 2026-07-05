@@ -1058,27 +1058,9 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 
 	// One specialization info is shared by both stages; Vulkan ignores map
 	// entries whose constantID isn't present in a stage's module.
-	const sksc_shader_meta_t* meta       = &mat_key->shader->meta;
-	uint32_t                  spec_count = meta->spec_constant_count < SKR_MAX_SPEC_CONSTANTS ? meta->spec_constant_count : SKR_MAX_SPEC_CONSTANTS;
 	VkSpecializationMapEntry  spec_entries[SKR_MAX_SPEC_CONSTANTS];
 	VkSpecializationInfo      spec_info;
-	const VkSpecializationInfo* spec = NULL;
-	if (spec_count > 0) {
-		for (uint32_t i = 0; i < spec_count; i++) {
-			spec_entries[i] = (VkSpecializationMapEntry){
-				.constantID = meta->spec_constants[i].constant_id,
-				.offset     = i * (uint32_t)sizeof(uint32_t),
-				.size       = sizeof(uint32_t),
-			};
-		}
-		spec_info = (VkSpecializationInfo){
-			.mapEntryCount = spec_count,
-			.pMapEntries   = spec_entries,
-			.dataSize      = spec_count * sizeof(uint32_t),
-			.pData         = mat_key->spec_constant_values,
-		};
-		spec = &spec_info;
-	}
+	const VkSpecializationInfo* spec = _skr_shader_make_spec_info(&mat_key->shader->meta, mat_key->spec_constant_values, spec_entries, &spec_info);
 
 	// Shader stages
 	VkPipelineShaderStageCreateInfo shader_stages[2];

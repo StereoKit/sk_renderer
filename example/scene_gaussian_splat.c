@@ -508,10 +508,10 @@ static scene_t* _scene_gaussian_splat_create(void) {
 
 	if (sort_shaders_valid) {
 		// Create compute pipelines
-		skr_compute_create(&scene->sort_init_shader, &scene->sort_init);
-		skr_compute_create(&scene->sort_upsweep_shader, &scene->sort_upsweep);
-		skr_compute_create(&scene->sort_scan_shader, &scene->sort_scan);
-		skr_compute_create(&scene->sort_downsweep_shader, &scene->sort_downsweep);
+		skr_compute_create(&scene->sort_init_shader, (skr_compute_info_t){0}, &scene->sort_init);
+		skr_compute_create(&scene->sort_upsweep_shader, (skr_compute_info_t){0}, &scene->sort_upsweep);
+		skr_compute_create(&scene->sort_scan_shader, (skr_compute_info_t){0}, &scene->sort_scan);
+		skr_compute_create(&scene->sort_downsweep_shader, (skr_compute_info_t){0}, &scene->sort_downsweep);
 
 		// Bind all buffers to all shaders (even if not all used, they're declared)
 		// Init kernel buffers
