@@ -52,6 +52,8 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->resource_count,      &bytes[at], sizeof(meta->resource_count     )); at += sizeof(meta->resource_count);
 	memcpy(&meta->vertex_input_count,  &bytes[at], sizeof(meta->vertex_input_count )); at += sizeof(meta->vertex_input_count);
 	memcpy(&meta->spec_constant_count, &bytes[at], sizeof(meta->spec_constant_count)); at += sizeof(meta->spec_constant_count);
+	memcpy(&meta->features,            &bytes[at], sizeof(meta->features));            at += sizeof(meta->features);
+	memcpy(&meta->features_reserved,   &bytes[at], sizeof(meta->features_reserved));   at += sizeof(meta->features_reserved);
 
 	memcpy(&meta->ops_vertex.total,        &bytes[at], sizeof(meta->ops_vertex.total));        at += sizeof(meta->ops_vertex.total);
 	memcpy(&meta->ops_vertex.tex_read,     &bytes[at], sizeof(meta->ops_vertex.tex_read));     at += sizeof(meta->ops_vertex.tex_read);
@@ -172,6 +174,9 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		memcpy( res->tags,         &bytes[at], sizeof(res->tags        )); at += sizeof(res->tags        );
 		memcpy(&res->bind,         &bytes[at], sizeof(res->bind        )); at += sizeof(res->bind        );
 		memcpy(&res->element_size, &bytes[at], sizeof(res->element_size)); at += sizeof(res->element_size);
+		memcpy(&res->shape,        &bytes[at], sizeof(res->shape       )); at += sizeof(res->shape       );
+		memcpy(&res->image_format, &bytes[at], sizeof(res->image_format)); at += sizeof(res->image_format);
+		at += 2; // reserved
 		res->name_hash = skr_hash(res->name);
 	}
 
@@ -193,7 +198,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_shader_file_t *out_file) {
 	uint16_t file_version = 0;
 	if (!sksc_shader_file_verify(data, size, &file_version, NULL, 0)) return sksc_result_bad_format;
-	if (file_version != 8)                                            return sksc_result_old_version;
+	if (file_version != 9)                                            return sksc_result_old_version;
 
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;
@@ -210,6 +215,7 @@ sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_
 		sksc_shader_file_stage_t *stage = &out_file->stages[i];
 		memcpy(&stage->language,  &bytes[at], sizeof(stage->language));  at += sizeof(stage->language);
 		memcpy(&stage->stage,     &bytes[at], sizeof(stage->stage));     at += sizeof(stage->stage);
+		memcpy(&stage->wave_size, &bytes[at], sizeof(stage->wave_size)); at += sizeof(stage->wave_size);
 		memcpy(&stage->code_size, &bytes[at], sizeof(stage->code_size)); at += sizeof(stage->code_size);
 
 		stage->code = NULL;

@@ -398,13 +398,99 @@ struct file_data_t {
 
 ///////////////////////////////////////////
 
+// Device-feature mask: scans a SPIR-V blob's OpCapability/OpExtension
+// declarations (raw opcode numbers, like the op counting in sksc_meta.cpp)
+// and maps them onto sksc_feature_bit_ values. Declarations with no assigned
+// bit set sksc_feature_bit_unknown so runtimes never silently under-check.
+static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
+	// capability value → feature bit; one bit can cover several capabilities
+	static const struct { uint32_t cap; uint8_t bit; } cap_bits[] = {
+		{ 9,    sksc_feature_bit_float16 },          // Float16
+		{ 4433, sksc_feature_bit_storage16 },        // StorageBuffer16BitAccess
+		{ 4434, sksc_feature_bit_storage16 },        // UniformAndStorageBuffer16BitAccess
+		{ 4435, sksc_feature_bit_storage16 },        // StoragePushConstant16
+		{ 4448, sksc_feature_bit_storage8 },         // StorageBuffer8BitAccess
+		{ 4449, sksc_feature_bit_storage8 },         // UniformAndStorageBuffer8BitAccess
+		{ 4450, sksc_feature_bit_storage8 },         // StoragePushConstant8
+		{ 49,   sksc_feature_bit_extended_formats }, // StorageImageExtendedFormats
+		{ 61,   sksc_feature_bit_subgroups },        // GroupNonUniform
+		{ 62,   sksc_feature_bit_subgroups },        // ...Vote
+		{ 63,   sksc_feature_bit_subgroups },        // ...Arithmetic
+		{ 64,   sksc_feature_bit_subgroups },        // ...Ballot
+		{ 65,   sksc_feature_bit_subgroups },        // ...Shuffle
+		{ 66,   sksc_feature_bit_subgroups },        // ...ShuffleRelative
+		{ 67,   sksc_feature_bit_subgroups },        // ...Clustered
+		{ 68,   sksc_feature_bit_subgroups },        // ...Quad
+		{ 4439, sksc_feature_bit_multiview },        // MultiView
+		{ 5379, sksc_feature_bit_demote },           // DemoteToHelperInvocationEXT
+		{ 11,   sksc_feature_bit_int64 },            // Int64
+		{ 10,   sksc_feature_bit_float64 },          // Float64
+		{ 22,   sksc_feature_bit_int16 },            // Int16
+		{ 39,   sksc_feature_bit_int8 },             // Int8
+		{ 55,   sksc_feature_bit_formatless },       // StorageImageReadWithoutFormat
+		{ 56,   sksc_feature_bit_formatless },       // StorageImageWriteWithoutFormat
+		{ 4166, sksc_feature_bit_tile_image },       // TileImageColorReadAccessEXT
+		{ 4167, sksc_feature_bit_tile_image },       // TileImageDepthReadAccessEXT
+		{ 4168, sksc_feature_bit_tile_image },       // TileImageStencilReadAccessEXT
+	};
+	// capabilities every Vulkan 1.1 runtime satisfies — no bit, never unknown
+	static const uint32_t baseline[] = { 1, 50, 43, 44, 40, 51 };
+	// Shader, ImageQuery, Sampled1D, Image1D, InputAttachment, DerivativeControl
+	static const struct { const char *name; uint8_t bit; } ext_bits[] = {
+		{ "SPV_KHR_8bit_storage",                sksc_feature_bit_storage8 },
+		{ "SPV_EXT_demote_to_helper_invocation", sksc_feature_bit_demote },
+		{ "SPV_EXT_shader_tile_image",           sksc_feature_bit_tile_image },
+	};
+
+	uint64_t bits = 0;
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t count  = words[i] >> 16;
+		uint32_t opcode = words[i] & 0xFFFF;
+		if (count == 0) break;
+
+		if (opcode == 17) { // OpCapability
+			uint32_t cap   = words[i + 1];
+			bool     known = false;
+			for (size_t k = 0; k < sizeof(cap_bits) / sizeof(cap_bits[0]); k++)
+				if (cap_bits[k].cap == cap) { bits |= 1ull << cap_bits[k].bit; known = true; }
+			for (size_t k = 0; k < sizeof(baseline) / sizeof(baseline[0]); k++)
+				if (baseline[k] == cap) known = true;
+			if (!known) bits |= 1ull << sksc_feature_bit_unknown;
+		} else if (opcode == 10) { // OpExtension
+			const char *name  = (const char *)&words[i + 1];
+			bool        known = false;
+			for (size_t k = 0; k < sizeof(ext_bits) / sizeof(ext_bits[0]); k++)
+				if (strncmp(name, ext_bits[k].name, (size_t)(count - 1) * 4) == 0) {
+					bits |= 1ull << ext_bits[k].bit;
+					known = true;
+				}
+			if (!known) bits |= 1ull << sksc_feature_bit_unknown;
+		} else if (opcode == 60) { // OpImageTexelPointer: image atomic access
+			bits |= 1ull << sksc_feature_bit_image_atomics;
+		}
+		i += count;
+	}
+	return bits;
+}
+
+///////////////////////////////////////////
+
 void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *out_size) {
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 8;
+	uint16_t version = 9;
 	data.write(tag);
 	data.write(version);
+
+	uint64_t features = 0;
+	for (uint32_t i = 0; i < file->stage_count; i++)
+		if (file->stages[i].language == skr_shader_lang_spirv && file->stages[i].code_size >= 20)
+			features |= sksc_spirv_features((const uint32_t *)file->stages[i].code,
+			                                file->stages[i].code_size / 4);
+	if (file->meta.wave_size > 0)
+		features |= 1ull << sksc_feature_bit_wave_size;
+	uint64_t features_reserved = 0;
 
 	data.write(file->stage_count);
 	data.write_fixed_str(file->meta.name, sizeof(file->meta.name));
@@ -412,6 +498,8 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	data.write(file->meta.resource_count);
 	data.write(file->meta.vertex_input_count);
 	data.write(file->meta.spec_constant_count);
+	data.write(features);
+	data.write(features_reserved);
 
 	data.write(file->meta.ops_vertex.total);
 	data.write(file->meta.ops_vertex.tex_read);
@@ -463,6 +551,10 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write_fixed_str(res->tags,  sizeof(res->tags));
 		data.write(res->bind);
 		data.write(res->element_size);
+		uint16_t reserved = 0;
+		data.write(res->shape);        // 0 = unreported; reflection does not fill these yet
+		data.write(res->image_format);
+		data.write(reserved);
 	}
 
 	for (uint32_t i = 0; i < file->meta.spec_constant_count; i++) {
@@ -478,6 +570,8 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		sksc_shader_file_stage_t *stage = &file->stages[i];
 		data.write(stage->language);
 		data.write(stage->stage);
+		uint32_t stage_wave = stage->stage == skr_stage_compute ? file->meta.wave_size : 0;
+		data.write(stage_wave);
 		data.write(stage->code_size);
 		data.write(stage->code, stage->code_size);
 	}
