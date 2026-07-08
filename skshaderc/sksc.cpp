@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 ///////////////////////////////////////////
 
@@ -22,19 +23,26 @@ void sksc_log_shader_info(const sksc_shader_file_t *file);
 ///////////////////////////////////////////
 
 void sksc_init() {
+#ifdef SKSC_HAS_GLSLANG
 	sksc_glslang_init();
+#endif
 }
 
 ///////////////////////////////////////////
 
 void sksc_shutdown() {
+#ifdef SKSC_HAS_GLSLANG
 	sksc_glslang_shutdown();
+#endif
 }
 
 ///////////////////////////////////////////
 
+#ifdef SKSC_HAS_GLSLANG
 // Repack all dynamically-allocated meta sub-arrays into a single contiguous
 // block. After this, sksc_shader_meta_free() only needs free(meta->buffers).
+// Only the glslang path builds meta piecewise; SVSL's container arrives already
+// packed via sksc_shader_file_load_memory.
 static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	uint32_t total_var_count     = 0;
 	uint32_t total_defaults_size = 0;
@@ -102,12 +110,46 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	meta->vertex_inputs  = new_vinputs;
 	meta->spec_constants = new_specs;
 }
+#endif // SKSC_HAS_GLSLANG
+
+// Case-insensitive check for a trailing ".svsl" on the source path.
+static bool _sksc_has_svsl_ext(const char *filename) {
+	if (!filename) return false;
+	size_t len = strlen(filename);
+	const char *ext = ".svsl";
+	size_t elen = strlen(ext);
+	if (len < elen) return false;
+	const char *tail = filename + (len - elen);
+	for (size_t i = 0; i < elen; i++)
+		if (tolower((unsigned char)tail[i]) != ext[i]) return false;
+	return true;
+}
 
 bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *settings, sksc_shader_file_t *out_file) {
 	*out_file = {};
 	 out_file->meta = {};
 	 out_file->meta.global_buffer_id = -1;
 
+	// The SVSL backend is used when explicitly requested (-svsl) or when the
+	// source file carries a .svsl extension.
+	bool want_svsl = settings->use_svsl || _sksc_has_svsl_ext(filename);
+#if defined(SKSC_HAS_SVSL) && !defined(SKSC_HAS_GLSLANG)
+	// No glslang backend in this build, so SVSL handles everything.
+	want_svsl = true;
+#endif
+	if (want_svsl) {
+#ifdef SKSC_HAS_SVSL
+		bool ok = sksc_svsl_compile(filename, hlsl_text, settings, out_file);
+		if (ok && !settings->silent_info)
+			sksc_log_shader_info(out_file);
+		return ok;
+#else
+		sksc_log(sksc_log_level_err, "SVSL backend requested, but skshaderc was built without it (SKSHADERC_ENABLE_SVSL=OFF)");
+		return false;
+#endif
+	}
+
+#ifdef SKSC_HAS_GLSLANG
 	array_t<sksc_shader_file_stage_t> stages       = {};
 	array_t<sksc_meta_item_t>         var_meta     = sksc_meta_find_defaults(hlsl_text);
 	array_t<sksc_ast_default_t>       ast_defaults = sksc_hlsl_find_initializers(hlsl_text);
@@ -164,6 +206,11 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 	_sksc_meta_pack(&out_file->meta);
 	return true;
+#else
+	(void)hlsl_text;
+	sksc_log(sksc_log_level_err, "Compiling '%s' needs the glslang backend, but skshaderc was built without it (SKSHADERC_ENABLE_GLSLANG=OFF). Use the SVSL backend (-svsl, or a .svsl source file).", filename);
+	return false;
+#endif
 }
 
 ///////////////////////////////////////////
@@ -432,6 +479,8 @@ static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) 
 		{ 4166, sksc_feature_bit_tile_image },       // TileImageColorReadAccessEXT
 		{ 4167, sksc_feature_bit_tile_image },       // TileImageDepthReadAccessEXT
 		{ 4168, sksc_feature_bit_tile_image },       // TileImageStencilReadAccessEXT
+		{ 6033, sksc_feature_bit_float_atomics },    // AtomicFloat32AddEXT
+		{ 5612, sksc_feature_bit_float_atomics },    // AtomicFloat32MinMaxEXT
 	};
 	// capabilities every Vulkan 1.1 runtime satisfies — no bit, never unknown
 	static const uint32_t baseline[] = { 1, 50, 43, 44, 40, 51 };
@@ -440,6 +489,8 @@ static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) 
 		{ "SPV_KHR_8bit_storage",                sksc_feature_bit_storage8 },
 		{ "SPV_EXT_demote_to_helper_invocation", sksc_feature_bit_demote },
 		{ "SPV_EXT_shader_tile_image",           sksc_feature_bit_tile_image },
+		{ "SPV_EXT_shader_atomic_float_add",     sksc_feature_bit_float_atomics },
+		{ "SPV_EXT_shader_atomic_float_min_max", sksc_feature_bit_float_atomics },
 	};
 
 	uint64_t bits = 0;

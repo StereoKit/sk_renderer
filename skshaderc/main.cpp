@@ -32,7 +32,9 @@
 #include "sksc.h"
 
 #include "miniz.h"
+#ifdef SKSC_HAS_SPIRV_TOOLS
 #include <spirv-tools/libspirv.hpp>
+#endif
 
 ///////////////////////////////////////////
 
@@ -182,6 +184,7 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		else if (strcmp(argv[i], "-raw")== 0) result.output_raw_shaders    = true;
 		else if (strcmp(argv[i], "-e" ) == 0) result.replace_ext           = false;
 		else if (strcmp(argv[i], "-f" ) == 0) result.only_if_changed       = false;
+		else if (strcmp(argv[i], "-svsl")== 0) result.shaderc.use_svsl     = true;
 		else if (strcmp(argv[i], "-d" ) == 0) result.shaderc.debug         = true;
 		else if (strcmp(argv[i], "-si") == 0) result.shaderc.silent_info   = true;
 		else if (strcmp(argv[i], "-sw") == 0) { result.shaderc.silent_info = true; result.shaderc.silent_warn = true; }
@@ -268,6 +271,9 @@ Options:
 	-si		No info is printed when compiling shaders.
 	-f		Force the shader to recompile, even if the timestamp on the
 			matching .sks file is newer.
+	-svsl		Compile the shader with the SVSL backend instead of the glslang
+			pipeline. Files ending in .svsl use SVSL automatically. Only
+			available when skshaderc was built with SKSHADERC_ENABLE_SVSL.
 
 	-d		Compile shaders with debug info embedded. Enabling this will
 			disable shader optimizations.
@@ -439,8 +445,10 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trailing_slash, const char *name_ext) {
 	bool result = true;
 
+#ifdef SKSC_HAS_SPIRV_TOOLS
 	// Create SPIRV-Tools context for disassembly
 	spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_1);
+#endif
 
 	for (uint32_t i = 0; i < file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &file->stages[i];
@@ -453,7 +461,12 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 			case skr_shader_lang_glsl_es:  lang = "glsl.es";  break;
 			case skr_shader_lang_glsl_web: lang = "glsl.web"; break;
 			case skr_shader_lang_hlsl:     lang = "hlsl";     break;
+			// Without the SPIRV-Tools disassembler we emit the raw binary module.
+#ifdef SKSC_HAS_SPIRV_TOOLS
 			case skr_shader_lang_spirv:    lang = "spvasm";   break;
+#else
+			case skr_shader_lang_spirv:    lang = "spv";      break;
+#endif
 		}
 		switch(stage->stage){
 			case skr_stage_compute: stage_name = "compute"; break;
@@ -463,6 +476,7 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 		snprintf(sub_filename, sizeof(sub_filename), "%s%s%s.%s.%s", folder, trailing_slash ? "":"/", name_ext, stage_name, lang);
 
 		if (stage->language == skr_shader_lang_spirv) {
+#ifdef SKSC_HAS_SPIRV_TOOLS
 			// Disassemble SPIRV to text
 			std::string disassembly;
 			const uint32_t *spirv_data = (const uint32_t *)stage->code;
@@ -473,6 +487,10 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 				sksc_log(sksc_log_level_err, "Failed to disassemble SPIRV");
 				result = false;
 			}
+#else
+			// No disassembler in this build: write the raw SPIR-V binary.
+			result = write_file(sub_filename, stage->code, stage->code_size) && result;
+#endif
 		} else {
 			result = write_file_txt(sub_filename, stage->code, stage->code_size - 1) && result;
 		}
@@ -672,7 +690,9 @@ bool write_header(const char *filename, void *file_data, size_t file_size, bool 
 		free(info);
 	}
 
-	// Write SPIRV disassembly as comments
+	// Write SPIRV disassembly as comments (skipped when this build has no
+	// SPIRV-Tools disassembler; the embedded container below is unaffected)
+#ifdef SKSC_HAS_SPIRV_TOOLS
 	if (shader_file) {
 		spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_1);
 		for (uint32_t i = 0; i < shader_file->stage_count; i++) {
@@ -706,6 +726,7 @@ bool write_header(const char *filename, void *file_data, size_t file_size, bool 
 			}
 		}
 	}
+#endif
 
 	// Write byte array
 	int32_t ct = fprintf(fp, "const unsigned char sks_%s%s[%zu] = {", name, zipped ? "_zip" : "", file_size);

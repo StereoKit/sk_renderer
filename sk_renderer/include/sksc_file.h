@@ -157,6 +157,12 @@ typedef enum {
 	// plus DepthReadAccess/StencilReadAccess when those are read
 	// (VK_EXT_shader_tile_image)
 	sksc_feature_bit_tile_image       = 14,
+	// VkPhysicalDeviceShaderAtomicFloatFeaturesEXT: shaderBufferFloat32Atomics
+	// and shaderSharedFloat32Atomics for exchange, plus the ...AtomicAdd members
+	// for add (VK_EXT_shader_atomic_float); float min/max additionally needs
+	// VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT ...Float32AtomicMinMax
+	// (VK_EXT_shader_atomic_float2)
+	sksc_feature_bit_float_atomics    = 15,
 	// a capability/extension with no assigned bit: fall back to parsing the
 	// SPIR-V's OpCapability/OpExtension lists before trusting this mask
 	sksc_feature_bit_unknown          = 63,

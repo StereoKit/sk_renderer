@@ -42,6 +42,7 @@ typedef struct sksc_settings_t {
 	char**      include_folders;
 	int32_t     include_folder_ct;
 	bool        target_langs[5];
+	bool        use_svsl;        // compile with the SVSL backend instead of glslang
 } sksc_settings_t;
 
 typedef struct sksc_log_item_t {
