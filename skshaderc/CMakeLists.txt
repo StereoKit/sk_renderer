@@ -229,7 +229,7 @@ if(SKSHADERC_ENABLE_SVSL)
 	message(STATUS "Fetching SVSL...")
 	FetchContent_Declare( SVSL
 		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
-		GIT_TAG        main
+		GIT_TAG        v2026.7.7
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
