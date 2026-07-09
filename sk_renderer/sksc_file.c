@@ -165,6 +165,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		memcpy(&com->count,         &bytes[at], sizeof(com->count        )); at += sizeof(com->count);
 		memcpy(&com->semantic,      &bytes[at], sizeof(com->semantic     )); at += sizeof(com->semantic);
 		memcpy(&com->semantic_slot, &bytes[at], sizeof(com->semantic_slot)); at += sizeof(com->semantic_slot);
+		memcpy(&com->location,      &bytes[at], sizeof(com->location     )); at += sizeof(com->location);
 	}
 
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
@@ -198,7 +199,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_shader_file_t *out_file) {
 	uint16_t file_version = 0;
 	if (!sksc_shader_file_verify(data, size, &file_version, NULL, 0)) return sksc_result_bad_format;
-	if (file_version != 9)                                            return sksc_result_old_version;
+	if (file_version != 10)                                           return sksc_result_old_version;
 
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;

@@ -24,6 +24,21 @@ void _skr_set_debug_name(VkDevice device, VkObjectType type, uint64_t handle, co
 	});
 }
 
+const char* _skr_semantic_name(skr_semantic_ semantic) {
+	switch (semantic) {
+		case skr_semantic_position:     return "Position";
+		case skr_semantic_texcoord:     return "TexCoord";
+		case skr_semantic_normal:       return "Normal";
+		case skr_semantic_binormal:     return "BiNormal";
+		case skr_semantic_tangent:      return "Tangent";
+		case skr_semantic_color:        return "Color";
+		case skr_semantic_psize:        return "PSize";
+		case skr_semantic_blendweight:  return "BlendWeight";
+		case skr_semantic_blendindices: return "BlendIndices";
+		default:                        return "None";
+	}
+}
+
 void _skr_append_vertex_format(char* ref_str, size_t str_size, const skr_vert_component_t* components, uint32_t component_count) {
 	if (!ref_str || !components || component_count == 0) return;
 

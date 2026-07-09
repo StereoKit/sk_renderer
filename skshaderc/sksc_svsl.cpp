@@ -161,9 +161,10 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 		return false;
 	}
 
-	// SVSL emits an SKS v9 container byte-identical in layout to skshaderc's own
-	// output, so load it back into the shared sksc_shader_file_t and let the
-	// normal pipeline take it from here.
+	// SVSL emits an SKS container byte-identical in layout to skshaderc's own
+	// output (version kept in lockstep via the libsvsl pin), so load it back
+	// into the shared sksc_shader_file_t and let the normal pipeline take it
+	// from here.
 	svsl_bytes_t sks = svsl_result_sks(result);
 	if (!sks.data || sks.size <= 0) {
 		sksc_log(sksc_log_level_err, "SVSL produced no container output");

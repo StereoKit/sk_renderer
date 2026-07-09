@@ -716,6 +716,11 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			}
 
 			ref_meta->vertex_inputs[curr].semantic_slot = semantic_idx;
+			// SPIR-V input location this attribute is decorated with. Read it
+			// straight from reflection rather than inferring from array index:
+			// enumeration order is not guaranteed to match location order, and
+			// skipped built-ins/SV_ inputs would break any index-based scheme.
+			ref_meta->vertex_inputs[curr].location = (uint8_t)input->location;
 			if      (strcmp_nocase(semantic, "sv_position" ) == 0) { ref_meta->vertex_inputs[curr].semantic = skr_semantic_position;     }
 			else if (strcmp_nocase(semantic, "binormal"    ) == 0) { ref_meta->vertex_inputs[curr].semantic = skr_semantic_binormal;     }
 			else if (strcmp_nocase(semantic, "blendindices") == 0) { ref_meta->vertex_inputs[curr].semantic = skr_semantic_blendindices; }

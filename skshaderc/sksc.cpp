@@ -362,7 +362,7 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 				case skr_semantic_texcoord:     semantic = "TexCoord";     break;
 				default:                        semantic = "NA";           break;
 			}
-			info.append("|  %s%d : %s%d", format, meta->vertex_inputs[i].count, semantic, meta->vertex_inputs[i].semantic_slot);
+			info.append("|  loc %d : %s%d : %s%d", meta->vertex_inputs[i].location, format, meta->vertex_inputs[i].count, semantic, meta->vertex_inputs[i].semantic_slot);
 		}
 	}
 
@@ -530,7 +530,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 9;
+	uint16_t version = 10;
 	data.write(tag);
 	data.write(version);
 
@@ -593,6 +593,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write(com->count);
 		data.write(com->semantic);
 		data.write(com->semantic_slot);
+		data.write(com->location);
 	}
 
 	for (uint32_t i = 0; i < file->meta.resource_count; i++) {

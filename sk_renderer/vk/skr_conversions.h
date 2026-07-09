@@ -27,3 +27,15 @@ bool                 _skr_tex_fmt_is_yuv(skr_tex_fmt_ format);
 uint32_t             _skr_vert_fmt_to_size (skr_vertex_fmt_ format);
 uint32_t             _skr_index_fmt_to_size(skr_index_fmt_  format);
 
+// Base numeric class a vertex format presents to a shader input. A mesh
+// component may only feed a shader input when their classes match: an integer
+// buffer format driving a float input (or the reverse) is invalid Vulkan that
+// renders garbage. Normalized integer formats are consumed as float, so they
+// classify as float.
+typedef enum {
+	skr_vert_class_float,
+	skr_vert_class_sint,
+	skr_vert_class_uint,
+} skr_vert_class_;
+skr_vert_class_      _skr_vert_fmt_class   (skr_vertex_fmt_ format);
+

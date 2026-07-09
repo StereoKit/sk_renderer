@@ -339,6 +339,7 @@ void                  _skr_render_list_sort                 (skr_render_list_t* 
 // Debug
 void                  _skr_set_debug_name                   (VkDevice device, VkObjectType type, uint64_t handle, const char* name);
 void                  _skr_append_vertex_format             (char* ref_str, size_t str_size, const skr_vert_component_t* components, uint32_t component_count);
+const char*           _skr_semantic_name                    (skr_semantic_ semantic);
 void                  _skr_append_material_config           (char* ref_str, size_t str_size, const _skr_pipeline_material_key_t* mat_key);
 void                  _skr_append_renderpass_config         (char* ref_str, size_t str_size, const skr_pipeline_renderpass_key_t* rp_key);
 void                  _skr_log_descriptor_writes            (const VkWriteDescriptorSet* writes, uint32_t write_ct, uint32_t buffer_ct, uint32_t image_ct);

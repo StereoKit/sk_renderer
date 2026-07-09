@@ -698,6 +698,7 @@ static _su_asset_loader_t _su_loader = {0};
 
 // Forward declarations
 static void _su_gltf_load_sync(su_gltf_t* gltf);
+static void _su_gltf_mark_loader_done(su_gltf_t* gltf);
 
 static int32_t _su_loader_thread(void* arg) {
 	(void)arg;
@@ -724,6 +725,11 @@ static int32_t _su_loader_thread(void* arg) {
 			switch (request.type) {
 			case _su_load_type_gltf:
 				_su_gltf_load_sync((su_gltf_t*)request.asset);
+				// Publish completion (after every write to the asset) so
+				// su_gltf_destroy can safely free it. Done here in the caller,
+				// not inside _su_gltf_load_sync, so it also covers that
+				// function's early failure returns.
+				_su_gltf_mark_loader_done((su_gltf_t*)request.asset);
 				break;
 			}
 		} else {
@@ -812,6 +818,12 @@ typedef struct {
 
 struct su_gltf_t {
 	su_gltf_state_      state;
+	// Set true by the loader thread once it has completely finished (or failed)
+	// this asset. `state` flips to ready before the textures finish loading, so
+	// it can't gate teardown; su_gltf_destroy waits on this instead. Written and
+	// read under _su_loader.queue_mutex so all the loader's writes to this gltf
+	// are visible before it may be freed.
+	bool                loader_done;
 	char                filepath[256];
 	skr_material_info_t shader_infos[SU_GLTF_MAX_SHADER_SETS];
 	int32_t             shader_count;
@@ -1290,11 +1302,33 @@ su_gltf_t* su_gltf_load(const char* filename, skr_shader_t* shader) {
 	return su_gltf_load_ex(filename, &info, 1);
 }
 
+// Loader-thread side of the su_gltf_destroy handshake: flag this asset as fully
+// loaded. Under queue_mutex so the loader's writes to the gltf are visible to a
+// destroyer that reads the flag under the same lock.
+static void _su_gltf_mark_loader_done(su_gltf_t* gltf) {
+	mtx_lock(&_su_loader.queue_mutex);
+	gltf->loader_done = true;
+	mtx_unlock(&_su_loader.queue_mutex);
+}
+
 void su_gltf_destroy(su_gltf_t* gltf) {
 	if (!gltf) return;
 
-	// TODO: If still loading, need to wait for loader thread to finish with this asset
-	// For now, sk_renderer's deferred destruction handles in-flight resources
+	// The loader thread creates this gltf's meshes and textures asynchronously
+	// and flips `state` to ready BEFORE the textures finish, so `state` can't
+	// tell us the loader is done. Freeing now would pull the struct out from
+	// under an in-flight skr_tex_create on the loader thread — a use-after-free
+	// that surfaces as dstImage=0x0 in vkCmdCopyBufferToImage. Block until the
+	// loader signals it is completely finished with this asset. The loader is
+	// always alive here (scenes are destroyed before su_shutdown joins it); the
+	// running check is a safety net so a post-shutdown destroy can't spin.
+	for (;;) {
+		mtx_lock(&_su_loader.queue_mutex);
+		bool done = gltf->loader_done;
+		mtx_unlock(&_su_loader.queue_mutex);
+		if (done || !_su_loader.running) break;
+		thrd_sleep(&(struct timespec){.tv_nsec = 500000}, NULL);  // 0.5ms
+	}
 
 	for (int32_t i = 0; i < gltf->mesh_count; i++) {
 		skr_mesh_destroy(&gltf->meshes[i]);

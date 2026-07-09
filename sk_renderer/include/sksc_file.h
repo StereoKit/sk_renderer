@@ -163,6 +163,11 @@ typedef enum {
 	// VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT ...Float32AtomicMinMax
 	// (VK_EXT_shader_atomic_float2)
 	sksc_feature_bit_float_atomics    = 15,
+	// VkPhysicalDeviceScalarBlockLayoutFeatures.scalarBlockLayout
+	// (VK_EXT_scalar_block_layout; optional-core in 1.2): a buffer layout in this
+	// shader breaks core relaxed block layout rules. Has no SPIR-V capability, so
+	// this bit is the only machine-readable signal.
+	sksc_feature_bit_scalar_layout    = 16,
 	// a capability/extension with no assigned bit: fall back to parsing the
 	// SPIR-V's OpCapability/OpExtension lists before trusting this mask
 	sksc_feature_bit_unknown          = 63,
@@ -174,6 +179,11 @@ typedef struct {
 	skr_semantic_   semantic;
 	uint8_t         semantic_slot;
 	uint8_t         binding;
+	// For shader meta vertex_inputs, the SPIR-V input location this attribute
+	// is decorated with; used at pipeline creation to wire mesh components to
+	// shader inputs by semantic. Ignored (and zero) for user-built mesh vert
+	// types, where component-to-buffer layout is described by binding/offset.
+	uint8_t         location;
 } skr_vert_component_t;
 
 typedef struct {
