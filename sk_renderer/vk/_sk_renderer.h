@@ -201,6 +201,7 @@ typedef struct {
 	bool                     has_android_hardware_buffer; // VK_ANDROID_external_memory_android_hardware_buffer
 	bool                     has_external_memory_dma_buf; // VK_EXT_external_memory_dma_buf
 	bool                     has_drm_format_modifier;     // VK_EXT_image_drm_format_modifier
+	bool                     has_external_fence_fd;       // VK_KHR_external_fence_fd
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
 	bool                     has_ycbcr_conversion;        // VkPhysicalDeviceSamplerYcbcrConversionFeatures::samplerYcbcrConversion
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve

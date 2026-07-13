@@ -768,6 +768,7 @@ SKR_API void              skr_render_list_add_indexed      (skr_render_list_t* r
 
 SKR_API void              skr_renderer_frame_begin         (void);
 SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_surfaces, uint32_t count);  // Submit frame with surface synchronization
+SKR_API int32_t           skr_renderer_frame_fence_fd      (void);  // Sync FD for the calling thread's most recent submission; call on the frame-submitting thread to get the frame fence. Caller closes it; -1 if unsupported or nothing submitted
 SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);
