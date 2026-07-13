@@ -842,7 +842,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.srcSubpass    = subpass_count - 1,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -852,7 +852,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.srcSubpass    = 0,  // Depth is only used in geometry subpass
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -1020,7 +1020,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.srcSubpass    = 0,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -1030,7 +1030,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.srcSubpass    = 0,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
