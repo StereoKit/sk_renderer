@@ -65,8 +65,10 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL _skr_vk_debug_callback(
 							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT    ? "INFO"    :
 							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ? "WARNING" :
 							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT   ? "ERROR"   : "UNKNOWN";
+	skr_log_    level        = severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT   ? skr_log_critical :
+							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ? skr_log_warning  : skr_log_info;
 
-	printf("[Vulkan:%s:%d] %s\n", severity_str, callback_data->messageIdNumber, callback_data->pMessage);
+	skr_log(level, "[Vulkan:%s:%d] %s", severity_str, callback_data->messageIdNumber, callback_data->pMessage);
 
 	if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
 		severity_str = severity_str;

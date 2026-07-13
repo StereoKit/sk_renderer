@@ -608,6 +608,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		&write_ct, &buffer_ct, &image_ct);
 	_skr_bind_pool_unlock();
 	if (fail_idx >= 0) {
+		_skr_cmd_release(ctx.cmd);
 		_skr_pipeline_unlock();
 		skr_log(skr_log_critical, "Blit missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		return;
