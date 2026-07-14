@@ -201,6 +201,7 @@ typedef struct {
 	bool                     has_android_hardware_buffer; // VK_ANDROID_external_memory_android_hardware_buffer
 	bool                     has_external_memory_dma_buf; // VK_EXT_external_memory_dma_buf
 	bool                     has_drm_format_modifier;     // VK_EXT_image_drm_format_modifier
+	bool                     has_external_fence_fd;       // VK_KHR_external_fence_fd
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
 	bool                     has_ycbcr_conversion;        // VkPhysicalDeviceSamplerYcbcrConversionFeatures::samplerYcbcrConversion
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
@@ -298,6 +299,8 @@ VkDeviceMemory        _skr_allocate_image_memory            (VkDevice device, Vk
 VkSampler             _skr_sampler_create_vk                (VkDevice device, skr_tex_sampler_t settings);
 skr_err_              _skr_tex_create_scratch               (const skr_tex_t* template_src, skr_tex_t* out_tex);
 VkDescriptorSetLayout _skr_shader_make_layout               (VkDevice device, bool has_push_descriptors, const sksc_shader_meta_t* meta, skr_stage_ stage_mask, const VkSampler* immutable_samplers, const int32_t* immutable_sampler_slots, int32_t immutable_sampler_count);
+void                  _skr_shader_resolve_spec_constants    (const sksc_shader_meta_t* meta, const skr_spec_constant_t* specs, uint32_t spec_count, uint32_t out_values[SKR_MAX_SPEC_CONSTANTS]);
+const VkSpecializationInfo* _skr_shader_make_spec_info      (const sksc_shader_meta_t* meta, const uint32_t* spec_values, VkSpecializationMapEntry out_entries[SKR_MAX_SPEC_CONSTANTS], VkSpecializationInfo* out_info);
 
 // Format helpers
 bool                  _skr_format_has_stencil               (VkFormat format);
@@ -337,6 +340,7 @@ void                  _skr_render_list_sort                 (skr_render_list_t* 
 // Debug
 void                  _skr_set_debug_name                   (VkDevice device, VkObjectType type, uint64_t handle, const char* name);
 void                  _skr_append_vertex_format             (char* ref_str, size_t str_size, const skr_vert_component_t* components, uint32_t component_count);
+const char*           _skr_semantic_name                    (skr_semantic_ semantic);
 void                  _skr_append_material_config           (char* ref_str, size_t str_size, const _skr_pipeline_material_key_t* mat_key);
 void                  _skr_append_renderpass_config         (char* ref_str, size_t str_size, const skr_pipeline_renderpass_key_t* rp_key);
 void                  _skr_log_descriptor_writes            (const VkWriteDescriptorSet* writes, uint32_t write_ct, uint32_t buffer_ct, uint32_t image_ct);

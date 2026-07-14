@@ -191,6 +191,22 @@ uint32_t _skr_vert_fmt_to_size(skr_vertex_fmt_ format) {
 	}
 }
 
+skr_vert_class_ _skr_vert_fmt_class(skr_vertex_fmt_ format) {
+	switch (format) {
+		case skr_vertex_fmt_i32:
+		case skr_vertex_fmt_i16:
+		case skr_vertex_fmt_i8:
+			return skr_vert_class_sint;
+		case skr_vertex_fmt_ui32:
+		case skr_vertex_fmt_ui16:
+		case skr_vertex_fmt_ui8:
+			return skr_vert_class_uint;
+		// f64/f32/f16 and every normalized integer format arrive as float.
+		default:
+			return skr_vert_class_float;
+	}
+}
+
 uint32_t _skr_index_fmt_to_size(skr_index_fmt_ format) {
 	switch (format) {
 		case skr_index_fmt_u32: return 4;

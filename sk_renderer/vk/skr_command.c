@@ -223,8 +223,13 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 			.commandPool        = ref_pool->cmd_pool,
 			.commandBufferCount = 1,
 		}, &slot->cmd);
+		VkExportFenceCreateInfo export_fence_info = {
+			.sType       = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+			.handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
 		vkCreateFence(_skr_vk.device, &(VkFenceCreateInfo){
 			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+			.pNext = _skr_vk.has_external_fence_fd ? &export_fence_info : NULL,
 		}, NULL, &slot->fence);
 		slot->destroy_list = _skr_destroy_list_create();
 		_skr_bump_alloc_init(&slot->const_bump,   skr_buffer_type_constant, _skr_vk.min_ubo_offset_align);
@@ -478,6 +483,27 @@ skr_future_t skr_future_get() {
 		.slot       = target,
 		.generation = target->generation,
 	};
+}
+
+int32_t skr_renderer_frame_fence_fd(void) {
+	if (!_skr_vk.has_external_fence_fd) return -1;
+
+	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
+	if (!pool || !pool->alive) return -1;
+
+	_skr_cmd_ring_slot_t* slot = pool->last_submitted;
+	if (!slot || slot->fence == VK_NULL_HANDLE) return -1;
+
+	VkFenceGetFdInfoKHR fd_info = {
+		.sType      = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+		.fence      = slot->fence,
+		.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	int fd = -1;
+	if (vkGetFenceFdKHR(_skr_vk.device, &fd_info, &fd) != VK_SUCCESS) {
+		return -1;
+	}
+	return fd;
 }
 
 bool skr_future_check(const skr_future_t* future) {

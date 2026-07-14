@@ -608,6 +608,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		&write_ct, &buffer_ct, &image_ct);
 	_skr_bind_pool_unlock();
 	if (fail_idx >= 0) {
+		_skr_cmd_release(ctx.cmd);
 		_skr_pipeline_unlock();
 		skr_log(skr_log_critical, "Blit missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		return;
@@ -767,7 +768,13 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 
 		// Get pipeline from the cache (using inlined indices)
 		VkPipeline pipeline = _skr_pipeline_get(item->pipeline_material_idx, _skr_vk.current_renderpass_idx, item->pipeline_vert_idx);
-		assert(pipeline != VK_NULL_HANDLE && "Is the Vertex format out of scope?");
+		if (pipeline == VK_NULL_HANDLE) {
+			// Pipeline creation failed — e.g. the mesh's vertex format is missing
+			// a semantic the shader consumes. The cause is logged by
+			// _skr_pipeline_create; skip the item rather than bind null and crash.
+			i += 1;
+			continue;
+		}
 
 		// Find consecutive items with same mesh/material/draw-params for batching
 		// Compare inlined data instead of pointers
@@ -936,7 +943,13 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 
 	// Get pipeline
 	VkPipeline pipeline = _skr_pipeline_get(material->pipeline_material_idx, _skr_vk.current_renderpass_idx, mesh->vert_type->pipeline_idx);
-	assert(pipeline != VK_NULL_HANDLE && "Is the Vertex format out of scope?");
+	if (pipeline == VK_NULL_HANDLE) {
+		// Pipeline creation failed — e.g. the mesh's vertex format is missing a
+		// semantic the shader consumes. The cause is logged by
+		// _skr_pipeline_create; skip the draw rather than bind null and crash.
+		_skr_cmd_release(cmd);
+		return;
+	}
 
 	// Bind pipeline
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);

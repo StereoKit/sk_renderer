@@ -27,7 +27,23 @@ typedef struct {
 	int32_t sim_size;
 	int32_t compute_iteration;
 	float   rotation;
+
+	// Flipped once per second and pushed via skr_compute_set_pipeline (see update).
+	bool  invert_color;
+	float spec_timer;
 } scene_reaction_diffusion_t;
+
+// Rebuild both compute pipelines with a new INVERT_COLOR spec value; the
+// buffers/textures/params bound at create time persist across the rebuild.
+static void _reaction_diffusion_set_invert(scene_reaction_diffusion_t* scene, bool invert) {
+	skr_spec_constant_t spec = { .name = "INVERT_COLOR", .value = invert ? 1.0 : 0.0 };
+	skr_compute_info_t  info = {
+		.spec_constants      = &spec,
+		.spec_constant_count = 1,
+	};
+	skr_compute_set_pipeline(&scene->compute_ping, info);
+	skr_compute_set_pipeline(&scene->compute_pong, info);
+}
 
 // Helper function for random hash
 static float _hash_f(int32_t aPosition, uint32_t aSeed) {
@@ -86,8 +102,8 @@ static scene_t* _scene_reaction_diffusion_create(void) {
 
 	// Load compute shader
 	scene->compute_sh = su_shader_load("shaders/compute_test.hlsl.sks", NULL);
-	skr_compute_create(&scene->compute_sh, &scene->compute_ping);
-	skr_compute_create(&scene->compute_sh, &scene->compute_pong);
+	skr_compute_create(&scene->compute_sh, (skr_compute_info_t){0}, &scene->compute_ping);
+	skr_compute_create(&scene->compute_sh, (skr_compute_info_t){0}, &scene->compute_pong);
 
 	// Create compute resources
 	typedef struct { float x, y; } float2;
@@ -159,6 +175,14 @@ static void _scene_reaction_diffusion_destroy(scene_t* base) {
 static void _scene_reaction_diffusion_update(scene_t* base, float delta_time) {
 	scene_reaction_diffusion_t* scene = (scene_reaction_diffusion_t*)base;
 	scene->rotation += delta_time;
+
+	// Flip the palette each second to exercise live pipeline rebuilds.
+	scene->spec_timer += delta_time;
+	if (scene->spec_timer >= 1.0f) {
+		scene->spec_timer  -= 1.0f;
+		scene->invert_color = !scene->invert_color;
+		_reaction_diffusion_set_invert(scene, scene->invert_color);
+	}
 
 	// Execute compute shader
 	for (int c = 0; c < 2; c++) {

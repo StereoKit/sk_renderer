@@ -55,6 +55,21 @@ typedef struct {
 
 static _skr_pipeline_cache_t _skr_pipeline_cache = {0};
 
+// Stored in the pipelines[] cache to mark a slot whose creation permanently
+// failed (incompatible mesh/shader vertex formats), distinct from
+// VK_NULL_HANDLE which means "not created yet". Without it a failed slot stays
+// VK_NULL_HANDLE and _skr_pipeline_get re-runs the whole remap — and re-logs
+// the error — on every affected draw, every frame. 0xFFFF… is never a real
+// Vulkan handle. It never escapes the cache: _skr_pipeline_get maps it back to
+// VK_NULL_HANDLE for callers, and the destroy paths skip it.
+#define SKR_PIPELINE_FAILED ((VkPipeline)(uintptr_t)-1)
+
+// A cache slot holds a real, destroyable pipeline only when it is neither the
+// "not created" nor the "creation failed" sentinel.
+static inline bool _skr_pipeline_is_real(VkPipeline p) {
+	return p != VK_NULL_HANDLE && p != SKR_PIPELINE_FAILED;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Forward declarations
 ///////////////////////////////////////////////////////////////////////////////
@@ -124,7 +139,7 @@ void _skr_pipeline_shutdown(void) {
 			for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 				for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 					int32_t idx = _skr_pipeline_index_3d(m, r, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-					if (_skr_pipeline_cache.pipelines[idx] != VK_NULL_HANDLE) {
+					if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx])) {
 						vkDestroyPipeline(_skr_vk.device, _skr_pipeline_cache.pipelines[idx], NULL);
 					}
 				}
@@ -356,7 +371,8 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 	for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(material_idx, r, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-			_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
+				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -381,7 +397,8 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(m, renderpass_idx, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-			_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
+				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -440,6 +457,21 @@ static bool _skr_vert_type_equals(const skr_vert_type_t* a, const skr_vert_type_
 	if (a->component_count > 0 && memcmp(a->attributes, b->attributes, sizeof(VkVertexInputAttributeDescription) * a->component_count) != 0)
 		return false;
 
+	// Compare the semantic-carrying fields the baked attributes don't capture.
+	// The pipeline remap (_skr_pipeline_create) now wires attributes to shader
+	// inputs by semantic + slot, reading them from the *cached* vert type. Two
+	// vert types with identical baked attributes but a different semantic ->
+	// offset mapping (e.g. position/normal vs normal/position, same formats)
+	// must not alias to one cache slot, or a mesh would silently inherit the
+	// other's wiring. (location rides in the struct too; compare it for
+	// completeness — a field-by-field loop also sidesteps struct padding.)
+	for (uint32_t i = 0; i < a->component_count; i++) {
+		if (a->components[i].semantic      != b->components[i].semantic      ||
+		    a->components[i].semantic_slot != b->components[i].semantic_slot ||
+		    a->components[i].location      != b->components[i].location)
+			return false;
+	}
+
 	return true;
 }
 
@@ -496,7 +528,8 @@ void _skr_pipeline_unregister_vertformat(int32_t vertformat_idx) {
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
 		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 			int32_t idx = _skr_pipeline_index_3d(m, r, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-			_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
+				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -512,15 +545,19 @@ VkPipeline _skr_pipeline_get(int32_t material_idx, int32_t renderpass_idx, int32
 	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count <= 0)                 return VK_NULL_HANDLE;
 	if (_skr_pipeline_cache.vertformats [vertformat_idx].ref_count <= 0)                 return VK_NULL_HANDLE;
 
-	// Check if pipeline already exists
-	int32_t idx = _skr_pipeline_index_3d(material_idx, renderpass_idx, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-	if (_skr_pipeline_cache.pipelines[idx] != VK_NULL_HANDLE) {
-		return _skr_pipeline_cache.pipelines[idx];
-	}
+	// Check the cache slot. A prior creation that failed is remembered as
+	// SKR_PIPELINE_FAILED so we neither retry it nor re-log its error every
+	// frame; report it to callers as VK_NULL_HANDLE (their "skip this draw"
+	// signal), never the raw sentinel.
+	int32_t    idx    = _skr_pipeline_index_3d(material_idx, renderpass_idx, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
+	VkPipeline cached = _skr_pipeline_cache.pipelines[idx];
+	if (cached == SKR_PIPELINE_FAILED) return VK_NULL_HANDLE;
+	if (cached != VK_NULL_HANDLE)      return cached;
 
-	// Create pipeline
+	// First request for this slot — create, and remember a failure so the
+	// descriptive error (logged inside _skr_pipeline_create) fires just once.
 	VkPipeline pipeline = _skr_pipeline_create(material_idx, renderpass_idx, vertformat_idx);
-	_skr_pipeline_cache.pipelines[idx] = pipeline;
+	_skr_pipeline_cache.pipelines[idx] = (pipeline == VK_NULL_HANDLE) ? SKR_PIPELINE_FAILED : pipeline;
 
 	return pipeline;
 }
@@ -805,7 +842,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.srcSubpass    = subpass_count - 1,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -815,7 +852,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.srcSubpass    = 0,  // Depth is only used in geometry subpass
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -983,7 +1020,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.srcSubpass    = 0,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -993,7 +1030,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 			.srcSubpass    = 0,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -1049,12 +1086,59 @@ static VkPipelineLayout _skr_pipeline_create_layout(VkDescriptorSetLayout descri
 	return layout;
 }
 
+// Max vertex attributes a pipeline can wire. Vulkan guarantees
+// maxVertexInputAttributes >= 16, which comfortably covers every builtin and
+// realistic mesh format.
+#define SKR_MAX_VERTEX_ATTRIBUTES 16
+
+static const char* _skr_vert_class_name(skr_vert_class_ cls) {
+	switch (cls) {
+		case skr_vert_class_sint: return "int";
+		case skr_vert_class_uint: return "uint";
+		default:                  return "float";
+	}
+}
+
+// Logs a descriptive vertex-layout error naming both sides by semantic, so a
+// mismatch reads as a diagnosable message instead of garbage geometry or a
+// validation-layer crash. `reason` states which input failed and why.
+static void _skr_log_vertex_layout_error(const skr_shader_t* shader, const skr_vert_type_t* vert_type, const char* reason) {
+	char   shader_wants[256];
+	char   mesh_has    [256];
+	size_t pos;
+
+	const sksc_shader_meta_t* meta = &shader->meta;
+	pos = 0;
+	shader_wants[0] = '\0';
+	for (int32_t i = 0; i < meta->vertex_input_count && pos < sizeof(shader_wants); i++) {
+		const skr_vert_component_t* v = &meta->vertex_inputs[i];
+		pos += snprintf(shader_wants + pos, sizeof(shader_wants) - pos, "%s%s%d(loc%d)",
+			i == 0 ? "" : ", ", _skr_semantic_name(v->semantic), v->semantic_slot, v->location);
+	}
+	pos = 0;
+	mesh_has[0] = '\0';
+	for (uint32_t i = 0; i < vert_type->component_count && pos < sizeof(mesh_has); i++) {
+		const skr_vert_component_t* v = &vert_type->components[i];
+		pos += snprintf(mesh_has + pos, sizeof(mesh_has) - pos, "%s%s%d",
+			i == 0 ? "" : ", ", _skr_semantic_name(v->semantic), v->semantic_slot);
+	}
+
+	skr_log(skr_log_critical, "Shader '%s' vertex input mismatch: %s\n  shader inputs: %s\n  mesh provides: %s",
+		meta->name[0] ? meta->name : "shader", reason, shader_wants, mesh_has);
+}
+
 static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_idx, int32_t vertformat_idx) {
 	const _skr_pipeline_material_key_t*  mat_key   = &_skr_pipeline_cache.materials   [material_idx  ].key;
 	const skr_pipeline_renderpass_key_t* rp_key    = &_skr_pipeline_cache.renderpasses[renderpass_idx].key;
 	const skr_vert_type_t*               vert_type = &_skr_pipeline_cache.vertformats [vertformat_idx].vert_type;
 	const VkPipelineLayout               layout    =  _skr_pipeline_cache.materials   [material_idx  ].layout;
 	const VkRenderPass                   rp        =  _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
+
+	// One specialization info is shared by both stages; Vulkan ignores map
+	// entries whose constantID isn't present in a stage's module.
+	VkSpecializationMapEntry  spec_entries[SKR_MAX_SPEC_CONSTANTS];
+	VkSpecializationInfo      spec_info;
+	const VkSpecializationInfo* spec = _skr_shader_make_spec_info(&mat_key->shader->meta, mat_key->spec_constant_values, spec_entries, &spec_info);
 
 	// Shader stages
 	VkPipelineShaderStageCreateInfo shader_stages[2];
@@ -1066,7 +1150,7 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 			.stage               = VK_SHADER_STAGE_VERTEX_BIT,
 			.module              = mat_key->shader->vertex_stage.shader,
 			.pName               = "vs",
-			.pSpecializationInfo = NULL,
+			.pSpecializationInfo = spec,
 		};
 	}
 
@@ -1076,17 +1160,73 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 			.stage               = VK_SHADER_STAGE_FRAGMENT_BIT,
 			.module              = mat_key->shader->pixel_stage.shader,
 			.pName               = "ps",
-			.pSpecializationInfo = NULL,
+			.pSpecializationInfo = spec,
 		};
 	}
 
-	// Vertex input - baked from vertex type
+	// Vertex input — wire mesh components to shader inputs by semantic + slot
+	// rather than by array position, so a mesh's component order is free of the
+	// shader's input declaration order. The attribute's location comes from the
+	// shader meta (the SPIR-V input location); format/offset/binding are reused
+	// from the vert type's baked attributes. Mesh components the shader does not
+	// consume are simply not emitted. See docs/PLAN_attribute_remap.md.
+	VkVertexInputAttributeDescription vert_attrs[SKR_MAX_VERTEX_ATTRIBUTES];
+	uint32_t                          vert_attr_count = 0;
+	if (vert_type) {
+		const sksc_shader_meta_t* meta = &mat_key->shader->meta;
+		for (int32_t in = 0; in < meta->vertex_input_count; in++) {
+			const skr_vert_component_t* input = &meta->vertex_inputs[in];
+
+			// Find the mesh component that carries this input's semantic + slot.
+			int32_t match = -1;
+			for (uint32_t c = 0; c < vert_type->component_count; c++) {
+				if (vert_type->components[c].semantic      == input->semantic &&
+				    vert_type->components[c].semantic_slot == input->semantic_slot) {
+					match = (int32_t)c;
+					break;
+				}
+			}
+			if (match == -1) {
+				char reason[128];
+				snprintf(reason, sizeof(reason), "no mesh component supplies input %s%d",
+					_skr_semantic_name(input->semantic), input->semantic_slot);
+				_skr_log_vertex_layout_error(mat_key->shader, vert_type, reason);
+				return VK_NULL_HANDLE;
+			}
+
+			// A buffer format's numeric class (int/uint/float, normalized ->
+			// float) must match the shader input's, or Vulkan reads garbage.
+			skr_vert_class_ mesh_class  = _skr_vert_fmt_class(vert_type->components[match].format);
+			skr_vert_class_ input_class = _skr_vert_fmt_class(input->format);
+			if (mesh_class != input_class) {
+				char reason[128];
+				snprintf(reason, sizeof(reason), "input %s%d expects %s but mesh supplies %s",
+					_skr_semantic_name(input->semantic), input->semantic_slot,
+					_skr_vert_class_name(input_class), _skr_vert_class_name(mesh_class));
+				_skr_log_vertex_layout_error(mat_key->shader, vert_type, reason);
+				return VK_NULL_HANDLE;
+			}
+
+			if (vert_attr_count >= SKR_MAX_VERTEX_ATTRIBUTES) {
+				skr_log(skr_log_critical, "Shader '%s' declares more than %d vertex inputs",
+					meta->name[0] ? meta->name : "shader", SKR_MAX_VERTEX_ATTRIBUTES);
+				return VK_NULL_HANDLE;
+			}
+			vert_attrs[vert_attr_count++] = (VkVertexInputAttributeDescription){
+				.location = input->location,
+				.binding  = vert_type->attributes[match].binding,
+				.format   = vert_type->attributes[match].format,
+				.offset   = vert_type->attributes[match].offset,
+			};
+		}
+	}
+
 	VkPipelineVertexInputStateCreateInfo vertex_input = {
 		.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount   = vert_type ? vert_type->binding_count : 0,
 		.pVertexBindingDescriptions      = vert_type ? vert_type->bindings : NULL,
-		.vertexAttributeDescriptionCount = vert_type ? vert_type->component_count : 0,
-		.pVertexAttributeDescriptions    = vert_type ? vert_type->attributes : NULL,
+		.vertexAttributeDescriptionCount = vert_attr_count,
+		.pVertexAttributeDescriptions    = vert_attr_count ? vert_attrs : NULL,
 	};
 
 	// Input assembly

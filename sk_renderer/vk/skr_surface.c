@@ -282,9 +282,9 @@ void skr_surface_resize(skr_surface_t* ref_surface) {
 	// Destroy old image views and framebuffers
 	for (uint32_t i = 0; i < ref_surface->image_count; i++) {
 		skr_tex_t* tex = &ref_surface->images[i];
-		if (tex->framebuffer      ) { vkDestroyFramebuffer(_skr_vk.device, tex->framebuffer,       NULL); }
-		if (tex->framebuffer_depth) { vkDestroyFramebuffer(_skr_vk.device, tex->framebuffer_depth, NULL); }
-		if (tex->view             ) { vkDestroyImageView  (_skr_vk.device, tex->view,              NULL); }
+		if (tex->framebuffer      ) { vkDestroyFramebuffer(_skr_vk.device, tex->framebuffer,       NULL); tex->framebuffer       = VK_NULL_HANDLE; }
+		if (tex->framebuffer_depth) { vkDestroyFramebuffer(_skr_vk.device, tex->framebuffer_depth, NULL); tex->framebuffer_depth = VK_NULL_HANDLE; }
+		if (tex->view             ) { vkDestroyImageView  (_skr_vk.device, tex->view,              NULL); tex->view              = VK_NULL_HANDLE; }
 	}
 
 	// Recreate swapchain using helper (old swapchain will be destroyed by helper)

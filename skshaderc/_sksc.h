@@ -38,3 +38,10 @@ bool                        sksc_meta_check_dup_resources(const sksc_shader_meta
 bool                        sksc_spirv_to_meta           (const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *meta);
 
 bool                        sksc_spirv_to_glsl         (const sksc_shader_file_stage_t *src_stage, const sksc_settings_t *settings, skr_shader_lang_ lang, sksc_shader_file_stage_t *out_stage, const sksc_shader_meta_t *meta, array_t<sksc_meta_item_t> var_meta);
+
+#ifdef SKSC_HAS_SVSL
+// Optional SVSL backend (skshaderc/sksc_svsl.cpp). Compiles the source with
+// libsvsl instead of the glslang pipeline and fills out_file from SVSL's SKS
+// container output.
+bool                        sksc_svsl_compile          (const char *filename, const char *hlsl_text, const sksc_settings_t *settings, sksc_shader_file_t *out_file);
+#endif

@@ -29,6 +29,19 @@ skr_err_ skr_vert_type_create(const skr_vert_component_t* items, int32_t item_co
 		return skr_err_invalid_parameter;
 	}
 
+	// Semantic + slot is the key the pipeline remap matches on, so a duplicate
+	// pair would be ambiguous — reject it up front rather than silently binding
+	// whichever component the match loop happens to hit first.
+	for (int32_t i = 0; i < item_count; i++) {
+		for (int32_t j = i + 1; j < item_count; j++) {
+			if (items[i].semantic      == items[j].semantic &&
+			    items[i].semantic_slot == items[j].semantic_slot) {
+				skr_log(skr_log_warning, "Cannot create vertex type with duplicate semantic + slot components");
+				return skr_err_invalid_parameter;
+			}
+		}
+	}
+
 	// Allocate storage
 	out_type->component_count = item_count;
 	out_type->components      = _skr_malloc(sizeof(skr_vert_component_t) * item_count);
@@ -84,6 +97,10 @@ skr_err_ skr_vert_type_create(const skr_vert_component_t* items, int32_t item_co
 		uint8_t  binding        = items[i].binding;
 		uint32_t component_size = _skr_vert_fmt_to_size(items[i].format) * items[i].count;
 
+		// location is a placeholder only: the real per-shader location is
+		// resolved at pipeline creation by matching semantics (see
+		// _skr_pipeline_create). format/binding/offset here are authoritative
+		// and reused by that remap.
 		out_type->attributes[i] = (VkVertexInputAttributeDescription){
 			.location = i,
 			.binding  = binding,

@@ -496,7 +496,7 @@ static scene_t* _scene_gi_create(void) {
 
 	// GI decay compute shader (voxel-only decay at cycle start, SH handled by EMA)
 	scene->gi_decay_shader = su_shader_load("shaders/gi_clear.hlsl.sks", "gi_decay");
-	skr_compute_create(&scene->gi_decay_shader, &scene->gi_decay_compute);
+	skr_compute_create(&scene->gi_decay_shader, (skr_compute_info_t){0}, &scene->gi_decay_compute);
 
 	// Voxel radiance textures (double-buffered)
 	scene->gi_voxel_write = 0;
@@ -510,7 +510,7 @@ static scene_t* _scene_gi_create(void) {
 
 	// Voxelize compute shader
 	scene->gi_voxelize_shader = su_shader_load("shaders/gi_voxelize.hlsl.sks", "gi_voxelize");
-	skr_compute_create(&scene->gi_voxelize_shader, &scene->gi_voxelize_compute);
+	skr_compute_create(&scene->gi_voxelize_shader, (skr_compute_info_t){0}, &scene->gi_voxelize_compute);
 	skr_compute_set_tex  (&scene->gi_voxelize_compute, "capture_tex", &scene->gi_capture_color);
 	skr_compute_set_param(&scene->gi_voxelize_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
@@ -529,12 +529,12 @@ static scene_t* _scene_gi_create(void) {
 
 	// Fast voxelize compute shader
 	scene->gi_fast_voxelize_shader = su_shader_load("shaders/gi_fast_voxelize.hlsl.sks", "gi_fast_voxelize");
-	skr_compute_create(&scene->gi_fast_voxelize_shader, &scene->gi_fast_voxelize_compute);
+	skr_compute_create(&scene->gi_fast_voxelize_shader, (skr_compute_info_t){0}, &scene->gi_fast_voxelize_compute);
 	skr_compute_set_param(&scene->gi_fast_voxelize_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
 	// Voxel-to-SH conversion (ray march the completed voxel volume → SH)
 	scene->gi_voxel_to_sh_shader = su_shader_load("shaders/gi_voxel_to_sh.hlsl.sks", "gi_voxel_to_sh");
-	skr_compute_create(&scene->gi_voxel_to_sh_shader, &scene->gi_voxel_to_sh_compute);
+	skr_compute_create(&scene->gi_voxel_to_sh_shader, (skr_compute_info_t){0}, &scene->gi_voxel_to_sh_compute);
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_r", &scene->gi_sh_r);
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_g", &scene->gi_sh_g);
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_b", &scene->gi_sh_b);

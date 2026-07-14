@@ -10,7 +10,64 @@
 #include <stdlib.h>
 #include <string.h>
 
-skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compute) {
+// Builds a pipeline into *out_pipeline from the compute's shader stage, applying
+// wave_size and info's resolved spec constants. Reads compute->shader/->layout
+// only; never touches compute->pipeline, so callers can build into a temp and
+// swap on success. On failure returns skr_err_device_error, *out_pipeline stays
+// VK_NULL_HANDLE. Assumes compute->layout is already valid.
+static skr_err_ _skr_compute_build_pipeline(const skr_compute_t* compute, skr_compute_info_t info, VkPipeline* out_pipeline) {
+	const skr_shader_t* shader = compute->shader;
+
+	// Optionally pin the compute subgroup/wave size. Driven by `//--wave_size = N`
+	// in the shader; requires VK_EXT_subgroup_size_control. Mismatched values
+	// fall back to the implementation default and emit a warning.
+	VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+	};
+	void* stage_pNext = NULL;
+	if (shader->meta.wave_size != 0) {
+		if (!_skr_vk.has_subgroup_size_control) {
+			skr_log(skr_log_warning, "Shader requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.wave_size);
+		} else if (shader->meta.wave_size < _skr_vk.min_subgroup_size || shader->meta.wave_size > _skr_vk.max_subgroup_size) {
+			skr_log(skr_log_warning, "Shader requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
+		} else if ((_skr_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+			skr_log(skr_log_warning, "Shader requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.wave_size);
+		} else {
+			required_subgroup_size.requiredSubgroupSize = shader->meta.wave_size;
+			stage_pNext = &required_subgroup_size;
+		}
+	}
+
+	uint32_t spec_values[SKR_MAX_SPEC_CONSTANTS];
+	_skr_shader_resolve_spec_constants(&shader->meta, info.spec_constants, info.spec_constant_count, spec_values);
+
+	VkSpecializationMapEntry    spec_entries[SKR_MAX_SPEC_CONSTANTS];
+	VkSpecializationInfo        spec_info;
+	const VkSpecializationInfo* spec = _skr_shader_make_spec_info(&shader->meta, spec_values, spec_entries, &spec_info);
+
+	VkComputePipelineCreateInfo pipeline_info = {
+		.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+		.stage  = (VkPipelineShaderStageCreateInfo){
+			.sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.pNext               = stage_pNext,
+			.stage               = VK_SHADER_STAGE_COMPUTE_BIT,
+			.module              = shader->compute_stage.shader,
+			.pName               = "cs",
+			.pSpecializationInfo = spec,
+		},
+		.layout = compute->layout,
+	};
+
+	VkResult vr = vkCreateComputePipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, out_pipeline);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkCreateComputePipelines");
+		*out_pipeline = VK_NULL_HANDLE;
+		return skr_err_device_error;
+	}
+	return skr_err_success;
+}
+
+skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info, skr_compute_t* out_compute) {
 	if (!out_compute) return skr_err_invalid_parameter;
 
 	// Zero out immediately
@@ -95,48 +152,14 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 		return skr_err_device_error;
 	}
 
-	// Optionally pin the compute subgroup/wave size. Driven by `//--wave_size = N`
-	// in the shader; requires VK_EXT_subgroup_size_control. Mismatched values
-	// fall back to the implementation default and emit a warning.
-	VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-	};
-	void* stage_pNext = NULL;
-	if (shader->meta.wave_size != 0) {
-		if (!_skr_vk.has_subgroup_size_control) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.wave_size);
-		} else if (shader->meta.wave_size < _skr_vk.min_subgroup_size || shader->meta.wave_size > _skr_vk.max_subgroup_size) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
-		} else if ((_skr_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.wave_size);
-		} else {
-			required_subgroup_size.requiredSubgroupSize = shader->meta.wave_size;
-			stage_pNext = &required_subgroup_size;
-		}
-	}
-
-	// Create compute pipeline
-	VkComputePipelineCreateInfo pipeline_info = {
-		.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-		.stage  = (VkPipelineShaderStageCreateInfo){
-			.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			.pNext  = stage_pNext,
-			.stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-			.module = shader->compute_stage.shader,
-			.pName  = "cs",
-		},
-		.layout = out_compute->layout,
-	};
-
-	vr = vkCreateComputePipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &out_compute->pipeline);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkCreateComputePipelines");
+	skr_err_ err = _skr_compute_build_pipeline(out_compute, info, &out_compute->pipeline);
+	if (err != skr_err_success) {
 		vkDestroyPipelineLayout(_skr_vk.device, out_compute->layout, NULL);
 		if (out_compute->descriptor_layout) {
 			vkDestroyDescriptorSetLayout(_skr_vk.device, out_compute->descriptor_layout, NULL);
 		}
 		*out_compute = (skr_compute_t){0};
-		return skr_err_device_error;
+		return err;
 	}
 
 	// Allocate memory for our resource binds
@@ -165,6 +188,28 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 	}
 
 	return skr_err_success;
+}
+
+void skr_compute_set_pipeline(skr_compute_t* ref_compute, skr_compute_info_t info) {
+	if (!ref_compute || !ref_compute->shader) return;
+
+	// The compute is locked to its create-time shader; only spec values change.
+	// layout, descriptor_layout, binds, and param_buffer are all retained.
+	const skr_shader_t* shader = ref_compute->shader;
+
+	// Build into a temp first: a failed rebuild must leave the still-working
+	// pipeline in place rather than stranding the object with no pipeline.
+	VkPipeline new_pipeline = VK_NULL_HANDLE;
+	skr_err_   err          = _skr_compute_build_pipeline(ref_compute, info, &new_pipeline);
+	if (err != skr_err_success) {
+		skr_log(skr_log_critical, "skr_compute_set_pipeline: failed to rebuild pipeline for '%s'; keeping previous pipeline", shader->meta.name);
+		return;
+	}
+
+	// Swap in the new pipeline, deferred-destroy the old (safe for in-flight
+	// command buffers).
+	_skr_cmd_destroy_pipeline(NULL, ref_compute->pipeline);
+	ref_compute->pipeline = new_pipeline;
 }
 
 bool skr_compute_is_valid(const skr_compute_t* compute) {

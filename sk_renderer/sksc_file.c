@@ -47,10 +47,13 @@ bool sksc_shader_file_verify(const void *data, uint32_t size, uint16_t *out_vers
 ///////////////////////////////////////////////////////////////////////////////
 
 static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_meta_t *meta) {
-	memcpy( meta->name,               &bytes[at], sizeof(meta->name              )); at += sizeof(meta->name);
-	memcpy(&meta->buffer_count,       &bytes[at], sizeof(meta->buffer_count      )); at += sizeof(meta->buffer_count);
-	memcpy(&meta->resource_count,     &bytes[at], sizeof(meta->resource_count    )); at += sizeof(meta->resource_count);
-	memcpy(&meta->vertex_input_count, &bytes[at], sizeof(meta->vertex_input_count)); at += sizeof(meta->vertex_input_count);
+	memcpy( meta->name,                &bytes[at], sizeof(meta->name               )); at += sizeof(meta->name);
+	memcpy(&meta->buffer_count,        &bytes[at], sizeof(meta->buffer_count       )); at += sizeof(meta->buffer_count);
+	memcpy(&meta->resource_count,      &bytes[at], sizeof(meta->resource_count     )); at += sizeof(meta->resource_count);
+	memcpy(&meta->vertex_input_count,  &bytes[at], sizeof(meta->vertex_input_count )); at += sizeof(meta->vertex_input_count);
+	memcpy(&meta->spec_constant_count, &bytes[at], sizeof(meta->spec_constant_count)); at += sizeof(meta->spec_constant_count);
+	memcpy(&meta->features,            &bytes[at], sizeof(meta->features));            at += sizeof(meta->features);
+	memcpy(&meta->features_reserved,   &bytes[at], sizeof(meta->features_reserved));   at += sizeof(meta->features_reserved);
 
 	memcpy(&meta->ops_vertex.total,        &bytes[at], sizeof(meta->ops_vertex.total));        at += sizeof(meta->ops_vertex.total);
 	memcpy(&meta->ops_vertex.tex_read,     &bytes[at], sizeof(meta->ops_vertex.tex_read));     at += sizeof(meta->ops_vertex.tex_read);
@@ -89,25 +92,28 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	}
 
 	// --- Single allocation for all sub-arrays ---
-	size_t buffers_size  = sizeof(sksc_shader_buffer_t  ) * meta->buffer_count;
-	size_t res_size      = sizeof(sksc_shader_resource_t) * meta->resource_count;
-	size_t vars_size     = sizeof(sksc_shader_var_t     ) * total_var_count;
-	size_t vinputs_size  = sizeof(skr_vert_component_t  ) * meta->vertex_input_count;
-	size_t total_size    = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size;
+	size_t buffers_size  = sizeof(sksc_shader_buffer_t       ) * meta->buffer_count;
+	size_t res_size      = sizeof(sksc_shader_resource_t     ) * meta->resource_count;
+	size_t vars_size     = sizeof(sksc_shader_var_t          ) * total_var_count;
+	size_t vinputs_size  = sizeof(skr_vert_component_t       ) * meta->vertex_input_count;
+	size_t spec_size     = sizeof(sksc_shader_spec_constant_t) * meta->spec_constant_count;
+	size_t total_size    = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size;
 
 	if (total_size == 0) {
-		meta->buffers       = NULL;
-		meta->resources     = NULL;
-		meta->vertex_inputs = NULL;
+		meta->buffers        = NULL;
+		meta->resources      = NULL;
+		meta->vertex_inputs  = NULL;
+		meta->spec_constants = NULL;
 		return at;
 	}
 
 	uint8_t *block = (uint8_t *)malloc(total_size);
 	memset(block, 0, total_size);
 
-	meta->buffers       = (sksc_shader_buffer_t  *)(block);
-	meta->resources     = (sksc_shader_resource_t*)(block + buffers_size);
-	meta->vertex_inputs = (skr_vert_component_t  *)(block + buffers_size + res_size + vars_size + total_defaults_size);
+	meta->buffers        = (sksc_shader_buffer_t       *)(block);
+	meta->resources      = (sksc_shader_resource_t     *)(block + buffers_size);
+	meta->vertex_inputs  = (skr_vert_component_t       *)(block + buffers_size + res_size + vars_size + total_defaults_size);
+	meta->spec_constants = (sksc_shader_spec_constant_t*)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size);
 	uint8_t *vars_cursor     = block + buffers_size + res_size;
 	uint8_t *defaults_cursor = block + buffers_size + res_size + vars_size;
 
@@ -159,6 +165,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		memcpy(&com->count,         &bytes[at], sizeof(com->count        )); at += sizeof(com->count);
 		memcpy(&com->semantic,      &bytes[at], sizeof(com->semantic     )); at += sizeof(com->semantic);
 		memcpy(&com->semantic_slot, &bytes[at], sizeof(com->semantic_slot)); at += sizeof(com->semantic_slot);
+		memcpy(&com->location,      &bytes[at], sizeof(com->location     )); at += sizeof(com->location);
 	}
 
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
@@ -168,7 +175,20 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		memcpy( res->tags,         &bytes[at], sizeof(res->tags        )); at += sizeof(res->tags        );
 		memcpy(&res->bind,         &bytes[at], sizeof(res->bind        )); at += sizeof(res->bind        );
 		memcpy(&res->element_size, &bytes[at], sizeof(res->element_size)); at += sizeof(res->element_size);
+		memcpy(&res->shape,        &bytes[at], sizeof(res->shape       )); at += sizeof(res->shape       );
+		memcpy(&res->image_format, &bytes[at], sizeof(res->image_format)); at += sizeof(res->image_format);
+		at += 2; // reserved
 		res->name_hash = skr_hash(res->name);
+	}
+
+	for (uint32_t i = 0; i < meta->spec_constant_count; i++) {
+		sksc_shader_spec_constant_t *spec = &meta->spec_constants[i];
+		memcpy( spec->name,          &bytes[at], sizeof(spec->name         )); at += sizeof(spec->name         );
+		memcpy(&spec->constant_id,   &bytes[at], sizeof(spec->constant_id  )); at += sizeof(spec->constant_id  );
+		memcpy(&spec->default_value, &bytes[at], sizeof(spec->default_value)); at += sizeof(spec->default_value);
+		memcpy(&spec->type,          &bytes[at], sizeof(spec->type         )); at += sizeof(spec->type         );
+		memcpy(&spec->stage_bits,    &bytes[at], sizeof(spec->stage_bits   )); at += sizeof(spec->stage_bits   );
+		spec->name_hash = skr_hash(spec->name);
 	}
 
 	return at;
@@ -179,7 +199,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_shader_file_t *out_file) {
 	uint16_t file_version = 0;
 	if (!sksc_shader_file_verify(data, size, &file_version, NULL, 0)) return sksc_result_bad_format;
-	if (file_version != 7)                                            return sksc_result_old_version;
+	if (file_version != 10)                                           return sksc_result_old_version;
 
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;
@@ -196,6 +216,7 @@ sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_
 		sksc_shader_file_stage_t *stage = &out_file->stages[i];
 		memcpy(&stage->language,  &bytes[at], sizeof(stage->language));  at += sizeof(stage->language);
 		memcpy(&stage->stage,     &bytes[at], sizeof(stage->stage));     at += sizeof(stage->stage);
+		memcpy(&stage->wave_size, &bytes[at], sizeof(stage->wave_size)); at += sizeof(stage->wave_size);
 		memcpy(&stage->code_size, &bytes[at], sizeof(stage->code_size)); at += sizeof(stage->code_size);
 
 		stage->code = NULL;

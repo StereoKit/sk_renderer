@@ -65,8 +65,10 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL _skr_vk_debug_callback(
 							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT    ? "INFO"    :
 							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ? "WARNING" :
 							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT   ? "ERROR"   : "UNKNOWN";
+	skr_log_    level        = severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT   ? skr_log_critical :
+							   severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ? skr_log_warning  : skr_log_info;
 
-	printf("[Vulkan:%s:%d] %s\n", severity_str, callback_data->messageIdNumber, callback_data->pMessage);
+	skr_log(level, "[Vulkan:%s:%d] %s", severity_str, callback_data->messageIdNumber, callback_data->pMessage);
 
 	if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
 		severity_str = severity_str;
@@ -181,6 +183,7 @@ bool skr_init(skr_settings_t settings) {
 		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 		VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
 		VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,       // Required-subgroup-size for compute (HLSL [WaveSize]/`//--wave_size`)
+		VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,           // Sync FD export for frame fences (VK_KHR_external_fence is core 1.1)
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -576,6 +579,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_drm_format_modifier     = false;
 	_skr_vk.has_custom_resolve          = false;
 	_skr_vk.has_subgroup_size_control   = false;
+	_skr_vk.has_external_fence_fd       = false;
 	bool has_image_format_list          = false;
 	bool has_swapchain                  = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
@@ -589,6 +593,7 @@ bool skr_init(skr_settings_t settings) {
 			if (strcmp(optional_device_exts[i], VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME  ) == 0) _skr_vk.has_drm_format_modifier      = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME          ) == 0) has_image_format_list                = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME     ) == 0) _skr_vk.has_subgroup_size_control    = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME        ) == 0) _skr_vk.has_external_fence_fd        = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif

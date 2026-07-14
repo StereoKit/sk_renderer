@@ -3,6 +3,10 @@
 
 //--wave_size = 32
 
+// Baked into the pipeline at creation; the scene flips it live via
+// skr_compute_set_pipeline to invert the output palette.
+[[vk::constant_id(0)]] const bool INVERT_COLOR = false;
+
 float feed;
 float kill;
 float diffuseA;
@@ -98,5 +102,7 @@ void cs( uint3 dispatchThreadID : SV_DispatchThreadID) {
 	} else {
 		col = color6.rgb;
 	}
+	if (INVERT_COLOR)
+		col = 1.0 - col;
 	out_tex[dispatchThreadID.xy] = float4(col,1);
 }

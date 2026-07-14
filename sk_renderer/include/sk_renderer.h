@@ -551,6 +551,13 @@ typedef struct skr_shader_tex_info_t {
 	const char* default_value;
 } skr_shader_tex_info_t;
 
+// A value for a shader spec constant ([[vk::constant_id(N)]] in HLSL). Values
+// are converted to the constant's declared type; bools are 0/1.
+typedef struct skr_spec_constant_t {
+	const char* name;   // Variable name from the HLSL declaration
+	double      value;
+} skr_spec_constant_t;
+
 typedef struct skr_material_info_t {
 	const skr_shader_t*  shader;
 	skr_cull_            cull;
@@ -563,7 +570,21 @@ typedef struct skr_material_info_t {
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
 	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)
+
+	// Spec constant overrides; unlisted constants keep their HLSL defaults.
+	// Values are copied out, the array doesn't need to outlive this call.
+	const skr_spec_constant_t* spec_constants;
+	uint32_t                   spec_constant_count;
 } skr_material_info_t;
+
+// The mutable pipeline state of a compute; the shader is locked separately at
+// create. Compute has no cull/blend/depth/stencil state, so this is spec-only.
+typedef struct skr_compute_info_t {
+	// Spec constant overrides; unlisted constants keep their HLSL defaults.
+	// Values are copied out, the array doesn't need to outlive this call.
+	const skr_spec_constant_t* spec_constants;
+	uint32_t                   spec_constant_count;
+} skr_compute_info_t;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Deferred pass assembly
@@ -723,7 +744,8 @@ SKR_API bool              skr_shader_get_param_info        (const skr_shader_t* 
 SKR_API bool              skr_shader_get_tex_info          (const skr_shader_t*     shader, const char* tex_name,   skr_shader_tex_info_t*   opt_out_info);
 SKR_API void              skr_shader_set_name              (      skr_shader_t* ref_shader, const char* name);
 
-SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_t* out_compute);
+SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_info_t info, skr_compute_t* out_compute);
+SKR_API void              skr_compute_set_pipeline         (      skr_compute_t* ref_compute, skr_compute_info_t info);
 SKR_API bool              skr_compute_is_valid             (const skr_compute_t*     compute);
 SKR_API void              skr_compute_destroy              (      skr_compute_t* ref_compute);
 SKR_API skr_bind_t        skr_compute_get_bind             (const skr_compute_t*     compute, const char* bind_name);
@@ -755,6 +777,7 @@ SKR_API void              skr_render_list_add_indexed      (skr_render_list_t* r
 
 SKR_API void              skr_renderer_frame_begin         (void);
 SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_surfaces, uint32_t count);  // Submit frame with surface synchronization
+SKR_API int32_t           skr_renderer_frame_fence_fd      (void);  // Sync FD for the calling thread's most recent submission; call on the frame-submitting thread to get the frame fence. Caller closes it; -1 if unsupported or nothing submitted
 SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);

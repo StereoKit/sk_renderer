@@ -152,69 +152,102 @@ set_target_properties(skshaderc_lib PROPERTIES
 	CXX_STANDARD 11
 	CXX_STANDARD_REQUIRED ON)
 
-# For SPIRV-Tools
-message(STATUS "Fetching SPIRV-Headers...")
-FetchContent_Declare( SPIRV-Headers
-	GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
-	GIT_TAG        ${VULKAN_VERSION}
-	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
-)
-FetchContent_MakeAvailable(SPIRV-Headers)
-target_link_libraries     (skshaderc_lib PUBLIC SPIRV)
+# Optional glslang backend: HLSL -> SPIR-V via glslang, optimized with the
+# SPIRV-Tools optimizer and reflected with SPIRV-Reflect. glslang also pulls in
+# the SPIRV-Tools disassembler, which powers the -raw/-h SPIR-V text output; a
+# build without glslang skips all of SPIRV-Headers/Tools/Reflect (well over 3MB
+# of the binary) and instead writes raw .spv for -raw and omits SPIR-V comments
+# in -h. SKSC_HAS_GLSLANG and SKSC_HAS_SPIRV_TOOLS gate this in code.
+option(SKSHADERC_ENABLE_GLSLANG "Build skshaderc with the glslang (HLSL) shader compiler backend" ON)
+if(SKSHADERC_ENABLE_GLSLANG)
+	# SPIRV-Headers underpins both SPIRV-Tools and glslang.
+	message(STATUS "Fetching SPIRV-Headers...")
+	FetchContent_Declare( SPIRV-Headers
+		GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+		GIT_TAG        ${VULKAN_VERSION}
+		GIT_SHALLOW    TRUE
+		GIT_PROGRESS   TRUE
+	)
+	FetchContent_MakeAvailable(SPIRV-Headers)
 
-# For optimizing SPIR-V shaders, a baseline amount of
-# optimization is crucial for meta compatability with
-# HLSL compilers.
-message(STATUS "Fetching SPIRV-Tools...")
-FetchContent_Declare( SPIRV-Tools
-	GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
-	GIT_TAG        ${VULKAN_VERSION}
-	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
-)
-set(SPIRV_SKIP_TESTS       ON  CACHE BOOL "")
-set(SPIRV_SKIP_EXECUTABLES ON  CACHE BOOL "")
-set(SPIRV_WERROR           OFF CACHE BOOL "")
-FetchContent_MakeAvailable(SPIRV-Tools)
-target_link_libraries     (skshaderc_lib PUBLIC SPIRV-Tools-opt)
+	# SPIRV-Tools: core provides the disassembler (-raw/-h text output), and
+	# SPIRV-Tools-opt the optimizer. A baseline amount of optimization is crucial
+	# for meta compatability with HLSL compilers.
+	message(STATUS "Fetching SPIRV-Tools...")
+	FetchContent_Declare( SPIRV-Tools
+		GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
+		GIT_TAG        ${VULKAN_VERSION}
+		GIT_SHALLOW    TRUE
+		GIT_PROGRESS   TRUE
+	)
+	set(SPIRV_SKIP_TESTS       ON  CACHE BOOL "")
+	set(SPIRV_SKIP_EXECUTABLES ON  CACHE BOOL "")
+	set(SPIRV_WERROR           OFF CACHE BOOL "")
+	FetchContent_MakeAvailable(SPIRV-Tools)
+	target_link_libraries     (skshaderc_lib PUBLIC SPIRV-Tools SPIRV-Tools-opt)
+	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_SPIRV_TOOLS)
 
-# For grabbing shader metadata, SPIRV-Cross can also do
-# this, but Reflect is lighter weight.
-message(STATUS "Fetching SPIRV-Reflect...")
-FetchContent_Declare( SPIRV-Reflect
-	GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Reflect.git
-	GIT_TAG        ${VULKAN_VERSION}
-	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
-)
-set(SPIRV_REFLECT_EXECUTABLE OFF CACHE BOOL "")
-set(SPIRV_REFLECT_STATIC_LIB ON CACHE BOOL "")
-FetchContent_MakeAvailable(SPIRV-Reflect)
-target_link_libraries     (skshaderc_lib PUBLIC spirv-reflect-static)
+	# For grabbing shader metadata, SPIRV-Cross can also do this, but Reflect is
+	# lighter weight.
+	message(STATUS "Fetching SPIRV-Reflect...")
+	FetchContent_Declare( SPIRV-Reflect
+		GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Reflect.git
+		GIT_TAG        ${VULKAN_VERSION}
+		GIT_SHALLOW    TRUE
+		GIT_PROGRESS   TRUE
+	)
+	set(SPIRV_REFLECT_EXECUTABLE OFF CACHE BOOL "")
+	set(SPIRV_REFLECT_STATIC_LIB ON CACHE BOOL "")
+	FetchContent_MakeAvailable(SPIRV-Reflect)
+	target_link_libraries     (skshaderc_lib PUBLIC spirv-reflect-static)
 
-# This is used to convert HLSL to SPIR-V. DXC is an
-# alternative, but is far more difficult to compile,
-# and generates a much larger binary.
-message(STATUS "Fetching glslang...")
-FetchContent_Declare( glslang
-	GIT_REPOSITORY https://github.com/maluoi/glslang.git # Custom fork of glslang for vk::image_format support
-	GIT_TAG        1d31fc505b53016a62167496da49bf0386fa08f7
-)
-set(GLSLANG_ENABLE_INSTALL  OFF  CACHE BOOL "")
-set(GLSLANG_TESTS           OFF  CACHE BOOL "")
-set(ENABLE_GLSLANG_BINARIES OFF  CACHE BOOL "")
-set(ENABLE_SPVREMAPPER      OFF  CACHE BOOL "")
-set(ENABLE_GLSLANG_JS       OFF  CACHE BOOL "")
-set(ENABLE_HLSL             ON   CACHE BOOL "")
-set(ENABLE_RTTI             OFF  CACHE BOOL "")
-FetchContent_MakeAvailable(glslang)
-target_link_libraries     (skshaderc_lib PUBLIC glslang)
+	# This is used to convert HLSL to SPIR-V. DXC is an alternative, but is far
+	# more difficult to compile, and generates a much larger binary.
+	message(STATUS "Fetching glslang...")
+	FetchContent_Declare( glslang
+		GIT_REPOSITORY https://github.com/maluoi/glslang.git # Custom fork of glslang for vk::image_format support
+		GIT_TAG        1d31fc505b53016a62167496da49bf0386fa08f7
+	)
+	set(GLSLANG_ENABLE_INSTALL  OFF  CACHE BOOL "")
+	set(GLSLANG_TESTS           OFF  CACHE BOOL "")
+	set(ENABLE_GLSLANG_BINARIES OFF  CACHE BOOL "")
+	set(ENABLE_SPVREMAPPER      OFF  CACHE BOOL "")
+	set(ENABLE_GLSLANG_JS       OFF  CACHE BOOL "")
+	set(ENABLE_HLSL             ON   CACHE BOOL "")
+	set(ENABLE_RTTI             OFF  CACHE BOOL "")
+	FetchContent_MakeAvailable(glslang)
+	target_link_libraries     (skshaderc_lib PUBLIC glslang SPIRV)
+	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_GLSLANG)
+	target_sources            (skshaderc_lib PRIVATE sksc_hlsl.cpp sksc_meta.cpp)
+endif()
+
+# Optional SVSL backend. When enabled, we fetch libsvsl (its CLI, tests, and
+# install rules stay off automatically for a FetchContent consumer), link it,
+# and compile the sksc_svsl.cpp bridge. SKSC_HAS_SVSL gates the backend in code.
+# The pinned libsvsl must emit the same SKS container version this repo's loader
+# expects (currently v10) — the tag below and sksc_file.c's version check move
+# in lockstep. See docs/PLAN_attribute_remap.md.
+option(SKSHADERC_ENABLE_SVSL "Build skshaderc with the optional SVSL shader compiler backend" ON)
+if(SKSHADERC_ENABLE_SVSL)
+	message(STATUS "Fetching SVSL...")
+	FetchContent_Declare( SVSL
+		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
+		GIT_TAG        v2026.7.9
+		GIT_SHALLOW    TRUE
+		GIT_PROGRESS   TRUE
+	)
+	FetchContent_MakeAvailable(SVSL)
+	target_link_libraries     (skshaderc_lib PUBLIC svsl::svsl)
+	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_SVSL)
+	target_sources            (skshaderc_lib PRIVATE sksc_svsl.cpp)
+endif()
+
+if(NOT SKSHADERC_ENABLE_GLSLANG AND NOT SKSHADERC_ENABLE_SVSL)
+	message(FATAL_ERROR "skshaderc needs at least one compiler backend: enable SKSHADERC_ENABLE_GLSLANG and/or SKSHADERC_ENABLE_SVSL.")
+endif()
 
 target_sources(skshaderc_lib PRIVATE
 	sksc.cpp
-	sksc_hlsl.cpp
-	sksc_meta.cpp
 	sksc_log.cpp
 	sksc.h
 	_sksc.h
