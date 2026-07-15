@@ -27,6 +27,16 @@ float3 linear_to_srgb(float3 c) {
 	return lerp(lo, hi, step(0.0031308, c));
 }
 
+// Round-to-nearest RGB565 from a [0,1] color. Rounding directly in 5/6-bit
+// space halves the worst-case endpoint error vs the old 8-bit-round-then-
+// truncate path (max ~4/255 vs ~7/255 per channel).
+uint pack565(float3 c) {
+	uint r = uint(saturate(c.r) * 31.0 + 0.5);
+	uint g = uint(saturate(c.g) * 63.0 + 0.5);
+	uint b = uint(saturate(c.b) * 31.0 + 0.5);
+	return (r << 11) | (g << 5) | b;
+}
+
 uint mip_level;
 uint image_width;
 uint image_height;
@@ -45,11 +55,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	if (bx >= blocks_x || by >= blocks_y)
 		return;
 
-	// Load 4x4 block. Bounding box computed in float space to avoid
-	// converting all 16 pixels to uint upfront.
+	// Load 4x4 block.
 	float3 pixels[16];
-	float3 cmin = float3(1, 1, 1);
-	float3 cmax = float3(0, 0, 0);
 
 	// Pack transparency into a bitmask instead of bool[16] to save VGPRs
 	uint trans_mask = 0;
@@ -64,8 +71,6 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 			uint idx = py * 4 + px;
 			pixels[idx] = texel.rgb;
-			cmin = min(cmin, texel.rgb);
-			cmax = max(cmax, texel.rgb);
 
 			if (ENABLE_ALPHA && texel.a < 0.5)
 				trans_mask |= (1u << idx);
@@ -81,30 +86,31 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		return;
 	}
 
-	// Recompute bounding box excluding transparent pixels (branchless)
-	if (ENABLE_ALPHA && has_transparent) {
-		cmin = float3(1, 1, 1);
-		cmax = float3(0, 0, 0);
-		[unroll] for (uint i = 0; i < 16; i++) {
-			float3 p = pixels[i];
-			bool opaque = !((trans_mask >> i) & 1u);
-			cmin = min(cmin, opaque ? p : float3(1, 1, 1));
-			cmax = max(cmax, opaque ? p : float3(0, 0, 0));
+	// FPS seed: 2 passes of "find pixel most distant from current anchor,
+	// anchor = that pixel" — converges on the block's diametric real pixel
+	// pair, a better color axis than bbox corners on anti-correlated content.
+	// Transparent pixels can't seed endpoints (their color is invisible).
+	float3 fps_a = pixels[0];
+	float3 fps_b = fps_a;
+	[unroll] for (uint iter = 0; iter < 2u; iter++) {
+		float  max_d2 = -1.0;
+		float3 far_p  = fps_a;
+		[unroll] for (uint fi = 0; fi < 16; fi++) {
+			float3 diff = pixels[fi] - fps_a;
+			float  d2   = dot(diff, diff);
+			if (ENABLE_ALPHA && ((trans_mask >> fi) & 1u))
+				d2 = -2.0;
+			far_p  = d2 > max_d2 ? pixels[fi] : far_p;
+			max_d2 = max(max_d2, d2);
 		}
+		fps_b = fps_a;
+		fps_a = far_p;
 	}
 
-	// Convert bounding box to [0,255] uint for quantization
-	uint3 imin = uint3(cmin * 255.0 + 0.5);
-	uint3 imax = uint3(cmax * 255.0 + 0.5);
-
-	// Inset by 1/16 of range
-	uint3 range = imax - imin;
-	imin += range >> 4;
-	imax -= range >> 4;
-
-	// Convert endpoints to RGB565
-	uint c0 = ((imax.r >> 3) << 11) | ((imax.g >> 2) << 5) | (imax.b >> 3);
-	uint c1 = ((imin.r >> 3) << 11) | ((imin.g >> 2) << 5) | (imin.b >> 3);
+	// Round-to-nearest 565 endpoints; mode ordering is normalized inside the
+	// refinement loop below.
+	uint c0 = pack565(fps_a);
+	uint c1 = pack565(fps_b);
 
 	bool alpha_mode = ENABLE_ALPHA && has_transparent;
 	uint indices    = 0;
@@ -257,10 +263,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		float3 ep0 = saturate((sum_ap * sum_bb - sum_bp * sum_ab) * inv_det);
 		float3 ep1 = saturate((sum_bp * sum_aa - sum_ap * sum_ab) * inv_det);
 
-		uint3 q0 = uint3(ep0 * 255.0 + 0.5);
-		uint3 q1 = uint3(ep1 * 255.0 + 0.5);
-		c0 = ((q0.r >> 3) << 11) | ((q0.g >> 2) << 5) | (q0.b >> 3);
-		c1 = ((q1.r >> 3) << 11) | ((q1.g >> 2) << 5) | (q1.b >> 3);
+		c0 = pack565(ep0);
+		c1 = pack565(ep1);
 	}
 
 	// Pack output: [c0_lo, c0_hi, c1_lo, c1_hi] [idx0..idx3]
