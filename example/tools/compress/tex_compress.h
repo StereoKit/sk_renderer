@@ -9,94 +9,81 @@
 
 // GPU Texture Compression
 //
-// Uses compute shaders to compress RGBA textures to BC1, BC7, BC6H,
-// ASTC 4x4, ASTC 6x6, or ASTC 8x8 HDR on the GPU. Zero CPU readback — compressed
-// data stays on the GPU via buffer-to-image copy (skr_tex_set_buffer).
+// Compresses RGBA textures on the GPU with compute shaders — zero CPU
+// readback, compressed data stays on the GPU via buffer-to-image copy
+// (skr_tex_set_buffer). Encoder shaders live next to this file in
+// shaders/; see tools/compress/README.md for the toolkit layout.
 //
 // Usage:
 //   tex_compress_init();
 //
-//   skr_tex_t source = ...; // RGBA32 texture with mips generated
-//   skr_tex_t compressed = tex_compress_astc6x6(&source);
+//   skr_tex_t source = ...; // texture with mips generated
+//   skr_tex_t compressed = tex_compress(&source, tex_compress_fmt_bc7);
 //
 //   tex_compress_shutdown();
+//
+// LDR formats expect an rgba32/rgba32_linear source; the HDR formats
+// (bc6h, astc8x8hdr) expect a float-format source (rg11b10/rgba16f/...).
+// Callers should probe output-format sampleability themselves via
+// skr_tex_fmt_is_supported — the desktop/mobile split is BC vs ASTC.
 
-void      tex_compress_init    (void);
+typedef enum tex_compress_fmt_ {
+	tex_compress_fmt_bc1,          // 4 bpp LDR RGB, opaque 4-color mode only
+	tex_compress_fmt_bc1_alpha,    // 4 bpp LDR RGBA, punch-through (1-bit) alpha
+	tex_compress_fmt_bc7,          // 8 bpp LDR RGBA, high quality (mode 6 + mode 5 trial)
+	tex_compress_fmt_bc6h,         // 8 bpp HDR RGB (UF16, mode 11) — float source
+	tex_compress_fmt_astc4x4,      // 8 bpp LDR RGB, high quality
+	tex_compress_fmt_astc6x6,      // 3.6 bpp LDR RGBA, multi-mode selector
+	tex_compress_fmt_astc8x8hdr,   // 2 bpp HDR RGB (CEM 11) — float source
+} tex_compress_fmt_;
+
+typedef enum tex_compress_load_ {
+	// Load one encoder family: ASTC if this GPU can sample it, BC otherwise.
+	// One family is all a runtime needs — ASTC covers mobile, BC covers
+	// desktop — and the other family's shaders are never even loaded.
+	tex_compress_load_auto,
+	// Load every encoder regardless of sampling support. For validation:
+	// tex_compress_readback works without a sampleable output format, which
+	// is how the demo scene exercises ASTC encoders on desktop GPUs.
+	tex_compress_load_all,
+} tex_compress_load_;
+
+// The first init after a shutdown decides what's loaded; later calls no-op.
+void      tex_compress_init    (tex_compress_load_ load);
 void      tex_compress_shutdown(void);
 
-// Compress a source RGBA texture to BC1 with full mip chain.
-// Source must be skr_tex_fmt_rgba32 or rgba32_linear with mips generated.
-// enable_alpha: false = opaque 4-color mode, true = punch-through alpha
-skr_tex_t tex_compress_bc1     (skr_tex_t* source, bool enable_alpha);
+// True when this format's encoder is loaded AND its output format is
+// sampleable on this GPU — i.e. tex_compress/_cube will produce a texture
+// that can actually be displayed. Use this to pick formats at runtime
+// instead of probing skr_tex_fmt_is_supported directly, which knows nothing
+// about which encoder family got loaded.
+bool      tex_compress_available(tex_compress_fmt_ format);
 
-// Compress to BC7 (mode 6 only) with full mip chain. High-quality LDR RGBA
-// at 8 bpp — the desktop counterpart of ASTC 4x4. Single subset, effective
-// 8-bit endpoints, 4-bit shared indices; alpha is interpolated (not
-// punch-through).
-skr_tex_t tex_compress_bc7     (skr_tex_t* source);
+// Compress a 2D source texture, full mip chain. Returns an invalid texture
+// on failure (unsupported format, invalid source, allocation failure).
+skr_tex_t tex_compress         (skr_tex_t* source, tex_compress_fmt_ format);
 
-// Compress to BC6H UF16 (HDR RGB, mode 11 only) with full mip chain.
-// Source must be a float-format texture (rgba16/rgba32 float) with
-// non-negative values; alpha is ignored (BC6H samples as 1.0). Output is
-// skr_tex_fmt_bc6h_rgbuf — supported on all desktop hardware, absent on
-// mobile (use ASTC 8x8 HDR there). See docs/BC6H_format.md.
-skr_tex_t tex_compress_bc6h    (skr_tex_t* source);
-
-// Compress to ASTC 4x4 (RGB only) with full mip chain. Per-pixel weights,
-// 3-bit weights, 8-bit endpoints.
-skr_tex_t tex_compress_astc4x4 (skr_tex_t* source);
-
-// Compress to ASTC 6x6 with full mip chain. Multi-mode per-block selector
-// that picks among:
-//   CEM 8 (RGB-only) modes — 4x4 grid 3-bit, 6x6pp 2-bit
-//   CEM 12 (RGBA) modes    — 3x3 grid 3-bit, 5x5 grid 2-bit (BISE trit),
-//                            3x3 dual-plane 2-bit
-// per-block based on alpha pattern + reconstruction SSE. Opaque blocks
-// pay only ~2 mode evaluations (matches RGB-only encoder cost); blocks
-// with varying alpha pay 3.
-skr_tex_t tex_compress_astc6x6 (skr_tex_t* source);
-
-// Compress to ASTC 8x8 HDR (CEM 11 RGB direct), single-mode v1: 4x4 weight
-// grid, 2-bit weights, 8-bit endpoints. Source must be a float-format
-// texture (rgba16/rgba32 float). Alpha is ignored. Output format is
-// skr_tex_fmt_astc8x8_rgba_hdr (decoder produces FP16). Hardware support
-// required for sampling — AMD desktop will display magenta.
-skr_tex_t tex_compress_astc8x8hdr(skr_tex_t* source);
-
-///////////////////////////////////////////////////////////////////////////////
-// Cubemap compression
-//
 // Compress a 6-layer cubemap by running the 2D encoder on each face and
-// assembling the results into a compressed cubemap (sampled as a normal
-// TextureCube). The source must be a cubemap with a full mip chain in a format
-// the chosen encoder accepts (rgba32 / rgba32_linear for the LDR encoders,
-// float for the HDR encoder). The returned texture has skr_tex_flags_cubemap
-// and the same mip count as the source.
+// assembling the results (GPU-side copies, no readback). The returned
+// texture has skr_tex_flags_cubemap and the source's mip count. Cube
+// sources arrive as linear light (float and sRGB-view textures both Load
+// as linear), so the LDR formats gamma-encode into their sRGB output
+// format — quantizing in perceptual space keeps precision in the darks.
+skr_tex_t tex_compress_cube    (skr_tex_t* cube_source, tex_compress_fmt_ format);
+
+///////////////////////////////////////////////////////////////////////////////
+// Validation & profiling utilities (used by the tex-compress demo scene)
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_tex_t tex_compress_cube_bc1       (skr_tex_t* cube_source);  // BC1 (opaque; source read as linear light, output sRGB-encoded)
-skr_tex_t tex_compress_cube_bc6h      (skr_tex_t* cube_source);  // BC6H UF16 (float source)
-skr_tex_t tex_compress_cube_bc7       (skr_tex_t* cube_source);  // BC7 (source read as linear light, output sRGB-encoded)
-skr_tex_t tex_compress_cube_astc4x4   (skr_tex_t* cube_source);  // ASTC 4x4 (linear)
-skr_tex_t tex_compress_cube_astc6x6   (skr_tex_t* cube_source);  // ASTC 6x6 (linear)
-skr_tex_t tex_compress_cube_astc8x8hdr(skr_tex_t* cube_source);  // ASTC 8x8 HDR (float source)
+// Compress mip 0 into a host-visible buffer, wait for the GPU, and return
+// the raw block bytes (malloc'd; caller frees). Desktop-only — stalls the
+// GPU. This is what feeds the auto-saved .astc/.dds regression artifacts;
+// it works even when the output format isn't sampleable on this hardware,
+// since no destination texture is involved.
+uint8_t*  tex_compress_readback(skr_tex_t* source, tex_compress_fmt_ format, int32_t* out_size);
 
-// Readback-only variants: allocate a host-visible buffer, dispatch the
-// compute shader at mip 0, wait for GPU, and return malloc'd bytes.
-// Desktop-only; stalls the GPU. Caller frees the returned pointer.
-uint8_t*  tex_compress_bc6h_readback      (skr_tex_t* source, int32_t* out_size);
-uint8_t*  tex_compress_bc7_readback       (skr_tex_t* source, int32_t* out_size);
-uint8_t*  tex_compress_astc4x4_readback   (skr_tex_t* source, int32_t* out_size);
-uint8_t*  tex_compress_astc6x6_readback   (skr_tex_t* source, int32_t* out_size);
-uint8_t*  tex_compress_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_size);
-
-// Profile-only variants: dispatch just the compute shader at mip 0 into a
-// cached device-local throwaway buffer. No texture, no readback, no buffer
-// reallocation per call — for per-frame profiling where you want to measure
-// the encoder shader cost, not the surrounding texture-upload plumbing.
-void      tex_compress_bc1_profile       (skr_tex_t* source, bool enable_alpha);
-void      tex_compress_bc6h_profile      (skr_tex_t* source);
-void      tex_compress_bc7_profile       (skr_tex_t* source);
-void      tex_compress_astc4x4_profile   (skr_tex_t* source);
-void      tex_compress_astc6x6_profile   (skr_tex_t* source);
-void      tex_compress_astc8x8hdr_profile(skr_tex_t* source);
+// Dispatch just the encoder at mip 0 into a cached throwaway buffer — no
+// texture, no readback, no per-call allocation. For per-frame profiling
+// where you want the encoder shader cost on the perf graph, not the
+// surrounding texture-upload plumbing.
+void      tex_compress_profile (skr_tex_t* source, tex_compress_fmt_ format);

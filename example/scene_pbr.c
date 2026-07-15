@@ -172,15 +172,15 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 	// Same policy as scene_gltf: HDR content prefers BC6H (desktop), then
 	// ASTC 8x8 HDR (mobile); LDR content falls back to BC1 on desktop.
 	scene->skybox_is_hdr = (equirect_format == skr_tex_fmt_rg11b10uf);
-	tex_compress_init();
-	if (scene->skybox_is_hdr && skr_tex_fmt_is_supported(skr_tex_fmt_bc6h_rgbuf, skr_tex_flags_readable, 1)) {
-		scene->cubemap_compressed  = tex_compress_cube_bc6h(&scene->cubemap_texture);
+	tex_compress_init(tex_compress_load_auto);
+	if (scene->skybox_is_hdr && tex_compress_available(tex_compress_fmt_bc6h)) {
+		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_bc6h);
 		scene->compressed_fmt_name = "BC6H";
-	} else if (skr_tex_fmt_is_supported(skr_tex_fmt_astc8x8_rgba_hdr, skr_tex_flags_readable, 1)) {
-		scene->cubemap_compressed  = tex_compress_cube_astc8x8hdr(&scene->cubemap_texture);
+	} else if (tex_compress_available(tex_compress_fmt_astc8x8hdr)) {
+		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_astc8x8hdr);
 		scene->compressed_fmt_name = "ASTC 8x8 HDR";
-	} else if (!scene->skybox_is_hdr && skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgb_srgb, skr_tex_flags_readable, 1)) {
-		scene->cubemap_compressed  = tex_compress_cube_bc1(&scene->cubemap_texture);
+	} else if (!scene->skybox_is_hdr && tex_compress_available(tex_compress_fmt_bc1)) {
+		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_bc1);
 		scene->compressed_fmt_name = "BC1";
 	}
 	if (skr_tex_is_valid(&scene->cubemap_compressed)) {

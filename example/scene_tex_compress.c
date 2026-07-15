@@ -22,16 +22,6 @@
 // Demonstrates runtime texture compression with BC1 (desktop) or ASTC (mobile),
 // plus ASTC 8x8 HDR for float content.
 
-typedef enum {
-	compress_fmt_none,
-	compress_fmt_bc1,
-	compress_fmt_bc7,
-	compress_fmt_bc6h,
-	compress_fmt_astc4x4,
-	compress_fmt_astc6x6,
-	compress_fmt_astc8x8hdr,
-} compress_fmt_;
-
 typedef struct {
 	scene_t        base;
 	skr_mesh_t     quad_mesh;
@@ -52,7 +42,7 @@ typedef struct {
 	double         psnr_db;          // Mip-0 PSNR vs original; <0 = not measured
 
 	// Format info
-	compress_fmt_  current_format;
+	tex_compress_fmt_ current_format;
 	bool           bc1_supported;
 	bool           bc7_supported;           // BC7 sampling — desktop yes, mobile no
 	bool           bc6h_supported;          // BC6H UF16 sampling — desktop yes, mobile no
@@ -147,34 +137,34 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	// Auto-switch format when image type changes — HDR file forces an HDR
 	// format (BC6H on desktop, ASTC 8x8 HDR otherwise); non-HDR file falls
 	// back from HDR-only selection to a sensible LDR default.
-	bool is_hdr_fmt = scene->current_format == compress_fmt_bc6h ||
-	                  scene->current_format == compress_fmt_astc8x8hdr;
+	bool is_hdr_fmt = scene->current_format == tex_compress_fmt_bc6h ||
+	                  scene->current_format == tex_compress_fmt_astc8x8hdr;
 	if (is_hdr && !is_hdr_fmt) {
-		scene->current_format = scene->bc6h_supported ? compress_fmt_bc6h : compress_fmt_astc8x8hdr;
+		scene->current_format = scene->bc6h_supported ? tex_compress_fmt_bc6h : tex_compress_fmt_astc8x8hdr;
 	} else if (!is_hdr && is_hdr_fmt) {
-		scene->current_format = scene->bc1_supported ? compress_fmt_bc1 : compress_fmt_astc6x6;
+		scene->current_format = scene->bc1_supported ? tex_compress_fmt_bc1_alpha : tex_compress_fmt_astc6x6;
 	}
 
 	// Use the format selected in UI (current_format is set by the radio buttons)
 	skr_tex_fmt_ tex_fmt  = skr_tex_fmt_none;
 	const char*  fmt_name = "none";
 
-	if (scene->current_format == compress_fmt_bc1 && scene->bc1_supported) {
+	if (scene->current_format == tex_compress_fmt_bc1_alpha && scene->bc1_supported) {
 		tex_fmt  = skr_tex_fmt_bc1_rgba_srgb;
 		fmt_name = "BC1";
-	} else if (scene->current_format == compress_fmt_bc7 && scene->bc7_supported) {
+	} else if (scene->current_format == tex_compress_fmt_bc7 && scene->bc7_supported) {
 		tex_fmt  = skr_tex_fmt_bc7_rgba_srgb;
 		fmt_name = "BC7";
-	} else if (scene->current_format == compress_fmt_bc6h && scene->bc6h_supported) {
+	} else if (scene->current_format == tex_compress_fmt_bc6h && scene->bc6h_supported) {
 		tex_fmt  = skr_tex_fmt_bc6h_rgbuf;
 		fmt_name = "BC6H";
-	} else if (scene->current_format == compress_fmt_astc4x4 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
+	} else if (scene->current_format == tex_compress_fmt_astc4x4 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
 		tex_fmt  = skr_tex_fmt_astc4x4_rgba_srgb;
 		fmt_name = "ASTC4x4";
-	} else if (scene->current_format == compress_fmt_astc6x6 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
+	} else if (scene->current_format == tex_compress_fmt_astc6x6 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
 		tex_fmt  = skr_tex_fmt_astc6x6_rgba_srgb;
 		fmt_name = "ASTC6x6";
-	} else if (scene->current_format == compress_fmt_astc8x8hdr) {
+	} else if (scene->current_format == tex_compress_fmt_astc8x8hdr) {
 		tex_fmt  = skr_tex_fmt_astc8x8_rgba_hdr;
 		fmt_name = "ASTC8x8 HDR";
 	} else {
@@ -201,28 +191,17 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	skr_tex_set_name(&scene->texture_source, "source_for_gpu");
 	skr_tex_generate_mips(&scene->texture_source, NULL);
 
+	// Skip the displayable-texture path on GPUs that can't sample the output
+	// (AMD desktop ASTC) — it'd spam the validation layer. The auto-save
+	// below still exercises the encoder via buffer readback.
+	bool displayable =
+		!((scene->current_format == tex_compress_fmt_astc4x4 ||
+		   scene->current_format == tex_compress_fmt_astc6x6) && !scene->astc6x6_supported) &&
+		!(scene->current_format == tex_compress_fmt_astc8x8hdr && !scene->astc8x8hdr_supported);
+
 	uint64_t start_ns = ska_time_get_elapsed_ns();
-	switch (scene->current_format) {
-		case compress_fmt_bc1:     scene->texture_compressed = tex_compress_bc1    (&scene->texture_source, true); break;
-		case compress_fmt_bc7:     scene->texture_compressed = tex_compress_bc7    (&scene->texture_source);       break;
-		case compress_fmt_bc6h:    scene->texture_compressed = tex_compress_bc6h   (&scene->texture_source);       break;
-		// Skip the displayable-texture path on GPUs that can't sample
-		// ASTC (AMD desktop) — it'd spam the validation layer. The
-		// auto-save below exercises the encoder via buffer readback.
-		case compress_fmt_astc4x4:
-			if (scene->astc6x6_supported)
-				scene->texture_compressed = tex_compress_astc4x4(&scene->texture_source);
-			break;
-		case compress_fmt_astc6x6:
-			if (scene->astc6x6_supported)
-				scene->texture_compressed = tex_compress_astc6x6(&scene->texture_source);
-			break;
-		case compress_fmt_astc8x8hdr:
-			if (scene->astc8x8hdr_supported)
-				scene->texture_compressed = tex_compress_astc8x8hdr(&scene->texture_source);
-			break;
-		default: break;
-	}
+	if (displayable)
+		scene->texture_compressed = tex_compress(&scene->texture_source, scene->current_format);
 	uint64_t end_ns = ska_time_get_elapsed_ns();
 
 	scene->gpu_compress_time_ms = (end_ns - start_ns) / 1000000.0;
@@ -251,43 +230,35 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	// Desktop only; no writable CWD on Android, and the validator is
 	// desktop-only anyway.
 #if !defined(__ANDROID__)
-	int32_t  astc_size = 0;
-	uint8_t* astc_data = NULL;
-	int32_t  astc_block_w = 0, astc_block_h = 0;
+	int32_t  astc_size  = 0;
+	uint8_t* astc_data  = NULL;
+	int32_t  astc_block = 0;
 	switch (scene->current_format) {
-		case compress_fmt_astc4x4:
-			astc_data = tex_compress_astc4x4_readback(&scene->texture_source, &astc_size);
-			astc_block_w = 4; astc_block_h = 4;
-			break;
-		case compress_fmt_astc6x6:
-			astc_data = tex_compress_astc6x6_readback(&scene->texture_source, &astc_size);
-			astc_block_w = 6; astc_block_h = 6;
-			break;
-		case compress_fmt_astc8x8hdr:
-			astc_data = tex_compress_astc8x8hdr_readback(&scene->texture_source, &astc_size);
-			astc_block_w = 8; astc_block_h = 8;
-			break;
+		case tex_compress_fmt_astc4x4:    astc_block = 4; break;
+		case tex_compress_fmt_astc6x6:    astc_block = 6; break;
+		case tex_compress_fmt_astc8x8hdr: astc_block = 8; break;
 		default: break;
 	}
+	if (astc_block)
+		astc_data = tex_compress_readback(&scene->texture_source, scene->current_format, &astc_size);
 	if (astc_data) {
 		const char* out_path = "astc_output.astc";
-		if (astc_write_file(out_path, width, height, astc_block_w, astc_block_h, astc_data, (size_t)astc_size))
+		if (astc_write_file(out_path, width, height, astc_block, astc_block, astc_data, (size_t)astc_size))
 			su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, astc_size, path);
 		else
 			su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
 		free(astc_data);
-	} else if (scene->current_format == compress_fmt_astc4x4 ||
-	           scene->current_format == compress_fmt_astc6x6 ||
-	           scene->current_format == compress_fmt_astc8x8hdr) {
+	} else if (scene->current_format == tex_compress_fmt_astc4x4 ||
+	           scene->current_format == tex_compress_fmt_astc6x6 ||
+	           scene->current_format == tex_compress_fmt_astc8x8hdr) {
 		su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
 	}
 
 	// The BC formats use a DDS container instead of .astc.
-	if (scene->current_format == compress_fmt_bc6h || scene->current_format == compress_fmt_bc7) {
-		bool     is_bc7   = scene->current_format == compress_fmt_bc7;
+	if (scene->current_format == tex_compress_fmt_bc6h || scene->current_format == tex_compress_fmt_bc7) {
+		bool     is_bc7   = scene->current_format == tex_compress_fmt_bc7;
 		int32_t  bc_size  = 0;
-		uint8_t* bc_data  = is_bc7 ? tex_compress_bc7_readback (&scene->texture_source, &bc_size)
-		                           : tex_compress_bc6h_readback(&scene->texture_source, &bc_size);
+		uint8_t* bc_data  = tex_compress_readback(&scene->texture_source, scene->current_format, &bc_size);
 		if (bc_data) {
 			const char* out_path = is_bc7 ? "bc7_output.dds" : "bc6h_output.dds";
 			if (_dds_write_bc(out_path, width, height, is_bc7 ? 99u : 95u, bc_data, (size_t)bc_size))
@@ -342,7 +313,10 @@ static scene_t* _scene_texcomp_create(void) {
 	scene->brightness   = 1.0f;
 
 	// Initialize GPU compression and quality measurement
-	tex_compress_init();
+	// load_all: this scene validates encoders via readback even when the
+	// output format isn't sampleable (ASTC on desktop) — see the format
+	// dropdown's validate-only entries.
+	tex_compress_init(tex_compress_load_all);
 	tex_psnr_init();
 
 	// Check format support
@@ -370,7 +344,7 @@ static scene_t* _scene_texcomp_create(void) {
 
 	// Default format: prefer BC1 (displayable on desktop); ASTC6x6 otherwise —
 	// it always at least runs the encoder via the validate-only path.
-	scene->current_format = scene->bc1_supported ? compress_fmt_bc1 : compress_fmt_astc6x6;
+	scene->current_format = scene->bc1_supported ? tex_compress_fmt_bc1_alpha : tex_compress_fmt_astc6x6;
 
 	// Default file path
 	strncpy(scene->file_path, "tree.png", sizeof(scene->file_path) - 1);
@@ -429,15 +403,7 @@ static void _scene_texcomp_update(scene_t* base, float delta_time) {
 	// creation, no buffer copy, no per-frame allocation. This gives an
 	// apples-to-apples shader cost comparison on the perf graph.
 	if (skr_tex_is_valid(&scene->texture_source)) {
-		switch (scene->current_format) {
-			case compress_fmt_bc1:        tex_compress_bc1_profile       (&scene->texture_source, true); break;
-			case compress_fmt_bc7:        tex_compress_bc7_profile       (&scene->texture_source);       break;
-			case compress_fmt_bc6h:       tex_compress_bc6h_profile      (&scene->texture_source);       break;
-			case compress_fmt_astc4x4:    tex_compress_astc4x4_profile   (&scene->texture_source);       break;
-			case compress_fmt_astc6x6:    tex_compress_astc6x6_profile   (&scene->texture_source);       break;
-			case compress_fmt_astc8x8hdr: tex_compress_astc8x8hdr_profile(&scene->texture_source);       break;
-			default: break;
-		}
+		tex_compress_profile(&scene->texture_source, scene->current_format);
 	}
 }
 
@@ -537,29 +503,29 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 		int         count       = 0;
 
 		if (scene->bc1_supported) {
-			labels[count] = "BC1 (DXT1)";                      values[count++] = compress_fmt_bc1;
+			labels[count] = "BC1 (DXT1)";                      values[count++] = tex_compress_fmt_bc1_alpha;
 		}
 		if (scene->bc7_supported) {
-			labels[count] = "BC7";                             values[count++] = compress_fmt_bc7;
+			labels[count] = "BC7";                             values[count++] = tex_compress_fmt_bc7;
 		}
 		if (scene->bc6h_supported) {
-			labels[count] = "BC6H (HDR)";                      values[count++] = compress_fmt_bc6h;
+			labels[count] = "BC6H (HDR)";                      values[count++] = tex_compress_fmt_bc6h;
 		}
 		if (scene->astc6x6_supported || scene->astc6x6_validate_only) {
-			labels[count] = "ASTC 4x4";       values[count++] = compress_fmt_astc4x4;
-			labels[count] = "ASTC 6x6";       values[count++] = compress_fmt_astc6x6;
+			labels[count] = "ASTC 4x4";       values[count++] = tex_compress_fmt_astc4x4;
+			labels[count] = "ASTC 6x6";       values[count++] = tex_compress_fmt_astc6x6;
 		}
 		// Always offer ASTC HDR: encoder runs on any GPU even when the
 		// output format isn't sampleable (validate-only path saves the .astc
 		// file, magenta on screen).
-		labels[count] = "ASTC 8x8 HDR";   values[count++] = compress_fmt_astc8x8hdr;
+		labels[count] = "ASTC 8x8 HDR";   values[count++] = tex_compress_fmt_astc8x8hdr;
 
 		int selected = 0;
 		for (int i = 0; i < count; i++) {
 			if (values[i] == (int)scene->current_format) { selected = i; break; }
 		}
 		if (igCombo_Str_arr("Format", &selected, labels, count, -1)) {
-			scene->current_format = (compress_fmt_)values[selected];
+			scene->current_format = (tex_compress_fmt_)values[selected];
 			scene->load_requested = true;
 		}
 	}
@@ -593,12 +559,12 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 	if (scene->img_width > 0) {
 		const char* fmt_name = "None";
 		switch (scene->current_format) {
-			case compress_fmt_bc1:        fmt_name = "BC1 (DXT1)";   break;
-			case compress_fmt_bc7:        fmt_name = "BC7";          break;
-			case compress_fmt_bc6h:       fmt_name = "BC6H";         break;
-			case compress_fmt_astc4x4:    fmt_name = "ASTC 4x4";     break;
-			case compress_fmt_astc6x6:    fmt_name = "ASTC 6x6";     break;
-			case compress_fmt_astc8x8hdr: fmt_name = "ASTC 8x8 HDR"; break;
+			case tex_compress_fmt_bc1_alpha:        fmt_name = "BC1 (DXT1)";   break;
+			case tex_compress_fmt_bc7:        fmt_name = "BC7";          break;
+			case tex_compress_fmt_bc6h:       fmt_name = "BC6H";         break;
+			case tex_compress_fmt_astc4x4:    fmt_name = "ASTC 4x4";     break;
+			case tex_compress_fmt_astc6x6:    fmt_name = "ASTC 6x6";     break;
+			case tex_compress_fmt_astc8x8hdr: fmt_name = "ASTC 8x8 HDR"; break;
 			default: break;
 		}
 
