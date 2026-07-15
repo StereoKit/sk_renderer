@@ -16,6 +16,7 @@
 typedef struct {
 	skr_shader_t  bc1_shader;
 	skr_shader_t  bc6h_shader;
+	skr_shader_t  bc7_shader;
 	skr_shader_t  astc4x4_shader;
 	skr_shader_t  astc6x6_shader;
 	skr_shader_t  astc8x8hdr_shader;
@@ -27,6 +28,8 @@ typedef struct {
 	skr_compute_t bc1_compute_alpha;
 	skr_compute_t bc1_compute_srgb;
 	skr_compute_t bc6h_compute;
+	skr_compute_t bc7_compute;
+	skr_compute_t bc7_compute_srgb;
 	skr_compute_t astc4x4_compute;
 	skr_compute_t astc6x6_compute;
 	skr_compute_t astc8x8hdr_compute;
@@ -50,6 +53,7 @@ void tex_compress_gpu_init(void) {
 
 	g_tc.bc1_shader        = su_shader_load("shaders/bc1_compress.hlsl.sks",        "bc1_compress");
 	g_tc.bc6h_shader       = su_shader_load("shaders/bc6h_compress.hlsl.sks",       "bc6h_compress");
+	g_tc.bc7_shader        = su_shader_load("shaders/bc7_compress.hlsl.sks",        "bc7_compress");
 	g_tc.astc4x4_shader    = su_shader_load("shaders/astc4x4_compress.hlsl.sks",    "astc4x4_compress");
 	g_tc.astc6x6_shader    = su_shader_load("shaders/astc6x6_compress.hlsl.sks",    "astc6x6_compress");
 	g_tc.astc8x8hdr_shader = su_shader_load("shaders/astc8x8hdr_compress.hlsl.sks", "astc8x8hdr_compress");
@@ -62,6 +66,11 @@ void tex_compress_gpu_init(void) {
 		skr_compute_create(&g_tc.bc1_shader, (skr_compute_info_t){ .spec_constants = &srgb_on,  .spec_constant_count = 1 }, &g_tc.bc1_compute_srgb);
 	}
 	if (skr_shader_is_valid(&g_tc.bc6h_shader))       skr_compute_create(&g_tc.bc6h_shader,       (skr_compute_info_t){0}, &g_tc.bc6h_compute);
+	if (skr_shader_is_valid(&g_tc.bc7_shader)) {
+		skr_spec_constant_t srgb_on = { .name = "SRGB_ENCODE", .value = 1.0 };
+		skr_compute_create(&g_tc.bc7_shader, (skr_compute_info_t){0}, &g_tc.bc7_compute);
+		skr_compute_create(&g_tc.bc7_shader, (skr_compute_info_t){ .spec_constants = &srgb_on, .spec_constant_count = 1 }, &g_tc.bc7_compute_srgb);
+	}
 	if (skr_shader_is_valid(&g_tc.astc4x4_shader))    skr_compute_create(&g_tc.astc4x4_shader,    (skr_compute_info_t){0}, &g_tc.astc4x4_compute);
 	if (skr_shader_is_valid(&g_tc.astc6x6_shader))    skr_compute_create(&g_tc.astc6x6_shader,    (skr_compute_info_t){0}, &g_tc.astc6x6_compute);
 	if (skr_shader_is_valid(&g_tc.astc8x8hdr_shader)) skr_compute_create(&g_tc.astc8x8hdr_shader, (skr_compute_info_t){0}, &g_tc.astc8x8hdr_compute);
@@ -75,11 +84,14 @@ void tex_compress_gpu_shutdown(void) {
 	if (skr_compute_is_valid(&g_tc.bc1_compute_alpha))  skr_compute_destroy(&g_tc.bc1_compute_alpha);
 	if (skr_compute_is_valid(&g_tc.bc1_compute_srgb))   skr_compute_destroy(&g_tc.bc1_compute_srgb);
 	if (skr_compute_is_valid(&g_tc.bc6h_compute))       skr_compute_destroy(&g_tc.bc6h_compute);
+	if (skr_compute_is_valid(&g_tc.bc7_compute))        skr_compute_destroy(&g_tc.bc7_compute);
+	if (skr_compute_is_valid(&g_tc.bc7_compute_srgb))   skr_compute_destroy(&g_tc.bc7_compute_srgb);
 	if (skr_compute_is_valid(&g_tc.astc4x4_compute))    skr_compute_destroy(&g_tc.astc4x4_compute);
 	if (skr_compute_is_valid(&g_tc.astc6x6_compute))    skr_compute_destroy(&g_tc.astc6x6_compute);
 	if (skr_compute_is_valid(&g_tc.astc8x8hdr_compute)) skr_compute_destroy(&g_tc.astc8x8hdr_compute);
 	if (skr_shader_is_valid (&g_tc.bc1_shader))         skr_shader_destroy (&g_tc.bc1_shader);
 	if (skr_shader_is_valid (&g_tc.bc6h_shader))        skr_shader_destroy (&g_tc.bc6h_shader);
+	if (skr_shader_is_valid (&g_tc.bc7_shader))         skr_shader_destroy (&g_tc.bc7_shader);
 	if (skr_shader_is_valid (&g_tc.astc4x4_shader))     skr_shader_destroy (&g_tc.astc4x4_shader);
 	if (skr_shader_is_valid (&g_tc.astc6x6_shader))     skr_shader_destroy (&g_tc.astc6x6_shader);
 	if (skr_shader_is_valid (&g_tc.astc8x8hdr_shader))  skr_shader_destroy (&g_tc.astc8x8hdr_shader);
@@ -182,6 +194,10 @@ skr_tex_t tex_compress_gpu_bc6h(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.bc6h_compute, source, skr_tex_fmt_bc6h_rgbuf, 4, 4, 16);
 }
 
+skr_tex_t tex_compress_gpu_bc7(skr_tex_t* source) {
+	return _compress_gpu(&g_tc.bc7_compute, source, skr_tex_fmt_bc7_rgba_srgb, 4, 4, 16);
+}
+
 skr_tex_t tex_compress_gpu_astc4x4(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.astc4x4_compute, source, skr_tex_fmt_astc4x4_rgba_srgb, 4, 4, 16);
 }
@@ -268,6 +284,12 @@ skr_tex_t tex_compress_gpu_cube_bc6h(skr_tex_t* cube_source) {
 	return _compress_gpu_cube(&g_tc.bc6h_compute, cube_source, skr_tex_fmt_bc6h_rgbuf, 4, 4, 16);
 }
 
+skr_tex_t tex_compress_gpu_cube_bc7(skr_tex_t* cube_source) {
+	// Cube sources arrive as linear light — gamma-encode into an sRGB BC7,
+	// same rationale as the BC1 cube path.
+	return _compress_gpu_cube(&g_tc.bc7_compute_srgb, cube_source, skr_tex_fmt_bc7_rgba_srgb, 4, 4, 16);
+}
+
 skr_tex_t tex_compress_gpu_cube_astc4x4(skr_tex_t* cube_source) {
 	return _compress_gpu_cube(&g_tc.astc4x4_compute, cube_source, skr_tex_fmt_astc4x4_rgba, 4, 4, 16);
 }
@@ -347,6 +369,10 @@ uint8_t* tex_compress_gpu_bc6h_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.bc6h_compute, source, 4, 4, 16, out_size);
 }
 
+uint8_t* tex_compress_gpu_bc7_readback(skr_tex_t* source, int32_t* out_size) {
+	return _compress_readback(&g_tc.bc7_compute, source, 4, 4, 16, out_size);
+}
+
 uint8_t* tex_compress_gpu_astc4x4_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.astc4x4_compute, source, 4, 4, 16, out_size);
 }
@@ -410,6 +436,10 @@ void tex_compress_gpu_bc1_profile(skr_tex_t* source, bool enable_alpha) {
 
 void tex_compress_gpu_bc6h_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.bc6h_compute, source, 4, 4, 16);
+}
+
+void tex_compress_gpu_bc7_profile(skr_tex_t* source) {
+	_profile_dispatch(&g_tc.bc7_compute, source, 4, 4, 16);
 }
 
 void tex_compress_gpu_astc4x4_profile(skr_tex_t* source) {
