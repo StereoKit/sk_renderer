@@ -71,14 +71,24 @@ quality_metrics_t quality_compare_rgba8(const uint8_t* a, const uint8_t* b, int3
 	const int32_t stride = 4;
 	const int64_t n      = (int64_t)width * (int64_t)height;
 
-	double sq_r = 0, sq_g = 0, sq_b = 0;
+	double sq_r = 0, sq_g = 0, sq_b = 0, sq_a = 0, sq_pm = 0;
 	for (int64_t i = 0; i < n; i++) {
 		double dr = (double)a[i * stride + 0] - (double)b[i * stride + 0];
 		double dg = (double)a[i * stride + 1] - (double)b[i * stride + 1];
 		double db = (double)a[i * stride + 2] - (double)b[i * stride + 2];
+		double da = (double)a[i * stride + 3] - (double)b[i * stride + 3];
 		sq_r += dr * dr;
 		sq_g += dg * dg;
 		sq_b += db * db;
+		sq_a += da * da;
+
+		// Premultiplied compare: what compositing actually shows
+		double aa = (double)a[i * stride + 3] / 255.0;
+		double ba = (double)b[i * stride + 3] / 255.0;
+		for (int32_t c = 0; c < 3; c++) {
+			double d = (double)a[i * stride + c] * aa - (double)b[i * stride + c] * ba;
+			sq_pm += d * d;
+		}
 	}
 
 	double mse_r   = sq_r / (double)n;
@@ -90,6 +100,8 @@ quality_metrics_t quality_compare_rgba8(const uint8_t* a, const uint8_t* b, int3
 	out.psnr_g   = _psnr(mse_g);
 	out.psnr_b   = _psnr(mse_b);
 	out.psnr_rgb = _psnr(mse_rgb);
+	out.psnr_a   = _psnr(sq_a / (double)n);
+	out.psnr_pm  = _psnr(sq_pm / (double)(n * 3));
 
 	out.ssim_r   = _ssim_channel(a, b, width, height, stride, 0);
 	out.ssim_g   = _ssim_channel(a, b, width, height, stride, 1);

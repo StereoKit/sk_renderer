@@ -99,8 +99,8 @@ static bool _astcenc_encode(const char* astcenc, const char* png_path, const cha
 
 static void _print_row(const char* label, int64_t bytes, const quality_metrics_t* m) {
 	if (bytes >= 0) {
-		printf("  %-24s  %8lld B   PSNR(RGB) %5.2f dB   PSNR(R/G/B) %5.2f/%5.2f/%5.2f   SSIM %.4f\n",
-			label, (long long)bytes, m->psnr_rgb, m->psnr_r, m->psnr_g, m->psnr_b, m->ssim_rgb);
+		printf("  %-24s  %8lld B   PSNR(RGB) %5.2f dB   PSNR(R/G/B/A) %5.2f/%5.2f/%5.2f/%5.2f   PSNR(PM) %5.2f   SSIM %.4f\n",
+			label, (long long)bytes, m->psnr_rgb, m->psnr_r, m->psnr_g, m->psnr_b, m->psnr_a, m->psnr_pm, m->ssim_rgb);
 	} else {
 		printf("  %-24s  (missing)\n", label);
 	}
