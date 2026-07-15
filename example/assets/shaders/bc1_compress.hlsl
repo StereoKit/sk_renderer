@@ -117,7 +117,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 	// LS_ROUNDS == 1 is the plain bounding-box encoder; 2 adds one
 	// least-squares refinement pass (see below).
-	#define LS_ROUNDS 2
+	#define LS_ROUNDS 3
 
 	// Two rounds: round 0 assigns indices from the bounding-box endpoints and
 	// accumulates least-squares sums; between rounds we solve for the
@@ -265,6 +265,51 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 		c0 = pack565(ep0);
 		c1 = pack565(ep1);
+	}
+
+	// 3-color-mode trial for the opaque pipeline: BC1's c0 <= c1 ordering
+	// gives {c0, midpoint, c1} plus a FREE BLACK at index 3 — dark texels
+	// often sit closer to black than to anything on the color axis. RGB-only
+	// usage: in RGBA views index 3 also decodes alpha=0, so the punch-through
+	// pipeline must not use it for opaque content (compiled out there).
+	if (!ENABLE_ALPHA) {
+		// Decoder picks 3-color mode from the raw 16-bit compare c0 <= c1.
+		uint c0s = min(best_c0, best_c1);
+		uint c1s = max(best_c0, best_c1);
+
+		float3 e0f, e1f;
+		{
+			uint r0 = (c0s >> 11) & 0x1F; uint g0 = (c0s >> 5) & 0x3F; uint b0 = c0s & 0x1F;
+			uint r1 = (c1s >> 11) & 0x1F; uint g1 = (c1s >> 5) & 0x3F; uint b1 = c1s & 0x1F;
+			e0f = float3((r0 << 3) | (r0 >> 2), (g0 << 2) | (g0 >> 4), (b0 << 3) | (b0 >> 2)) / 255.0;
+			e1f = float3((r1 << 3) | (r1 >> 2), (g1 << 2) | (g1 >> 4), (b1 << 3) | (b1 >> 2)) / 255.0;
+		}
+		float3 midf = (e0f + e1f) * 0.5;
+
+		// 16 pixels x 4 candidates — exhaustive nearest beats projection
+		// tricks at this size, and handles off-axis black correctly.
+		uint  indices3 = 0;
+		float sse3     = 0;
+		[unroll] for (uint j = 0; j < 16; j++) {
+			float3 p  = pixels[j];
+			float3 d0 = p - e0f;  float err  = dot(d0, d0);
+			uint   idx = 0;
+			float3 d1 = p - e1f;  float err1 = dot(d1, d1);
+			if (err1 < err) { err = err1; idx = 1u; }
+			float3 dm = p - midf; float errm = dot(dm, dm);
+			if (errm < err) { err = errm; idx = 2u; }
+			float  errb = dot(p, p);
+			if (errb < err) { err = errb; idx = 3u; }
+			indices3 |= idx << (j * 2);
+			sse3     += err;
+		}
+
+		if (sse3 < best_sse) {
+			best_sse     = sse3;
+			best_indices = indices3;
+			best_c0      = c0s;
+			best_c1      = c1s;
+		}
 	}
 
 	// Pack output: [c0_lo, c0_hi, c1_lo, c1_hi] [idx0..idx3]
