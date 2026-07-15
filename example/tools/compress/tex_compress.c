@@ -3,8 +3,8 @@
 // Copyright (c) 2026 Nick Klingensmith
 // Copyright (c) 2026 Qualcomm Technologies, Inc.
 
-#include "tex_compress_gpu.h"
-#include "scene_util.h"
+#include "tex_compress.h"
+#include "../scene_util.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -40,15 +40,15 @@ typedef struct {
 	// texture; grown as needed.
 	skr_buffer_t  profile_buffer;
 	uint32_t      profile_buffer_bytes;
-} tex_compress_gpu_state_t;
+} tex_compress_state_t;
 
-static tex_compress_gpu_state_t g_tc = {0};
+static tex_compress_state_t g_tc = {0};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Init / Shutdown
 ///////////////////////////////////////////////////////////////////////////////
 
-void tex_compress_gpu_init(void) {
+void tex_compress_init(void) {
 	if (g_tc.initialized) return;
 
 	g_tc.bc1_shader        = su_shader_load("shaders/bc1_compress.hlsl.sks",        "bc1_compress");
@@ -78,7 +78,7 @@ void tex_compress_gpu_init(void) {
 	g_tc.initialized = true;
 }
 
-void tex_compress_gpu_shutdown(void) {
+void tex_compress_shutdown(void) {
 	if (skr_buffer_is_valid (&g_tc.profile_buffer))     skr_buffer_destroy (&g_tc.profile_buffer);
 	if (skr_compute_is_valid(&g_tc.bc1_compute_opaque)) skr_compute_destroy(&g_tc.bc1_compute_opaque);
 	if (skr_compute_is_valid(&g_tc.bc1_compute_alpha))  skr_compute_destroy(&g_tc.bc1_compute_alpha);
@@ -95,7 +95,7 @@ void tex_compress_gpu_shutdown(void) {
 	if (skr_shader_is_valid (&g_tc.astc4x4_shader))     skr_shader_destroy (&g_tc.astc4x4_shader);
 	if (skr_shader_is_valid (&g_tc.astc6x6_shader))     skr_shader_destroy (&g_tc.astc6x6_shader);
 	if (skr_shader_is_valid (&g_tc.astc8x8hdr_shader))  skr_shader_destroy (&g_tc.astc8x8hdr_shader);
-	g_tc = (tex_compress_gpu_state_t){0};
+	g_tc = (tex_compress_state_t){0};
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -106,11 +106,11 @@ static skr_tex_t _compress_gpu(skr_compute_t* compute, skr_tex_t* source, skr_te
 	skr_tex_t result = {0};
 
 	if (!g_tc.initialized || !skr_compute_is_valid(compute)) {
-		su_log(su_log_warning, "tex_compress_gpu: not initialized or compute invalid");
+		su_log(su_log_warning, "tex_compress: not initialized or compute invalid");
 		return result;
 	}
 	if (!skr_tex_is_valid(source)) {
-		su_log(su_log_warning, "tex_compress_gpu: source texture invalid");
+		su_log(su_log_warning, "tex_compress: source texture invalid");
 		return result;
 	}
 
@@ -133,7 +133,7 @@ static skr_tex_t _compress_gpu(skr_compute_t* compute, skr_tex_t* source, skr_te
 	if (skr_buffer_create(NULL, total_blocks, block_bytes,
 			skr_buffer_type_storage, skr_use_compute_readwrite,
 			&output_buffer) != skr_err_success) {
-		su_log(su_log_warning, "tex_compress_gpu: failed to allocate output buffer (%u blocks)", total_blocks);
+		su_log(su_log_warning, "tex_compress: failed to allocate output buffer (%u blocks)", total_blocks);
 		return result;
 	}
 	skr_buffer_set_name(&output_buffer, "tc_gpu_output");
@@ -185,28 +185,28 @@ static skr_tex_t _compress_gpu(skr_compute_t* compute, skr_tex_t* source, skr_te
 // Public API
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_tex_t tex_compress_gpu_bc1(skr_tex_t* source, bool enable_alpha) {
+skr_tex_t tex_compress_bc1(skr_tex_t* source, bool enable_alpha) {
 	return _compress_gpu(enable_alpha ? &g_tc.bc1_compute_alpha : &g_tc.bc1_compute_opaque,
 		source, skr_tex_fmt_bc1_rgba_srgb, 4, 4, 8);
 }
 
-skr_tex_t tex_compress_gpu_bc6h(skr_tex_t* source) {
+skr_tex_t tex_compress_bc6h(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.bc6h_compute, source, skr_tex_fmt_bc6h_rgbuf, 4, 4, 16);
 }
 
-skr_tex_t tex_compress_gpu_bc7(skr_tex_t* source) {
+skr_tex_t tex_compress_bc7(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.bc7_compute, source, skr_tex_fmt_bc7_rgba_srgb, 4, 4, 16);
 }
 
-skr_tex_t tex_compress_gpu_astc4x4(skr_tex_t* source) {
+skr_tex_t tex_compress_astc4x4(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.astc4x4_compute, source, skr_tex_fmt_astc4x4_rgba_srgb, 4, 4, 16);
 }
 
-skr_tex_t tex_compress_gpu_astc6x6(skr_tex_t* source) {
+skr_tex_t tex_compress_astc6x6(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.astc6x6_compute, source, skr_tex_fmt_astc6x6_rgba_srgb, 6, 6, 16);
 }
 
-skr_tex_t tex_compress_gpu_astc8x8hdr(skr_tex_t* source) {
+skr_tex_t tex_compress_astc8x8hdr(skr_tex_t* source) {
 	return _compress_gpu(&g_tc.astc8x8hdr_compute, source, skr_tex_fmt_astc8x8_rgba_hdr, 8, 8, 16);
 }
 
@@ -224,11 +224,11 @@ static skr_tex_t _compress_gpu_cube(skr_compute_t* compute, skr_tex_t* cube_sour
 	skr_tex_t result = {0};
 
 	if (!g_tc.initialized || !skr_compute_is_valid(compute)) {
-		su_log(su_log_warning, "tex_compress_gpu_cube: not initialized or compute invalid");
+		su_log(su_log_warning, "tex_compress_cube: not initialized or compute invalid");
 		return result;
 	}
 	if (!skr_tex_is_valid(cube_source)) {
-		su_log(su_log_warning, "tex_compress_gpu_cube: source texture invalid");
+		su_log(su_log_warning, "tex_compress_cube: source texture invalid");
 		return result;
 	}
 
@@ -240,7 +240,7 @@ static skr_tex_t _compress_gpu_cube(skr_compute_t* compute, skr_tex_t* cube_sour
 	skr_tex_create(compressed_fmt, skr_tex_flags_readable | skr_tex_flags_dynamic | skr_tex_flags_cubemap,
 		su_sampler_linear_clamp, (skr_vec3i_t){size.x, size.y, 6}, 1, mip_count, NULL, &result);
 	if (!skr_tex_is_valid(&result)) {
-		su_log(su_log_warning, "tex_compress_gpu_cube: failed to create compressed cubemap");
+		su_log(su_log_warning, "tex_compress_cube: failed to create compressed cubemap");
 		return result;
 	}
 	skr_tex_set_name(&result, "tc_gpu_compressed_cube");
@@ -250,7 +250,7 @@ static skr_tex_t _compress_gpu_cube(skr_compute_t* compute, skr_tex_t* cube_sour
 	skr_tex_create(src_fmt, skr_tex_flags_readable | skr_tex_flags_dynamic,
 		su_sampler_linear_clamp, (skr_vec3i_t){size.x, size.y, 1}, 1, mip_count, NULL, &face);
 	if (!skr_tex_is_valid(&face)) {
-		su_log(su_log_warning, "tex_compress_gpu_cube: failed to create scratch face");
+		su_log(su_log_warning, "tex_compress_cube: failed to create scratch face");
 		skr_tex_destroy(&result);
 		return (skr_tex_t){0};
 	}
@@ -273,32 +273,32 @@ static skr_tex_t _compress_gpu_cube(skr_compute_t* compute, skr_tex_t* cube_sour
 	return result;
 }
 
-skr_tex_t tex_compress_gpu_cube_bc1(skr_tex_t* cube_source) {
+skr_tex_t tex_compress_cube_bc1(skr_tex_t* cube_source) {
 	// Cube sources arrive as linear light — float formats and sRGB-view
 	// textures both Load as linear — so gamma-encode into an sRGB BC1 for
 	// usable precision in the darks.
 	return _compress_gpu_cube(&g_tc.bc1_compute_srgb, cube_source, skr_tex_fmt_bc1_rgb_srgb, 4, 4, 8);
 }
 
-skr_tex_t tex_compress_gpu_cube_bc6h(skr_tex_t* cube_source) {
+skr_tex_t tex_compress_cube_bc6h(skr_tex_t* cube_source) {
 	return _compress_gpu_cube(&g_tc.bc6h_compute, cube_source, skr_tex_fmt_bc6h_rgbuf, 4, 4, 16);
 }
 
-skr_tex_t tex_compress_gpu_cube_bc7(skr_tex_t* cube_source) {
+skr_tex_t tex_compress_cube_bc7(skr_tex_t* cube_source) {
 	// Cube sources arrive as linear light — gamma-encode into an sRGB BC7,
 	// same rationale as the BC1 cube path.
 	return _compress_gpu_cube(&g_tc.bc7_compute_srgb, cube_source, skr_tex_fmt_bc7_rgba_srgb, 4, 4, 16);
 }
 
-skr_tex_t tex_compress_gpu_cube_astc4x4(skr_tex_t* cube_source) {
+skr_tex_t tex_compress_cube_astc4x4(skr_tex_t* cube_source) {
 	return _compress_gpu_cube(&g_tc.astc4x4_compute, cube_source, skr_tex_fmt_astc4x4_rgba, 4, 4, 16);
 }
 
-skr_tex_t tex_compress_gpu_cube_astc6x6(skr_tex_t* cube_source) {
+skr_tex_t tex_compress_cube_astc6x6(skr_tex_t* cube_source) {
 	return _compress_gpu_cube(&g_tc.astc6x6_compute, cube_source, skr_tex_fmt_astc6x6_rgba, 6, 6, 16);
 }
 
-skr_tex_t tex_compress_gpu_cube_astc8x8hdr(skr_tex_t* cube_source) {
+skr_tex_t tex_compress_cube_astc8x8hdr(skr_tex_t* cube_source) {
 	return _compress_gpu_cube(&g_tc.astc8x8hdr_compute, cube_source, skr_tex_fmt_astc8x8_rgba_hdr, 8, 8, 16);
 }
 
@@ -365,23 +365,23 @@ static uint8_t* _compress_readback(skr_compute_t* compute, skr_tex_t* source, ui
 	return bytes_out;
 }
 
-uint8_t* tex_compress_gpu_bc6h_readback(skr_tex_t* source, int32_t* out_size) {
+uint8_t* tex_compress_bc6h_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.bc6h_compute, source, 4, 4, 16, out_size);
 }
 
-uint8_t* tex_compress_gpu_bc7_readback(skr_tex_t* source, int32_t* out_size) {
+uint8_t* tex_compress_bc7_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.bc7_compute, source, 4, 4, 16, out_size);
 }
 
-uint8_t* tex_compress_gpu_astc4x4_readback(skr_tex_t* source, int32_t* out_size) {
+uint8_t* tex_compress_astc4x4_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.astc4x4_compute, source, 4, 4, 16, out_size);
 }
 
-uint8_t* tex_compress_gpu_astc6x6_readback(skr_tex_t* source, int32_t* out_size) {
+uint8_t* tex_compress_astc6x6_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.astc6x6_compute, source, 6, 6, 16, out_size);
 }
 
-uint8_t* tex_compress_gpu_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_size) {
+uint8_t* tex_compress_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_size) {
 	return _compress_readback(&g_tc.astc8x8hdr_compute, source, 8, 8, 16, out_size);
 }
 
@@ -429,27 +429,27 @@ static void _profile_dispatch(skr_compute_t* compute, skr_tex_t* source, uint32_
 	skr_compute_execute(compute, (blocks_x + 7) / 8, (blocks_y + 7) / 8, 1);
 }
 
-void tex_compress_gpu_bc1_profile(skr_tex_t* source, bool enable_alpha) {
+void tex_compress_bc1_profile(skr_tex_t* source, bool enable_alpha) {
 	_profile_dispatch(enable_alpha ? &g_tc.bc1_compute_alpha : &g_tc.bc1_compute_opaque,
 		source, 4, 4, 8);
 }
 
-void tex_compress_gpu_bc6h_profile(skr_tex_t* source) {
+void tex_compress_bc6h_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.bc6h_compute, source, 4, 4, 16);
 }
 
-void tex_compress_gpu_bc7_profile(skr_tex_t* source) {
+void tex_compress_bc7_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.bc7_compute, source, 4, 4, 16);
 }
 
-void tex_compress_gpu_astc4x4_profile(skr_tex_t* source) {
+void tex_compress_astc4x4_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.astc4x4_compute, source, 4, 4, 16);
 }
 
-void tex_compress_gpu_astc6x6_profile(skr_tex_t* source) {
+void tex_compress_astc6x6_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.astc6x6_compute, source, 6, 6, 16);
 }
 
-void tex_compress_gpu_astc8x8hdr_profile(skr_tex_t* source) {
+void tex_compress_astc8x8hdr_profile(skr_tex_t* source) {
 	_profile_dispatch(&g_tc.astc8x8hdr_compute, source, 8, 8, 16);
 }

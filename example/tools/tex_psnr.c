@@ -54,7 +54,7 @@ double tex_psnr(const skr_tex_t* reference, const skr_tex_t* compressed) {
 	skr_buffer_set_name(&partials, "tex_psnr_partials");
 
 	// Same begin/flush/end sandwich as the compression readback path — works
-	// both inside and outside an open frame (see tex_compress_gpu.c).
+	// both inside and outside an open frame (see compress/tex_compress.c).
 	skr_cmd_begin();
 
 	skr_compute_set_tex   (&g_psnr.compute, "tex_ref",     (skr_tex_t*)reference);

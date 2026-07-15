@@ -19,13 +19,7 @@ RWStructuredBuffer<uint2> output_blocks : register(u1);
 // hardware decodes a *_srgb output format back to linear at sample time.
 [[vk::constant_id(1)]] const bool SRGB_ENCODE = false;
 
-float3 linear_to_srgb(float3 c) {
-	// IEC 61966-2-1 transfer function
-	c = max(c, 0.0);
-	float3 lo = c * 12.92;
-	float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-	return lerp(lo, hi, step(0.0031308, c));
-}
+#include "bc_common.hlsli"
 
 // Round-to-nearest RGB565 from a [0,1] color. Rounding directly in 5/6-bit
 // space halves the worst-case endpoint error vs the old 8-bit-round-then-

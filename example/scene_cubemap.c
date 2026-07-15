@@ -5,7 +5,7 @@
 
 #include "scene.h"
 #include "tools/scene_util.h"
-#include "tools/tex_compress_gpu.h"
+#include "tools/compress/tex_compress.h"
 #include "app.h"
 
 #include <stdlib.h>
@@ -106,12 +106,12 @@ static scene_t* _scene_cubemap_create(void) {
 	// GPU-compress the cubemap (per-face 2D compression assembled back into a
 	// cube). Runs at load so the path is always exercised; the UI toggle picks
 	// which version the materials sample.
-	tex_compress_gpu_init();
+	tex_compress_init();
 	if (skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgb_srgb, skr_tex_flags_readable, 1)) {
-		scene->cubemap_compressed  = tex_compress_gpu_cube_bc1(&scene->cubemap_texture);
+		scene->cubemap_compressed  = tex_compress_cube_bc1(&scene->cubemap_texture);
 		scene->compressed_fmt_name = "BC1";
 	} else if (skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba, skr_tex_flags_readable, 1)) {
-		scene->cubemap_compressed  = tex_compress_gpu_cube_astc6x6(&scene->cubemap_texture);
+		scene->cubemap_compressed  = tex_compress_cube_astc6x6(&scene->cubemap_texture);
 		scene->compressed_fmt_name = "ASTC 6x6";
 	}
 	if (skr_tex_is_valid(&scene->cubemap_compressed)) {
@@ -157,7 +157,7 @@ static void _scene_cubemap_destroy(scene_t* base) {
 	skr_tex_destroy(&scene->cubemap_texture);
 	if (skr_tex_is_valid(&scene->cubemap_compressed))
 		skr_tex_destroy(&scene->cubemap_compressed);
-	tex_compress_gpu_shutdown();
+	tex_compress_shutdown();
 
 	free(scene);
 }

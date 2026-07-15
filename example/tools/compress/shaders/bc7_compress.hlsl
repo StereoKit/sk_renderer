@@ -47,12 +47,7 @@ RWStructuredBuffer<uint4> output_blocks : register(u1);
 // variant: quantize in the space the *_srgb output format decodes from.
 [[vk::constant_id(0)]] const bool SRGB_ENCODE = false;
 
-float3 linear_to_srgb(float3 c) {
-	c = max(c, 0.0);
-	float3 lo = c * 12.92;
-	float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-	return lerp(lo, hi, step(0.0031308, c));
-}
+#include "bc_common.hlsli"
 
 uint mip_level;
 uint image_width;
@@ -64,16 +59,9 @@ uint buffer_offset;
 // Mode 6 quantization + packing
 ///////////////////////////////////////////////////////////////////////////////
 
-// BC7 2-bit index weights in 1/64ths (mode 5 index planes).
+// BC7 2-bit index weights in 1/64ths (mode 5 index planes). The 4-bit W4
+// table comes from bc_common.hlsli.
 static const float W2[4] = { 0.0 / 64.0, 21.0 / 64.0, 43.0 / 64.0, 64.0 / 64.0 };
-
-// BC7 4-bit index weights in 1/64ths (same table as BC6H).
-static const float W4[16] = {
-	 0.0 / 64.0,  4.0 / 64.0,  9.0 / 64.0, 13.0 / 64.0,
-	17.0 / 64.0, 21.0 / 64.0, 26.0 / 64.0, 30.0 / 64.0,
-	34.0 / 64.0, 38.0 / 64.0, 43.0 / 64.0, 47.0 / 64.0,
-	51.0 / 64.0, 55.0 / 64.0, 60.0 / 64.0, 64.0 / 64.0,
-};
 
 // Quantize a [0,255] endpoint to 7 bits + shared p-bit. p is chosen per
 // endpoint (both candidates evaluated); this returns e7 for a given p.
@@ -102,16 +90,6 @@ void quantize_ep(float4 target, bool opaque, out uint4 q, out uint p) {
 	bool use_b = dot(db, db) <= dot(da, da);
 	p = use_b ? 1u : 0u;
 	q = use_b ? qb : qa;
-}
-
-// OR count bits of value into the 128-bit block at a bit offset (LSB-first).
-void write_bits(inout uint4 b, uint offset, uint count, uint value) {
-	value &= (1u << count) - 1u;
-	uint word = offset >> 5u;
-	uint bit  = offset & 31u;
-	b[word] |= value << bit;
-	if (bit + count > 32u)
-		b[word + 1u] |= value >> (32u - bit);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -169,8 +169,7 @@ target_sources(sk_renderer_test PRIVATE
 	bloom.c
 	text/text.c
 	tools/scene_util.c
-	tools/tex_compress.c
-	tools/tex_compress_gpu.c
+	tools/compress/tex_compress.c
 	tools/tex_psnr.c
 	tools/compress/astc_io.c
 	imgui_backend/imgui_impl_sk_renderer.cpp
@@ -258,14 +257,17 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/msaa_resolve_wide.hlsl
 	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
-	assets/shaders/bc1_compress.hlsl
-	assets/shaders/bc6h_compress.hlsl
-	assets/shaders/bc7_compress.hlsl
-	assets/shaders/astc4x4_compress.hlsl
-	assets/shaders/astc6x6_compress.hlsl
-	assets/shaders/astc8x8hdr_compress.hlsl
 	assets/shaders/tex_compare.hlsl
-	assets/shaders/tex_psnr.hlsl
+	# GPU texture compression toolkit — sources live with the tool code in
+	# tools/compress/ (see tools/compress/README.md); compiled .sks output
+	# lands in generated/shaders/ alongside everything else.
+	tools/compress/shaders/bc1_compress.hlsl
+	tools/compress/shaders/bc6h_compress.hlsl
+	tools/compress/shaders/bc7_compress.hlsl
+	tools/compress/shaders/astc4x4_compress.hlsl
+	tools/compress/shaders/astc6x6_compress.hlsl
+	tools/compress/shaders/astc8x8hdr_compress.hlsl
+	tools/compress/shaders/tex_psnr.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

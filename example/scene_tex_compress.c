@@ -5,8 +5,7 @@
 
 #include "scene.h"
 #include "tools/scene_util.h"
-#include "tools/tex_compress.h"
-#include "tools/tex_compress_gpu.h"
+#include "tools/compress/tex_compress.h"
 #include "tools/tex_psnr.h"
 #include "tools/compress/astc_io.h"
 #include "app.h"
@@ -49,7 +48,6 @@ typedef struct {
 	int32_t        img_height;
 	int32_t        original_size;    // Uncompressed bytes; full mip chain on the GPU path
 	int32_t        compressed_size;  // Compressed bytes over the same mip range
-	double         compress_time_ms;
 	double         gpu_compress_time_ms;
 	double         psnr_db;          // Mip-0 PSNR vs original; <0 = not measured
 
@@ -62,8 +60,7 @@ typedef struct {
 	bool           astc6x6_validate_only;   // Compute works but display format unsupported (AMD desktop)
 	bool           astc8x8hdr_supported;    // ASTC 8x8 HDR sampling — Adreno/Mali yes, AMD desktop no
 
-	// GPU compression
-	bool           use_gpu;
+	// GPU compression source (with mips) for the compute encoders
 	skr_tex_t      texture_source;
 
 	// File loading UI
@@ -191,149 +188,118 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 		return;
 	}
 
-	if (scene->use_gpu) {
-		// GPU path: create source texture with mips, compress on GPU. HDR
-		// source uses rg11b10 (the format su_image_load decodes Radiance
-		// .hdr into); LDR source uses rgba32_linear so mip filtering stays
-		// in linear space rather than sRGB.
-		skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10uf : skr_tex_fmt_rgba32_linear,
-			skr_tex_flags_readable | skr_tex_flags_gen_mips,
-			su_sampler_linear_clamp,
-			(skr_vec3i_t){width, height, 1}, 1, 0,
-			&(skr_tex_data_t){.data = pixels, .mip_count = 1, .layer_count = 1},
-			&scene->texture_source);
-		skr_tex_set_name(&scene->texture_source, "source_for_gpu");
-		skr_tex_generate_mips(&scene->texture_source, NULL);
+	// GPU path: create source texture with mips, compress on GPU. HDR
+	// source uses rg11b10 (the format su_image_load decodes Radiance
+	// .hdr into); LDR source uses rgba32_linear so mip filtering stays
+	// in linear space rather than sRGB.
+	skr_tex_create(is_hdr ? skr_tex_fmt_rg11b10uf : skr_tex_fmt_rgba32_linear,
+		skr_tex_flags_readable | skr_tex_flags_gen_mips,
+		su_sampler_linear_clamp,
+		(skr_vec3i_t){width, height, 1}, 1, 0,
+		&(skr_tex_data_t){.data = pixels, .mip_count = 1, .layer_count = 1},
+		&scene->texture_source);
+	skr_tex_set_name(&scene->texture_source, "source_for_gpu");
+	skr_tex_generate_mips(&scene->texture_source, NULL);
 
-		uint64_t start_ns = ska_time_get_elapsed_ns();
-		switch (scene->current_format) {
-			case compress_fmt_bc1:     scene->texture_compressed = tex_compress_gpu_bc1    (&scene->texture_source, true); break;
-			case compress_fmt_bc7:     scene->texture_compressed = tex_compress_gpu_bc7    (&scene->texture_source);       break;
-			case compress_fmt_bc6h:    scene->texture_compressed = tex_compress_gpu_bc6h   (&scene->texture_source);       break;
-			// Skip the displayable-texture path on GPUs that can't sample
-			// ASTC (AMD desktop) — it'd spam the validation layer. The
-			// auto-save below exercises the encoder via buffer readback.
-			case compress_fmt_astc4x4:
-				if (scene->astc6x6_supported)
-					scene->texture_compressed = tex_compress_gpu_astc4x4(&scene->texture_source);
-				break;
-			case compress_fmt_astc6x6:
-				if (scene->astc6x6_supported)
-					scene->texture_compressed = tex_compress_gpu_astc6x6(&scene->texture_source);
-				break;
-			case compress_fmt_astc8x8hdr:
-				if (scene->astc8x8hdr_supported)
-					scene->texture_compressed = tex_compress_gpu_astc8x8hdr(&scene->texture_source);
-				break;
-			default: break;
-		}
-		uint64_t end_ns = ska_time_get_elapsed_ns();
+	uint64_t start_ns = ska_time_get_elapsed_ns();
+	switch (scene->current_format) {
+		case compress_fmt_bc1:     scene->texture_compressed = tex_compress_bc1    (&scene->texture_source, true); break;
+		case compress_fmt_bc7:     scene->texture_compressed = tex_compress_bc7    (&scene->texture_source);       break;
+		case compress_fmt_bc6h:    scene->texture_compressed = tex_compress_bc6h   (&scene->texture_source);       break;
+		// Skip the displayable-texture path on GPUs that can't sample
+		// ASTC (AMD desktop) — it'd spam the validation layer. The
+		// auto-save below exercises the encoder via buffer readback.
+		case compress_fmt_astc4x4:
+			if (scene->astc6x6_supported)
+				scene->texture_compressed = tex_compress_astc4x4(&scene->texture_source);
+			break;
+		case compress_fmt_astc6x6:
+			if (scene->astc6x6_supported)
+				scene->texture_compressed = tex_compress_astc6x6(&scene->texture_source);
+			break;
+		case compress_fmt_astc8x8hdr:
+			if (scene->astc8x8hdr_supported)
+				scene->texture_compressed = tex_compress_astc8x8hdr(&scene->texture_source);
+			break;
+		default: break;
+	}
+	uint64_t end_ns = ska_time_get_elapsed_ns();
 
-		scene->gpu_compress_time_ms = (end_ns - start_ns) / 1000000.0;
+	scene->gpu_compress_time_ms = (end_ns - start_ns) / 1000000.0;
 
-		// The GPU path compresses the full mip chain, so size both sides of
-		// the ratio over the whole chain.
-		skr_vec3i_t base = {width, height, 1};
-		uint32_t    mips = skr_tex_calc_mip_count(base);
-		uint64_t    orig_bytes = 0, comp_bytes = 0;
-		for (uint32_t m = 0; m < mips; m++) {
-			orig_bytes += skr_tex_calc_mip_size(skr_tex_fmt_rgba32_linear, base, m);
-			comp_bytes += skr_tex_calc_mip_size(tex_fmt, base, m);
-		}
-		scene->original_size   = (int32_t)orig_bytes;
-		scene->compressed_size = (int32_t)comp_bytes;
+	// The GPU path compresses the full mip chain, so size both sides of
+	// the ratio over the whole chain.
+	skr_vec3i_t base = {width, height, 1};
+	uint32_t    mips = skr_tex_calc_mip_count(base);
+	uint64_t    orig_bytes = 0, comp_bytes = 0;
+	for (uint32_t m = 0; m < mips; m++) {
+		orig_bytes += skr_tex_calc_mip_size(skr_tex_fmt_rgba32_linear, base, m);
+		comp_bytes += skr_tex_calc_mip_size(tex_fmt, base, m);
+	}
+	scene->original_size   = (int32_t)orig_bytes;
+	scene->compressed_size = (int32_t)comp_bytes;
 
-		// Timed on the CPU around command recording — the actual GPU cost
-		// shows up on the perf graph via the per-frame profile dispatch.
-		su_log(su_log_info, "GPU %s: command recording took %.3f ms",
-			fmt_name, scene->gpu_compress_time_ms);
+	// Timed on the CPU around command recording — the actual GPU cost
+	// shows up on the perf graph via the per-frame profile dispatch.
+	su_log(su_log_info, "GPU %s: command recording took %.3f ms",
+		fmt_name, scene->gpu_compress_time_ms);
 
-		// Auto-save ASTC output for validation against astcenc reference.
-		// Uses a dedicated readback-only dispatch so this works even on GPUs
-		// that can't sample ASTC (AMD desktop), since no destination texture
-		// is involved — just a host-visible compute output buffer.
-		// Desktop only; no writable CWD on Android, and the validator is
-		// desktop-only anyway.
+	// Auto-save ASTC output for validation against astcenc reference.
+	// Uses a dedicated readback-only dispatch so this works even on GPUs
+	// that can't sample ASTC (AMD desktop), since no destination texture
+	// is involved — just a host-visible compute output buffer.
+	// Desktop only; no writable CWD on Android, and the validator is
+	// desktop-only anyway.
 #if !defined(__ANDROID__)
-		int32_t  astc_size = 0;
-		uint8_t* astc_data = NULL;
-		int32_t  astc_block_w = 0, astc_block_h = 0;
-		switch (scene->current_format) {
-			case compress_fmt_astc4x4:
-				astc_data = tex_compress_gpu_astc4x4_readback(&scene->texture_source, &astc_size);
-				astc_block_w = 4; astc_block_h = 4;
-				break;
-			case compress_fmt_astc6x6:
-				astc_data = tex_compress_gpu_astc6x6_readback(&scene->texture_source, &astc_size);
-				astc_block_w = 6; astc_block_h = 6;
-				break;
-			case compress_fmt_astc8x8hdr:
-				astc_data = tex_compress_gpu_astc8x8hdr_readback(&scene->texture_source, &astc_size);
-				astc_block_w = 8; astc_block_h = 8;
-				break;
-			default: break;
-		}
-		if (astc_data) {
-			const char* out_path = "astc_output.astc";
-			if (astc_write_file(out_path, width, height, astc_block_w, astc_block_h, astc_data, (size_t)astc_size))
-				su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, astc_size, path);
+	int32_t  astc_size = 0;
+	uint8_t* astc_data = NULL;
+	int32_t  astc_block_w = 0, astc_block_h = 0;
+	switch (scene->current_format) {
+		case compress_fmt_astc4x4:
+			astc_data = tex_compress_astc4x4_readback(&scene->texture_source, &astc_size);
+			astc_block_w = 4; astc_block_h = 4;
+			break;
+		case compress_fmt_astc6x6:
+			astc_data = tex_compress_astc6x6_readback(&scene->texture_source, &astc_size);
+			astc_block_w = 6; astc_block_h = 6;
+			break;
+		case compress_fmt_astc8x8hdr:
+			astc_data = tex_compress_astc8x8hdr_readback(&scene->texture_source, &astc_size);
+			astc_block_w = 8; astc_block_h = 8;
+			break;
+		default: break;
+	}
+	if (astc_data) {
+		const char* out_path = "astc_output.astc";
+		if (astc_write_file(out_path, width, height, astc_block_w, astc_block_h, astc_data, (size_t)astc_size))
+			su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, astc_size, path);
+		else
+			su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
+		free(astc_data);
+	} else if (scene->current_format == compress_fmt_astc4x4 ||
+	           scene->current_format == compress_fmt_astc6x6 ||
+	           scene->current_format == compress_fmt_astc8x8hdr) {
+		su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
+	}
+
+	// The BC formats use a DDS container instead of .astc.
+	if (scene->current_format == compress_fmt_bc6h || scene->current_format == compress_fmt_bc7) {
+		bool     is_bc7   = scene->current_format == compress_fmt_bc7;
+		int32_t  bc_size  = 0;
+		uint8_t* bc_data  = is_bc7 ? tex_compress_bc7_readback (&scene->texture_source, &bc_size)
+		                           : tex_compress_bc6h_readback(&scene->texture_source, &bc_size);
+		if (bc_data) {
+			const char* out_path = is_bc7 ? "bc7_output.dds" : "bc6h_output.dds";
+			if (_dds_write_bc(out_path, width, height, is_bc7 ? 99u : 95u, bc_data, (size_t)bc_size))
+				su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, bc_size, path);
 			else
 				su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
-			free(astc_data);
-		} else if (scene->current_format == compress_fmt_astc4x4 ||
-		           scene->current_format == compress_fmt_astc6x6 ||
-		           scene->current_format == compress_fmt_astc8x8hdr) {
+			free(bc_data);
+		} else {
 			su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
 		}
-
-		// The BC formats use a DDS container instead of .astc.
-		if (scene->current_format == compress_fmt_bc6h || scene->current_format == compress_fmt_bc7) {
-			bool     is_bc7   = scene->current_format == compress_fmt_bc7;
-			int32_t  bc_size  = 0;
-			uint8_t* bc_data  = is_bc7 ? tex_compress_gpu_bc7_readback (&scene->texture_source, &bc_size)
-			                           : tex_compress_gpu_bc6h_readback(&scene->texture_source, &bc_size);
-			if (bc_data) {
-				const char* out_path = is_bc7 ? "bc7_output.dds" : "bc6h_output.dds";
-				if (_dds_write_bc(out_path, width, height, is_bc7 ? 99u : 95u, bc_data, (size_t)bc_size))
-					su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, bc_size, path);
-				else
-					su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
-				free(bc_data);
-			} else {
-				su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
-			}
-		}
-#endif
-	} else {
-		// CPU path — BC1 is the only CPU encoder.
-		if (scene->current_format != compress_fmt_bc1) {
-			su_log(su_log_warning, "TexCompress: %s has no CPU encoder, switching to GPU path", fmt_name);
-			scene->use_gpu = true;
-			su_image_free(pixels);
-			_load_image(scene, path);
-			return;
-		}
-
-		uint64_t start_ns = ska_time_get_elapsed_ns();
-		uint8_t* compressed_data = bc1_compress(pixels, width, height);
-		scene->original_size   = width * height * 4;
-		scene->compressed_size = bc1_calc_size(width, height);
-		uint64_t end_ns = ska_time_get_elapsed_ns();
-
-		scene->compress_time_ms = (end_ns - start_ns) / 1000000.0;
-		su_log(su_log_info, "CPU %s: Compression took %.3f ms (%.1f MP/s)",
-			fmt_name, scene->compress_time_ms,
-			(width * height) / (scene->compress_time_ms * 1000.0));
-
-		skr_tex_create(tex_fmt,
-			skr_tex_flags_readable,
-			su_sampler_linear_clamp,
-			(skr_vec3i_t){width, height, 1}, 1, 0,
-			&(skr_tex_data_t){.data = compressed_data, .mip_count = 1, .layer_count = 1},
-			&scene->texture_compressed);
-		skr_tex_set_name(&scene->texture_compressed, "compressed");
-		free(compressed_data);
 	}
+#endif
 
 	// Update compare material: tex_left = original, tex_right = compressed.
 	// If the compressed texture couldn't be created (AMD ASTC validate-only
@@ -372,12 +338,11 @@ static scene_t* _scene_texcomp_create(void) {
 	scene->base.size    = sizeof(scene_texcomp_t);
 	scene->time         = 0.0f;
 	scene->cam_distance = 5.0f;
-	scene->use_gpu      = true;
 	scene->swipe        = 0.5f;
 	scene->brightness   = 1.0f;
 
 	// Initialize GPU compression and quality measurement
-	tex_compress_gpu_init();
+	tex_compress_init();
 	tex_psnr_init();
 
 	// Check format support
@@ -444,7 +409,7 @@ static void _scene_texcomp_destroy(scene_t* base) {
 	if (skr_tex_is_valid(&scene->texture_source))     skr_tex_destroy(&scene->texture_source);
 
 	tex_psnr_shutdown();
-	tex_compress_gpu_shutdown();
+	tex_compress_shutdown();
 	free(scene);
 }
 
@@ -463,14 +428,14 @@ static void _scene_texcomp_update(scene_t* base, float delta_time) {
 	// output buffer and do just the compute dispatch at mip 0 — no texture
 	// creation, no buffer copy, no per-frame allocation. This gives an
 	// apples-to-apples shader cost comparison on the perf graph.
-	if (scene->use_gpu && skr_tex_is_valid(&scene->texture_source)) {
+	if (skr_tex_is_valid(&scene->texture_source)) {
 		switch (scene->current_format) {
-			case compress_fmt_bc1:        tex_compress_gpu_bc1_profile       (&scene->texture_source, true); break;
-			case compress_fmt_bc7:        tex_compress_gpu_bc7_profile       (&scene->texture_source);       break;
-			case compress_fmt_bc6h:       tex_compress_gpu_bc6h_profile      (&scene->texture_source);       break;
-			case compress_fmt_astc4x4:    tex_compress_gpu_astc4x4_profile   (&scene->texture_source);       break;
-			case compress_fmt_astc6x6:    tex_compress_gpu_astc6x6_profile   (&scene->texture_source);       break;
-			case compress_fmt_astc8x8hdr: tex_compress_gpu_astc8x8hdr_profile(&scene->texture_source);       break;
+			case compress_fmt_bc1:        tex_compress_bc1_profile       (&scene->texture_source, true); break;
+			case compress_fmt_bc7:        tex_compress_bc7_profile       (&scene->texture_source);       break;
+			case compress_fmt_bc6h:       tex_compress_bc6h_profile      (&scene->texture_source);       break;
+			case compress_fmt_astc4x4:    tex_compress_astc4x4_profile   (&scene->texture_source);       break;
+			case compress_fmt_astc6x6:    tex_compress_astc6x6_profile   (&scene->texture_source);       break;
+			case compress_fmt_astc8x8hdr: tex_compress_astc8x8hdr_profile(&scene->texture_source);       break;
 			default: break;
 		}
 	}
@@ -563,11 +528,6 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 
 	igSeparator();
 
-	// GPU toggle
-	if (igCheckbox("GPU Compression", &scene->use_gpu)) {
-		scene->load_requested = true;
-	}
-
 	// Format selection — dropdown of supported formats only. We build a
 	// parallel array of (label, enum_value) so skipped formats don't push
 	// later entries onto the wrong index.
@@ -644,8 +604,7 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 
 		igText("Image: %d x %d", scene->img_width, scene->img_height);
 		igText("Format: %s", fmt_name);
-		igText("Original:   %.1f KB (RGBA8%s)", scene->original_size / 1024.0f,
-			scene->use_gpu ? ", all mips" : "");
+		igText("Original:   %.1f KB (RGBA8, all mips)", scene->original_size / 1024.0f);
 		igText("Compressed: %.1f KB", scene->compressed_size / 1024.0f);
 		if (scene->compressed_size > 0)
 			igText("Ratio:      %.1f:1", (float)scene->original_size / scene->compressed_size);
@@ -653,15 +612,9 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 			igText("PSNR:       %.2f dB", scene->psnr_db);
 
 		igSeparator();
-		if (scene->use_gpu) {
-			// CPU-side command recording cost; actual GPU encoder cost is on
-			// the perf graph via the per-frame profile dispatch.
-			igText("Record: %.2f ms (CPU side)", scene->gpu_compress_time_ms);
-		} else {
-			double megapix  = (scene->img_width * scene->img_height) / 1000000.0;
-			double mp_per_s = megapix / (scene->compress_time_ms / 1000.0);
-			igText("CPU:  %.2f ms (%.1f MP/s)", scene->compress_time_ms, mp_per_s);
-		}
+		// CPU-side command recording cost; actual GPU encoder cost is on
+		// the perf graph via the per-frame profile dispatch.
+		igText("Record: %.2f ms (CPU side)", scene->gpu_compress_time_ms);
 
 		igSeparator();
 		igSliderFloat("Swipe",      &scene->swipe,      0.0f, 1.0f,  "%.2f",  0);
@@ -669,8 +622,7 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 		// detail, LDR content may want brightness = 1 to 4 to brighten dark
 		// areas. Log scale gives both fine control at the low end and reach.
 		igSliderFloat("Brightness", &scene->brightness, 0.01f, 8.0f, "×%.2f", ImGuiSliderFlags_Logarithmic);
-		igTextColored((ImVec4){0.7f, 0.7f, 0.7f, 1.0f}, "Left: Original  |  Right: %s%s",
-			scene->use_gpu ? "GPU " : "", fmt_name);
+		igTextColored((ImVec4){0.7f, 0.7f, 0.7f, 1.0f}, "Left: Original  |  Right: GPU %s", fmt_name);
 	} else {
 		igTextColored((ImVec4){1.0f, 0.5f, 0.5f, 1.0f}, "No image loaded");
 	}
