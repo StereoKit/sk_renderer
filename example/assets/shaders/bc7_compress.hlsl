@@ -1,6 +1,7 @@
 //--name = bc7_compress
 
-// BC7 GPU texture compression — mode 6 only.
+// BC7 GPU texture compression — mode 6, plus a mode 5 trial for blocks
+// with varying alpha.
 //
 // Each thread compresses one 4x4 block into 128 bits: 7-bit mode field
 // (six zeros then a 1), two RGBA endpoints at 7 bits/channel plus one
@@ -26,8 +27,16 @@
 // invisible for opaque rendering and a 0.4% bleed if such a texture is
 // ever alpha-blended.
 //
-// v1 limitations (deliberate, same flavor as BC6H's mode-11-only):
-// sharp alpha edges would prefer mode 5's separate alpha indices, and
+// Mode 5 trial (blocks with varying alpha only — the opaque flag gates it,
+// so opaque content pays nothing): mode 6's single shared index can't serve
+// a color gradient and an alpha edge running in different directions. Mode 5
+// splits them — separate 2-bit color and 2-bit alpha index planes, 7-bit
+// bit-replicated RGB endpoints, full 8-bit alpha endpoints. The trial is a
+// cheap one-shot (RGB bbox axis + exact alpha range, no LS); its true
+// reconstruction SSE competes against mode 6's best round and the lower
+// error wins. Rotation is always 0.
+//
+// Remaining headroom (deliberate, same flavor as BC6H's mode-11-only):
 // hard color edges would prefer mode 1/3 partitions. Measure first.
 
 Texture2D<float4>         source_tex    : register(t0);
@@ -54,6 +63,9 @@ uint buffer_offset;
 ///////////////////////////////////////////////////////////////////////////////
 // Mode 6 quantization + packing
 ///////////////////////////////////////////////////////////////////////////////
+
+// BC7 2-bit index weights in 1/64ths (mode 5 index planes).
+static const float W2[4] = { 0.0 / 64.0, 21.0 / 64.0, 43.0 / 64.0, 64.0 / 64.0 };
 
 // BC7 4-bit index weights in 1/64ths (same table as BC6H).
 static const float W4[16] = {
@@ -233,35 +245,116 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		quantize_ep(ep1, opaque, q1, p1);
 	}
 
-	// Anchor rule: pixel 0 stores only 3 index bits, MSB implied zero. If its
-	// index has the MSB set, swap the endpoints (with their p-bits) and
-	// complement every index (k -> 15-k == XOR the whole nibble array).
-	if ((best_idx_lo & 0x8u) != 0u) {
-		uint4 tq = best_q0; best_q0 = best_q1; best_q1 = tq;
-		uint  tp = best_p0; best_p0 = best_p1; best_p1 = tp;
-		best_idx_lo ^= 0xFFFFFFFFu;
-		best_idx_hi ^= 0xFFFFFFFFu;
+	// Mode 5 trial — only for blocks with varying alpha (see header note).
+	// One-shot: RGB bbox axis for the color plane, exact min/max for the
+	// alpha plane, 2-bit indices each, honest reconstruction SSE vs mode 6.
+	bool  use_mode5 = false;
+	uint3 m5_c0 = uint3(0, 0, 0), m5_c1 = uint3(0, 0, 0);
+	uint  m5_a0 = 0, m5_a1 = 0;
+	uint  m5_cidx = 0, m5_aidx = 0;   // 2 bits per pixel
+	if (!opaque) {
+		float3 cmin = pixels[0].rgb, cmax = cmin;
+		float  amin = pixels[0].a,   amax = amin;
+		[unroll] for (uint i = 1; i < 16; i++) {
+			cmin = min(cmin, pixels[i].rgb); cmax = max(cmax, pixels[i].rgb);
+			amin = min(amin, pixels[i].a);   amax = max(amax, pixels[i].a);
+		}
+
+		// Mode 5 color endpoints are 7-bit, decoded by bit replication;
+		// alpha endpoints are full 8-bit (exact).
+		m5_c0 = uint3(cmin * (127.0 / 255.0) + 0.5);
+		m5_c1 = uint3(cmax * (127.0 / 255.0) + 0.5);
+		m5_a0 = uint(amin + 0.5);
+		m5_a1 = uint(amax + 0.5);
+		float3 e0 = float3((m5_c0 << 1) | (m5_c0 >> 6));
+		float3 e1 = float3((m5_c1 << 1) | (m5_c1 >> 6));
+		float  a0 = float(m5_a0), a1 = float(m5_a1);
+
+		float3 caxis   = (e1 - e0) * float3(2.0, 4.0, 1.0);
+		float  clen    = dot(e1 - e0, caxis);
+		float  cproj0  = dot(e0, caxis);
+		float  inv_cl  = clen > 1e-3 ? 1.0 / clen : 0.0;
+		float  inv_al  = (a1 - a0) > 0.5 ? 1.0 / (a1 - a0) : 0.0;
+
+		// 2-bit bucket thresholds: midpoints of the W2 levels {0,21,43,64}.
+		float sse5 = 0.0;
+		[unroll] for (uint j = 0; j < 16; j++) {
+			float wn = saturate((dot(pixels[j].rgb, caxis) - cproj0) * inv_cl);
+			uint  kc = uint(wn >= 10.5 / 64.0) + uint(wn >= 32.0 / 64.0) + uint(wn >= 53.5 / 64.0);
+			float an = saturate((pixels[j].a - a0) * inv_al);
+			uint  ka = uint(an >= 10.5 / 64.0) + uint(an >= 32.0 / 64.0) + uint(an >= 53.5 / 64.0);
+			m5_cidx |= kc << (j * 2);
+			m5_aidx |= ka << (j * 2);
+
+			float3 dc = pixels[j].rgb - lerp(e0, e1, W2[kc]);
+			float  da = pixels[j].a   - lerp(a0, a1, W2[ka]);
+			sse5 += dot(dc, dc) + da * da;
+		}
+		use_mode5 = sse5 < best_sse;
 	}
 
-	// Pack mode 6: mode field 0000001 (bit 6 set), then R0 R1 G0 G1 B0 B1
-	// A0 A1 (7 bits each), P0 P1, then 63 index bits (pixel 0 is 3 bits).
 	uint4 block = uint4(0, 0, 0, 0);
-	write_bits(block,  0, 7, 0x40u);
-	write_bits(block,  7, 7, best_q0.r);
-	write_bits(block, 14, 7, best_q1.r);
-	write_bits(block, 21, 7, best_q0.g);
-	write_bits(block, 28, 7, best_q1.g);
-	write_bits(block, 35, 7, best_q0.b);
-	write_bits(block, 42, 7, best_q1.b);
-	write_bits(block, 49, 7, best_q0.a);
-	write_bits(block, 56, 7, best_q1.a);
-	write_bits(block, 63, 1, best_p0);
-	write_bits(block, 64, 1, best_p1);
-	write_bits(block, 65, 3, best_idx_lo & 0x7u);
-	[unroll] for (uint j = 1; j < 16; j++) {
-		uint k = (j < 8) ? ((best_idx_lo >> (j * 4)) & 0xFu)
-		                 : ((best_idx_hi >> ((j - 8) * 4)) & 0xFu);
-		write_bits(block, 68 + (j - 1) * 4, 4, k);
+	if (use_mode5) {
+		// Anchor rule per index plane: pixel 0 stores 1 of its 2 bits. If the
+		// MSB is set, swap that plane's endpoints and complement its indices
+		// (k -> 3-k == XOR the whole 2-bit array).
+		if ((m5_cidx & 0x2u) != 0u) {
+			uint3 t = m5_c0; m5_c0 = m5_c1; m5_c1 = t;
+			m5_cidx ^= 0xFFFFFFFFu;
+		}
+		if ((m5_aidx & 0x2u) != 0u) {
+			uint t = m5_a0; m5_a0 = m5_a1; m5_a1 = t;
+			m5_aidx ^= 0xFFFFFFFFu;
+		}
+
+		// Pack mode 5: mode field 000001 (bit 5 set), rotation 00, then
+		// R0 R1 G0 G1 B0 B1 (7 bits each), A0 A1 (8 bits each), 31 bits of
+		// color indices, 31 bits of alpha indices (pixel 0 is 1 bit each).
+		write_bits(block,  0, 6, 0x20u);
+		write_bits(block,  8, 7, m5_c0.r);
+		write_bits(block, 15, 7, m5_c1.r);
+		write_bits(block, 22, 7, m5_c0.g);
+		write_bits(block, 29, 7, m5_c1.g);
+		write_bits(block, 36, 7, m5_c0.b);
+		write_bits(block, 43, 7, m5_c1.b);
+		write_bits(block, 50, 8, m5_a0);
+		write_bits(block, 58, 8, m5_a1);
+		write_bits(block, 66, 1, m5_cidx & 1u);
+		[unroll] for (uint j = 1; j < 16; j++)
+			write_bits(block, 67 + (j - 1) * 2, 2, (m5_cidx >> (j * 2)) & 3u);
+		write_bits(block, 97, 1, m5_aidx & 1u);
+		[unroll] for (uint j2 = 1; j2 < 16; j2++)
+			write_bits(block, 98 + (j2 - 1) * 2, 2, (m5_aidx >> (j2 * 2)) & 3u);
+	} else {
+		// Anchor rule: pixel 0 stores only 3 index bits, MSB implied zero. If
+		// its index has the MSB set, swap the endpoints (with their p-bits)
+		// and complement every index (k -> 15-k == XOR the whole nibble array).
+		if ((best_idx_lo & 0x8u) != 0u) {
+			uint4 tq = best_q0; best_q0 = best_q1; best_q1 = tq;
+			uint  tp = best_p0; best_p0 = best_p1; best_p1 = tp;
+			best_idx_lo ^= 0xFFFFFFFFu;
+			best_idx_hi ^= 0xFFFFFFFFu;
+		}
+
+		// Pack mode 6: mode field 0000001 (bit 6 set), then R0 R1 G0 G1 B0 B1
+		// A0 A1 (7 bits each), P0 P1, then 63 index bits (pixel 0 is 3 bits).
+		write_bits(block,  0, 7, 0x40u);
+		write_bits(block,  7, 7, best_q0.r);
+		write_bits(block, 14, 7, best_q1.r);
+		write_bits(block, 21, 7, best_q0.g);
+		write_bits(block, 28, 7, best_q1.g);
+		write_bits(block, 35, 7, best_q0.b);
+		write_bits(block, 42, 7, best_q1.b);
+		write_bits(block, 49, 7, best_q0.a);
+		write_bits(block, 56, 7, best_q1.a);
+		write_bits(block, 63, 1, best_p0);
+		write_bits(block, 64, 1, best_p1);
+		write_bits(block, 65, 3, best_idx_lo & 0x7u);
+		[unroll] for (uint j = 1; j < 16; j++) {
+			uint k = (j < 8) ? ((best_idx_lo >> (j * 4)) & 0xFu)
+			                 : ((best_idx_hi >> ((j - 8) * 4)) & 0xFu);
+			write_bits(block, 68 + (j - 1) * 4, 4, k);
+		}
 	}
 
 	output_blocks[buffer_offset + by * blocks_x + bx] = block;
