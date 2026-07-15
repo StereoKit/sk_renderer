@@ -26,6 +26,7 @@
 typedef enum {
 	compress_fmt_none,
 	compress_fmt_bc1,
+	compress_fmt_bc6h,
 	compress_fmt_astc4x4,
 	compress_fmt_astc6x6,
 	compress_fmt_astc8x8hdr,
@@ -54,6 +55,7 @@ typedef struct {
 	// Format info
 	compress_fmt_  current_format;
 	bool           bc1_supported;
+	bool           bc6h_supported;          // BC6H UF16 sampling — desktop yes, mobile no
 	bool           astc6x6_supported;       // Texture sampling supported (drives display)
 	bool           astc6x6_validate_only;   // Compute works but display format unsupported (AMD desktop)
 	bool           astc8x8hdr_supported;    // ASTC 8x8 HDR sampling — Adreno/Mali yes, AMD desktop no
@@ -69,6 +71,40 @@ typedef struct {
 	// Camera
 	float          cam_distance;
 } scene_texcomp_t;
+
+///////////////////////////////////////////////////////////////////////////////
+// DDS output (BC6H validation)
+///////////////////////////////////////////////////////////////////////////////
+
+// Minimal DDS writer for BC6H_UF16 blocks, mip 0 only — the BC6H analog of
+// the .astc auto-save. DDS with a DX10 extension header is the standard
+// container for BC6H, so external tools (texconv, GIMP, RenderDoc) and the
+// CPU reference decoder can both read it.
+static bool _dds_write_bc6h(const char* path, int32_t width, int32_t height, const void* data, size_t size) {
+	FILE* f = fopen(path, "wb");
+	if (!f) return false;
+
+	uint32_t hdr[37] = {0};
+	hdr[ 0] = 0x20534444;             // 'DDS '
+	hdr[ 1] = 124;                    // header size
+	hdr[ 2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000; // CAPS|HEIGHT|WIDTH|PIXELFORMAT|LINEARSIZE
+	hdr[ 3] = (uint32_t)height;
+	hdr[ 4] = (uint32_t)width;
+	hdr[ 5] = (uint32_t)size;         // linear size of mip 0
+	hdr[ 7] = 1;                      // mip count
+	hdr[19] = 32;                     // pixelformat size
+	hdr[20] = 0x4;                    // DDPF_FOURCC
+	hdr[21] = 0x30315844;             // 'DX10'
+	hdr[27] = 0x1000;                 // DDSCAPS_TEXTURE
+	hdr[32] = 95;                     // DXGI_FORMAT_BC6H_UF16
+	hdr[33] = 3;                      // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+	hdr[35] = 1;                      // array size
+
+	bool ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+	          fwrite(data, size, 1, f) == 1;
+	fclose(f);
+	return ok;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Image Loading
@@ -108,12 +144,14 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 		&scene->texture_original);
 	skr_tex_set_name(&scene->texture_original, "original");
 
-	// Auto-switch format when image type changes — HDR file forces ASTC 8x8
-	// HDR (only HDR encoder we have); non-HDR file falls back from HDR-only
-	// selection to a sensible LDR default.
-	if (is_hdr && scene->current_format != compress_fmt_astc8x8hdr) {
-		scene->current_format = compress_fmt_astc8x8hdr;
-	} else if (!is_hdr && scene->current_format == compress_fmt_astc8x8hdr) {
+	// Auto-switch format when image type changes — HDR file forces an HDR
+	// format (BC6H on desktop, ASTC 8x8 HDR otherwise); non-HDR file falls
+	// back from HDR-only selection to a sensible LDR default.
+	bool is_hdr_fmt = scene->current_format == compress_fmt_bc6h ||
+	                  scene->current_format == compress_fmt_astc8x8hdr;
+	if (is_hdr && !is_hdr_fmt) {
+		scene->current_format = scene->bc6h_supported ? compress_fmt_bc6h : compress_fmt_astc8x8hdr;
+	} else if (!is_hdr && is_hdr_fmt) {
 		scene->current_format = scene->bc1_supported ? compress_fmt_bc1 : compress_fmt_astc6x6;
 	}
 
@@ -124,6 +162,9 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	if (scene->current_format == compress_fmt_bc1 && scene->bc1_supported) {
 		tex_fmt  = skr_tex_fmt_bc1_rgba_srgb;
 		fmt_name = "BC1";
+	} else if (scene->current_format == compress_fmt_bc6h && scene->bc6h_supported) {
+		tex_fmt  = skr_tex_fmt_bc6h_rgbuf;
+		fmt_name = "BC6H";
 	} else if (scene->current_format == compress_fmt_astc4x4 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
 		tex_fmt  = skr_tex_fmt_astc4x4_rgba_srgb;
 		fmt_name = "ASTC4x4";
@@ -161,6 +202,7 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 		uint64_t start_ns = ska_time_get_elapsed_ns();
 		switch (scene->current_format) {
 			case compress_fmt_bc1:     scene->texture_compressed = tex_compress_gpu_bc1    (&scene->texture_source, true); break;
+			case compress_fmt_bc6h:    scene->texture_compressed = tex_compress_gpu_bc6h   (&scene->texture_source);       break;
 			// Skip the displayable-texture path on GPUs that can't sample
 			// ASTC (AMD desktop) — it'd spam the validation layer. The
 			// auto-save below exercises the encoder via buffer readback.
@@ -235,6 +277,22 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 		           scene->current_format == compress_fmt_astc6x6 ||
 		           scene->current_format == compress_fmt_astc8x8hdr) {
 			su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
+		}
+
+		// BC6H uses a DDS container instead of .astc.
+		if (scene->current_format == compress_fmt_bc6h) {
+			int32_t  bc6h_size = 0;
+			uint8_t* bc6h_data = tex_compress_gpu_bc6h_readback(&scene->texture_source, &bc6h_size);
+			if (bc6h_data) {
+				const char* out_path = "bc6h_output.dds";
+				if (_dds_write_bc6h(out_path, width, height, bc6h_data, (size_t)bc6h_size))
+					su_log(su_log_info, "%s: saved %s (%d bytes) from %s", fmt_name, out_path, bc6h_size, path);
+				else
+					su_log(su_log_warning, "%s: failed to save %s", fmt_name, out_path);
+				free(bc6h_data);
+			} else {
+				su_log(su_log_warning, "%s: readback dispatch failed", fmt_name);
+			}
 		}
 #endif
 	} else {
@@ -315,6 +373,7 @@ static scene_t* _scene_texcomp_create(void) {
 
 	// Check format support
 	scene->bc1_supported        = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb,     skr_tex_flags_readable, 1);
+	scene->bc6h_supported       = skr_tex_fmt_is_supported(skr_tex_fmt_bc6h_rgbuf,        skr_tex_flags_readable, 1);
 	scene->astc6x6_supported    = skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba_srgb, skr_tex_flags_readable, 1);
 	// HDR ASTC reuses the LDR 8x8 Vulkan format (HDR signalled per-block via
 	// CEM). Sampling support is the LDR 8x8 sample feature plus the optional
@@ -326,8 +385,9 @@ static scene_t* _scene_texcomp_create(void) {
 	// astcenc — desktop AMD GPUs hit this path.
 	scene->astc6x6_validate_only = !scene->astc6x6_supported;
 
-	su_log(su_log_info, "TexCompress: BC1 %s, ASTC6x6 %s, ASTC8x8HDR %s",
+	su_log(su_log_info, "TexCompress: BC1 %s, BC6H %s, ASTC6x6 %s, ASTC8x8HDR %s",
 		scene->bc1_supported     ? "supported" : "not supported",
+		scene->bc6h_supported    ? "supported" : "not supported",
 		scene->astc6x6_supported ? "supported" :
 		scene->astc6x6_validate_only ? "validate-only (no display)" : "not supported",
 		scene->astc8x8hdr_supported ? "supported" : "validate-only (no display)");
@@ -395,6 +455,7 @@ static void _scene_texcomp_update(scene_t* base, float delta_time) {
 	if (scene->use_gpu && skr_tex_is_valid(&scene->texture_source)) {
 		switch (scene->current_format) {
 			case compress_fmt_bc1:        tex_compress_gpu_bc1_profile       (&scene->texture_source, true); break;
+			case compress_fmt_bc6h:       tex_compress_gpu_bc6h_profile      (&scene->texture_source);       break;
 			case compress_fmt_astc4x4:    tex_compress_gpu_astc4x4_profile   (&scene->texture_source);       break;
 			case compress_fmt_astc6x6:    tex_compress_gpu_astc6x6_profile   (&scene->texture_source);       break;
 			case compress_fmt_astc8x8hdr: tex_compress_gpu_astc8x8hdr_profile(&scene->texture_source);       break;
@@ -472,6 +533,8 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 	igText("Format Support:");
 	igTextColored(scene->bc1_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
 		"  BC1:          %s", scene->bc1_supported ? "Yes" : "No");
+	igTextColored(scene->bc6h_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
+		"  BC6H:         %s", scene->bc6h_supported ? "Yes" : "No");
 	// ASTC 4x4 and 6x6 share one sampling probe — Vulkan's LDR ASTC feature
 	// is all-or-nothing. The encoder always runs; validate-only means the
 	// result can't be displayed, only read back.
@@ -501,6 +564,9 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 
 		if (scene->bc1_supported) {
 			labels[count] = "BC1 (DXT1)";                      values[count++] = compress_fmt_bc1;
+		}
+		if (scene->bc6h_supported) {
+			labels[count] = "BC6H (HDR)";                      values[count++] = compress_fmt_bc6h;
 		}
 		if (scene->astc6x6_supported || scene->astc6x6_validate_only) {
 			labels[count] = "ASTC 4x4";       values[count++] = compress_fmt_astc4x4;
@@ -551,6 +617,7 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 		const char* fmt_name = "None";
 		switch (scene->current_format) {
 			case compress_fmt_bc1:        fmt_name = "BC1 (DXT1)";   break;
+			case compress_fmt_bc6h:       fmt_name = "BC6H";         break;
 			case compress_fmt_astc4x4:    fmt_name = "ASTC 4x4";     break;
 			case compress_fmt_astc6x6:    fmt_name = "ASTC 6x6";     break;
 			case compress_fmt_astc8x8hdr: fmt_name = "ASTC 8x8 HDR"; break;

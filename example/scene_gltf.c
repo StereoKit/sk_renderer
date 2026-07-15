@@ -137,13 +137,15 @@ static void _load_skybox(scene_gltf_t* scene, const char* path) {
 	skr_tex_generate_mips(&scene->cubemap_texture, &scene->mipgen_shader);
 
 	// GPU-compress the environment map (per-face, all IBL mips preserved).
-	// Format choice is content- and hardware-dependent: HDR needs the ASTC 8x8
-	// HDR profile (mobile); LDR skybox content can fall back to BC1 on desktop.
-	// HDR content on a GPU without ASTC sampling (AMD desktop) stays
-	// uncompressed — BC1 would clamp away the HDR range.
+	// Format choice is content- and hardware-dependent: HDR content prefers
+	// BC6H (desktop; 8 bpp, high quality), then ASTC 8x8 HDR (mobile); LDR
+	// skybox content can fall back to BC1 on desktop.
 	scene->skybox_is_hdr = (equirect_format == skr_tex_fmt_rg11b10uf);
 	tex_compress_gpu_init();
-	if (skr_tex_fmt_is_supported(skr_tex_fmt_astc8x8_rgba_hdr, skr_tex_flags_readable, 1)) {
+	if (scene->skybox_is_hdr && skr_tex_fmt_is_supported(skr_tex_fmt_bc6h_rgbuf, skr_tex_flags_readable, 1)) {
+		scene->cubemap_compressed  = tex_compress_gpu_cube_bc6h(&scene->cubemap_texture);
+		scene->compressed_fmt_name = "BC6H";
+	} else if (skr_tex_fmt_is_supported(skr_tex_fmt_astc8x8_rgba_hdr, skr_tex_flags_readable, 1)) {
 		scene->cubemap_compressed  = tex_compress_gpu_cube_astc8x8hdr(&scene->cubemap_texture);
 		scene->compressed_fmt_name = "ASTC 8x8 HDR";
 	} else if (!scene->skybox_is_hdr && skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgb_srgb, skr_tex_flags_readable, 1)) {
@@ -167,7 +169,11 @@ static void _load_skybox(scene_gltf_t* scene, const char* path) {
 		.cull         = skr_cull_none,
 		.queue_offset = 100,
 	}, &scene->skybox_material);
-	skr_material_set_tex(&scene->skybox_material, "cubemap", &scene->cubemap_texture);
+	// Honor the compressed-view toggle across skybox reloads — render() swaps
+	// the global t5 from the same state, and the two must agree.
+	skr_material_set_tex(&scene->skybox_material, "cubemap",
+		(scene->show_compressed && skr_tex_is_valid(&scene->cubemap_compressed))
+			? &scene->cubemap_compressed : &scene->cubemap_texture);
 
 	scene->skybox_mesh = su_mesh_create_fullscreen_quad();
 	skr_mesh_set_name(&scene->skybox_mesh, "skybox_fullscreen_quad");

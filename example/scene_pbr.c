@@ -5,6 +5,7 @@
 
 #include "scene.h"
 #include "tools/scene_util.h"
+#include "tools/tex_compress_gpu.h"
 #include "app.h"
 
 #include <stdlib.h>
@@ -39,6 +40,13 @@ typedef struct scene_pbr_t {
 	skr_mesh_t     skybox_mesh;
 	bool           cubemap_ready;
 	char*          skybox_path;
+
+	// GPU-compressed copy of the environment cubemap, with a UI toggle so the
+	// IBL result can be compared against the uncompressed original.
+	skr_tex_t      cubemap_compressed;
+	const char*    compressed_fmt_name;
+	bool           show_compressed;
+	bool           skybox_is_hdr;
 
 	float          time;
 	float          delta_time;
@@ -92,6 +100,10 @@ static void _destroy_skybox(scene_pbr_t* scene) {
 	skr_shader_destroy  (&scene->mipgen_shader);
 	skr_shader_destroy  (&scene->equirect_to_cubemap_shader);
 	skr_tex_destroy     (&scene->cubemap_texture);
+	if (skr_tex_is_valid(&scene->cubemap_compressed))
+		skr_tex_destroy(&scene->cubemap_compressed);
+	scene->cubemap_compressed  = (skr_tex_t){0};
+	scene->compressed_fmt_name = NULL;
 
 	free(scene->skybox_path);
 	scene->skybox_path   = NULL;
@@ -156,6 +168,29 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 	scene->mipgen_shader = su_shader_load("shaders/cubemap_mipgen.hlsl.sks", "cubemap_mipgen");
 	skr_tex_generate_mips(&scene->cubemap_texture, &scene->mipgen_shader);
 
+	// GPU-compress the environment map (per-face, all IBL mips preserved).
+	// Same policy as scene_gltf: HDR content prefers BC6H (desktop), then
+	// ASTC 8x8 HDR (mobile); LDR content falls back to BC1 on desktop.
+	scene->skybox_is_hdr = (equirect_format == skr_tex_fmt_rg11b10uf);
+	tex_compress_gpu_init();
+	if (scene->skybox_is_hdr && skr_tex_fmt_is_supported(skr_tex_fmt_bc6h_rgbuf, skr_tex_flags_readable, 1)) {
+		scene->cubemap_compressed  = tex_compress_gpu_cube_bc6h(&scene->cubemap_texture);
+		scene->compressed_fmt_name = "BC6H";
+	} else if (skr_tex_fmt_is_supported(skr_tex_fmt_astc8x8_rgba_hdr, skr_tex_flags_readable, 1)) {
+		scene->cubemap_compressed  = tex_compress_gpu_cube_astc8x8hdr(&scene->cubemap_texture);
+		scene->compressed_fmt_name = "ASTC 8x8 HDR";
+	} else if (!scene->skybox_is_hdr && skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgb_srgb, skr_tex_flags_readable, 1)) {
+		scene->cubemap_compressed  = tex_compress_gpu_cube_bc1(&scene->cubemap_texture);
+		scene->compressed_fmt_name = "BC1";
+	}
+	if (skr_tex_is_valid(&scene->cubemap_compressed)) {
+		skr_tex_set_name(&scene->cubemap_compressed, "pbr_environment_cubemap_compressed");
+		su_log(su_log_info, "PBR: GPU-compressed environment to %s", scene->compressed_fmt_name);
+	} else {
+		su_log(su_log_info, "PBR: environment compression unavailable (%s content, no matching displayable format)",
+			scene->skybox_is_hdr ? "HDR" : "LDR");
+	}
+
 	scene->skybox_shader = su_shader_load("shaders/cubemap_skybox.hlsl.sks", "skybox_shader");
 	skr_material_create((skr_material_info_t){
 		.shader       = &scene->skybox_shader,
@@ -164,7 +199,11 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 		.cull         = skr_cull_none,
 		.queue_offset = 100,
 	}, &scene->skybox_material);
-	skr_material_set_tex(&scene->skybox_material, "cubemap", &scene->cubemap_texture);
+	// Honor the compressed-view toggle across skybox reloads — render() swaps
+	// the global t5 from the same state, and the two must agree.
+	skr_material_set_tex(&scene->skybox_material, "cubemap",
+		(scene->show_compressed && skr_tex_is_valid(&scene->cubemap_compressed))
+			? &scene->cubemap_compressed : &scene->cubemap_texture);
 
 	scene->skybox_mesh = su_mesh_create_fullscreen_quad();
 	skr_mesh_set_name(&scene->skybox_mesh, "pbr_skybox_fullscreen_quad");
@@ -250,6 +289,7 @@ static void _scene_pbr_destroy(scene_t* base) {
 	skr_shader_destroy(&scene->pbr_shader);
 
 	_destroy_skybox(scene);
+	tex_compress_gpu_shutdown();
 
 	free(scene);
 }
@@ -264,9 +304,11 @@ static void _scene_pbr_render(scene_t* base, int32_t width, int32_t height, skr_
 	scene_pbr_t* scene = (scene_pbr_t*)base;
 
 	if (scene->cubemap_ready && ref_system_buffer) {
-		ref_system_buffer->cubemap_info = (float4){(float)scene->cubemap_texture.size.x, (float)scene->cubemap_texture.size.y, (float)scene->cubemap_texture.mip_levels, 0.0f};
+		skr_tex_t* env = (scene->show_compressed && skr_tex_is_valid(&scene->cubemap_compressed))
+			? &scene->cubemap_compressed : &scene->cubemap_texture;
+		ref_system_buffer->cubemap_info = (float4){(float)env->size.x, (float)env->size.y, (float)env->mip_levels, 0.0f};
 		ref_system_buffer->time         = scene->time;
-		skr_renderer_set_global_texture(5, &scene->cubemap_texture);
+		skr_renderer_set_global_texture(5, env);
 	}
 
 	if (scene->cubemap_ready) {
@@ -389,6 +431,16 @@ static void _scene_pbr_render_ui(scene_t* base) {
 
 	igText("Skybox: %s", _get_filename(scene->skybox_path));
 	igText("Cubemap: %s", scene->cubemap_ready ? "Ready" : "Not loaded");
+
+	if (skr_tex_is_valid(&scene->cubemap_compressed)) {
+		if (igCheckbox("Compressed environment", &scene->show_compressed)) {
+			// Skybox samples via its own material; PBR materials pick up the
+			// swap through the per-frame global t5 binding in render().
+			skr_material_set_tex(&scene->skybox_material, "cubemap",
+				scene->show_compressed ? &scene->cubemap_compressed : &scene->cubemap_texture);
+		}
+		igText("Compressed as: %s", scene->compressed_fmt_name);
+	}
 
 	if (su_file_dialog_supported()) {
 		if (igButton("Load Skybox...", (ImVec2){-1, 0})) {

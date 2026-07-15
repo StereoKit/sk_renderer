@@ -9,7 +9,7 @@
 
 // GPU Texture Compression
 //
-// Uses compute shaders to compress RGBA textures to BC1, ASTC 4x4,
+// Uses compute shaders to compress RGBA textures to BC1, BC6H, ASTC 4x4,
 // ASTC 6x6, or ASTC 8x8 HDR on the GPU. Zero CPU readback — compressed
 // data stays on the GPU via buffer-to-image copy (skr_tex_set_buffer).
 //
@@ -28,6 +28,13 @@ void      tex_compress_gpu_shutdown(void);
 // Source must be skr_tex_fmt_rgba32 or rgba32_linear with mips generated.
 // enable_alpha: false = opaque 4-color mode, true = punch-through alpha
 skr_tex_t tex_compress_gpu_bc1     (skr_tex_t* source, bool enable_alpha);
+
+// Compress to BC6H UF16 (HDR RGB, mode 11 only) with full mip chain.
+// Source must be a float-format texture (rgba16/rgba32 float) with
+// non-negative values; alpha is ignored (BC6H samples as 1.0). Output is
+// skr_tex_fmt_bc6h_rgbuf — supported on all desktop hardware, absent on
+// mobile (use ASTC 8x8 HDR there). See docs/BC6H_format.md.
+skr_tex_t tex_compress_gpu_bc6h    (skr_tex_t* source);
 
 // Compress to ASTC 4x4 (RGB only) with full mip chain. Per-pixel weights,
 // 3-bit weights, 8-bit endpoints.
@@ -62,6 +69,7 @@ skr_tex_t tex_compress_gpu_astc8x8hdr(skr_tex_t* source);
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_tex_t tex_compress_gpu_cube_bc1       (skr_tex_t* cube_source);  // BC1 (opaque; source read as linear light, output sRGB-encoded)
+skr_tex_t tex_compress_gpu_cube_bc6h      (skr_tex_t* cube_source);  // BC6H UF16 (float source)
 skr_tex_t tex_compress_gpu_cube_astc4x4   (skr_tex_t* cube_source);  // ASTC 4x4 (linear)
 skr_tex_t tex_compress_gpu_cube_astc6x6   (skr_tex_t* cube_source);  // ASTC 6x6 (linear)
 skr_tex_t tex_compress_gpu_cube_astc8x8hdr(skr_tex_t* cube_source);  // ASTC 8x8 HDR (float source)
@@ -69,6 +77,7 @@ skr_tex_t tex_compress_gpu_cube_astc8x8hdr(skr_tex_t* cube_source);  // ASTC 8x8
 // Readback-only variants: allocate a host-visible buffer, dispatch the
 // compute shader at mip 0, wait for GPU, and return malloc'd bytes.
 // Desktop-only; stalls the GPU. Caller frees the returned pointer.
+uint8_t*  tex_compress_gpu_bc6h_readback      (skr_tex_t* source, int32_t* out_size);
 uint8_t*  tex_compress_gpu_astc4x4_readback   (skr_tex_t* source, int32_t* out_size);
 uint8_t*  tex_compress_gpu_astc6x6_readback   (skr_tex_t* source, int32_t* out_size);
 uint8_t*  tex_compress_gpu_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_size);
@@ -78,6 +87,7 @@ uint8_t*  tex_compress_gpu_astc8x8hdr_readback(skr_tex_t* source, int32_t* out_s
 // reallocation per call — for per-frame profiling where you want to measure
 // the encoder shader cost, not the surrounding texture-upload plumbing.
 void      tex_compress_gpu_bc1_profile       (skr_tex_t* source, bool enable_alpha);
+void      tex_compress_gpu_bc6h_profile      (skr_tex_t* source);
 void      tex_compress_gpu_astc4x4_profile   (skr_tex_t* source);
 void      tex_compress_gpu_astc6x6_profile   (skr_tex_t* source);
 void      tex_compress_gpu_astc8x8hdr_profile(skr_tex_t* source);
