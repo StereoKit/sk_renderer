@@ -286,6 +286,24 @@ void encode_mode_5x5_rgba(
 		}
 	}
 
+	// Same post-quantization ordering re-check as Mode B: the decoder's
+	// swap+blue-contract test runs on DEQUANTIZED sums, and r192
+	// quantization can invert a near-tied 8-bit ordering. Alpha swaps along
+	// with RGB for CEM 12.
+	{
+		uint s0 = astc_dequant_r192(astc_r192_quant_lut[min(e0.r, 255u)])
+		        + astc_dequant_r192(astc_r192_quant_lut[min(e0.g, 255u)])
+		        + astc_dequant_r192(astc_r192_quant_lut[min(e0.b, 255u)]);
+		uint s1 = astc_dequant_r192(astc_r192_quant_lut[min(e1.r, 255u)])
+		        + astc_dequant_r192(astc_r192_quant_lut[min(e1.g, 255u)])
+		        + astc_dequant_r192(astc_r192_quant_lut[min(e1.b, 255u)]);
+		if (s0 > s1) {
+			uint3 tmp = e0; e0 = e1; e1 = tmp;
+			uint  at  = a0; a0 = a1; a1 = at;
+			[unroll] for (uint i = 0; i < 25; i++) weights[i] = 3u - weights[i];
+		}
+	}
+
 	uint4 block = uint4(0, 0, 0, 0);
 	astc_write_header_5x5_rgba(block);
 	astc_write_endpoints_rgba6trit(block, e0, e1, a0, a1);
@@ -557,6 +575,24 @@ void encode_mode_6x6pp_rgb_only(
 				[unroll] for (uint i = 0; i < 36; i++) weights[i] = 3u - weights[i];
 			}
 			e0 = n0; e1 = n1;
+		}
+	}
+
+	// The decoder decides swap+blue-contract from the DEQUANTIZED endpoint
+	// sums; r80 quantization moves channels by up to ±2, so an ordering that
+	// held in 8-bit space can invert — the decoder would then swap AND
+	// blue-contract the block into visible garbage. Re-check the ordering on
+	// the decoder's actual values and re-order if needed.
+	{
+		uint s0 = astc_dequant_r80(astc_r80_quant_lut[min(e0.r, 255u)])
+		        + astc_dequant_r80(astc_r80_quant_lut[min(e0.g, 255u)])
+		        + astc_dequant_r80(astc_r80_quant_lut[min(e0.b, 255u)]);
+		uint s1 = astc_dequant_r80(astc_r80_quant_lut[min(e1.r, 255u)])
+		        + astc_dequant_r80(astc_r80_quant_lut[min(e1.g, 255u)])
+		        + astc_dequant_r80(astc_r80_quant_lut[min(e1.b, 255u)]);
+		if (s0 > s1) {
+			uint3 tmp = e0; e0 = e1; e1 = tmp;
+			[unroll] for (uint i = 0; i < 36; i++) weights[i] = 3u - weights[i];
 		}
 	}
 

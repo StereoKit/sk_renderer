@@ -7,6 +7,7 @@
 #include "tools/scene_util.h"
 #include "tools/tex_compress.h"
 #include "tools/tex_compress_gpu.h"
+#include "tools/tex_psnr.h"
 #include "tools/compress/astc_io.h"
 #include "app.h"
 
@@ -48,6 +49,7 @@ typedef struct {
 	int32_t        compressed_size;  // Compressed bytes over the same mip range
 	double         compress_time_ms;
 	double         gpu_compress_time_ms;
+	double         psnr_db;          // Mip-0 PSNR vs original; <0 = not measured
 
 	// Format info
 	compress_fmt_  current_format;
@@ -274,6 +276,15 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	skr_material_set_tex(&scene->material_compare, "tex_right",
 		skr_tex_is_valid(&scene->texture_compressed) ? &scene->texture_compressed : &scene->texture_original);
 
+	// Measure mip-0 quality through the hardware decoder. LDR only — the
+	// 8-bit sRGB PSNR convention doesn't apply to HDR content.
+	scene->psnr_db = -1.0;
+	if (!is_hdr && skr_tex_is_valid(&scene->texture_compressed)) {
+		scene->psnr_db = tex_psnr(&scene->texture_original, &scene->texture_compressed);
+		if (scene->psnr_db >= 0)
+			su_log(su_log_info, "%s: PSNR %.2f dB", fmt_name, scene->psnr_db);
+	}
+
 	su_image_free(pixels);
 
 	su_log(su_log_info, "%s: Compressed %dx%d image (%.1f KB -> %.1f KB, %.1f:1 ratio)",
@@ -298,8 +309,9 @@ static scene_t* _scene_texcomp_create(void) {
 	scene->swipe        = 0.5f;
 	scene->brightness   = 1.0f;
 
-	// Initialize GPU compression
+	// Initialize GPU compression and quality measurement
 	tex_compress_gpu_init();
+	tex_psnr_init();
 
 	// Check format support
 	scene->bc1_supported        = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb,     skr_tex_flags_readable, 1);
@@ -360,6 +372,7 @@ static void _scene_texcomp_destroy(scene_t* base) {
 	if (skr_tex_is_valid(&scene->texture_compressed)) skr_tex_destroy(&scene->texture_compressed);
 	if (skr_tex_is_valid(&scene->texture_source))     skr_tex_destroy(&scene->texture_source);
 
+	tex_psnr_shutdown();
 	tex_compress_gpu_shutdown();
 	free(scene);
 }
@@ -551,6 +564,8 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 		igText("Compressed: %.1f KB", scene->compressed_size / 1024.0f);
 		if (scene->compressed_size > 0)
 			igText("Ratio:      %.1f:1", (float)scene->original_size / scene->compressed_size);
+		if (scene->psnr_db >= 0)
+			igText("PSNR:       %.2f dB", scene->psnr_db);
 
 		igSeparator();
 		if (scene->use_gpu) {

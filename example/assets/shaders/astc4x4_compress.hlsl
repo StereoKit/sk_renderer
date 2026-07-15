@@ -39,12 +39,13 @@ uint buffer_offset;
 // endpoint swap can use `v ^ 1` as the weight mirror. (The trit+2bit table,
 // UNQ_R12_V, lives in astc_common.hlsli.)
 
-// trit+1bit (6 lvl): v → unquantized weight in [0, 1]
+// trit+1bit (6 lvl): v → unquantized weight in [0, 1]. Raw values
+// (0,63,12,51,25,38) with the decoder's "> 32 → +1" bump, over 64.
 // v: 0, 1,      2,     3,     4,     5
-// w: 0, 63/63, 12/63, 51/63, 25/63, 38/63
+// w: 0, 64/64, 12/64, 52/64, 25/64, 39/64
 static const float UNQ_R6_V[6] = {
-	 0.0/63.0,  1.0,       12.0/63.0, 51.0/63.0,
-	25.0/63.0, 38.0/63.0,
+	 0.0/64.0,  1.0,       12.0/64.0, 52.0/64.0,
+	25.0/64.0, 39.0/64.0,
 };
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -800,36 +800,40 @@ void astc_quantize_hdr_rgb(float3 color0_in, float3 color1_in, out uint v0, out 
 
 // Quantize a normalized weight target in [0, 1] to trit+1bit (6 levels) and
 // return the encoded value v ∈ [0, 5]. Thresholds and LEVEL_TO_V derived
-// from mesa's unquantise_weights for (wt_trits=1, wt_bits=1): unquantized
-// levels land at {0, 12, 25, 38, 51, 63} / 63, and the trit encoding
-// scrambles v-to-level (v∈[0,5] maps to level indices {0, 5, 2, 4, 1, 3}).
+// from the spec's weight unquantization for (wt_trits=1, wt_bits=1): raw
+// values are {0, 12, 25, 38, 51, 63}, then the decoder bumps values > 32 by
+// +1 and interpolates against 64, so the true levels are
+// {0, 12, 25, 39, 52, 64} / 64. The trit encoding scrambles v-to-level
+// (v∈[0,5] maps to level indices {0, 5, 2, 4, 1, 3}).
 uint astc_quantize_weight_trit_1bit(float target) {
 	uint level =
-		uint(target >=  6.0 / 63.0) +
-		uint(target >= 18.5 / 63.0) +
-		uint(target >= 31.5 / 63.0) +
-		uint(target >= 44.5 / 63.0) +
-		uint(target >= 57.0 / 63.0);
+		uint(target >=  6.0 / 64.0) +
+		uint(target >= 18.5 / 64.0) +
+		uint(target >= 32.0 / 64.0) +
+		uint(target >= 45.5 / 64.0) +
+		uint(target >= 58.0 / 64.0);
 	static const uint LEVEL_TO_V[6] = { 0u, 2u, 4u, 5u, 3u, 1u };
 	return LEVEL_TO_V[level];
 }
 
 // Quantize a normalized weight target in [0, 1] to trit+2bit (12 levels)
-// and return the encoded value v ∈ [0, 11]. Levels {0, 5, 11, 18, 24, 30,
-// 33, 39, 45, 52, 58, 63} / 63.
+// and return the encoded value v ∈ [0, 11]. Raw values {0, 5, 11, 18, 24,
+// 30, 33, 39, 45, 52, 58, 63} get the decoder's "> 32 → +1" bump and
+// interpolate against 64: true levels are
+// {0, 5, 11, 18, 24, 30, 34, 40, 46, 53, 59, 64} / 64.
 uint astc_quantize_weight_trit_2bit(float target) {
 	uint level =
-		uint(target >=  2.5 / 63.0) +
-		uint(target >=  8.0 / 63.0) +
-		uint(target >= 14.5 / 63.0) +
-		uint(target >= 21.0 / 63.0) +
-		uint(target >= 27.0 / 63.0) +
-		uint(target >= 31.5 / 63.0) +
-		uint(target >= 36.0 / 63.0) +
-		uint(target >= 42.0 / 63.0) +
-		uint(target >= 48.5 / 63.0) +
-		uint(target >= 55.0 / 63.0) +
-		uint(target >= 60.5 / 63.0);
+		uint(target >=  2.5 / 64.0) +
+		uint(target >=  8.0 / 64.0) +
+		uint(target >= 14.5 / 64.0) +
+		uint(target >= 21.0 / 64.0) +
+		uint(target >= 27.0 / 64.0) +
+		uint(target >= 32.0 / 64.0) +
+		uint(target >= 37.0 / 64.0) +
+		uint(target >= 43.0 / 64.0) +
+		uint(target >= 49.5 / 64.0) +
+		uint(target >= 56.0 / 64.0) +
+		uint(target >= 61.5 / 64.0);
 	static const uint LEVEL_TO_V[12] = { 0u, 4u, 8u, 2u, 6u, 10u, 11u, 7u, 3u, 9u, 5u, 1u };
 	return LEVEL_TO_V[level];
 }
@@ -838,12 +842,16 @@ uint astc_quantize_weight_trit_2bit(float target) {
 // level index). For trit+Bbit encoding the decoder's unquantize(v) is not
 // monotonic in v — it produces pairs that mirror across 0.5, which is why
 // LS-refine endpoint swap can use `v ^ 1` as the weight mirror.
+// Raw values (0,63,18,45,5,58,24,39,11,52,30,33) with the decoder's
+// "> 32 → +1" bump applied, over 64:
 // v: 0,      1,  2,     3,     4,    5,     6,     7,     8,     9,     10,    11
-// w: 0/63, 63/63, 18/63, 45/63, 5/63, 58/63, 24/63, 39/63, 11/63, 52/63, 30/63, 33/63
+// w: 0/64, 64/64, 18/64, 46/64, 5/64, 59/64, 24/64, 40/64, 11/64, 53/64, 30/64, 34/64
+// Note every v^1 pair still sums to exactly 1 — the endpoint-swap weight
+// mirror stays valid.
 static const float UNQ_R12_V[12] = {
-	 0.0/63.0,  1.0,       18.0/63.0, 45.0/63.0,
-	 5.0/63.0, 58.0/63.0,  24.0/63.0, 39.0/63.0,
-	11.0/63.0, 52.0/63.0,  30.0/63.0, 33.0/63.0,
+	 0.0/64.0,  1.0,       18.0/64.0, 46.0/64.0,
+	 5.0/64.0, 59.0/64.0,  24.0/64.0, 40.0/64.0,
+	11.0/64.0, 53.0/64.0,  30.0/64.0, 34.0/64.0,
 };
 
 // Full 5-weight trit+1bit group (13 bits total: 5·1 binary + 8 T-bits)
