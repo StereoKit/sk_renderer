@@ -17,9 +17,14 @@
 // ASTC 4x4 RGBA mode); LS solve and SSE stay unweighted.
 //
 // Endpoint quantization: e8 = (e7 << 1) | p, exact 8-bit when p lands
-// right. The p-bit is shared across a endpoint's four channels, so it is
+// right. The p-bit is shared across an endpoint's four channels, so it is
 // chosen per endpoint by trying both values and keeping the lower total
-// squared endpoint error.
+// squared endpoint error — re-chosen every LS round, since the refined
+// endpoints often want the opposite parity from the seeds. Fully-opaque
+// blocks exclude alpha from the vote entirely (see quantize_ep) — their
+// alpha may decode as 254 where RGB needs the even endpoint grid, which is
+// invisible for opaque rendering and a 0.4% bleed if such a texture is
+// ever alpha-blended.
 //
 // v1 limitations (deliberate, same flavor as BC6H's mode-11-only):
 // sharp alpha edges would prefer mode 5's separate alpha indices, and
@@ -69,6 +74,24 @@ float4 dequant7(uint4 e7, uint p) {
 	return float4((e7 << 1) | p);
 }
 
+// Quantize one endpoint, choosing its p-bit from the actual target. Opaque
+// blocks vote on RGB only: their alpha is unused at composite time, and any
+// weight on the a=255 target drags parity odd and was measured at -2 dB RGB
+// on dark content (only p=0 reaches exact black). The <= comparison breaks
+// genuine ties toward p=1, which reaches alpha 255 exactly — so opaque
+// blocks get 255 whenever it's free, 254 only when RGB actually needs the
+// even grid. Blocks with real alpha vote with all four channels.
+void quantize_ep(float4 target, bool opaque, out uint4 q, out uint p) {
+	uint4  qa = quantize7(target, 0u);
+	uint4  qb = quantize7(target, 1u);
+	float4 da = target - dequant7(qa, 0u);
+	float4 db = target - dequant7(qb, 1u);
+	if (opaque) { da.a = 0.0; db.a = 0.0; }
+	bool use_b = dot(db, db) <= dot(da, da);
+	p = use_b ? 1u : 0u;
+	q = use_b ? qb : qa;
+}
+
 // OR count bits of value into the 128-bit block at a bit offset (LSB-first).
 void write_bits(inout uint4 b, uint offset, uint count, uint value) {
 	value &= (1u << count) - 1u;
@@ -93,6 +116,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 	// Load 4x4 block in [0,255] float4 — the space mode 6 endpoints live in.
 	float4 pixels[16];
+	float  min_a = 255.0;
 	[unroll] for (uint py = 0; py < 4; py++) {
 		[unroll] for (uint px = 0; px < 4; px++) {
 			uint sx = min(bx * 4 + px, image_width  - 1);
@@ -101,8 +125,10 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			if (SRGB_ENCODE)
 				texel.rgb = linear_to_srgb(texel.rgb);
 			pixels[py * 4 + px] = saturate(texel) * 255.0;
+			min_a = min(min_a, pixels[py * 4 + px].a);
 		}
 	}
+	bool opaque = min_a >= 254.5;
 
 	// FPS seed: 2 passes of "find pixel most distant from current anchor,
 	// anchor = that pixel" — converges on the block's diametric real pixel
@@ -122,21 +148,10 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		fps_a = far_p;
 	}
 
-	// Choose each endpoint's p-bit once from the seed targets, then keep it
-	// fixed through the LS rounds — the refined endpoints stay in the same
-	// neighborhood, and a stable p keeps rounds comparable.
-	uint p0, p1;
-	{
-		float4 d0a = fps_b - dequant7(quantize7(fps_b, 0u), 0u);
-		float4 d0b = fps_b - dequant7(quantize7(fps_b, 1u), 1u);
-		p0 = dot(d0b, d0b) < dot(d0a, d0a) ? 1u : 0u;
-		float4 d1a = fps_a - dequant7(quantize7(fps_a, 0u), 0u);
-		float4 d1b = fps_a - dequant7(quantize7(fps_a, 1u), 1u);
-		p1 = dot(d1b, d1b) < dot(d1a, d1a) ? 1u : 0u;
-	}
-
-	uint4 q0 = quantize7(fps_b, p0);
-	uint4 q1 = quantize7(fps_a, p1);
+	uint4 q0, q1;
+	uint  p0, p1;
+	quantize_ep(fps_b, opaque, q0, p0);
+	quantize_ep(fps_a, opaque, q1, p1);
 
 	#define LS_ROUNDS 3
 
@@ -214,8 +229,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		float4 ep0 = clamp((sum_ap * sum_bb - sum_bp * sum_ab) * inv_det, 0.0, 255.0);
 		float4 ep1 = clamp((sum_bp * sum_aa - sum_ap * sum_ab) * inv_det, 0.0, 255.0);
 
-		q0 = quantize7(ep0, p0);
-		q1 = quantize7(ep1, p1);
+		quantize_ep(ep0, opaque, q0, p0);
+		quantize_ep(ep1, opaque, q1, p1);
 	}
 
 	// Anchor rule: pixel 0 stores only 3 index bits, MSB implied zero. If its
