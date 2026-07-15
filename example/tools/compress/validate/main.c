@@ -42,9 +42,6 @@ static const char* _find_astcenc(const char* override_path) {
 		"astcenc-sse4.1",
 		"astcenc-sse2",
 		"astcenc",
-		"/home/koujaku/Apps/astcenc/astcenc-avx2",
-		"/home/koujaku/Apps/astcenc/astcenc-sse4.1",
-		"/home/koujaku/Apps/astcenc/astcenc-sse2",
 		NULL
 	};
 	candidates[0] = override_path ? override_path : getenv("ASTCENC_BIN");

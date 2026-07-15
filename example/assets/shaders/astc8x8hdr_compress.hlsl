@@ -30,7 +30,6 @@
 // extension) decodes correctly. astcenc -dh decodes for offline validation.
 
 Texture2D<float4>         source_tex    : register(t0);
-SamplerState              source_tex_s  : register(s0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
 uint mip_level;
@@ -45,11 +44,8 @@ uint buffer_offset;
 // Mode A: 6x5 grid, 2-bit weights — Voronoi assignment + bilinear interp.
 ///////////////////////////////////////////////////////////////////////////////
 
-// 2-bit weight unquant levels (UNQ_R4) and midpoint thresholds.
-static const float UNQ_R4[4]  = { 0.0, 21.0/64.0, 43.0/64.0, 1.0 };
-static const float UNQ_R4_T0  = 21.0 / 128.0;  // ≈ 0.164
-static const float UNQ_R4_T1  = 0.5;
-static const float UNQ_R4_T2  = 107.0 / 128.0; // ≈ 0.836
+// 2-bit weight unquant levels (UNQ_R4) and midpoint thresholds (UNQ_R4_T0..T2)
+// come from astc_common.hlsli.
 
 // Voronoi assignment for 6x5 grid: 6 X grid points, 5 Y. X cell counts
 // {1,2,1,1,2,1}, Y {1,2,2,2,1}. Total = 2·8 + 3·16 = 64 pixels ✓.
@@ -73,15 +69,11 @@ static const uint A_BL_WY[8] = { 0u, 9u, 2u, 11u, 5u, 14u, 7u, 0u };
 // Mode B: 4x4 grid, trit+2bit (12 lvl) BISE weights.
 ///////////////////////////////////////////////////////////////////////////////
 
-// trit+2bit unquant indexed by ENCODED v ∈ [0, 11]. Trit-encoded unquant is
-// non-monotonic in v, pairs as (v, v^1) mirror across 0.5 — so the LS-style
-// endpoint-swap would use v^1 to flip weights if needed (we don't LS in HDR
-// but use this for SSE lookup after quantization).
-static const float UNQ_R12_V[12] = {
-	 0.0/63.0,  1.0,       18.0/63.0, 45.0/63.0,
-	 5.0/63.0, 58.0/63.0,  24.0/63.0, 39.0/63.0,
-	11.0/63.0, 52.0/63.0,  30.0/63.0, 33.0/63.0,
-};
+// trit+2bit unquant indexed by ENCODED v ∈ [0, 11] is UNQ_R12_V from
+// astc_common.hlsli. Trit-encoded unquant is non-monotonic in v, pairs as
+// (v, v^1) mirror across 0.5 — so the LS-style endpoint-swap would use v^1
+// to flip weights if needed (we don't LS in HDR but use this for SSE lookup
+// after quantization).
 
 // 4x4 grid in 8x8 block: each grid cell covers a 2x2 pixel patch. Pixel
 // positions (in /16 units) are 0,7,14,21,27,34,41,48 against grid posts at
@@ -142,13 +134,13 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		return;
 	}
 
-	// Precompute per-pixel projection (raw and normalized to [0,1]).
-	float pixel_proj    [64];
-	float pixel_proj_norm[64];
+	// Precompute per-pixel projection. The normalized-to-[0,1] form is
+	// recomputed at each use site as (pixel_proj - c0_proj) * inv_axis_len_sq
+	// rather than stored — keeps register pressure down.
+	float pixel_proj[64];
 	float inv_axis_len_sq = 1.0 / axis_len_sq;
 	[unroll] for (uint pi = 0; pi < 64; pi++) {
-		pixel_proj[pi]      = dot(lns_pixels[pi], axis);
-		pixel_proj_norm[pi] = (pixel_proj[pi] - c0_proj) * inv_axis_len_sq;
+		pixel_proj[pi] = dot(lns_pixels[pi], axis);
 	}
 
 	///////////////////////////////////////////////////////////////////////
@@ -187,7 +179,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				float w01 = UNQ_R4[weights_A[jy1 * 6u + jx ]];
 				float w11 = UNQ_R4[weights_A[jy1 * 6u + jx1]];
 				float w_i = lerp(lerp(w00, w10, fx), lerp(w01, w11, fx), fy);
-				float err = pixel_proj_norm[sy * 8u + sx] - w_i;
+				float p_n = (pixel_proj[sy * 8u + sx] - c0_proj) * inv_axis_len_sq;
+				float err = p_n - w_i;
 				sse_A += err * err;
 			}
 		}
@@ -226,7 +219,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				float w01 = UNQ_R12_V[weights_B[jy1 * 4u + jx ]];
 				float w11 = UNQ_R12_V[weights_B[jy1 * 4u + jx1]];
 				float w_i = lerp(lerp(w00, w10, fx), lerp(w01, w11, fx), fy);
-				float err = pixel_proj_norm[sy * 8u + sx] - w_i;
+				float p_n = (pixel_proj[sy * 8u + sx] - c0_proj) * inv_axis_len_sq;
+				float err = p_n - w_i;
 				sse_B += err * err;
 			}
 		}
@@ -246,25 +240,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		astc_write_header_8x8_hdr_rgb_4x4_r12(block);
 		astc_write_endpoints_v6              (block, v0, v1, v2, v3, v4, v5);
 		// 16 weights = 3 full 5-trit groups + 1 partial-1 group.
-		uint base = 0u;
-		[unroll] for (uint g = 0; g < 3; g++) {
-			uint vb0 = weights_B[g * 5u + 0u];
-			uint vb1 = weights_B[g * 5u + 1u];
-			uint vb2 = weights_B[g * 5u + 2u];
-			uint vb3 = weights_B[g * 5u + 3u];
-			uint vb4 = weights_B[g * 5u + 4u];
-			uint t0 = vb0 >> 2, m0 = vb0 & 3u;
-			uint t1 = vb1 >> 2, m1 = vb1 & 3u;
-			uint t2 = vb2 >> 2, m2 = vb2 & 3u;
-			uint t3 = vb3 >> 2, m3 = vb3 & 3u;
-			uint t4 = vb4 >> 2, m4 = vb4 & 3u;
-			uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
-			astc_write_weight_trit_2bit_full(block, base, T, m0, m1, m2, m3, m4);
-			base += 18u;
-		}
-		uint v15 = weights_B[15];
-		uint T_p = astc_trit_pack_lut[v15 >> 2];
-		astc_write_weight_trit_2bit_partial1(block, base, T_p, v15 & 3u);
+		astc_write_weights16_trit_2bit(block, weights_B);
 	}
 	output_blocks[buffer_offset + by * blocks_x + bx] = block;
 }

@@ -69,46 +69,6 @@ static inline int32_t bc1_calc_size(int32_t width, int32_t height) {
 	return blocks_x * blocks_y * 8;
 }
 
-// ETC2 RGB8 Compression
-//
-// ETC2 (Ericsson Texture Compression 2) is mandatory on OpenGL ES 3.0+ and
-// Vulkan mobile devices. Backwards compatible with ETC1.
-//
-// Features:
-// - Sub-block based compression (two 2x4 or 4x2 sub-blocks per 4x4 block)
-// - Intensity modulation (base color + luminance offsets)
-// - ETC2 extended modes: T-mode, H-mode, Planar for better gradients/edges
-// - Handles non-power-of-two dimensions
-//
-// Output format: 8 bytes per 4x4 block
-// - Bytes 0-3: Base colors, flip bit, diff bit, table indices
-// - Bytes 4-7: 16x 2-bit pixel indices (MSB and LSB planes)
-//
-// Note: This encoder implements ETC1 modes (individual/differential) which
-// are valid ETC2. For better quality, T/H/Planar modes can be added later.
-
-// Compress RGBA8 image to ETC2 RGB8
-//
-// Parameters:
-//   rgba   - Source image data (RGBA8, 4 bytes per pixel, alpha ignored)
-//   width  - Image width in pixels (any size, doesn't need to be multiple of 4)
-//   height - Image height in pixels (any size, doesn't need to be multiple of 4)
-//
-// Returns:
-//   Newly allocated ETC2 data, caller must free()
-//   Size is ((width+3)/4) * ((height+3)/4) * 8 bytes
-//   Returns NULL on allocation failure
-//
-uint8_t* etc2_rgb8_compress(const uint8_t* rgba, int32_t width, int32_t height);
-
-// Calculate ETC2 RGB8 data size for given dimensions
-// Returns size in bytes (same as BC1 - 8 bytes per 4x4 block)
-static inline int32_t etc2_rgb8_calc_size(int32_t width, int32_t height) {
-	int32_t blocks_x = (width  + 3) / 4;
-	int32_t blocks_y = (height + 3) / 4;
-	return blocks_x * blocks_y * 8;
-}
-
 // Calculate ASTC 6x6 data size for given dimensions
 // Returns size in bytes (16 bytes per 6x6 block)
 static inline int32_t astc6x6_calc_size(int32_t width, int32_t height) {

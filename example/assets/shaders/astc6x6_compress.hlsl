@@ -17,7 +17,7 @@
 // decoder reconstruction. Per-block CEM/grid choice means a single texture
 // can mix opaque and translucent blocks at no extra cost.
 //
-//   Mode A — CEM 8, 4x4 grid, 3-bit weights, 8-bit endpoints (0x053)
+//   Mode A — CEM 8, 4x4 grid, trit+2bit (12 lvl) weights, 8-bit endpoints (0x251)
 //            RGB-only. Decoder writes alpha=1.0 unconditionally, so blocks
 //            whose source alpha is uniformly opaque win cleanly here:
 //            zero alpha error, full 8-bit color precision, more bits free
@@ -43,7 +43,6 @@
 //            as the secondary plane.
 
 Texture2D<float4>         source_tex    : register(t0);
-SamplerState              source_tex_s  : register(s0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
 uint mip_level;
@@ -58,21 +57,16 @@ static const float UNQ_R8[8] = {
 	0.0,         9.0 / 64.0, 18.0 / 64.0, 27.0 / 64.0,
 	37.0 / 64.0, 46.0 / 64.0, 55.0 / 64.0, 1.0
 };
-static const float UNQ_R4[4] = { 0.0, 21.0 / 64.0, 43.0 / 64.0, 1.0 };
 
-// trit+2bit (12 lvl) BISE weights, indexed by ENCODED v ∈ [0, 11]. Used by
-// Mode A (the CEM 8 smooth-mode upgrade from 3-bit to trit+2bit: +50%
-// axial precision, same 4x4 grid + range-256 endpoints). Trit-encoded
-// unquant is non-monotonic in v, paired as (v, v^1) mirror across 0.5 —
-// same shape as our LDR 4x4 Mode A table.
-static const float UNQ_R12_V[12] = {
-	 0.0/63.0,  1.0,       18.0/63.0, 45.0/63.0,
-	 5.0/63.0, 58.0/63.0,  24.0/63.0, 39.0/63.0,
-	11.0/63.0, 52.0/63.0,  30.0/63.0, 33.0/63.0,
-};
+// 2-bit weight unquant (UNQ_R4 + UNQ_R4_T0..T2 thresholds) and the trit+2bit
+// (12 lvl) BISE table indexed by ENCODED v (UNQ_R12_V) come from
+// astc_common.hlsli. UNQ_R12_V is used by Mode A (the CEM 8 smooth-mode
+// upgrade from 3-bit to trit+2bit: +50% axial precision, same 4x4 grid +
+// range-256 endpoints); trit-encoded unquant is non-monotonic in v, paired
+// as (v, v^1) mirror across 0.5 — same shape as our LDR 4x4 Mode A table.
 
 ///////////////////////////////////////////////////////////////////////////////
-// Mode A: 3x3 weight grid, 3-bit weights, 8-bit RGBA endpoints
+// Mode C: 3x3 weight grid, 3-bit weights, 8-bit RGBA endpoints
 ///////////////////////////////////////////////////////////////////////////////
 
 void encode_mode_3x3_rgba(
@@ -204,7 +198,7 @@ void encode_mode_3x3_rgba(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Mode B: 5x5 weight grid, 2-bit weights, range-192 RGBA endpoints (BISE trit)
+// Mode D: 5x5 weight grid, 2-bit weights, range-192 RGBA endpoints (BISE trit)
 ///////////////////////////////////////////////////////////////////////////////
 
 void encode_mode_5x5_rgba(
@@ -221,9 +215,9 @@ void encode_mode_5x5_rgba(
 
 	// 2-bit weights, 4 levels — same threshold table as the RGB 6x6pp variant.
 	float T[3];
-	T[0] = faxis_len_sq * 0.1640625 + fc0_proj;
-	T[1] = faxis_len_sq * 0.5000000 + fc0_proj;
-	T[2] = faxis_len_sq * 0.8359375 + fc0_proj;
+	T[0] = faxis_len_sq * UNQ_R4_T0 + fc0_proj;
+	T[1] = faxis_len_sq * UNQ_R4_T1 + fc0_proj;
+	T[2] = faxis_len_sq * UNQ_R4_T2 + fc0_proj;
 
 	// 25 grid points via bilinear downsample of pproj. Coords (0, 1.25, 2.5,
 	// 3.75, 5.0) per axis on a 6x6 block.
@@ -358,15 +352,14 @@ void encode_mode_5x5_rgba(
 //         G varying in opposite directions, common in dark saturated foliage
 //         blocks) where the bbox picks fictional corner colors no pixel
 //         occupies and reconstruction collapses to a muddy mid-axis color.
-//         Outer-computed axis/proj params are ignored — Mode A recomputes
-//         them against its FPS-derived endpoints.
+//         Axis/projection are computed locally against the FPS-derived
+//         endpoints, so the outer-computed bbox axis params aren't taken.
 ///////////////////////////////////////////////////////////////////////////////
 
 void encode_mode_4x4_rgb_only(
 	in  float4 pixels[36],
-	in  float3 faxis_outer,     in  float faxis_len_sq_outer, in float fc0_proj_outer,
-	in  float  pproj_outer[36], in  uint3 imin_rgb,           in uint3 imax_rgb,
-	out uint4  out_block,       out float out_sse)
+	in  uint3  imin_rgb,  in  uint3 imax_rgb,
+	out uint4  out_block, out float out_sse)
 {
 	// FPS: 2 passes of "find pixel most distant from current anchor,
 	// anchor = that pixel." Converges to approximately the block's diametric
@@ -479,25 +472,7 @@ void encode_mode_4x4_rgb_only(
 
 	// 16 weights = 3 full 5-trit groups + 1 partial-1 group (same BISE
 	// layout as LDR 4x4 Mode A).
-	uint base = 0u;
-	[unroll] for (uint g = 0; g < 3; g++) {
-		uint v0 = weights[g * 5u + 0u];
-		uint v1 = weights[g * 5u + 1u];
-		uint v2 = weights[g * 5u + 2u];
-		uint v3 = weights[g * 5u + 3u];
-		uint v4 = weights[g * 5u + 4u];
-		uint t0 = v0 >> 2, m0 = v0 & 3u;
-		uint t1 = v1 >> 2, m1 = v1 & 3u;
-		uint t2 = v2 >> 2, m2 = v2 & 3u;
-		uint t3 = v3 >> 2, m3 = v3 & 3u;
-		uint t4 = v4 >> 2, m4 = v4 & 3u;
-		uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
-		astc_write_weight_trit_2bit_full(block, base, T, m0, m1, m2, m3, m4);
-		base += 18u;
-	}
-	uint v15 = weights[15];
-	uint T_p = astc_trit_pack_lut[v15 >> 2];
-	astc_write_weight_trit_2bit_partial1(block, base, T_p, v15 & 3u);
+	astc_write_weights16_trit_2bit(block, weights);
 
 	out_block = block;
 
@@ -544,9 +519,9 @@ void encode_mode_6x6pp_rgb_only(
 	uint3 e1 = imax_rgb;
 
 	float T[3];
-	T[0] = faxis_len_sq * 0.1640625 + fc0_proj;
-	T[1] = faxis_len_sq * 0.5000000 + fc0_proj;
-	T[2] = faxis_len_sq * 0.8359375 + fc0_proj;
+	T[0] = faxis_len_sq * UNQ_R4_T0 + fc0_proj;
+	T[1] = faxis_len_sq * UNQ_R4_T1 + fc0_proj;
+	T[2] = faxis_len_sq * UNQ_R4_T2 + fc0_proj;
 
 	uint weights[36];
 	if (faxis_len_sq < 1e-6) {
@@ -649,9 +624,9 @@ void encode_mode_dual_3x3_rgba(
 
 	// Primary (RGB) weight thresholds: 2-bit = 4 levels.
 	float T_rgb[3];
-	T_rgb[0] = faxis_len_sq * 0.1640625 + fc0_proj;
-	T_rgb[1] = faxis_len_sq * 0.5000000 + fc0_proj;
-	T_rgb[2] = faxis_len_sq * 0.8359375 + fc0_proj;
+	T_rgb[0] = faxis_len_sq * UNQ_R4_T0 + fc0_proj;
+	T_rgb[1] = faxis_len_sq * UNQ_R4_T1 + fc0_proj;
+	T_rgb[2] = faxis_len_sq * UNQ_R4_T2 + fc0_proj;
 
 	// Secondary (alpha) is 1D — quantize per-pixel alpha to 4 levels using
 	// (alpha - amin) / (amax - amin) against {0.164, 0.5, 0.836} thresholds.
@@ -706,7 +681,7 @@ void encode_mode_dual_3x3_rgba(
 				float p01 = a_t[iy1 * 6 + ix0];
 				float p11 = a_t[iy1 * 6 + ix1];
 				float p   = lerp(lerp(p00, p10, tx), lerp(p01, p11, tx), ty);
-				uint  q   = uint(p >= 0.1640625) + uint(p >= 0.5) + uint(p >= 0.8359375);
+				uint  q   = uint(p >= UNQ_R4_T0) + uint(p >= UNQ_R4_T1) + uint(p >= UNQ_R4_T2);
 				weights_sec[wy * 3 + wx] = q;
 			}
 		}
@@ -879,7 +854,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		// Opaque block: CEM 12 modes are strictly worse than CEM 8 here —
 		// they spend endpoint bits on alpha that doesn't need encoding,
 		// at no quality benefit (alpha=1.0 either way).
-		encode_mode_4x4_rgb_only  (pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, b, s);
+		encode_mode_4x4_rgb_only  (pixels, imin_rgb, imax_rgb, b, s);
 		best = b; best_sse = s;
 		encode_mode_6x6pp_rgb_only(pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, b, s);
 		if (s < best_sse) { best = b; best_sse = s; }

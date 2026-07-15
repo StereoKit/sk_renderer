@@ -23,7 +23,6 @@
 // = 42 bits for B=1).
 
 Texture2D<float4>         source_tex    : register(t0);
-SamplerState              source_tex_s  : register(s0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
 uint mip_level;
@@ -34,19 +33,11 @@ uint buffer_offset;
 
 #include "astc_common.hlsli"
 
-// Trit-BISE weight unquant tables, indexed by the ENCODED v value (not level
+// Trit-BISE weight unquant table, indexed by the ENCODED v value (not level
 // index). For trit+Bbit encoding the decoder's unquantize(v) is not monotonic
 // in v — it produces pairs that mirror across 0.5, which is why LS-refine
-// endpoint swap can use `v ^ 1` as the weight mirror.
-
-// trit+2bit (12 lvl): v → unquantized weight in [0, 1]
-// v: 0,      1,  2,     3,     4,    5,     6,     7,     8,     9,     10,    11
-// w: 0/63, 63/63, 18/63, 45/63, 5/63, 58/63, 24/63, 39/63, 11/63, 52/63, 30/63, 33/63
-static const float UNQ_R12_V[12] = {
-	 0.0/63.0,  1.0,       18.0/63.0, 45.0/63.0,
-	 5.0/63.0, 58.0/63.0,  24.0/63.0, 39.0/63.0,
-	11.0/63.0, 52.0/63.0,  30.0/63.0, 33.0/63.0,
-};
+// endpoint swap can use `v ^ 1` as the weight mirror. (The trit+2bit table,
+// UNQ_R12_V, lives in astc_common.hlsli.)
 
 // trit+1bit (6 lvl): v → unquantized weight in [0, 1]
 // v: 0, 1,      2,     3,     4,     5
@@ -123,26 +114,7 @@ uint4 encode_mode_4x4_rgb(in float3 pixels[16], in uint3 imin, in uint3 imax) {
 	astc_write_endpoints_rgb8(block, e0, e1);
 
 	// 16 weights = 3 full 5-trit groups + 1 partial-1 group.
-	uint base = 0u;
-	[unroll] for (uint g = 0; g < 3; g++) {
-		uint v0 = weights[g * 5u + 0u];
-		uint v1 = weights[g * 5u + 1u];
-		uint v2 = weights[g * 5u + 2u];
-		uint v3 = weights[g * 5u + 3u];
-		uint v4 = weights[g * 5u + 4u];
-		uint t0 = v0 >> 2, m0 = v0 & 3u;
-		uint t1 = v1 >> 2, m1 = v1 & 3u;
-		uint t2 = v2 >> 2, m2 = v2 & 3u;
-		uint t3 = v3 >> 2, m3 = v3 & 3u;
-		uint t4 = v4 >> 2, m4 = v4 & 3u;
-		uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
-		astc_write_weight_trit_2bit_full(block, base, T, m0, m1, m2, m3, m4);
-		base += 18u;
-	}
-	// Partial-1 for weight 15.
-	uint v15 = weights[15];
-	uint T_p = astc_trit_pack_lut[v15 >> 2];
-	astc_write_weight_trit_2bit_partial1(block, base, T_p, v15 & 3u);
+	astc_write_weights16_trit_2bit(block, weights);
 
 	return block;
 }
@@ -213,27 +185,8 @@ uint4 encode_mode_4x4_rgba(in float4 pixels[16], in uint3 imin, in uint3 imax, i
 	astc_write_header_4x4_rgba_r6(block);
 	astc_write_endpoints_rgba8(block, e0, e1, a0, a1);
 
-	// 16 weights = 3 full 5-trit groups + 1 partial-1 group. B=1 so each m
-	// is a single bit.
-	uint base = 0u;
-	[unroll] for (uint g = 0; g < 3; g++) {
-		uint v0 = weights[g * 5u + 0u];
-		uint v1 = weights[g * 5u + 1u];
-		uint v2 = weights[g * 5u + 2u];
-		uint v3 = weights[g * 5u + 3u];
-		uint v4 = weights[g * 5u + 4u];
-		uint t0 = v0 >> 1, m0 = v0 & 1u;
-		uint t1 = v1 >> 1, m1 = v1 & 1u;
-		uint t2 = v2 >> 1, m2 = v2 & 1u;
-		uint t3 = v3 >> 1, m3 = v3 & 1u;
-		uint t4 = v4 >> 1, m4 = v4 & 1u;
-		uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
-		astc_write_weight_trit_1bit_full(block, base, T, m0, m1, m2, m3, m4);
-		base += 13u;
-	}
-	uint v15 = weights[15];
-	uint T_p = astc_trit_pack_lut[v15 >> 1];
-	astc_write_weight_trit_1bit_partial1(block, base, T_p, v15 & 1u);
+	// 16 weights = 3 full 5-trit groups + 1 partial-1 group (B=1, single-bit m).
+	astc_write_weights16_trit_1bit(block, weights);
 
 	return block;
 }

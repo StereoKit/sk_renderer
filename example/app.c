@@ -338,7 +338,7 @@ app_t* app_create(int32_t start_scene) {
 
 	// Start with the requested scene (default to 0 if out of range or -1)
 	app->scene_index = -1;
-	int32_t initial_scene = (start_scene >= 0 && start_scene < app->scene_count) ? start_scene : 14;
+	int32_t initial_scene = (start_scene >= 0 && start_scene < app->scene_count) ? start_scene : 0;
 	_switch_scene(app, initial_scene);
 
 	return app;

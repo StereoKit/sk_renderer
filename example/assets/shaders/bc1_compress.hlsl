@@ -8,15 +8,30 @@
 // Port of the CPU bounding-box encoder from tools/tex_compress.c.
 
 Texture2D<float4>         source_tex    : register(t0);
-SamplerState              source_tex_s  : register(s0);
 RWStructuredBuffer<uint2> output_blocks : register(u1);
+
+// Pipeline-specialized: the C side creates one compute per value, so the
+// branches below fold away at pipeline-compile time.
+[[vk::constant_id(0)]] const bool ENABLE_ALPHA = false;  // false = opaque only (4-color), true = punch-through alpha
+// Encode linear-light input to sRGB before quantizing, for use with float or
+// sRGB-view sources (which Load as linear). BC1's 5:6:5 endpoints band badly
+// in the darks if fed linear values; quantizing in sRGB space matches how the
+// hardware decodes a *_srgb output format back to linear at sample time.
+[[vk::constant_id(1)]] const bool SRGB_ENCODE = false;
+
+float3 linear_to_srgb(float3 c) {
+	// IEC 61966-2-1 transfer function
+	c = max(c, 0.0);
+	float3 lo = c * 12.92;
+	float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+	return lerp(lo, hi, step(0.0031308, c));
+}
 
 uint mip_level;
 uint image_width;
 uint image_height;
 uint blocks_x;
 uint buffer_offset;
-uint enable_alpha;  // 0 = opaque only (4-color), 1 = punch-through alpha
 
 ///////////////////////////////////////////////////////////////////////////////
 // BC1 block encoder
@@ -44,13 +59,15 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			uint sx = min(bx * 4 + px, image_width  - 1);
 			uint sy = min(by * 4 + py, image_height - 1);
 			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			if (SRGB_ENCODE)
+				texel.rgb = linear_to_srgb(texel.rgb);
 
 			uint idx = py * 4 + px;
 			pixels[idx] = texel.rgb;
 			cmin = min(cmin, texel.rgb);
 			cmax = max(cmax, texel.rgb);
 
-			if (enable_alpha && texel.a < 0.5)
+			if (ENABLE_ALPHA && texel.a < 0.5)
 				trans_mask |= (1u << idx);
 		}
 	}
@@ -59,13 +76,13 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	bool has_opaque      = (trans_mask != 0xFFFF);
 
 	// Alpha path: fully transparent block early-out
-	if (enable_alpha && !has_opaque) {
+	if (ENABLE_ALPHA && !has_opaque) {
 		output_blocks[buffer_offset + by * blocks_x + bx] = uint2(0, 0xFFFFFFFF);
 		return;
 	}
 
 	// Recompute bounding box excluding transparent pixels (branchless)
-	if (enable_alpha && has_transparent) {
+	if (ENABLE_ALPHA && has_transparent) {
 		cmin = float3(1, 1, 1);
 		cmax = float3(0, 0, 0);
 		[unroll] for (uint i = 0; i < 16; i++) {
@@ -90,7 +107,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	uint c1 = ((imin.r >> 3) << 11) | ((imin.g >> 2) << 5) | (imin.b >> 3);
 
 	// Set up color mode
-	if (enable_alpha && has_transparent) {
+	if (ENABLE_ALPHA && has_transparent) {
 		// 3-color + alpha: need c0 <= c1
 		if (c0 > c1) { uint t = c0; c0 = c1; c1 = t; }
 		if (c0 == c1 && c0 > 0) c0--;
@@ -126,10 +143,19 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	// so the inner loop is just: dot(pixel, faxis) >= threshold.
 	uint indices = 0;
 
-	if (faxis_len_sq == 0.0) {
-		// Degenerate: all same color — transparent pixels get index 3
-		indices = (enable_alpha) ? (trans_mask * 3u) : 0;
-	} else if (enable_alpha && has_transparent) {
+	if (faxis_len_sq < 1e-6) {
+		// Degenerate: all same color — everything index 0, except transparent
+		// pixels which need index 3. Indices are 2 bits per pixel, so spread
+		// each trans_mask bit j out to bit 2j, then *3 fills both bits.
+		if (ENABLE_ALPHA && has_transparent) {
+			uint spread = trans_mask;
+			spread = (spread | (spread << 8)) & 0x00FF00FFu;
+			spread = (spread | (spread << 4)) & 0x0F0F0F0Fu;
+			spread = (spread | (spread << 2)) & 0x33333333u;
+			spread = (spread | (spread << 1)) & 0x55555555u;
+			indices = spread * 3u;
+		}
+	} else if (ENABLE_ALPHA && has_transparent) {
 		// 3-color + alpha mode
 		// Original: (dot(p, faxis) - fc0_proj) * 4 >= faxis_len_sq * N
 		// Folded:    dot(p, faxis) >= faxis_len_sq * N / 4 + fc0_proj

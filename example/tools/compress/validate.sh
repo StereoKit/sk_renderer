@@ -42,10 +42,7 @@ fi
 # Locate astcenc (validate.sh also shells out to it for the final decoded PNG).
 ASTCENC="${ASTCENC_BIN:-}"
 if [[ -z "$ASTCENC" ]]; then
-	for c in astcenc-avx2 astcenc-sse4.1 astcenc-sse2 astcenc \
-		/home/koujaku/Apps/astcenc/astcenc-avx2 \
-		/home/koujaku/Apps/astcenc/astcenc-sse4.1 \
-		/home/koujaku/Apps/astcenc/astcenc-sse2; do
+	for c in astcenc-avx2 astcenc-sse4.1 astcenc-sse2 astcenc; do
 		if command -v "$c" >/dev/null 2>&1 || [[ -x "$c" ]]; then
 			ASTCENC="$c"
 			break

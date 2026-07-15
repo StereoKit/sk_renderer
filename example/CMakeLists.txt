@@ -258,7 +258,6 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
 	assets/shaders/bc1_compress.hlsl
-	assets/shaders/etc2_compress.hlsl
 	assets/shaders/astc4x4_compress.hlsl
 	assets/shaders/astc6x6_compress.hlsl
 	assets/shaders/astc8x8hdr_compress.hlsl

@@ -24,7 +24,6 @@ struct psIn {
 	float4 pos    : SV_POSITION;
 	float2 uv     : TEXCOORD0;
 	float4 color  : COLOR0;
-	float2 screen : TEXCOORD1; // pixel coords for line thickness
 };
 
 Texture2D    tex_left         : register(t3);
@@ -43,7 +42,6 @@ psIn vs(vsIn input, skr_ids_t ids) {
 	output.pos    = mul(world, viewproj[ids.view]);
 	output.uv     = input.uv;
 	output.color  = input.color;
-	output.screen = output.pos.xy / output.pos.w; // NDC, used for line width
 	return output;
 }
 
@@ -59,7 +57,8 @@ float4 ps(psIn input) : SV_TARGET {
 	// Vertical line at uv.x == swipe. Width is fixed in UV-space (~0.002 of
 	// the quad width) — gives a thin clean line at any zoom level. fwidth
 	// would tie it to screen-pixels but adds a derivative cost we don't need.
-	// Drawn after brightness so the line stays pure white regardless.
+	// Drawn after brightness so the line isn't dimmed with the image (the
+	// final multiply by input.color below still tints it).
 	float dist_to_line = abs(input.uv.x - swipe);
 	float line_blend   = saturate(1.0 - dist_to_line * 500.0);
 	col = lerp(col, line_color, line_blend);

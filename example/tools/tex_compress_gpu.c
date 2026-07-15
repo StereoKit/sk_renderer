@@ -15,12 +15,16 @@
 
 typedef struct {
 	skr_shader_t  bc1_shader;
-	skr_shader_t  etc2_shader;
 	skr_shader_t  astc4x4_shader;
 	skr_shader_t  astc6x6_shader;
 	skr_shader_t  astc8x8hdr_shader;
-	skr_compute_t bc1_compute;
-	skr_compute_t etc2_compute;
+	// BC1 alpha handling and sRGB encoding are spec constants, so each use
+	// gets its own pipeline with the branches compiled out. The srgb variant
+	// gamma-encodes linear-light sources (float or sRGB-view textures, which
+	// Load as linear) so the 5:6:5 endpoints quantize in perceptual space.
+	skr_compute_t bc1_compute_opaque;
+	skr_compute_t bc1_compute_alpha;
+	skr_compute_t bc1_compute_srgb;
 	skr_compute_t astc4x4_compute;
 	skr_compute_t astc6x6_compute;
 	skr_compute_t astc8x8hdr_compute;
@@ -40,30 +44,36 @@ static tex_compress_gpu_state_t g_tc = {0};
 ///////////////////////////////////////////////////////////////////////////////
 
 void tex_compress_gpu_init(void) {
+	if (g_tc.initialized) return;
+
 	g_tc.bc1_shader        = su_shader_load("shaders/bc1_compress.hlsl.sks",        "bc1_compress");
-	g_tc.etc2_shader       = su_shader_load("shaders/etc2_compress.hlsl.sks",       "etc2_compress");
 	g_tc.astc4x4_shader    = su_shader_load("shaders/astc4x4_compress.hlsl.sks",    "astc4x4_compress");
 	g_tc.astc6x6_shader    = su_shader_load("shaders/astc6x6_compress.hlsl.sks",    "astc6x6_compress");
 	g_tc.astc8x8hdr_shader = su_shader_load("shaders/astc8x8hdr_compress.hlsl.sks", "astc8x8hdr_compress");
 
-	if (skr_shader_is_valid(&g_tc.bc1_shader))        skr_compute_create(&g_tc.bc1_shader,        &g_tc.bc1_compute);
-	if (skr_shader_is_valid(&g_tc.etc2_shader))       skr_compute_create(&g_tc.etc2_shader,       &g_tc.etc2_compute);
-	if (skr_shader_is_valid(&g_tc.astc4x4_shader))    skr_compute_create(&g_tc.astc4x4_shader,    &g_tc.astc4x4_compute);
-	if (skr_shader_is_valid(&g_tc.astc6x6_shader))    skr_compute_create(&g_tc.astc6x6_shader,    &g_tc.astc6x6_compute);
-	if (skr_shader_is_valid(&g_tc.astc8x8hdr_shader)) skr_compute_create(&g_tc.astc8x8hdr_shader, &g_tc.astc8x8hdr_compute);
+	if (skr_shader_is_valid(&g_tc.bc1_shader)) {
+		skr_spec_constant_t alpha_on = { .name = "ENABLE_ALPHA", .value = 1.0 };
+		skr_spec_constant_t srgb_on  = { .name = "SRGB_ENCODE",  .value = 1.0 };
+		skr_compute_create(&g_tc.bc1_shader, (skr_compute_info_t){0}, &g_tc.bc1_compute_opaque);
+		skr_compute_create(&g_tc.bc1_shader, (skr_compute_info_t){ .spec_constants = &alpha_on, .spec_constant_count = 1 }, &g_tc.bc1_compute_alpha);
+		skr_compute_create(&g_tc.bc1_shader, (skr_compute_info_t){ .spec_constants = &srgb_on,  .spec_constant_count = 1 }, &g_tc.bc1_compute_srgb);
+	}
+	if (skr_shader_is_valid(&g_tc.astc4x4_shader))    skr_compute_create(&g_tc.astc4x4_shader,    (skr_compute_info_t){0}, &g_tc.astc4x4_compute);
+	if (skr_shader_is_valid(&g_tc.astc6x6_shader))    skr_compute_create(&g_tc.astc6x6_shader,    (skr_compute_info_t){0}, &g_tc.astc6x6_compute);
+	if (skr_shader_is_valid(&g_tc.astc8x8hdr_shader)) skr_compute_create(&g_tc.astc8x8hdr_shader, (skr_compute_info_t){0}, &g_tc.astc8x8hdr_compute);
 
 	g_tc.initialized = true;
 }
 
 void tex_compress_gpu_shutdown(void) {
 	if (skr_buffer_is_valid (&g_tc.profile_buffer))     skr_buffer_destroy (&g_tc.profile_buffer);
-	if (skr_compute_is_valid(&g_tc.bc1_compute))        skr_compute_destroy(&g_tc.bc1_compute);
-	if (skr_compute_is_valid(&g_tc.etc2_compute))       skr_compute_destroy(&g_tc.etc2_compute);
+	if (skr_compute_is_valid(&g_tc.bc1_compute_opaque)) skr_compute_destroy(&g_tc.bc1_compute_opaque);
+	if (skr_compute_is_valid(&g_tc.bc1_compute_alpha))  skr_compute_destroy(&g_tc.bc1_compute_alpha);
+	if (skr_compute_is_valid(&g_tc.bc1_compute_srgb))   skr_compute_destroy(&g_tc.bc1_compute_srgb);
 	if (skr_compute_is_valid(&g_tc.astc4x4_compute))    skr_compute_destroy(&g_tc.astc4x4_compute);
 	if (skr_compute_is_valid(&g_tc.astc6x6_compute))    skr_compute_destroy(&g_tc.astc6x6_compute);
 	if (skr_compute_is_valid(&g_tc.astc8x8hdr_compute)) skr_compute_destroy(&g_tc.astc8x8hdr_compute);
 	if (skr_shader_is_valid (&g_tc.bc1_shader))         skr_shader_destroy (&g_tc.bc1_shader);
-	if (skr_shader_is_valid (&g_tc.etc2_shader))        skr_shader_destroy (&g_tc.etc2_shader);
 	if (skr_shader_is_valid (&g_tc.astc4x4_shader))     skr_shader_destroy (&g_tc.astc4x4_shader);
 	if (skr_shader_is_valid (&g_tc.astc6x6_shader))     skr_shader_destroy (&g_tc.astc6x6_shader);
 	if (skr_shader_is_valid (&g_tc.astc8x8hdr_shader))  skr_shader_destroy (&g_tc.astc8x8hdr_shader);
@@ -102,9 +112,12 @@ static skr_tex_t _compress_gpu(skr_compute_t* compute, skr_tex_t* source, skr_te
 	// Create device-local storage buffer for all compressed mip data.
 	// Each block occupies block_bytes; packed tightly, mip-major.
 	skr_buffer_t output_buffer;
-	skr_buffer_create(NULL, total_blocks, block_bytes,
-		skr_buffer_type_storage, skr_use_compute_readwrite,
-		&output_buffer);
+	if (skr_buffer_create(NULL, total_blocks, block_bytes,
+			skr_buffer_type_storage, skr_use_compute_readwrite,
+			&output_buffer) != skr_err_success) {
+		su_log(su_log_warning, "tex_compress_gpu: failed to allocate output buffer (%u blocks)", total_blocks);
+		return result;
+	}
 	skr_buffer_set_name(&output_buffer, "tc_gpu_output");
 
 	// Create the compressed output texture (empty, we'll copy into it).
@@ -155,13 +168,8 @@ static skr_tex_t _compress_gpu(skr_compute_t* compute, skr_tex_t* source, skr_te
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_tex_t tex_compress_gpu_bc1(skr_tex_t* source, bool enable_alpha) {
-	uint32_t alpha = enable_alpha ? 1 : 0;
-	skr_compute_set_param(&g_tc.bc1_compute, "enable_alpha", sksc_shader_var_uint, 1, &alpha);
-	return _compress_gpu(&g_tc.bc1_compute, source, skr_tex_fmt_bc1_rgba_srgb, 4, 4, 8);
-}
-
-skr_tex_t tex_compress_gpu_etc2(skr_tex_t* source) {
-	return _compress_gpu(&g_tc.etc2_compute, source, skr_tex_fmt_etc1_rgb_srgb, 4, 4, 8);
+	return _compress_gpu(enable_alpha ? &g_tc.bc1_compute_alpha : &g_tc.bc1_compute_opaque,
+		source, skr_tex_fmt_bc1_rgba_srgb, 4, 4, 8);
 }
 
 skr_tex_t tex_compress_gpu_astc4x4(skr_tex_t* source) {
@@ -240,9 +248,10 @@ static skr_tex_t _compress_gpu_cube(skr_compute_t* compute, skr_tex_t* cube_sour
 }
 
 skr_tex_t tex_compress_gpu_cube_bc1(skr_tex_t* cube_source) {
-	uint32_t alpha = 0;
-	skr_compute_set_param(&g_tc.bc1_compute, "enable_alpha", sksc_shader_var_uint, 1, &alpha);
-	return _compress_gpu_cube(&g_tc.bc1_compute, cube_source, skr_tex_fmt_bc1_rgb, 4, 4, 8);
+	// Cube sources arrive as linear light — float formats and sRGB-view
+	// textures both Load as linear — so gamma-encode into an sRGB BC1 for
+	// usable precision in the darks.
+	return _compress_gpu_cube(&g_tc.bc1_compute_srgb, cube_source, skr_tex_fmt_bc1_rgb_srgb, 4, 4, 8);
 }
 
 skr_tex_t tex_compress_gpu_cube_astc4x4(skr_tex_t* cube_source) {
@@ -377,13 +386,8 @@ static void _profile_dispatch(skr_compute_t* compute, skr_tex_t* source, uint32_
 }
 
 void tex_compress_gpu_bc1_profile(skr_tex_t* source, bool enable_alpha) {
-	uint32_t alpha = enable_alpha ? 1 : 0;
-	skr_compute_set_param(&g_tc.bc1_compute, "enable_alpha", sksc_shader_var_uint, 1, &alpha);
-	_profile_dispatch(&g_tc.bc1_compute, source, 4, 4, 8);
-}
-
-void tex_compress_gpu_etc2_profile(skr_tex_t* source) {
-	_profile_dispatch(&g_tc.etc2_compute, source, 4, 4, 8);
+	_profile_dispatch(enable_alpha ? &g_tc.bc1_compute_alpha : &g_tc.bc1_compute_opaque,
+		source, 4, 4, 8);
 }
 
 void tex_compress_gpu_astc4x4_profile(skr_tex_t* source) {

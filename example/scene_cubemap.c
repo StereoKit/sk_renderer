@@ -5,11 +5,15 @@
 
 #include "scene.h"
 #include "tools/scene_util.h"
+#include "tools/tex_compress_gpu.h"
 #include "app.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#include <cimgui.h>
 
 // Cubemap scene - displays a reflective sphere and skybox using a generated cubemap
 typedef struct {
@@ -30,6 +34,12 @@ typedef struct {
 
 	// Textures
 	skr_tex_t      cubemap_texture;
+
+	// GPU-compressed copy of the cubemap (BC1 on desktop, ASTC 6x6 where
+	// that's the displayable format) with a UI toggle to compare.
+	skr_tex_t      cubemap_compressed;
+	const char*    compressed_fmt_name;
+	bool           show_compressed;
 
 	float rotation;
 } scene_cubemap_t;
@@ -93,6 +103,24 @@ static scene_t* _scene_cubemap_create(void) {
 	// Generate mips for the cubemap using our custom shader
 	skr_tex_generate_mips(&scene->cubemap_texture, &scene->mipgen_shader);
 
+	// GPU-compress the cubemap (per-face 2D compression assembled back into a
+	// cube). Runs at load so the path is always exercised; the UI toggle picks
+	// which version the materials sample.
+	tex_compress_gpu_init();
+	if (skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgb_srgb, skr_tex_flags_readable, 1)) {
+		scene->cubemap_compressed  = tex_compress_gpu_cube_bc1(&scene->cubemap_texture);
+		scene->compressed_fmt_name = "BC1";
+	} else if (skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba, skr_tex_flags_readable, 1)) {
+		scene->cubemap_compressed  = tex_compress_gpu_cube_astc6x6(&scene->cubemap_texture);
+		scene->compressed_fmt_name = "ASTC 6x6";
+	}
+	if (skr_tex_is_valid(&scene->cubemap_compressed)) {
+		skr_tex_set_name(&scene->cubemap_compressed, "color_cubemap_compressed");
+		su_log(su_log_info, "Cubemap: GPU-compressed to %s", scene->compressed_fmt_name);
+	} else {
+		su_log(su_log_warning, "Cubemap: no displayable compressed format, toggle disabled");
+	}
+
 	// Load reflection shader
 	scene->reflection_shader = su_shader_load("shaders/cubemap_reflection.hlsl.sks", "reflection_shader");
 	skr_material_create((skr_material_info_t){
@@ -127,6 +155,9 @@ static void _scene_cubemap_destroy(scene_t* base) {
 	skr_shader_destroy(&scene->skybox_shader);
 	skr_shader_destroy(&scene->mipgen_shader);
 	skr_tex_destroy(&scene->cubemap_texture);
+	if (skr_tex_is_valid(&scene->cubemap_compressed))
+		skr_tex_destroy(&scene->cubemap_compressed);
+	tex_compress_gpu_shutdown();
 
 	free(scene);
 }
@@ -192,6 +223,23 @@ static bool _scene_cubemap_get_camera(scene_t* base, scene_camera_t* out_camera)
 	return true;  // Use this camera
 }
 
+static void _scene_cubemap_render_ui(scene_t* base) {
+	scene_cubemap_t* scene = (scene_cubemap_t*)base;
+
+	igText("Cubemap");
+	igSeparator();
+	if (skr_tex_is_valid(&scene->cubemap_compressed)) {
+		if (igCheckbox("Show compressed", &scene->show_compressed)) {
+			skr_tex_t* tex = scene->show_compressed ? &scene->cubemap_compressed : &scene->cubemap_texture;
+			skr_material_set_tex(&scene->sphere_material, "cubemap", tex);
+			skr_material_set_tex(&scene->skybox_material, "cubemap", tex);
+		}
+		igText("Compressed as: %s", scene->compressed_fmt_name);
+	} else {
+		igTextColored((ImVec4){1.0f, 0.5f, 0.5f, 1.0f}, "No displayable compressed format");
+	}
+}
+
 const scene_vtable_t scene_cubemap_vtable = {
 	.name       = "Cubemap (Reflection & Skybox)",
 	.create     = _scene_cubemap_create,
@@ -199,4 +247,5 @@ const scene_vtable_t scene_cubemap_vtable = {
 	.update     = _scene_cubemap_update,
 	.render     = _scene_cubemap_render,
 	.get_camera = _scene_cubemap_get_camera,
+	.render_ui  = _scene_cubemap_render_ui,
 };
