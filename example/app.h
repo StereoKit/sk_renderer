@@ -30,6 +30,10 @@ void    app_set_scene  (app_t* app, int32_t scene_index);
 int32_t app_scene_index(app_t* app);
 int32_t app_scene_count(app_t* app);
 
+// Rendering configuration
+void app_set_resolve_mode(app_t* app, int32_t mode);     // enum resolve_mode_ index, see resolve_mode_names
+void app_set_msaa        (app_t* app, int32_t samples);  // 1 = MSAA off; call before the first frame
+
 // Input handling
 void app_key_press     (app_t* app, app_key_ key);
 void app_set_frame_time(app_t* app, float frame_time_ms);

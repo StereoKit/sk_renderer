@@ -78,10 +78,13 @@ typedef struct skr_tex_t {
 	VkImage                image;
 	VkDeviceMemory         memory;
 	VkImageView            view;
-	VkFramebuffer          framebuffer;            // Cached framebuffer (color only, no depth)
-	VkFramebuffer          framebuffer_depth;      // Cached framebuffer (color + depth, if last used with depth)
-	VkRenderPass           framebuffer_pass;       // Render pass the color-only framebuffer was created for
-	VkRenderPass           framebuffer_depth_pass; // Render pass the depth framebuffer was created for
+	VkFramebuffer          framebuffer;             // Cached framebuffer (color only, no depth)
+	VkFramebuffer          framebuffer_depth;       // Cached framebuffer (color + depth, if last used with depth)
+	VkRenderPass           framebuffer_pass;        // Render pass the color-only framebuffer was created for
+	VkRenderPass           framebuffer_depth_pass;  // Render pass the depth framebuffer was created for
+	uint64_t               framebuffer_views;       // Fingerprint of the views the cached framebuffer was built
+	uint64_t               framebuffer_depth_views; // from — other attachments can be destroyed while the cache
+	                                                // target survives, so the render pass alone under-keys the cache
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;

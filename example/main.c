@@ -38,7 +38,10 @@ int main(int argc, char* argv[]) {
 	// Parse command line arguments
 	int  test_frames   = 0;   // 0 = run normally, >0 = exit after N frames
 	int  start_scene   = -1;  // -1 = use default, >= 0 = start with this scene
+	int  resolve_mode  = -1;  // -1 = use default, >= 0 = enum resolve_mode_ index
+	int  msaa          = -1;  // -1 = use default, 1 = off, 2/4/8 = sample count
 	bool test_all      = false;
+	bool cycle_resolve = false;  // Step through every resolve mode transition (stale-cache regression)
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-test") == 0) {
 			test_frames = 10;  // Default test mode: 10 frames
@@ -49,6 +52,12 @@ int main(int argc, char* argv[]) {
 			test_frames = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "-scene") == 0 && i + 1 < argc) {
 			start_scene = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-resolve") == 0 && i + 1 < argc) {
+			resolve_mode = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-msaa") == 0 && i + 1 < argc) {
+			msaa = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-cycleresolve") == 0) {
+			cycle_resolve = true;
 		}
 	}
 
@@ -186,6 +195,10 @@ int main(int argc, char* argv[]) {
 
 	// Create application
 	app_t* app = app_create(start_scene);
+	if (app && resolve_mode >= 0)
+		app_set_resolve_mode(app, resolve_mode);
+	if (app && msaa >= 1)
+		app_set_msaa(app, msaa);
 	if (!app) {
 		su_log(su_log_critical, "Failed to create application!");
 		ImGui_ImplSkRenderer_Shutdown();
@@ -207,6 +220,13 @@ int main(int argc, char* argv[]) {
 
 	while (running) {
 		frame_count++;
+
+		// Alternate normal ↔ each other resolve mode every 4 frames, covering
+		// every mode transition — regression for stale cached framebuffers.
+		if (cycle_resolve) {
+			int32_t step = frame_count / 4;
+			app_set_resolve_mode(app, (step & 1) ? (step / 2) % 7 : 0);
+		}
 
 		// Exit after N frames in test mode, or advance to next scene in testall mode
 		if (test_frames > 0 && frame_count >= test_frames) {

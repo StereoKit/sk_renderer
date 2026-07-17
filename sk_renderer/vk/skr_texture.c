@@ -1525,7 +1525,6 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	skr_material_t material;
 	skr_material_create((skr_material_info_t){
 		.shader      = fragment_shader,
-		.cull        = skr_cull_none,
 		.depth_test  = skr_compare_always,
 		.write_mask  = skr_write_rgba,
 	}, &material);
@@ -1814,7 +1813,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			}, VK_SUBPASS_CONTENTS_INLINE);
 
 			vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f});
+			// Flipped viewport, matching every other pass — fullscreen
+			// shaders use the canonical negated-y vertex formula
+			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)mip_height, (float)mip_width, -(float)mip_height, 0.0f, 1.0f});
 			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
 
 			_skr_bind_descriptors(

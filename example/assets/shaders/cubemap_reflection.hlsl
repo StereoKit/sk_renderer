@@ -5,6 +5,7 @@
 struct Inst {
 	float4x4 world;
 	float    roughness;  // 0 = smooth (mip 0), 1 = rough (highest mip)
+	float3   _pad;       // Matches the C-side padding to a 16-aligned stride
 };
 StructuredBuffer<Inst> inst : register(t2, space0);
 

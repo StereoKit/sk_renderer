@@ -27,12 +27,14 @@ const bool enable_stereo          = true;
 enum resolve_mode_ {
 	resolve_mode_normal,         // No postfx, auto resolve
 	resolve_mode_auto_postfx,    // Auto resolve + postfx invert
+	resolve_mode_chain_postfx,   // Auto resolve + postfx invert x2 (chained, pooled intermediate)
 	resolve_mode_manual_postfx,  // Manual resolve + integral invert
 	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
 	resolve_mode_oled_subpixel,  // OLED subpixel-aware resolve (Texture2DMS, separate pass)
+	resolve_mode_depth_fog,      // Postfx reads depth as input attachment (on-tile resolved under MSAA)
 	resolve_mode_max,
 };
-const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve" };
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX" };
 
 // Application state
 struct app_t {
@@ -68,6 +70,9 @@ struct app_t {
 	// PostFX
 	skr_shader_t   postfx_shader;
 	skr_material_t postfx_mat;
+	skr_material_t postfx_mat2;  // Second invert for the chained mode — two inverts ≈ identity
+	skr_shader_t   depth_fog_shader;
+	skr_material_t depth_fog_mat;
 
 	// Manual MSAA resolve
 	skr_shader_t   resolve_shader;
@@ -165,8 +170,16 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 		| (manual_resolve ? skr_tex_flags_input_attachment : 0)
 		| (separate_pass  ? skr_tex_flags_readable         : 0);
 	skr_tex_create(msaa_format,       msaa_flags, separate_pass ? linear_clamp : no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->color_msaa);
-	skr_tex_flags_ depth_flags = skr_tex_flags_writeable | ((app->msaa > 1) ? skr_tex_flags_input_attachment : 0);
-	skr_tex_create(app->depth_format, depth_flags, no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->depth_buffer);
+	// input_attachment covers both the MSAA tile path and postfx depth reads.
+	// Depth is sized unrounded: at 1x MSAA geometry renders straight to the
+	// (odd-sized) swapchain image, and attachments may be larger than the
+	// framebuffer but never smaller.
+	int32_t depth_w = (int32_t)(width  * app->render_scale);
+	int32_t depth_h = (int32_t)(height * app->render_scale);
+	if (depth_w < 2) depth_w = 2;
+	if (depth_h < 2) depth_h = 2;
+	skr_tex_flags_ depth_flags = skr_tex_flags_writeable | skr_tex_flags_input_attachment;
+	skr_tex_create(app->depth_format, depth_flags, no_sampler, (skr_vec3i_t){depth_w, depth_h, 1}, app->msaa, 1, NULL, &app->depth_buffer);
 
 	if (enable_offscreen || needs_upscale) {
 		// Offscreen target at render scale. Readable so the upscale blit can sample it.
@@ -184,9 +197,10 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 				linear_clamp,
 				(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->upscale_target);
 		}
-	} else if (app->msaa > 1) {
-		// Intermediate color target for auto-resolve + postfx mode.
-		// Data stays in tile memory (transient) — postfx reads as input, writes to render_target.
+	} else {
+		// Intermediate color target for the postfx modes (geometry target at 1x,
+		// resolve target under MSAA). Data stays in tile memory (transient) —
+		// postfx reads as input, writes to render_target.
 		skr_tex_create(render_target->format,
 			skr_tex_flags_writeable | skr_tex_flags_input_attachment | skr_tex_flags_in_tile_msaa,
 			no_sampler,
@@ -205,10 +219,7 @@ static void _destroy_render_targets(app_t* app) {
 	skr_tex_destroy(&app->color_msaa);
 	skr_tex_destroy(&app->depth_buffer);
 	skr_tex_destroy(&app->upscale_target);
-	bool needs_upscale = (app->render_scale < 1.0f) || (app->viewport_scale < 1.0f);
-	if (enable_offscreen || needs_upscale || app->msaa > 1) {
-		skr_tex_destroy(&app->scene_color);
-	}
+	skr_tex_destroy(&app->scene_color);
 }
 
 static void _switch_scene(app_t* app, int32_t new_index) {
@@ -271,15 +282,24 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->postfx_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->postfx_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->postfx_mat);
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->postfx_shader,
+			.depth_test = skr_compare_always,
+		}, &app->postfx_mat2);
+	}
+	app->depth_fog_shader = su_shader_load("shaders/postfx_depth_fog.hlsl.sks", "postfx_depth_fog");
+	if (skr_shader_is_valid(&app->depth_fog_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->depth_fog_shader,
+			.depth_test = skr_compare_always,
+		}, &app->depth_fog_mat);
 	}
 	app->resolve_shader = su_shader_load("shaders/msaa_resolve.hlsl.sks", "msaa_resolve");
 	if (skr_shader_is_valid(&app->resolve_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->resolve_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->resolve_mat);
 	}
@@ -287,7 +307,6 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->wide_resolve_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->wide_resolve_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->wide_resolve_mat);
 	}
@@ -295,7 +314,6 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->oled_resolve_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->oled_resolve_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->oled_resolve_mat);
 	}
@@ -303,7 +321,6 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->upscale_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->upscale_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->upscale_mat);
 	}
@@ -370,8 +387,13 @@ void app_destroy(app_t* app) {
 	skr_render_list_destroy(&app->render_list);
 
 	// Destroy postfx (always destroy if created, regardless of runtime toggle)
+	if (skr_shader_is_valid(&app->depth_fog_shader)) {
+		skr_material_destroy(&app->depth_fog_mat);
+		skr_shader_destroy(&app->depth_fog_shader);
+	}
 	if (skr_shader_is_valid(&app->postfx_shader)) {
 		skr_material_destroy(&app->postfx_mat);
+		skr_material_destroy(&app->postfx_mat2);
 		skr_shader_destroy(&app->postfx_shader);
 	}
 	if (skr_shader_is_valid(&app->resolve_shader)) {
@@ -416,6 +438,16 @@ int32_t app_scene_index(app_t* app) {
 
 int32_t app_scene_count(app_t* app) {
 	return app ? app->scene_count : 0;
+}
+
+void app_set_resolve_mode(app_t* app, int32_t mode) {
+	if (!app || mode < 0 || mode >= resolve_mode_max) return;
+	app->resolve_mode = mode;
+}
+
+void app_set_msaa(app_t* app, int32_t samples) {
+	if (!app || samples < 1 || samples > skr_get_max_msaa_samples()) return;
+	app->msaa = samples;
 }
 
 void app_key_press(app_t* app, app_key_ key) {
@@ -542,7 +574,9 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	//
 	// *render_target = scene_color when enable_offscreen or needs_upscale
 	// final_output   = render_target when !needs_upscale, else upscale_src
-	bool use_postfx         = (app->resolve_mode == resolve_mode_auto_postfx)   && skr_material_is_valid(&app->postfx_mat);
+	bool use_chain_postfx   = (app->resolve_mode == resolve_mode_chain_postfx)  && skr_material_is_valid(&app->postfx_mat) && skr_material_is_valid(&app->postfx_mat2);
+	bool use_depth_fog      = (app->resolve_mode == resolve_mode_depth_fog)     && skr_material_is_valid(&app->depth_fog_mat);
+	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog;
 	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
 	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
 	bool use_oled_subpixel  = (app->resolve_mode == resolve_mode_oled_subpixel) && app->msaa > 1 && skr_material_is_valid(&app->oled_resolve_mat);
@@ -598,8 +632,12 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	if (use_manual_resolve)
 		skr_pass_add_resolve(&pass, &app->resolve_mat);
-	if (use_postfx)
+	if (use_depth_fog)
+		skr_pass_add_postfx(&pass, &app->depth_fog_mat);
+	else if (use_postfx)
 		skr_pass_add_postfx(&pass, &app->postfx_mat);
+	if (use_chain_postfx)
+		skr_pass_add_postfx(&pass, &app->postfx_mat2);
 	skr_pass_submit(&pass);
 	skr_render_list_clear(&app->render_list);
 

@@ -11,6 +11,7 @@
 #include "skr_pipeline.h"
 #include "skr_conversions.h"
 #include "skr_scratch.h"
+#include "skr_transient.h"
 
 #include <stdio.h>
 #include <assert.h>
@@ -53,23 +54,45 @@ uint64_t _skr_time_get_ns(void) {
 #endif
 }
 
-static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* cache_target, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, bool has_depth) {
-	VkFramebuffer* cached_fb   = has_depth ? &cache_target->framebuffer_depth      : &cache_target->framebuffer;
-	VkRenderPass*  cached_pass = has_depth ? &cache_target->framebuffer_depth_pass : &cache_target->framebuffer_pass;
+// FNV-1a over attachment view handles. A cached framebuffer must be dropped
+// when any attachment it references is destroyed — the cache target texture
+// can outlive the others (e.g. a swapchain image cache target with recreated
+// color/depth attachments), so the render pass alone under-keys the cache.
+static uint64_t _skr_view_fingerprint(const VkImageView* views, uint32_t count) {
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (uint32_t i = 0; i < count; i++) {
+		hash ^= (uint64_t)views[i];
+		hash *= 0x100000001b3ull;
+	}
+	return hash;
+}
 
-	// Check if we have a cached framebuffer for this render pass
-	if (*cached_fb != VK_NULL_HANDLE && *cached_pass == render_pass) {
+static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* cache_target, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, bool has_depth) {
+	VkFramebuffer* cached_fb    = has_depth ? &cache_target->framebuffer_depth       : &cache_target->framebuffer;
+	VkRenderPass*  cached_pass  = has_depth ? &cache_target->framebuffer_depth_pass  : &cache_target->framebuffer_pass;
+	uint64_t*      cached_views = has_depth ? &cache_target->framebuffer_depth_views : &cache_target->framebuffer_views;
+
+	VkImageView views[3];
+	uint32_t    view_count = 0;
+	if (color)       views[view_count++] = color->view;
+	if (depth)       views[view_count++] = depth->view;
+	if (opt_resolve) views[view_count++] = opt_resolve->view;
+	uint64_t fingerprint = _skr_view_fingerprint(views, view_count);
+
+	// Check if we have a cached framebuffer for this render pass + attachments
+	if (*cached_fb != VK_NULL_HANDLE && *cached_pass == render_pass && *cached_views == fingerprint) {
 		return *cached_fb;
 	}
 
-	// Destroy old cached framebuffer if render pass changed
+	// Destroy old cached framebuffer if render pass or attachments changed
 	if (*cached_fb != VK_NULL_HANDLE) {
 		_skr_cmd_destroy_framebuffer(NULL, *cached_fb);
 	}
 
 	// Create and cache new framebuffer
-	*cached_fb   = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
-	*cached_pass = render_pass;
+	*cached_fb    = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
+	*cached_pass  = render_pass;
+	*cached_views = fingerprint;
 	return *cached_fb;
 }
 
@@ -248,7 +271,8 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 		_skr_vk.cpu_timestamps_valid[prev_flight] = true;
 	}
 
-	_skr_scratch_pool_tick();  // Evict scratch mipgen textures idle for N frames
+	_skr_scratch_pool_tick();    // Evict scratch mipgen textures idle for N frames
+	_skr_transient_pool_tick();  // Evict transient postfx attachments idle for N frames
 
 	_skr_vk.in_frame = false;
 	_skr_vk.frame++;
@@ -1107,13 +1131,14 @@ void skr_pass_add_resolve(skr_pass_t* pass, skr_material_t* resolve_material) {
 	pass->resolve_material = resolve_material;
 }
 
-// Build descriptor writes for a material's parameter buffer and resource
-// bindings. Used by resolve and postfx subpasses. Returns -1 on success, or
-// the failing bind index.
+// Build descriptor writes for a material's parameter buffer, system buffer,
+// and resource bindings. Used by resolve and postfx subpasses. Returns -1 on
+// success, or the failing bind index.
 static int32_t _skr_build_material_descriptors(
 	_skr_cmd_ctx_t*         ctx,
 	skr_material_t*         mat,
-	VkWriteDescriptorSet*   writes,       uint32_t write_max,
+	const void*             system_data,   uint32_t system_data_size,
+	VkWriteDescriptorSet*   writes,        uint32_t write_max,
 	VkDescriptorBufferInfo* buffer_infos,  uint32_t buffer_max,
 	VkDescriptorImageInfo*  image_infos,   uint32_t image_max,
 	uint32_t* out_write_ct, uint32_t* out_buffer_ct, uint32_t* out_image_ct)
@@ -1141,8 +1166,33 @@ static int32_t _skr_build_material_descriptors(
 		}
 	}
 
-	// Material texture/buffer/input attachment binds
-	const int32_t ignore_slots[] = { SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot };
+	// System data buffer — the same per-pass data the geometry draws get, so
+	// postfx shaders can use view/projection matrices and friends.
+	if (mat->has_system_buffer && system_data && system_data_size > 0) {
+		skr_bump_result_t system_bump = _skr_bump_alloc_write(ctx->const_bump, system_data, system_data_size);
+		if (system_bump.buffer) {
+			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
+				.buffer = system_bump.buffer->buffer,
+				.offset = system_bump.offset,
+				.range  = system_data_size,
+			};
+			writes[write_ct++] = (VkWriteDescriptorSet){
+				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot,
+				.descriptorCount = 1,
+				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo     = &buffer_infos[buffer_ct++],
+			};
+		}
+	}
+
+	// Material texture/buffer/input attachment binds. The instance buffer is
+	// ignored like the draw path does — shader includes may declare it even
+	// though a fullscreen subpass never reads instances.
+	const int32_t ignore_slots[] = {
+		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
+		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,
+		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot };
 
 	_skr_bind_pool_lock();
 	skr_material_bind_t* mat_binds = _skr_bind_pool_get(mat->bind_start);
@@ -1198,12 +1248,48 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 	bool has_resolve = pass->resolve_material && skr_material_is_valid(pass->resolve_material);
 
+	// Depth becomes a postfx input attachment when any postfx shader declares
+	// an input attachment named "depth". Under MSAA the geometry subpass also
+	// resolves depth on-tile so postfx always reads single-sample depth.
+	VkSampleCountFlagBits samples = has_color ? color->samples : (has_depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT);
+	bool postfx_reads_depth = false;
+	if (has_depth) {
+		for (uint32_t p = 0; p < pass->postfx_count && !postfx_reads_depth; p++) {
+			skr_material_t* mat = pass->postfx[p];
+			if (!mat || !skr_material_is_valid(mat)) continue;
+			const sksc_shader_meta_t* meta = &mat->key.shader->meta;
+			for (uint32_t r = 0; r < meta->resource_count; r++) {
+				if (meta->resources[r].bind.register_type == skr_register_input_attachment &&
+				    strcmp(meta->resources[r].name, "depth") == 0) { postfx_reads_depth = true; break; }
+			}
+		}
+	}
+	if (postfx_reads_depth) {
+		if (!_skr_vk.has_create_renderpass2) {
+			skr_log(skr_log_critical, "PostFX depth read requires VK_KHR_create_renderpass2, which this device lacks");
+			postfx_reads_depth = false;
+		} else if (samples > VK_SAMPLE_COUNT_1_BIT && !_skr_vk.has_depth_stencil_resolve) {
+			skr_log(skr_log_critical, "PostFX depth read with MSAA requires VK_KHR_depth_stencil_resolve, which this device lacks");
+			postfx_reads_depth = false;
+		} else if (_skr_format_has_stencil(skr_tex_fmt_to_native(depth->format))) {
+			skr_log(skr_log_critical, "PostFX depth read requires a stencil-free depth format");
+			postfx_reads_depth = false;
+		} else if (samples == VK_SAMPLE_COUNT_1_BIT && !(depth->flags & skr_tex_flags_input_attachment)) {
+			// Under MSAA, postfx reads the pooled resolve transient instead,
+			// so only the direct 1x read needs the usage flag on the caller's
+			// depth texture.
+			skr_log(skr_log_critical, "PostFX depth read requires the depth texture be created with skr_tex_flags_input_attachment");
+			postfx_reads_depth = false;
+		}
+	}
+
 	// Build renderpass key for subpass 0 (geometry)
 	skr_pipeline_renderpass_key_t rp_key = {
 		.color_format        = has_color ? skr_tex_fmt_to_native(color->format) : VK_FORMAT_UNDEFINED,
 		.depth_format        = has_depth ? skr_tex_fmt_to_native(depth->format) : VK_FORMAT_UNDEFINED,
 		.resolve_format      = use_msaa  ? skr_tex_fmt_to_native(resolve->format) : VK_FORMAT_UNDEFINED,
-		.samples             = has_color ? color->samples : (has_depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
+		.samples             = samples,
+		.postfx_reads_depth  = postfx_reads_depth,
 		.depth_store_op      = (has_depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op       = (pass->clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
 		.view_mask           = view_mask,
@@ -1245,68 +1331,56 @@ void skr_pass_submit(skr_pass_t* pass) {
 		rp_idx_postfx[p] = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	}
 
-	// Create intermediate transient textures for postfx chaining (postfx_count - 1).
-	// NOTE: These are allocated every frame. This is fine for 0-1 intermediates (typical),
-	// but if chained postfx becomes common, consider caching in a transient image pool.
+	// Acquire pooled transient intermediates for postfx chaining (postfx_count - 1).
+	// The renderpass's EXTERNAL dependencies on the postfx subpasses make
+	// cross-pass reuse of these images safe.
 	VkFormat intermediate_format = use_msaa ? skr_tex_fmt_to_native(resolve->format) : skr_tex_fmt_to_native(color->format);
 	if (rp_key.postfx_output_format != VK_FORMAT_UNDEFINED)
 		intermediate_format = rp_key.postfx_output_format;
 
-	uint32_t  intermediate_count = pass->postfx_count > 1 ? pass->postfx_count - 1 : 0;
-	skr_tex_t intermediates[SKR_PASS_MAX_POSTFX];
-	memset(intermediates, 0, sizeof(intermediates));
+	uint32_t   intermediate_count = pass->postfx_count > 1 ? pass->postfx_count - 1 : 0;
+	skr_tex_t* intermediates[SKR_PASS_MAX_POSTFX] = {0};
+	skr_tex_t* depth_resolve_tex = NULL;
 
 	uint32_t render_width  = has_color ? color->size.x : (has_depth ? depth->size.x : 0);
 	uint32_t render_height = has_color ? color->size.y : (has_depth ? depth->size.y : 0);
 
 	for (uint32_t i = 0; i < intermediate_count; i++) {
-		// Create a transient image: COLOR_ATTACHMENT + INPUT_ATTACHMENT + TRANSIENT
-		VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+		intermediates[i] = _skr_transient_acquire(intermediate_format, (int32_t)render_width, (int32_t)render_height, view_count, false);
+		if (!intermediates[i]) {
+			skr_log(skr_log_critical, "skr_pass_submit: failed to acquire postfx intermediate %u", i);
+			goto cleanup;
+		}
+	}
 
-		VkImageCreateInfo img_info = {
-			.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-			.imageType     = VK_IMAGE_TYPE_2D,
-			.format        = intermediate_format,
-			.extent        = { render_width, render_height, 1 },
-			.mipLevels     = 1,
-			.arrayLayers   = (uint32_t)view_count,
-			.samples       = VK_SAMPLE_COUNT_1_BIT,
-			.tiling        = VK_IMAGE_TILING_OPTIMAL,
-			.usage         = usage,
-			.sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
-			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		};
-		VkResult vr = vkCreateImage(_skr_vk.device, &img_info, NULL, &intermediates[i].image);
-		if (vr != VK_SUCCESS) {
-			skr_log(skr_log_critical, "skr_pass_submit: vkCreateImage intermediate %u: 0x%X", i, (uint32_t)vr);
+	// Pooled 1x transient the geometry subpass resolves depth into for postfx
+	if (postfx_reads_depth && samples > VK_SAMPLE_COUNT_1_BIT) {
+		depth_resolve_tex = _skr_transient_acquire(rp_key.depth_format, (int32_t)render_width, (int32_t)render_height, view_count, true);
+		if (!depth_resolve_tex) {
+			skr_log(skr_log_critical, "skr_pass_submit: failed to acquire depth resolve target");
 			goto cleanup;
 		}
-		if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, intermediates[i].image, true, &intermediates[i].memory) == VK_NULL_HANDLE) {
-			skr_log(skr_log_critical, "skr_pass_submit: failed to allocate intermediate memory");
-			goto cleanup;
-		}
-		vkBindImageMemory(_skr_vk.device, intermediates[i].image, intermediates[i].memory, 0);
+	}
 
-		VkImageViewCreateInfo view_info = {
-			.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.image      = intermediates[i].image,
-			.viewType   = view_count > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
-			.format     = intermediate_format,
-			.subresourceRange = {
-				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel   = 0,
-				.levelCount     = 1,
-				.baseArrayLayer = 0,
-				.layerCount     = (uint32_t)view_count,
-			},
-		};
-		vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &intermediates[i].view);
-		if (vr != VK_SUCCESS) {
-			skr_log(skr_log_critical, "skr_pass_submit: vkCreateImageView intermediate %u: 0x%X", i, (uint32_t)vr);
-			goto cleanup;
+	// The postfx chain reads the scene as an input attachment, so the texture
+	// the geometry lands in (resolve under MSAA, color otherwise) must be
+	// input-attachment capable, and can't also be the final output. When the
+	// caller's texture is neither, route the scene through a pooled tile-local
+	// transient — the original target then only receives the final postfx
+	// write. Note this can't preserve previous target contents, so a LOAD
+	// color op renders over undefined data here.
+	skr_tex_t* scene_transient = NULL;
+	if (pass->postfx_count > 0) {
+		skr_tex_t* scene_src = use_msaa ? resolve : color;
+		if (scene_src && (scene_src == final_output || !(scene_src->flags & skr_tex_flags_input_attachment))) {
+			scene_transient = _skr_transient_acquire(skr_tex_fmt_to_native(scene_src->format), (int32_t)render_width, (int32_t)render_height, view_count, false);
+			if (!scene_transient) {
+				skr_log(skr_log_critical, "skr_pass_submit: failed to acquire postfx scene target");
+				goto cleanup;
+			}
+			if (use_msaa) resolve = scene_transient;
+			else          color   = scene_transient;
 		}
-		intermediates[i].size        = (skr_vec3i_t){ (int32_t)render_width, (int32_t)render_height, 1 };
-		intermediates[i].layer_count = (uint32_t)view_count;
 	}
 
 	// Build framebuffer with all attachments matching renderpass attachment order:
@@ -1315,20 +1389,24 @@ void skr_pass_submit(skr_pass_t* pass) {
 		VkImageView fb_attachments[SKR_POSTFX_MAX_ATTACHMENTS];
 		uint32_t    fb_count = 0;
 
-		if (has_color)  fb_attachments[fb_count++] = color->view;
-		if (use_msaa)   fb_attachments[fb_count++] = resolve->view;
-		if (has_depth)  fb_attachments[fb_count++] = depth->view;
+		if (has_color)          fb_attachments[fb_count++] = color->view;
+		if (use_msaa)           fb_attachments[fb_count++] = resolve->view;
+		if (has_depth)          fb_attachments[fb_count++] = depth->view;
+		if (depth_resolve_tex)  fb_attachments[fb_count++] = depth_resolve_tex->view;
 		for (uint32_t i = 0; i < intermediate_count; i++)
-			fb_attachments[fb_count++] = intermediates[i].view;
+			fb_attachments[fb_count++] = intermediates[i]->view;
 		bool resolve_is_final = has_resolve && pass->postfx_count == 0;
 		if (!resolve_is_final)
 			fb_attachments[fb_count++] = final_output->view;
 
-		// Cache framebuffer on final_output when no intermediates (common case).
-		// With intermediates, create fresh each frame since they're transient.
-		VkFramebuffer framebuffer = VK_NULL_HANDLE;
-		bool cache_fb = (intermediate_count == 0);
-		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE && final_output->framebuffer_depth_pass == render_pass) {
+		// Cache framebuffer on final_output when no pooled transients are
+		// attached (common case) — pooled views vary between frames.
+		VkFramebuffer framebuffer  = VK_NULL_HANDLE;
+		bool     cache_fb    = (intermediate_count == 0 && !depth_resolve_tex && !scene_transient);
+		uint64_t fingerprint = _skr_view_fingerprint(fb_attachments, fb_count);
+		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE
+			&& final_output->framebuffer_depth_pass  == render_pass
+			&& final_output->framebuffer_depth_views == fingerprint) {
 			framebuffer = final_output->framebuffer_depth;
 		} else {
 			if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE) {
@@ -1349,8 +1427,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 				goto cleanup;
 			}
 			if (cache_fb) {
-				final_output->framebuffer_depth      = framebuffer;
-				final_output->framebuffer_depth_pass = render_pass;
+				final_output->framebuffer_depth       = framebuffer;
+				final_output->framebuffer_depth_pass  = render_pass;
+				final_output->framebuffer_depth_views = fingerprint;
 			}
 		}
 
@@ -1365,7 +1444,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 					VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
 					VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
 			}
-			if (color && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+			if (color && color != scene_transient && rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
 				_skr_barrier_batch_add(&batch, ctx.cmd, color,
 					_skr_tex_attachment_layout(color),
 					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1391,7 +1470,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 				clear_values[clear_count] = (VkClearValue){ .depthStencil = {.depth = pass->clear_depth, .stencil = pass->clear_stencil} };
 			clear_count++;
 		}
-		clear_count += intermediate_count; // intermediates (DONT_CARE load)
+		if (depth_resolve_tex) clear_count++; // depth resolve (DONT_CARE load)
+		clear_count += intermediate_count;    // intermediates (DONT_CARE load)
 		if (!resolve_is_final)
 			clear_count++; // final output (DONT_CARE load)
 
@@ -1461,6 +1541,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 			uint32_t write_ct = 0, buffer_ct = 0, image_ct = 0;
 
 			int32_t fail_idx = _skr_build_material_descriptors(&ctx, resolve_mat,
+				pass->draws[0].system_data, pass->draws[0].system_data_size,
 				writes, 32, buffer_infos, 16, image_infos, 16,
 				&write_ct, &buffer_ct, &image_ct);
 			if (fail_idx >= 0)
@@ -1469,7 +1550,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 			VkPipeline pipeline = _skr_pipeline_get(resolve_mat->pipeline_material_idx, rp_idx_resolve, null_vert_idx);
 			if (pipeline != VK_NULL_HANDLE) {
 				vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)render_width, (float)render_height, 0.0f, 1.0f});
+				// Flipped viewport, matching every other pass — fullscreen
+				// shaders use the canonical negated-y vertex formula
+				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)render_height, (float)render_width, -(float)render_height, 0.0f, 1.0f});
 				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {render_width, render_height}});
 
 				_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1493,16 +1576,24 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 			bool is_last = (p == pass->postfx_count - 1);
 
-			// Auto-bind input attachments by scanning shader metadata
+			// Auto-bind input attachments by scanning shader metadata. Under
+			// MSAA, "depth" binds the on-tile resolved 1x depth, not the
+			// multisampled depth buffer.
 			const sksc_shader_meta_t* meta = &postfx_mat->key.shader->meta;
+			bool depth_unavailable = false;
 			for (uint32_t r = 0; r < meta->resource_count; r++) {
 				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
 				const char* name = meta->resources[r].name;
 				if (strcmp(name, "color") == 0 && prev_color) {
 					skr_material_set_tex(postfx_mat, "color", prev_color);
-				} else if (strcmp(name, "depth") == 0 && depth) {
-					skr_material_set_tex(postfx_mat, "depth", depth);
+				} else if (strcmp(name, "depth") == 0) {
+					if (postfx_reads_depth) skr_material_set_tex(postfx_mat, "depth", depth_resolve_tex ? depth_resolve_tex : depth);
+					else                    depth_unavailable = true;
 				}
+			}
+			if (depth_unavailable) {
+				skr_log(skr_log_critical, "PostFX %u reads depth, which this pass can't provide — skipping", p);
+				continue;
 			}
 
 			VkWriteDescriptorSet   writes      [32];
@@ -1511,6 +1602,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 			uint32_t write_ct = 0, buffer_ct = 0, image_ct = 0;
 
 			int32_t fail_idx = _skr_build_material_descriptors(&ctx, postfx_mat,
+				pass->draws[0].system_data, pass->draws[0].system_data_size,
 				writes, 32, buffer_infos, 16, image_infos, 16,
 				&write_ct, &buffer_ct, &image_ct);
 			if (fail_idx >= 0) {
@@ -1522,7 +1614,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 			VkPipeline pipeline = _skr_pipeline_get(postfx_mat->pipeline_material_idx, rp_idx_postfx[p], null_vert_idx);
 			if (pipeline != VK_NULL_HANDLE) {
 				vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)render_width, (float)render_height, 0.0f, 1.0f});
+				// Flipped viewport, matching every other pass — fullscreen
+				// shaders use the canonical negated-y vertex formula
+				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)render_height, (float)render_width, -(float)render_height, 0.0f, 1.0f});
 				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {render_width, render_height}});
 
 				_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1535,7 +1629,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 			// Update prev_color for next postfx in chain
 			if (!is_last && intermediate_count > 0)
-				prev_color = &intermediates[p];
+				prev_color = intermediates[p];
 		}
 
 		vkCmdEndRenderPass(ctx.cmd);
@@ -1545,18 +1639,14 @@ void skr_pass_submit(skr_pass_t* pass) {
 			? _skr_tex_sample_layout    (final_output)
 			: _skr_tex_attachment_layout(final_output));
 
-		// Defer-destroy transient resources (cached framebuffer is not destroyed here)
+		// Defer-destroy the uncached framebuffer; intermediates return to the
+		// transient pool for reuse by later passes.
 		if (!cache_fb)
 			_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
-		// Destroy list is LIFO — push memory, then image, then view, so the
-		// resources retire in dependency order (view → image → memory). The
-		// memory must outlive the image (VUID-vkFreeMemory-memory-00677), and
-		// the image must outlive the view that references it.
-		for (uint32_t i = 0; i < intermediate_count; i++) {
-			_skr_cmd_destroy_memory    (ctx.destroy_list, intermediates[i].memory);
-			_skr_cmd_destroy_image     (ctx.destroy_list, intermediates[i].image);
-			_skr_cmd_destroy_image_view(ctx.destroy_list, intermediates[i].view);
-		}
+		for (uint32_t i = 0; i < intermediate_count; i++)
+			_skr_transient_release(intermediates[i]);
+		_skr_transient_release(depth_resolve_tex);
+		_skr_transient_release(scene_transient);
 	}
 
 	_skr_vk.current_color_texture = NULL;
@@ -1566,12 +1656,11 @@ void skr_pass_submit(skr_pass_t* pass) {
 	return;
 
 cleanup:
-	// Error path: clean up any partially created intermediates
-	for (uint32_t i = 0; i < intermediate_count; i++) {
-		if (intermediates[i].view)   vkDestroyImageView(_skr_vk.device, intermediates[i].view,   NULL);
-		if (intermediates[i].image)  vkDestroyImage    (_skr_vk.device, intermediates[i].image,  NULL);
-		if (intermediates[i].memory) vkFreeMemory      (_skr_vk.device, intermediates[i].memory, NULL);
-	}
+	// Error path: return any acquired transients to the pool
+	for (uint32_t i = 0; i < intermediate_count; i++)
+		_skr_transient_release(intermediates[i]);
+	_skr_transient_release(depth_resolve_tex);
+	_skr_transient_release(scene_transient);
 	_skr_cmd_release(ctx.cmd);
 	_skr_pipeline_unlock();
 }

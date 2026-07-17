@@ -140,6 +140,8 @@ target_sources(sk_renderer PRIVATE
 	sk_renderer/vk/skr_texture.c
 	sk_renderer/vk/skr_scratch.h
 	sk_renderer/vk/skr_scratch.c
+	sk_renderer/vk/skr_transient.h
+	sk_renderer/vk/skr_transient.c
 	sk_renderer/vk/skr_pipeline.h
 	sk_renderer/vk/skr_pipeline.c
 	sk_renderer/vk/skr_compute.c

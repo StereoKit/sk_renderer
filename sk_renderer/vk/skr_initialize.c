@@ -7,6 +7,7 @@
 #include "skr_pipeline.h"
 #include "skr_conversions.h"
 #include "skr_scratch.h"
+#include "skr_transient.h"
 
 #include "skr_mipgen_2d.hlsl.h"
 #include "skr_mipgen_cube.hlsl.h"
@@ -135,6 +136,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_bind_pool_init();
 	_skr_sampler_cache_init();
 	_skr_scratch_pool_init();
+	_skr_transient_pool_init();
 
 	// Set up bind slot configuration (use defaults if not provided)
 	if (settings.bind_settings) {
@@ -184,6 +186,9 @@ bool skr_init(skr_settings_t settings) {
 		VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
 		VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,       // Required-subgroup-size for compute (HLSL [WaveSize]/`//--wave_size`)
 		VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,           // Sync FD export for frame fences (VK_KHR_external_fence is core 1.1)
+		VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,         // Postfx depth input attachments (per-reference aspect masks)
+		VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,       // On-tile depth resolve so postfx reads 1x depth under MSAA
+		VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME,      // Reports whether drivers actually merge the postfx subpass chain
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -580,6 +585,9 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_custom_resolve          = false;
 	_skr_vk.has_subgroup_size_control   = false;
 	_skr_vk.has_external_fence_fd       = false;
+	_skr_vk.has_create_renderpass2      = false;
+	_skr_vk.has_depth_stencil_resolve   = false;
+	_skr_vk.has_subpass_merge_feedback  = false;
 	bool has_image_format_list          = false;
 	bool has_swapchain                  = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
@@ -594,6 +602,9 @@ bool skr_init(skr_settings_t settings) {
 			if (strcmp(optional_device_exts[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME          ) == 0) has_image_format_list                = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME     ) == 0) _skr_vk.has_subgroup_size_control    = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME        ) == 0) _skr_vk.has_external_fence_fd        = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME      ) == 0) _skr_vk.has_create_renderpass2       = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME    ) == 0) _skr_vk.has_depth_stencil_resolve    = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME   ) == 0) _skr_vk.has_subpass_merge_feedback   = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
@@ -649,6 +660,9 @@ bool skr_init(skr_settings_t settings) {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
 		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_size_query : NULL,
 	};
+	VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT subpass_merge_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
+	};
 	VkPhysicalDeviceMultiviewFeatures multiview_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
 		.pNext = &ycbcr_query,
@@ -657,11 +671,16 @@ bool skr_init(skr_settings_t settings) {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
 		.pNext = &multiview_query,
 	};
+	if (_skr_vk.has_subpass_merge_feedback) {
+		subpass_merge_query.pNext = features2_query.pNext;
+		features2_query.pNext     = &subpass_merge_query;
+	}
 	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
 
 	_skr_vk.has_ycbcr_conversion = ycbcr_query.samplerYcbcrConversion != 0;
 	// Only consider subgroup size control supported if the feature flag is set, not just the extension.
-	_skr_vk.has_subgroup_size_control = _skr_vk.has_subgroup_size_control && subgroup_size_query.subgroupSizeControl;
+	_skr_vk.has_subgroup_size_control  = _skr_vk.has_subgroup_size_control  && subgroup_size_query.subgroupSizeControl;
+	_skr_vk.has_subpass_merge_feedback = _skr_vk.has_subpass_merge_feedback && subpass_merge_query.subpassMergeFeedback;
 
 	// Multiview is a hard requirement for stereo/XR rendering. It's part of
 	// Vulkan 1.1 core but is still a feature flag, so an implementation can
@@ -691,6 +710,10 @@ bool skr_init(skr_settings_t settings) {
 		.pNext                  = _skr_vk.has_subgroup_size_control ? (void*)&subgroup_size_features : (void*)&multiview_features,
 		.samplerYcbcrConversion = _skr_vk.has_ycbcr_conversion ? VK_TRUE : VK_FALSE,
 	};
+
+	// VK_KHR_depth_stencil_resolve requires create_renderpass2; SAMPLE_ZERO
+	// depth resolve support is mandated by the extension, so no mode query.
+	_skr_vk.has_depth_stencil_resolve = _skr_vk.has_depth_stencil_resolve && _skr_vk.has_create_renderpass2;
 
 	// Query multiview properties (and subgroup size limits if supported)
 	VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_props = {
@@ -729,6 +752,14 @@ bool skr_init(skr_settings_t settings) {
 		.ppEnabledExtensionNames = device_exts,
 		.pEnabledFeatures        = &device_features,
 	};
+
+	VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT subpass_merge_features = {
+		.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
+		.pNext                = (void*)device_info.pNext,
+		.subpassMergeFeedback = VK_TRUE,
+	};
+	if (_skr_vk.has_subpass_merge_feedback)
+		device_info.pNext = &subpass_merge_features;
 
 	// Create VkDevice - either via callback (for OpenXR enable2) or directly
 	if (settings.device_create_callback) {
@@ -894,8 +925,11 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.capabilities[skr_capability_presentation] = has_surface && has_swapchain;
 
 	// Log optional extension status
-	skr_log(skr_log_info, "[%s] %s",           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,             _skr_vk.has_push_descriptors ? "true" : "false");
-	skr_log(skr_log_info, "[%s] %s",           VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME, _skr_vk.has_custom_resolve   ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s",           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,             _skr_vk.has_push_descriptors      ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s",           VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME, _skr_vk.has_custom_resolve        ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s",           VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,         _skr_vk.has_create_renderpass2    ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s",           VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,       _skr_vk.has_depth_stencil_resolve ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s",           VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME,      _skr_vk.has_subpass_merge_feedback? "true" : "false");
 	skr_log(skr_log_info, "[%s] max %u views", VK_KHR_MULTIVIEW_EXTENSION_NAME,                   _skr_vk.max_multiview_view_count);
 
 	_skr_vk.initialized = true;
@@ -914,7 +948,8 @@ void skr_shutdown(void) {
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_2d);
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_cube);
 
-	_skr_scratch_pool_shutdown();  // Free pooled mipgen scratch textures before command shutdown
+	_skr_scratch_pool_shutdown();   // Free pooled mipgen scratch textures before command shutdown
+	_skr_transient_pool_shutdown(); // Free pooled transient postfx attachments before command shutdown
 
 	_skr_cmd_shutdown      ();  // Executes per-command destroy lists (may free bind pool slots)
 	_skr_pipeline_shutdown ();
