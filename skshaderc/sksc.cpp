@@ -481,16 +481,26 @@ static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) 
 		{ 4168, sksc_feature_bit_tile_image },       // TileImageStencilReadAccessEXT
 		{ 6033, sksc_feature_bit_float_atomics },    // AtomicFloat32AddEXT
 		{ 5612, sksc_feature_bit_float_atomics },    // AtomicFloat32MinMaxEXT
+		{ 4484, sksc_feature_bit_qcom_sample_weighted }, // TextureSampleWeightedQCOM
+		{ 4485, sksc_feature_bit_qcom_box_filter },      // TextureBoxFilterQCOM
+		{ 4486, sksc_feature_bit_qcom_block_match },     // TextureBlockMatchQCOM
+		{ 4498, sksc_feature_bit_qcom_image_proc2 },     // TextureBlockMatch2QCOM
+		{ 4495, sksc_feature_bit_qcom_tile_shading },    // TileShadingQCOM
 	};
 	// capabilities every Vulkan 1.1 runtime satisfies — no bit, never unknown
 	static const uint32_t baseline[] = { 1, 50, 43, 44, 40, 51 };
 	// Shader, ImageQuery, Sampled1D, Image1D, InputAttachment, DerivativeControl
+	// bit 0xFF = the extension is known but sets no bit itself: its capabilities
+	// carry the precise per-op bits (image processing splits into three)
 	static const struct { const char *name; uint8_t bit; } ext_bits[] = {
 		{ "SPV_KHR_8bit_storage",                sksc_feature_bit_storage8 },
 		{ "SPV_EXT_demote_to_helper_invocation", sksc_feature_bit_demote },
 		{ "SPV_EXT_shader_tile_image",           sksc_feature_bit_tile_image },
 		{ "SPV_EXT_shader_atomic_float_add",     sksc_feature_bit_float_atomics },
 		{ "SPV_EXT_shader_atomic_float_min_max", sksc_feature_bit_float_atomics },
+		{ "SPV_QCOM_image_processing",           0xFF },
+		{ "SPV_QCOM_image_processing2",          sksc_feature_bit_qcom_image_proc2 },
+		{ "SPV_QCOM_tile_shading",               sksc_feature_bit_qcom_tile_shading },
 	};
 
 	uint64_t bits = 0;
@@ -512,7 +522,7 @@ static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) 
 			bool        known = false;
 			for (size_t k = 0; k < sizeof(ext_bits) / sizeof(ext_bits[0]); k++)
 				if (strncmp(name, ext_bits[k].name, (size_t)(count - 1) * 4) == 0) {
-					bits |= 1ull << ext_bits[k].bit;
+					if (ext_bits[k].bit != 0xFF) bits |= 1ull << ext_bits[k].bit;
 					known = true;
 				}
 			if (!known) bits |= 1ull << sksc_feature_bit_unknown;
@@ -530,7 +540,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 10;
+	uint16_t version = 11;
 	data.write(tag);
 	data.write(version);
 
@@ -559,6 +569,8 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	data.write(file->meta.ops_pixel.tex_read);
 	data.write(file->meta.ops_pixel.dynamic_flow);
 	data.write(file->meta.wave_size);
+	data.write(file->meta.tile_apron[0]); // v11: //--apron (QCOM tile shading)
+	data.write(file->meta.tile_apron[1]);
 
 	for (uint32_t i = 0; i < file->meta.buffer_count; i++) {
 		sksc_shader_buffer_t *buff = &file->meta.buffers[i];

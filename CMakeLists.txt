@@ -1,3 +1,26 @@
+# Android build. Needs ANDROID_HOME set, a JDK for APK signing, and the
+# platform matching the example's MIN_SDK for the compile jar
+# (`sdkmanager "platforms;android-29"`). Cross-compiling uses the pre-built
+# host skshaderc from bin/tools/ for shader compilation — run a native build
+# first so it exists and is current (a stale one emits old SKS containers the
+# runtime refuses):
+#
+#   export ANDROID_NDK=$ANDROID_HOME/ndk/25.2.9519653   # or whichever is installed
+#   cmake -B build-android \
+#       -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+#       -DANDROID_ABI=arm64-v8a \
+#       -DANDROID_PLATFORM=android-32 \
+#       -DANDROID_STL=c++_static \
+#       -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build-android -j$(nproc)
+#
+#   # Install + launch on a connected device (or manually:
+#   #   adb install -r build-android/example/sk_renderer_test.apk
+#   #   adb shell am start -n net.stereokit.renderer_test/net.stereokit.sk_app.SkAppActivity)
+#   cmake --build build-android --target sk_renderer_test-run
+#
+#   # Filtered logcat for the app
+#   adb logcat -v color --uid `adb shell pm list package -U net.stereokit.renderer_test | cut -d ":" -f3`
 cmake_minimum_required(VERSION 3.10)
 project(sk_renderer VERSION 0.1.0)
 

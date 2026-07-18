@@ -1283,6 +1283,34 @@ void skr_pass_submit(skr_pass_t* pass) {
 		}
 	}
 
+	// Tile shading: a postfx shader reading attachments as tile attachments
+	// (VK_QCOM_tile_shading) turns the whole pass into a tile shading render
+	// pass, using the largest //--apron any postfx shader requested.
+	bool     pass_tile_shading = false;
+	uint32_t tile_apron[2]     = {0, 0};
+	for (uint32_t p = 0; p < pass->postfx_count; p++) {
+		skr_material_t* mat = pass->postfx[p];
+		if (!mat || !skr_material_is_valid(mat)) continue;
+		const sksc_shader_meta_t* meta = &mat->key.shader->meta;
+		if (meta->features & ((uint64_t)1 << sksc_feature_bit_qcom_tile_shading)) {
+			pass_tile_shading = true;
+			if (meta->tile_apron[0] > tile_apron[0]) tile_apron[0] = meta->tile_apron[0];
+			if (meta->tile_apron[1] > tile_apron[1]) tile_apron[1] = meta->tile_apron[1];
+		}
+	}
+	if (pass_tile_shading && !_skr_vk.has_qcom_tile_shading) {
+		// The shader should have been rejected by skr_shader_check_support; the
+		// pass still runs, but the tile-attachment reads will not work.
+		skr_log(skr_log_critical, "PostFX uses tile attachments, but this device lacks VK_QCOM_tile_shading");
+		pass_tile_shading = false;
+	}
+	if (pass_tile_shading && (tile_apron[0] > _skr_vk.max_tile_apron || tile_apron[1] > _skr_vk.max_tile_apron)) {
+		skr_log(skr_log_warning, "PostFX tile apron (%u, %u) exceeds device max %u — clamping; edge-of-tile reads past the clamp are undefined",
+			tile_apron[0], tile_apron[1], _skr_vk.max_tile_apron);
+		if (tile_apron[0] > _skr_vk.max_tile_apron) tile_apron[0] = _skr_vk.max_tile_apron;
+		if (tile_apron[1] > _skr_vk.max_tile_apron) tile_apron[1] = _skr_vk.max_tile_apron;
+	}
+
 	// Build renderpass key for subpass 0 (geometry)
 	skr_pipeline_renderpass_key_t rp_key = {
 		.color_format        = has_color ? skr_tex_fmt_to_native(color->format) : VK_FORMAT_UNDEFINED,
@@ -1290,6 +1318,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 		.resolve_format      = use_msaa  ? skr_tex_fmt_to_native(resolve->format) : VK_FORMAT_UNDEFINED,
 		.samples             = samples,
 		.postfx_reads_depth  = postfx_reads_depth,
+		.tile_shading        = pass_tile_shading,
+		.tile_apron          = { (uint8_t)tile_apron[0], (uint8_t)tile_apron[1] },
 		.depth_store_op      = (has_depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op       = (pass->clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
 		.view_mask           = view_mask,
@@ -1582,8 +1612,18 @@ void skr_pass_submit(skr_pass_t* pass) {
 			const sksc_shader_meta_t* meta = &postfx_mat->key.shader->meta;
 			bool depth_unavailable = false;
 			for (uint32_t r = 0; r < meta->resource_count; r++) {
-				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
 				const char* name = meta->resources[r].name;
+				// Tile attachments named "color" bind the previous scene target
+				// too — read on-tile via VK_QCOM_tile_shading rather than as an
+				// input attachment, so neighborhood reads within the apron work.
+				if (meta->resources[r].bind.register_type == skr_register_tile_sampled &&
+				    strcmp(name, "color") == 0 && prev_color) {
+					if (!(prev_color->flags & skr_tex_flags_readable))
+						skr_log(skr_log_critical, "PostFX %u reads the scene as a tile attachment, which needs the scene target created with skr_tex_flags_readable", p);
+					skr_material_set_tex(postfx_mat, "color", prev_color);
+					continue;
+				}
+				if (meta->resources[r].bind.register_type != skr_register_input_attachment) continue;
 				if (strcmp(name, "color") == 0 && prev_color) {
 					skr_material_set_tex(postfx_mat, "color", prev_color);
 				} else if (strcmp(name, "depth") == 0) {

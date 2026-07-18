@@ -221,18 +221,15 @@ if(SKSHADERC_ENABLE_GLSLANG)
 	target_sources            (skshaderc_lib PRIVATE sksc_hlsl.cpp sksc_meta.cpp)
 endif()
 
-# Optional SVSL backend. When enabled, we fetch libsvsl (its CLI, tests, and
-# install rules stay off automatically for a FetchContent consumer), link it,
-# and compile the sksc_svsl.cpp bridge. SKSC_HAS_SVSL gates the backend in code.
-# The pinned libsvsl must emit the same SKS container version this repo's loader
-# expects (currently v10) — the tag below and sksc_file.c's version check move
-# in lockstep. See docs/PLAN_attribute_remap.md.
+# Optional SVSL backend. To build against an in-progress SVSL
+# checkout instead of the fetched tag, override the source dir:
+#   cmake -B build -DFETCHCONTENT_SOURCE_DIR_SVSL=/path/to/SVSL
 option(SKSHADERC_ENABLE_SVSL "Build skshaderc with the optional SVSL shader compiler backend" ON)
 if(SKSHADERC_ENABLE_SVSL)
 	message(STATUS "Fetching SVSL...")
 	FetchContent_Declare( SVSL
 		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
-		GIT_TAG        v2026.7.9
+		GIT_TAG        v2026.7.17
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)

@@ -252,6 +252,10 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gi_voxel_to_sh.hlsl
 	assets/shaders/postfx_invert.hlsl
 	assets/shaders/postfx_depth_fog.hlsl
+	assets/shaders/postfx_fog_density.svsl
+	assets/shaders/postfx_fog_scatter.svsl
+	assets/shaders/postfx_fog_scatter_taps.svsl
+	assets/shaders/postfx_fog_tile.svsl
 	assets/shaders/msaa_resolve.hlsl
 	assets/shaders/msaa_resolve_wide.hlsl
 	assets/shaders/msaa_resolve_oled.hlsl

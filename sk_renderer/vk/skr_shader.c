@@ -60,6 +60,8 @@ skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, skr_shade
 	return shader;
 }
 
+static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta);
+
 skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shader_t* out_shader) {
 	if (!out_shader) return skr_err_invalid_parameter;
 
@@ -87,6 +89,17 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 		return err;
 	}
 
+	// Device-support gate, before any VkShaderModule exists: a shader whose
+	// declared requirements (meta features, pinned subgroup size) this device
+	// didn't enable can never reach a working pipeline, and its SPIR-V may not
+	// even be a legal module here (e.g. SPIR-V 1.4 without VK_KHR_spirv_1_4).
+	// Nothing can fix this at runtime, so it simply comes back as an invalid
+	// shader — the warnings below are the whole diagnostic.
+	if (!_skr_shader_meta_supported(&file.meta)) {
+		sksc_shader_file_destroy(&file);
+		return skr_err_unsupported;
+	}
+
 	// Create shader stages from the file
 	skr_shader_stage_t v_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_vertex);
 	skr_shader_stage_t p_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_pixel);
@@ -101,6 +114,72 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 	*out_shader = _skr_shader_create_manual(&meta, v_stage, p_stage, c_stage);
 
 	return skr_err_success;
+}
+
+// Human-readable name for a sksc_feature_bit_, used only for diagnostic logging
+// when a shader fails the support gate in skr_shader_create.
+static const char* _skr_feature_bit_name(int32_t bit) {
+	switch (bit) {
+		case sksc_feature_bit_float16:           return "shaderFloat16";
+		case sksc_feature_bit_storage16:         return "16-bit storage";
+		case sksc_feature_bit_storage8:          return "8-bit storage";
+		case sksc_feature_bit_extended_formats:  return "shaderStorageImageExtendedFormats";
+		case sksc_feature_bit_image_atomics:     return "storage image atomics";
+		case sksc_feature_bit_subgroups:         return "subgroup operations";
+		case sksc_feature_bit_wave_size:         return "subgroup size control";
+		case sksc_feature_bit_multiview:         return "multiview";
+		case sksc_feature_bit_demote:            return "demote to helper invocation";
+		case sksc_feature_bit_int64:             return "shaderInt64";
+		case sksc_feature_bit_float64:           return "shaderFloat64";
+		case sksc_feature_bit_int16:             return "shaderInt16";
+		case sksc_feature_bit_int8:              return "shaderInt8";
+		case sksc_feature_bit_formatless:        return "formatless storage image read/write";
+		case sksc_feature_bit_tile_image:        return "shader tile image";
+		case sksc_feature_bit_float_atomics:     return "float atomics";
+		case sksc_feature_bit_scalar_layout:     return "scalar block layout";
+		case sksc_feature_bit_qcom_sample_weighted: return "textureSampleWeighted (VK_QCOM_image_processing)";
+		case sksc_feature_bit_qcom_box_filter:      return "textureBoxFilter (VK_QCOM_image_processing)";
+		case sksc_feature_bit_qcom_block_match:     return "textureBlockMatch (VK_QCOM_image_processing)";
+		case sksc_feature_bit_qcom_image_proc2:     return "VK_QCOM_image_processing2";
+		case sksc_feature_bit_qcom_tile_shading:    return "VK_QCOM_tile_shading";
+		case sksc_feature_bit_unknown:           return "an unrecognized capability";
+		default:                                 return "an unknown feature";
+	}
+}
+
+// Returns true if the current device can run this shader: every device feature
+// the shader's SPIR-V declared (meta->features) is enabled here, and any pinned
+// subgroup size is in range. skr_shader_create calls this before creating any
+// module — a false result means pipeline creation could never succeed, so the
+// shader comes back invalid. The feature-mask comparison is the device-agnostic
+// sksc_shader_meta_missing_features(); this wrapper feeds it the live device
+// mask, adds the numeric subgroup-size check, and logs the specifics as
+// warnings so the caller gets them even though the result is a plain bool.
+static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta) {
+	bool     supported = true;
+	uint64_t missing   = sksc_shader_meta_missing_features(meta, _skr_vk.enabled_features);
+	if (missing != 0) {
+		supported = false;
+		for (int32_t bit = 0; bit < 64; bit++) {
+			if (missing & ((uint64_t)1 << bit))
+				skr_log(skr_log_warning, "Shader '%s' requires unsupported feature: %s", meta->name, _skr_feature_bit_name(bit));
+		}
+	}
+
+	// A pinned subgroup size is a numeric constraint the feature mask can't
+	// express: subgroup size control must be present and the size must sit
+	// within the device's reported range.
+	if (meta->wave_size != 0) {
+		if (!_skr_vk.has_subgroup_size_control) {
+			skr_log(skr_log_warning, "Shader '%s' pins subgroup size %u but the device lacks subgroup size control", meta->name, meta->wave_size);
+			supported = false;
+		} else if (meta->wave_size < _skr_vk.min_subgroup_size || meta->wave_size > _skr_vk.max_subgroup_size) {
+			skr_log(skr_log_warning, "Shader '%s' pins subgroup size %u outside the device range [%u, %u]", meta->name, meta->wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
+			supported = false;
+		}
+	}
+
+	return supported;
 }
 
 bool skr_shader_is_valid(const skr_shader_t* shader) {
@@ -272,6 +351,11 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 			case skr_register_readwrite:        desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
 			case skr_register_readwrite_tex:    desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
 			case skr_register_input_attachment: desc_type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;       break; // (SubpassInput)
+			// VK_QCOM_image_processing / VK_QCOM_tile_shading (SKS v11)
+			case skr_register_sample_weight:    desc_type = VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM; break;
+			case skr_register_block_match:      desc_type = VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM;   break;
+			case skr_register_tile_sampled:     desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   break; // tile attachment, sampled
+			case skr_register_tile_storage:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            break; // tile attachment, storage
 			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
 
@@ -304,6 +388,11 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 			case skr_register_readwrite:        desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
 			case skr_register_readwrite_tex:    desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
 			case skr_register_input_attachment: desc_type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;       break; // (SubpassInput)
+			// VK_QCOM_image_processing / VK_QCOM_tile_shading (SKS v11)
+			case skr_register_sample_weight:    desc_type = VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM; break;
+			case skr_register_block_match:      desc_type = VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM;   break;
+			case skr_register_tile_sampled:     desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   break; // tile attachment, sampled
+			case skr_register_tile_storage:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            break; // tile attachment, storage
 			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
 

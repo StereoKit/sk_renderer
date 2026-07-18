@@ -1,0 +1,51 @@
+//--name = postfx_fog_scatter_taps
+//--fog_color:color = 0.15,0.2,0.25,1
+//--scatter_max     = 4
+
+// Extension-free fallback for postfx_fog_scatter.svsl: the same density-driven
+// scatter over the prepass output (scene rgb + fog density in alpha), but the
+// box filter is a hand-rolled 3x3 tap cross instead of BoxFilterQCOM, so it
+// runs on any device — desktop included. Nine taps approximate the box; linear
+// filtering between texels keeps the fractional spread smooth. The averaged
+// alpha doubles as the blurred density for a soft fog edge, mirroring the
+// QCOM version's use of the filtered alpha.
+
+Texture2D    scene_tex;  // t0, density prepass output
+SamplerState tex_smp;    // s0
+
+float4 fog_color;
+float  scatter_max;  // widest tap spread, in texels
+float2 source_size;  // prepass target dimensions, for pixel → uv
+
+struct psIn {
+	float4 pos : SV_POSITION;
+};
+
+psIn vs(uint id : SV_VertexID) {
+	psIn o;
+	float2 uv = float2(id & 2, (id << 1) & 2);
+	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+
+float4 ps(psIn input) : SV_TARGET {
+	// The prepass target can be larger than the active viewport, so uvs come
+	// from pixel position over the full texture size, not [0,1] across the blit.
+	float2 uv      = input.pos.xy / source_size;
+	float  density = scene_tex.Sample(tex_smp, uv).a;
+
+	float2 step = (density * scatter_max) / source_size;
+	float4 acc =
+		  scene_tex.Sample(tex_smp, uv + float2(-step.x, -step.y))
+		+ scene_tex.Sample(tex_smp, uv + float2(      0, -step.y))
+		+ scene_tex.Sample(tex_smp, uv + float2( step.x, -step.y))
+		+ scene_tex.Sample(tex_smp, uv + float2(-step.x,       0))
+		+ scene_tex.Sample(tex_smp, uv)
+		+ scene_tex.Sample(tex_smp, uv + float2( step.x,       0))
+		+ scene_tex.Sample(tex_smp, uv + float2(-step.x,  step.y))
+		+ scene_tex.Sample(tex_smp, uv + float2(      0,  step.y))
+		+ scene_tex.Sample(tex_smp, uv + float2( step.x,  step.y));
+	float4 scatter = acc / 9.0;
+
+	return float4(lerp(scatter.rgb, fog_color.rgb, scatter.a), 1);
+}

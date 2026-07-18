@@ -302,6 +302,9 @@ static bool _skr_renderpass_key_matches_base(const skr_pipeline_renderpass_key_t
 	    && a->has_resolve_subpass      == b->has_resolve_subpass
 	    && a->use_custom_resolve_flags == b->use_custom_resolve_flags
 	    && a->postfx_reads_depth       == b->postfx_reads_depth
+	    && a->tile_shading             == b->tile_shading
+	    && a->tile_apron[0]            == b->tile_apron[0]
+	    && a->tile_apron[1]            == b->tile_apron[1]
 	    && a->postfx_output_format     == b->postfx_output_format
 	    && a->final_color_layout       == b->final_color_layout
 	    && a->final_resolve_layout     == b->final_resolve_layout
@@ -889,9 +892,17 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		.pDepthStencilResolveAttachment = &depth_resolve_ref,
 	};
 	bool use_auto_resolve = use_msaa && !key->has_resolve_subpass;
+	// Tile shading apron: the subpasses that *produce* the tile data (geometry,
+	// and manual resolve below) rasterize into the apron border so a later
+	// tile-attachment read finds valid neighbors at tile edges. The reading
+	// postfx subpasses do NOT get the bit — their fragments only run on real
+	// tile pixels, keeping every read within tile + apron.
+	VkSubpassDescriptionFlags apron_flag = (key->tile_shading && (key->tile_apron[0] | key->tile_apron[1]))
+		? VK_SUBPASS_DESCRIPTION_TILE_SHADING_APRON_BIT_QCOM : 0;
 	subpasses[0] = (VkSubpassDescription2){
 		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
 		.pNext                   = resolve_depth ? &depth_resolve_info : NULL,
+		.flags                   = apron_flag,
 		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
 		.viewMask                = key->view_mask,
 		.colorAttachmentCount    = has_color ? 1 : 0,
@@ -919,9 +930,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 		subpasses[1] = (VkSubpassDescription2){
 			.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-			.flags                   = key->use_custom_resolve_flags
+			.flags                   = apron_flag | (key->use_custom_resolve_flags
 				? (VK_SUBPASS_DESCRIPTION_FRAGMENT_REGION_BIT_QCOM | VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM)
-				: 0,
+				: 0),
 			.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
 			.viewMask                = key->view_mask,
 			.inputAttachmentCount    = 1,
@@ -1039,10 +1050,26 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 	}
 
-	// Subpass N → N+1: tile-local dependency (covers resolve + postfx chain)
+	// Subpass N → N+1: tile-local dependency (covers resolve + postfx chain).
+	// In a tile shading pass the consuming subpass reads the attachment as a
+	// tile attachment too; that access is a 64-bit sync2 flag, so it's carried
+	// by a chained VkMemoryBarrier2 (which supersedes the dependency's own
+	// masks). BY_REGION in a tile shading pass is tile-granular rather than
+	// pixel-granular — exactly what makes the neighborhood reads legal.
+	VkMemoryBarrier2 tile_read_barriers[SKR_POSTFX_MAX_SUBPASSES];
 	for (uint32_t s = 0; s + 1 < subpass_count; s++) {
+		if (key->tile_shading) {
+			tile_read_barriers[s] = (VkMemoryBarrier2){
+				.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+				.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+				.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+				.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+				.dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_2_SHADER_TILE_ATTACHMENT_READ_BIT_QCOM,
+			};
+		}
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.pNext           = key->tile_shading ? &tile_read_barriers[s] : NULL,
 			.srcSubpass      = s,
 			.dstSubpass      = s + 1,
 			.srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1109,6 +1136,17 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		.correlatedViewMaskCount = key->correlation_mask ? 1 : 0,
 		.pCorrelatedViewMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
 	};
+
+	// Mark the whole render pass as a tile shading pass with the requested apron
+	VkRenderPassTileShadingCreateInfoQCOM tile_shading_info = {
+		.sType         = VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM,
+		.flags         = VK_TILE_SHADING_RENDER_PASS_ENABLE_BIT_QCOM,
+		.tileApronSize = { key->tile_apron[0], key->tile_apron[1] },
+	};
+	if (key->tile_shading) {
+		tile_shading_info.pNext = (void*)render_pass_info.pNext;
+		render_pass_info.pNext  = &tile_shading_info;
+	}
 
 	// Subpass merge feedback — drivers that report it tell us whether this
 	// chain actually merged into one tile pass. Tile-locality of the whole

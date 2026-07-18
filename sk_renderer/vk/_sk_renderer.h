@@ -46,11 +46,20 @@ typedef struct {
 	bool                  postfx_reads_depth;       // Postfx subpasses get depth as an input attachment; under
 	                                                // MSAA the geometry subpass also resolves depth on-tile
 	                                                // (VK_KHR_depth_stencil_resolve) so postfx reads 1x depth
+	bool                  tile_shading;             // VK_QCOM_tile_shading pass: a postfx shader reads an
+	                                                // attachment as a tile attachment (neighborhood reads on-tile)
+	uint8_t               tile_apron[2];            // VkRenderPassTileShadingCreateInfoQCOM::tileApronSize, from
+	                                                // the postfx shader's //--apron meta, clamped to maxApronSize
 	VkFormat              postfx_output_format;     // Format of the final postfx output attachment
 	VkImageLayout         final_color_layout;       // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_resolve_layout;     // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_depth_layout;       // 0 or DEPTH_STENCIL_ATTACHMENT_OPTIMAL = default; DEPTH_STENCIL_READ_ONLY = readable
 } skr_pipeline_renderpass_key_t;
+// The renderpass cache deduplicates by memcmp over this struct, so its layout
+// must have no padding holes — every byte a named field, single-byte fields in
+// groups of 4/8. The assert trips when a new field breaks that; re-pack (or add
+// explicit pad bytes) rather than letting uninitialized padding poison dedup.
+_Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must stay padding-free for memcmp dedup");
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
 #define skr_MAX_COMMAND_RING    8   // Number of command buffers per thread
@@ -212,6 +221,16 @@ typedef struct {
 	bool                     has_depth_stencil_resolve;   // VK_KHR_depth_stencil_resolve (implies create_renderpass2)
 	bool                     has_subpass_merge_feedback;  // VK_EXT_subpass_merge_feedback + feature bit
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
+	bool                     has_qcom_image_proc;         // VK_QCOM_image_processing + all three feature bits, plus its
+	                                                      // SPIR-V 1.4 prerequisites (VK_KHR_spirv_1_4 + shader_float_controls)
+	                                                      // and VK_KHR_format_feature_flags2
+	bool                     has_qcom_tile_shading;       // VK_QCOM_tile_shading fragment-stage set (tileShading,
+	                                                      // fragmentStage, colorAttachments, sampledAttachments, apron)
+	                                                      // + VK_QCOM_tile_properties + synchronization2 + renderpass2
+	uint32_t                 max_tile_apron;              // VkPhysicalDeviceTileShadingPropertiesQCOM::maxApronSize
+	VkSampler                sampler_image_proc;          // The one legal QCOM image-processing sampler config (nearest,
+	                                                      // clamp-to-edge, lod 0); bound in place of the texture's own
+	                                                      // sampler on bindings whose meta shape declares bit 6
 	uint32_t                 min_subgroup_size;           // From VkPhysicalDeviceSubgroupSizeControlPropertiesEXT
 	uint32_t                 max_subgroup_size;
 	VkShaderStageFlags       required_subgroup_size_stages; // Stages that allow VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
@@ -220,6 +239,12 @@ typedef struct {
 
 	// Capability system (runtime-queried feature support)
 	bool                     capabilities[skr_capability_max];
+
+	// Shader-support mask: bit (1 << sksc_feature_bit_) set iff that device
+	// feature is actually enabled at device creation. Compared against a
+	// shader meta's `features` by skr_shader_check_support. See skr_initialize.c
+	// where it's built, and keep it in sync as new features get enabled.
+	uint64_t                 enabled_features;
 
 	// Memory allocators
 	void*                  (*malloc_func) (size_t size);

@@ -189,6 +189,14 @@ bool skr_init(skr_settings_t settings) {
 		VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,         // Postfx depth input attachments (per-reference aspect masks)
 		VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,       // On-tile depth resolve so postfx reads 1x depth under MSAA
 		VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME,      // Reports whether drivers actually merge the postfx subpass chain
+		VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,       // Prerequisite of VK_KHR_spirv_1_4 on a 1.1 device
+		VK_KHR_SPIRV_1_4_EXTENSION_NAME,                   // QCOM image-processing shaders are SPIR-V 1.4 modules
+		VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,      // Prerequisite of VK_QCOM_image_processing
+		VK_QCOM_IMAGE_PROCESSING_EXTENSION_NAME,           // textureBoxFilter/SampleWeighted/BlockMatch (fog scatter etc.)
+		VK_QCOM_IMAGE_PROCESSING_2_EXTENSION_NAME,         // textureBlockMatchWindow/Gather variants
+		VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,           // Video decode, and 64-bit access flags for tile-attachment deps
+		VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME,            // Prerequisite of VK_QCOM_tile_shading
+		VK_QCOM_TILE_SHADING_EXTENSION_NAME,               // On-tile attachment reads with apron (tile-local postfx kernels)
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -202,9 +210,11 @@ bool skr_init(skr_settings_t settings) {
 	};
 	const uint32_t optional_device_ext_count = sizeof(optional_device_exts) / sizeof(optional_device_exts[0]);
 
-	// Video decode extensions (all required together for video support)
+	// Video decode extensions (all required together for video support).
+	// VK_KHR_synchronization2 is also required, but lives in the optional list
+	// above since tile shading needs it too — the video check below requires it
+	// separately.
 	const char* video_device_exts[] = {
-		VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
 		VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
 		VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
 		VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
@@ -588,8 +598,17 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_create_renderpass2      = false;
 	_skr_vk.has_depth_stencil_resolve   = false;
 	_skr_vk.has_subpass_merge_feedback  = false;
+	_skr_vk.has_qcom_image_proc         = false;
 	bool has_image_format_list          = false;
 	bool has_swapchain                  = false;
+	bool has_shader_float_controls      = false;
+	bool has_spirv_1_4                  = false;
+	bool has_format_feature_flags2      = false;
+	bool has_qcom_image_proc_ext        = false;
+	bool has_qcom_image_proc2_ext       = false;
+	bool has_sync2_ext                  = false;
+	bool has_tile_props_ext             = false;
+	bool has_tile_shading_ext           = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
 		if (_skr_ext_available(optional_device_exts[i], available_device_exts, available_device_ext_count)) {
 			device_exts[device_ext_count++] = optional_device_exts[i];
@@ -605,6 +624,14 @@ bool skr_init(skr_settings_t settings) {
 			if (strcmp(optional_device_exts[i], VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME      ) == 0) _skr_vk.has_create_renderpass2       = true;
 			if (strcmp(optional_device_exts[i], VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME    ) == 0) _skr_vk.has_depth_stencil_resolve    = true;
 			if (strcmp(optional_device_exts[i], VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME   ) == 0) _skr_vk.has_subpass_merge_feedback   = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME   ) == 0) has_shader_float_controls            = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_SPIRV_1_4_EXTENSION_NAME               ) == 0) has_spirv_1_4                        = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME  ) == 0) has_format_feature_flags2            = true;
+			if (strcmp(optional_device_exts[i], VK_QCOM_IMAGE_PROCESSING_EXTENSION_NAME       ) == 0) has_qcom_image_proc_ext              = true;
+			if (strcmp(optional_device_exts[i], VK_QCOM_IMAGE_PROCESSING_2_EXTENSION_NAME     ) == 0) has_qcom_image_proc2_ext             = true;
+			if (strcmp(optional_device_exts[i], VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME       ) == 0) has_sync2_ext                        = true;
+			if (strcmp(optional_device_exts[i], VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME        ) == 0) has_tile_props_ext                   = true;
+			if (strcmp(optional_device_exts[i], VK_QCOM_TILE_SHADING_EXTENSION_NAME           ) == 0) has_tile_shading_ext                 = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
@@ -614,24 +641,11 @@ bool skr_init(skr_settings_t settings) {
 		}
 	}
 
-	// Add video decode extensions if all are available (they're all-or-nothing)
+	// Video decode extensions are added after the feature query below —
+	// enabling them is contingent on the synchronization2 *feature*, not just
+	// the extension string, so the decision waits until that's known.
 	_skr_vk.has_video_decode = false;
-	if (_skr_vk.video_decode_queue_family != UINT32_MAX) {
-		uint32_t video_found = 0;
-		for (uint32_t v = 0; v < video_device_ext_count; v++) {
-			if (_skr_ext_available(video_device_exts[v], available_device_exts, available_device_ext_count))
-				video_found++;
-		}
-		if (video_found == video_device_ext_count && device_ext_count + video_device_ext_count <= 64) {
-			for (uint32_t v = 0; v < video_device_ext_count; v++)
-				device_exts[device_ext_count++] = video_device_exts[v];
-			_skr_vk.has_video_decode = true;
-			skr_log(skr_log_info, "Vulkan video decode extensions enabled");
-		}
-	}
 
-	_skr_free(available_device_exts);
-	
 	// Query available device features
 	VkPhysicalDeviceFeatures available_features;
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
@@ -663,6 +677,18 @@ bool skr_init(skr_settings_t settings) {
 	VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT subpass_merge_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
 	};
+	VkPhysicalDeviceImageProcessingFeaturesQCOM image_proc_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+	};
+	VkPhysicalDeviceImageProcessing2FeaturesQCOM image_proc2_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM,
+	};
+	VkPhysicalDeviceSynchronization2Features sync2_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+	};
+	VkPhysicalDeviceTileShadingFeaturesQCOM tile_shading_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM,
+	};
 	VkPhysicalDeviceMultiviewFeatures multiview_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
 		.pNext = &ycbcr_query,
@@ -675,12 +701,73 @@ bool skr_init(skr_settings_t settings) {
 		subpass_merge_query.pNext = features2_query.pNext;
 		features2_query.pNext     = &subpass_merge_query;
 	}
+	// The QCOM image-processing shaders are SPIR-V 1.4 modules, so the extension
+	// is only usable when the SPIR-V 1.4 chain is also present on this 1.1 device.
+	bool image_proc_deps = has_qcom_image_proc_ext && has_spirv_1_4 && has_shader_float_controls && has_format_feature_flags2;
+	if (image_proc_deps) {
+		image_proc_query.pNext = features2_query.pNext;
+		features2_query.pNext  = &image_proc_query;
+		if (has_qcom_image_proc2_ext) {
+			image_proc2_query.pNext = features2_query.pNext;
+			features2_query.pNext   = &image_proc2_query;
+		}
+	}
+	if (has_sync2_ext) {
+		sync2_query.pNext     = features2_query.pNext;
+		features2_query.pNext = &sync2_query;
+	}
+	if (has_tile_shading_ext && has_tile_props_ext) {
+		tile_shading_query.pNext = features2_query.pNext;
+		features2_query.pNext    = &tile_shading_query;
+	}
 	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
 
 	_skr_vk.has_ycbcr_conversion = ycbcr_query.samplerYcbcrConversion != 0;
 	// Only consider subgroup size control supported if the feature flag is set, not just the extension.
 	_skr_vk.has_subgroup_size_control  = _skr_vk.has_subgroup_size_control  && subgroup_size_query.subgroupSizeControl;
 	_skr_vk.has_subpass_merge_feedback = _skr_vk.has_subpass_merge_feedback && subpass_merge_query.subpassMergeFeedback;
+	// Each image-processing op family is its own device feature and its own
+	// sksc_feature_bit_, so each enables independently — a device exposing only
+	// textureBoxFilter still runs box-filter shaders.
+	bool enable_sample_weighted = image_proc_deps && image_proc_query.textureSampleWeighted;
+	bool enable_box_filter      = image_proc_deps && image_proc_query.textureBoxFilter;
+	bool enable_block_match     = image_proc_deps && image_proc_query.textureBlockMatch;
+	// The Window/Gather block-match variants layer on VK_QCOM_image_processing2,
+	// and imply plain block match.
+	bool enable_block_match2    = image_proc_deps && has_qcom_image_proc2_ext
+		&& enable_block_match && image_proc2_query.textureBlockMatch2;
+	// Any enabled op means image-processing bindings can occur, which is what
+	// the dedicated sampler exists for.
+	_skr_vk.has_qcom_image_proc = enable_sample_weighted || enable_box_filter || enable_block_match;
+	bool has_synchronization2 = has_sync2_ext && sync2_query.synchronization2;
+
+	// Add video decode extensions now that sync2's feature status is known
+	// (they're all-or-nothing, and the whole set requires synchronization2)
+	if (_skr_vk.video_decode_queue_family != UINT32_MAX && has_synchronization2) {
+		uint32_t video_found = 0;
+		for (uint32_t v = 0; v < video_device_ext_count; v++) {
+			if (_skr_ext_available(video_device_exts[v], available_device_exts, available_device_ext_count))
+				video_found++;
+		}
+		if (video_found == video_device_ext_count && device_ext_count + video_device_ext_count <= 64) {
+			for (uint32_t v = 0; v < video_device_ext_count; v++)
+				device_exts[device_ext_count++] = video_device_exts[v];
+			_skr_vk.has_video_decode = true;
+			skr_log(skr_log_info, "Vulkan video decode extensions enabled");
+		}
+	}
+	_skr_free(available_device_exts);
+	// Tile shading here means the fragment-stage feature set: shaders reading
+	// color attachments as sampled tile attachments, with an apron. The
+	// cross-subpass tile-attachment dependency needs 64-bit access flags
+	// (VkMemoryBarrier2 → synchronization2) and the renderpass2 path.
+	_skr_vk.has_qcom_tile_shading = has_tile_shading_ext && has_tile_props_ext
+		&& has_synchronization2 && _skr_vk.has_create_renderpass2
+		&& tile_shading_query.tileShading
+		&& tile_shading_query.tileShadingFragmentStage
+		&& tile_shading_query.tileShadingColorAttachments
+		&& tile_shading_query.tileShadingSampledAttachments
+		&& tile_shading_query.tileShadingApron;
 
 	// Multiview is a hard requirement for stereo/XR rendering. It's part of
 	// Vulkan 1.1 core but is still a feature flag, so an implementation can
@@ -727,7 +814,15 @@ bool skr_init(skr_settings_t settings) {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
 		.pNext = &multiview_props,
 	};
+	VkPhysicalDeviceTileShadingPropertiesQCOM tile_shading_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_PROPERTIES_QCOM,
+	};
+	if (_skr_vk.has_qcom_tile_shading) {
+		tile_shading_props.pNext = props2.pNext;
+		props2.pNext             = &tile_shading_props;
+	}
 	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
+	_skr_vk.max_tile_apron = _skr_vk.has_qcom_tile_shading ? tile_shading_props.maxApronSize : 0;
 	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
 	if (_skr_vk.has_subgroup_size_control) {
 		_skr_vk.min_subgroup_size             = subgroup_props.minSubgroupSize;
@@ -735,8 +830,9 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.required_subgroup_size_stages = subgroup_props.requiredSubgroupSizeStages;
 	}
 
-	// Synchronization2 is required by the video decode path; chained only when
-	// video decode is enabled.
+	// Synchronization2 is required by video decode and by tile shading's
+	// tile-attachment subpass dependencies (VkMemoryBarrier2); enable it
+	// whenever the device offers it.
 	VkPhysicalDeviceSynchronization2Features sync2_features = {
 		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
 		.pNext            = &ycbcr_features,
@@ -745,7 +841,7 @@ bool skr_init(skr_settings_t settings) {
 
 	VkDeviceCreateInfo device_info = {
 		.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-		.pNext                   = _skr_vk.has_video_decode ? (void*)&sync2_features : (void*)&ycbcr_features,
+		.pNext                   = has_synchronization2 ? (void*)&sync2_features : (void*)&ycbcr_features,
 		.queueCreateInfoCount    = queue_info_count,
 		.pQueueCreateInfos       = queue_infos,
 		.enabledExtensionCount   = device_ext_count,
@@ -760,6 +856,36 @@ bool skr_init(skr_settings_t settings) {
 	};
 	if (_skr_vk.has_subpass_merge_feedback)
 		device_info.pNext = &subpass_merge_features;
+
+	VkPhysicalDeviceImageProcessingFeaturesQCOM image_proc_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.pNext                 = (void*)device_info.pNext,
+		.textureSampleWeighted = enable_sample_weighted ? VK_TRUE : VK_FALSE,
+		.textureBoxFilter      = enable_box_filter      ? VK_TRUE : VK_FALSE,
+		.textureBlockMatch     = enable_block_match     ? VK_TRUE : VK_FALSE,
+	};
+	if (_skr_vk.has_qcom_image_proc)
+		device_info.pNext = &image_proc_features;
+
+	VkPhysicalDeviceImageProcessing2FeaturesQCOM image_proc2_features = {
+		.sType                   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM,
+		.pNext                   = (void*)device_info.pNext,
+		.textureBlockMatch2      = VK_TRUE,
+	};
+	if (enable_block_match2)
+		device_info.pNext = &image_proc2_features;
+
+	VkPhysicalDeviceTileShadingFeaturesQCOM tile_shading_features = {
+		.sType                         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM,
+		.pNext                         = (void*)device_info.pNext,
+		.tileShading                   = VK_TRUE,
+		.tileShadingFragmentStage      = VK_TRUE,
+		.tileShadingColorAttachments   = VK_TRUE,
+		.tileShadingSampledAttachments = VK_TRUE,
+		.tileShadingApron              = VK_TRUE,
+	};
+	if (_skr_vk.has_qcom_tile_shading)
+		device_info.pNext = &tile_shading_features;
 
 	// Create VkDevice - either via callback (for OpenXR enable2) or directly
 	if (settings.device_create_callback) {
@@ -910,12 +1036,6 @@ bool skr_init(skr_settings_t settings) {
 	color = 0xFF000000;
 	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
 
-	// Built-in fallback mipgen shaders. Used by skr_tex_generate_mips when the
-	// caller passes no shader and the texture format doesn't support blit
-	// (e.g. B10G11R11_UFLOAT on Mesa llvmpipe).
-	if (skr_shader_create(sks_skr_mipgen_2d_hlsl,   sizeof(sks_skr_mipgen_2d_hlsl),   &_skr_vk.builtin_mipgen_2d  ) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_2d,   "skr_builtin_mipgen_2d");
-	if (skr_shader_create(sks_skr_mipgen_cube_hlsl, sizeof(sks_skr_mipgen_cube_hlsl), &_skr_vk.builtin_mipgen_cube) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_cube, "skr_builtin_mipgen_cube");
-
 	// Populate capability array
 	_skr_vk.capabilities[skr_capability_external_vk ] = true;
 	_skr_vk.capabilities[skr_capability_external_gl ] = _skr_vk.has_external_memory_fd || _skr_vk.has_external_memory_win32;
@@ -924,9 +1044,95 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode && _skr_vk.has_ycbcr_conversion;
 	_skr_vk.capabilities[skr_capability_presentation] = has_surface && has_swapchain;
 
+	// Build the shader-support mask: one bit per sksc_feature_bit_ that this
+	// device actually enabled above, so skr_shader_check_support can reject a
+	// shader before it reaches a material/pipeline. A bit left clear means the
+	// feature simply isn't enabled here yet — enable it in the device_features /
+	// pNext chain above, then set its bit here. sksc_feature_bit_unknown is
+	// deliberately never set: a shader that needs an unclassified capability
+	// can't be verified, so it must fail the check.
+	_skr_vk.enabled_features = 0;
+	// Multiview is a hard requirement enforced above, and basic subgroup ops are
+	// core in Vulkan 1.1 (the floor multiview implies). The `subgroups` bit is
+	// coarse — it does not distinguish op classes (clustered/quad/…) that some
+	// devices lack — but the common case is covered.
+	_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_multiview;
+	_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_subgroups;
+	// Storage-image atomics are gated by the bound image's VkFormat at draw
+	// time, not by a device feature, so this never blocks pipeline creation.
+	_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_image_atomics;
+	if (_skr_vk.has_subgroup_size_control)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_wave_size;
+	if (enable_sample_weighted)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_sample_weighted;
+	if (enable_box_filter)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_box_filter;
+	if (enable_block_match)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_block_match;
+	if (enable_block_match2)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_image_proc2;
+	if (_skr_vk.has_qcom_tile_shading)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_tile_shading;
+
+	// QCOM image-processing ops (BoxFilterQCOM etc.) are only legal with a
+	// sampler created with the IMAGE_PROCESSING flag, and such a sampler's
+	// other creation parameters are pinned by the spec (nearest filtering,
+	// clamp-to-edge, lod 0, no anisotropy/compare) — the ops define their own
+	// filtering. So one shared sampler covers every image-processing binding;
+	// _skr_material_add_writes substitutes it when a binding's meta shape
+	// declares bit 6.
+	_skr_vk.sampler_image_proc = VK_NULL_HANDLE;
+	if (_skr_vk.has_qcom_image_proc) {
+		VkSamplerCreateInfo image_proc_sampler_info = {
+			.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+			.flags        = VK_SAMPLER_CREATE_IMAGE_PROCESSING_BIT_QCOM,
+			.magFilter    = VK_FILTER_NEAREST,
+			.minFilter    = VK_FILTER_NEAREST,
+			.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+			.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		};
+		VkResult sampler_vr = vkCreateSampler(_skr_vk.device, &image_proc_sampler_info, NULL, &_skr_vk.sampler_image_proc);
+		if (sampler_vr == VK_SUCCESS) {
+			_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_SAMPLER, (uint64_t)_skr_vk.sampler_image_proc, "sampler_image_processing_qcom");
+		} else {
+			skr_log(skr_log_warning, "vkCreateSampler (QCOM image processing) failed: 0x%X", (uint32_t)sampler_vr);
+			_skr_vk.sampler_image_proc  = VK_NULL_HANDLE;
+			_skr_vk.has_qcom_image_proc = false;
+			_skr_vk.enabled_features   &= ~(((uint64_t)1 << sksc_feature_bit_qcom_sample_weighted)
+			                              | ((uint64_t)1 << sksc_feature_bit_qcom_box_filter)
+			                              | ((uint64_t)1 << sksc_feature_bit_qcom_block_match)
+			                              | ((uint64_t)1 << sksc_feature_bit_qcom_image_proc2));
+		}
+	}
+
+	// Built-in fallback mipgen shaders. Used by skr_tex_generate_mips when the
+	// caller passes no shader and the texture format doesn't support blit
+	// (e.g. B10G11R11_UFLOAT on Mesa llvmpipe). Created only after
+	// enabled_features exists: skr_shader_create gates on that mask, and an
+	// empty mask would refuse these (mipgen_cube needs multiview).
+	if (skr_shader_create(sks_skr_mipgen_2d_hlsl,   sizeof(sks_skr_mipgen_2d_hlsl),   &_skr_vk.builtin_mipgen_2d  ) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_2d,   "skr_builtin_mipgen_2d");
+	if (skr_shader_create(sks_skr_mipgen_cube_hlsl, sizeof(sks_skr_mipgen_cube_hlsl), &_skr_vk.builtin_mipgen_cube) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_cube, "skr_builtin_mipgen_cube");
+
 	// Log optional extension status
 	skr_log(skr_log_info, "[%s] %s",           VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,             _skr_vk.has_push_descriptors      ? "true" : "false");
 	skr_log(skr_log_info, "[%s] %s",           VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME, _skr_vk.has_custom_resolve        ? "true" : "false");
+	skr_log(skr_log_info, "[%s] %s (weighted %d box %d match %d window %d)", VK_QCOM_IMAGE_PROCESSING_EXTENSION_NAME, _skr_vk.has_qcom_image_proc ? "true" : "false",
+		enable_sample_weighted ? 1 : 0, enable_box_filter ? 1 : 0, enable_block_match ? 1 : 0, enable_block_match2 ? 1 : 0);
+	// Tile shading folds several prerequisites into one bool; when it's off,
+	// say which piece is missing so a device log answers "why" by itself.
+	if (_skr_vk.has_qcom_tile_shading)
+		skr_log(skr_log_info, "[%s] true (max apron %u)", VK_QCOM_TILE_SHADING_EXTENSION_NAME, _skr_vk.max_tile_apron);
+	else if (!has_tile_shading_ext)
+		skr_log(skr_log_info, "[%s] false (extension not present)", VK_QCOM_TILE_SHADING_EXTENSION_NAME);
+	else
+		skr_log(skr_log_info, "[%s] false (deps: tile_properties %d sync2 %d renderpass2 %d | features: tileShading %d fragmentStage %d colorAttachments %d sampledAttachments %d apron %d)",
+			VK_QCOM_TILE_SHADING_EXTENSION_NAME,
+			has_tile_props_ext ? 1 : 0, has_synchronization2 ? 1 : 0, _skr_vk.has_create_renderpass2 ? 1 : 0,
+			tile_shading_query.tileShading ? 1 : 0, tile_shading_query.tileShadingFragmentStage ? 1 : 0,
+			tile_shading_query.tileShadingColorAttachments ? 1 : 0, tile_shading_query.tileShadingSampledAttachments ? 1 : 0,
+			tile_shading_query.tileShadingApron ? 1 : 0);
 	skr_log(skr_log_info, "[%s] %s",           VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,         _skr_vk.has_create_renderpass2    ? "true" : "false");
 	skr_log(skr_log_info, "[%s] %s",           VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,       _skr_vk.has_depth_stencil_resolve ? "true" : "false");
 	skr_log(skr_log_info, "[%s] %s",           VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME,      _skr_vk.has_subpass_merge_feedback? "true" : "false");
@@ -959,6 +1165,7 @@ void skr_shutdown(void) {
 
 	_skr_bind_pool_shutdown();     // Free bind pool after all deferred destroys are done
 	_skr_sampler_cache_shutdown(); // Destroy cached samplers after GPU is idle
+	if (_skr_vk.sampler_image_proc != VK_NULL_HANDLE) vkDestroySampler(_skr_vk.device, _skr_vk.sampler_image_proc, NULL);
 
 	// Free dynamic arrays
 	if (_skr_vk.pending_transitions)      _skr_free(_skr_vk.pending_transitions);

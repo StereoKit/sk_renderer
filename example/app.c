@@ -32,9 +32,14 @@ enum resolve_mode_ {
 	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
 	resolve_mode_oled_subpixel,  // OLED subpixel-aware resolve (Texture2DMS, separate pass)
 	resolve_mode_depth_fog,      // Postfx reads depth as input attachment (on-tile resolved under MSAA)
+	resolve_mode_fog_scatter,    // Depth fog + light scatter: on-tile density prepass (postfx, depth
+	                             // never stored), then a VK_QCOM_image_processing box-filter blit
+	                             // whose kernel widens with the density packed in alpha
+	resolve_mode_fog_tile,       // Same effect entirely on-tile: VK_QCOM_tile_shading postfx reads
+	                             // color as a tile attachment with a 4px apron (kernel capped there)
 	resolve_mode_max,
 };
-const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX" };
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX", "Depth Fog + Scatter (QCOM)", "Fog Scatter On-Tile (QCOM)" };
 
 // Application state
 struct app_t {
@@ -60,7 +65,8 @@ struct app_t {
 	skr_tex_t color_msaa;
 	skr_tex_t depth_buffer;
 	skr_tex_t scene_color;
-	skr_tex_t upscale_target;  // Readable postfx output when upscale + postfx both active
+	skr_tex_t upscale_target;      // Readable postfx output when upscale + postfx both active
+	skr_tex_t fog_scatter_target;  // Readable density prepass output (rgb + density alpha) the scatter blit box-filters
 	int32_t   current_width;
 	int32_t   current_height;
 
@@ -73,6 +79,17 @@ struct app_t {
 	skr_material_t postfx_mat2;  // Second invert for the chained mode — two inverts ≈ identity
 	skr_shader_t   depth_fog_shader;
 	skr_material_t depth_fog_mat;
+	// Fog + scatter pair: density prepass (postfx subpass, keeps depth on-tile)
+	// + a scatter blit. The blit prefers the VK_QCOM_image_processing box
+	// filter and falls back to plain 9-tap sampling when the device lacks it.
+	skr_shader_t   fog_density_shader;
+	skr_material_t fog_density_mat;
+	skr_shader_t   fog_scatter_shader;
+	skr_material_t fog_scatter_mat;
+	bool           fog_scatter_qcom;    // Blit uses BoxFilterQCOM rather than the tap fallback
+	// Fog on-tile: same effect as a tile-shading postfx subpass (apron reads).
+	skr_shader_t   fog_tile_shader;
+	skr_material_t fog_tile_mat;
 
 	// Manual MSAA resolve
 	skr_shader_t   resolve_shader;
@@ -165,6 +182,8 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	bool wide_kernel     = (app->resolve_mode == resolve_mode_wide_kernel);
 	bool oled_subpixel   = (app->resolve_mode == resolve_mode_oled_subpixel);
 	bool manual_resolve  = (app->resolve_mode == resolve_mode_manual_postfx);
+	bool fog_scatter     = (app->resolve_mode == resolve_mode_fog_scatter);
+	bool fog_tile        = (app->resolve_mode == resolve_mode_fog_tile);
 	bool separate_pass   = wide_kernel || oled_subpixel;
 	skr_tex_flags_ msaa_flags = skr_tex_flags_writeable
 		| (manual_resolve ? skr_tex_flags_input_attachment : 0)
@@ -197,6 +216,14 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 				linear_clamp,
 				(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->upscale_target);
 		}
+	} else if (fog_tile) {
+		// On-tile fog reads this as a sampled tile attachment: SAMPLED usage
+		// rules out the transient flag, but the render pass still never stores
+		// it — the data lives and dies in tile memory.
+		skr_tex_create(render_target->format,
+			skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_input_attachment,
+			linear_clamp,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
 	} else {
 		// Intermediate color target for the postfx modes (geometry target at 1x,
 		// resolve target under MSAA). Data stays in tile memory (transient) —
@@ -205,6 +232,16 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 			skr_tex_flags_writeable | skr_tex_flags_input_attachment | skr_tex_flags_in_tile_msaa,
 			no_sampler,
 			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
+	}
+
+	// Fog scatter: the density prepass writes scene rgb + density alpha here,
+	// and the scatter blit reads it back with BoxFilterQCOM — so unlike the
+	// other postfx outputs, this one must be readable.
+	if (fog_scatter) {
+		skr_tex_create(app->offscreen_format,
+			skr_tex_flags_readable | skr_tex_flags_writeable,
+			linear_clamp,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->fog_scatter_target);
 	}
 
 	app->current_width  = width;
@@ -219,6 +256,7 @@ static void _destroy_render_targets(app_t* app) {
 	skr_tex_destroy(&app->color_msaa);
 	skr_tex_destroy(&app->depth_buffer);
 	skr_tex_destroy(&app->upscale_target);
+	skr_tex_destroy(&app->fog_scatter_target);
 	skr_tex_destroy(&app->scene_color);
 }
 
@@ -295,6 +333,34 @@ app_t* app_create(int32_t start_scene) {
 			.shader     = &app->depth_fog_shader,
 			.depth_test = skr_compare_always,
 		}, &app->depth_fog_mat);
+	}
+	// Fog + scatter: the density prepass is an ordinary postfx; the scatter
+	// blit prefers BoxFilterQCOM. skr_shader_create refuses shaders the device
+	// can't run (VK_QCOM_image_processing here), so an invalid result routes
+	// to the extension-free tap fallback and the mode works everywhere.
+	app->fog_density_shader = su_shader_load("shaders/postfx_fog_density.svsl.sks", "postfx_fog_density");
+	app->fog_scatter_shader = su_shader_load("shaders/postfx_fog_scatter.svsl.sks", "postfx_fog_scatter");
+	app->fog_scatter_qcom   = skr_shader_is_valid(&app->fog_scatter_shader);
+	if (!app->fog_scatter_qcom)
+		app->fog_scatter_shader = su_shader_load("shaders/postfx_fog_scatter_taps.svsl.sks", "postfx_fog_scatter_taps");
+	if (skr_shader_is_valid(&app->fog_density_shader) && skr_shader_is_valid(&app->fog_scatter_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->fog_density_shader,
+			.depth_test = skr_compare_always,
+		}, &app->fog_density_mat);
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->fog_scatter_shader,
+			.depth_test = skr_compare_always,
+		}, &app->fog_scatter_mat);
+	}
+	// Fog on-tile needs VK_QCOM_tile_shading; no fallback — the scatter mode
+	// above already is the non-tile version of this effect.
+	app->fog_tile_shader = su_shader_load("shaders/postfx_fog_tile.svsl.sks", "postfx_fog_tile");
+	if (skr_shader_is_valid(&app->fog_tile_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->fog_tile_shader,
+			.depth_test = skr_compare_always,
+		}, &app->fog_tile_mat);
 	}
 	app->resolve_shader = su_shader_load("shaders/msaa_resolve.hlsl.sks", "msaa_resolve");
 	if (skr_shader_is_valid(&app->resolve_shader)) {
@@ -391,6 +457,13 @@ void app_destroy(app_t* app) {
 		skr_material_destroy(&app->depth_fog_mat);
 		skr_shader_destroy(&app->depth_fog_shader);
 	}
+	// The fog materials only exist when their shaders passed the device gate
+	if (skr_material_is_valid(&app->fog_density_mat))  skr_material_destroy(&app->fog_density_mat);
+	if (skr_material_is_valid(&app->fog_scatter_mat))  skr_material_destroy(&app->fog_scatter_mat);
+	if (skr_material_is_valid(&app->fog_tile_mat))     skr_material_destroy(&app->fog_tile_mat);
+	if (skr_shader_is_valid(&app->fog_density_shader)) skr_shader_destroy(&app->fog_density_shader);
+	if (skr_shader_is_valid(&app->fog_scatter_shader)) skr_shader_destroy(&app->fog_scatter_shader);
+	if (skr_shader_is_valid(&app->fog_tile_shader))    skr_shader_destroy(&app->fog_tile_shader);
 	if (skr_shader_is_valid(&app->postfx_shader)) {
 		skr_material_destroy(&app->postfx_mat);
 		skr_material_destroy(&app->postfx_mat2);
@@ -571,12 +644,18 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// manual_resolve    | color_msaa      | final_output    | NULL
 	// wide_kernel       | color_msaa      | NULL            | NULL (separate pass)
 	// oled_subpixel     | color_msaa      | NULL            | NULL (separate pass)
+	// fog_scatter       | as auto_postfx  | as auto_postfx  | fog_scatter_target (+scatter blit)
 	//
 	// *render_target = scene_color when enable_offscreen or needs_upscale
 	// final_output   = render_target when !needs_upscale, else upscale_src
 	bool use_chain_postfx   = (app->resolve_mode == resolve_mode_chain_postfx)  && skr_material_is_valid(&app->postfx_mat) && skr_material_is_valid(&app->postfx_mat2);
 	bool use_depth_fog      = (app->resolve_mode == resolve_mode_depth_fog)     && skr_material_is_valid(&app->depth_fog_mat);
-	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog;
+	// Gate on the support flag, not just material validity — the material is
+	// never created on devices without VK_QCOM_image_processing, and the mode
+	// must fall back to plain rendering there.
+	bool use_fog_scatter    = (app->resolve_mode == resolve_mode_fog_scatter)   && skr_material_is_valid(&app->fog_density_mat) && skr_material_is_valid(&app->fog_scatter_mat);
+	bool use_fog_tile       = (app->resolve_mode == resolve_mode_fog_tile)      && skr_material_is_valid(&app->fog_tile_mat);
+	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog || use_fog_scatter || use_fog_tile;
 	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
 	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
 	bool use_oled_subpixel  = (app->resolve_mode == resolve_mode_oled_subpixel) && app->msaa > 1 && skr_material_is_valid(&app->oled_resolve_mat);
@@ -586,7 +665,9 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// goes to upscale_target (a separate readable texture) to avoid aliasing in the framebuffer.
 	skr_tex_t* upscale_src = NULL;  // What the upscale blit reads from (NULL = no upscale)
 	if (needs_upscale)
-		upscale_src = (use_postfx && app->msaa > 1) ? &app->upscale_target : &app->scene_color;
+		// Fog scatter always blits into upscale_target: its postfx output is the
+		// density prepass texture, which the scatter blit must not write back to.
+		upscale_src = ((use_postfx && app->msaa > 1) || use_fog_scatter) ? &app->upscale_target : &app->scene_color;
 
 	skr_tex_t* final_output = needs_upscale ? upscale_src : render_target;
 
@@ -607,9 +688,11 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	} else if (use_postfx) {
 		// Auto postfx: geometry writes to scene_color (or resolves there for MSAA),
 		// postfx reads as input attachment (tile-local), writes to final_output.
+		// Fog scatter diverts the postfx (density prepass) to a readable target
+		// instead — the scatter blit box-filters it into final_output afterwards.
 		color_target   = (app->msaa > 1) ? &app->color_msaa : &app->scene_color;
 		resolve_target = (app->msaa > 1) ? &app->scene_color : NULL;
-		postfx_output  = final_output;
+		postfx_output  = use_fog_scatter ? &app->fog_scatter_target : final_output;
 	} else {
 		color_target   = (app->msaa > 1) ? &app->color_msaa : ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target);
 		resolve_target = (app->msaa > 1) ? ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target) : NULL;
@@ -632,7 +715,16 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	if (use_manual_resolve)
 		skr_pass_add_resolve(&pass, &app->resolve_mat);
-	if (use_depth_fog)
+	if (use_fog_tile) {
+		// The pass auto-binds "color" (tile attachment) and "depth" (input
+		// attachment); only the pixel→uv scale needs setting here. The clip
+		// planes come from the projection in the system buffer, in-shader.
+		float source_size[2] = { (float)render_w, (float)render_h };
+		skr_material_set_param(&app->fog_tile_mat, "source_size", sksc_shader_var_float, 2, source_size);
+		skr_pass_add_postfx(&pass, &app->fog_tile_mat);
+	} else if (use_fog_scatter)
+		skr_pass_add_postfx(&pass, &app->fog_density_mat);
+	else if (use_depth_fog)
 		skr_pass_add_postfx(&pass, &app->depth_fog_mat);
 	else if (use_postfx)
 		skr_pass_add_postfx(&pass, &app->postfx_mat);
@@ -650,6 +742,18 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	if (use_oled_subpixel) {
 		skr_material_set_tex(&app->oled_resolve_mat, "msaa_color", &app->color_msaa);
 		skr_renderer_blit(&app->oled_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+	}
+	// Fog scatter: box-filter the density prepass output, kernel width driven
+	// by the fog density each pixel packed into alpha (VK_QCOM_image_processing)
+	if (use_fog_scatter) {
+		float source_size[2] = { (float)render_w, (float)render_h };
+		skr_material_set_param(&app->fog_scatter_mat, "source_size", sksc_shader_var_float, 2, source_size);
+		// The QCOM shader binds the prepass twice — box-filtered and plain —
+		// while the tap fallback only has the plain binding.
+		if (app->fog_scatter_qcom)
+			skr_material_set_tex(&app->fog_scatter_mat, "scene_box", &app->fog_scatter_target);
+		skr_material_set_tex  (&app->fog_scatter_mat, "scene_tex", &app->fog_scatter_target);
+		skr_renderer_blit(&app->fog_scatter_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
 	}
 
 	// Post-processing (operates at render resolution, before upscale)
@@ -723,6 +827,10 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	igText("MSAA: %dx", app->msaa);
 	if (app->msaa > 1)
 		igCombo_Str_arr("Resolve Mode", &app->resolve_mode, resolve_mode_names, resolve_mode_max, 0);
+	if (app->resolve_mode == resolve_mode_fog_scatter && !app->fog_scatter_qcom)
+		igText("Scatter: 9-tap fallback\n(no VK_QCOM_image_processing)");
+	if (app->resolve_mode == resolve_mode_fog_tile && !skr_material_is_valid(&app->fog_tile_mat))
+		igTextColored((ImVec4){1.0f, 0.45f, 0.35f, 1.0f}, "Needs VK_QCOM_tile_shading\n(renders without postfx here)");
 
 	float gpu_ms   = skr_renderer_get_gpu_time_us() / 1000.0f;
 	float cpu_ms   = skr_renderer_get_cpu_time_us() / 1000.0f;

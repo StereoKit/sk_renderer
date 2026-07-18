@@ -62,6 +62,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->ops_pixel.tex_read,      &bytes[at], sizeof(meta->ops_pixel.tex_read));      at += sizeof(meta->ops_pixel.tex_read);
 	memcpy(&meta->ops_pixel.dynamic_flow,  &bytes[at], sizeof(meta->ops_pixel.dynamic_flow));  at += sizeof(meta->ops_pixel.dynamic_flow);
 	memcpy(&meta->wave_size,               &bytes[at], sizeof(meta->wave_size));               at += sizeof(meta->wave_size);
+	memcpy(&meta->tile_apron,              &bytes[at], sizeof(meta->tile_apron));              at += sizeof(meta->tile_apron); // v11
 
 	// --- Pass 1: scan buffer section to accumulate var/defaults totals ---
 	uint32_t buffer_section_start = at;
@@ -199,7 +200,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_shader_file_t *out_file) {
 	uint16_t file_version = 0;
 	if (!sksc_shader_file_verify(data, size, &file_version, NULL, 0)) return sksc_result_bad_format;
-	if (file_version != 10)                                           return sksc_result_old_version;
+	if (file_version != 11)                                           return sksc_result_old_version;
 
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;
@@ -257,6 +258,17 @@ skr_bind_t sksc_shader_meta_get_bind(const sksc_shader_meta_t *meta, const char 
 			return meta->resources[i].bind;
 	}
 	return (skr_bind_t){0};
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+uint64_t sksc_shader_meta_missing_features(const sksc_shader_meta_t *meta, uint64_t enabled_features) {
+	if (meta == NULL) return 0;
+	// Every requirement bit the shader declared that the capability mask doesn't
+	// advertise. The compiler sets sksc_feature_bit_unknown when it saw a
+	// capability it couldn't classify; a capability mask must never claim that
+	// bit, so an unverifiable requirement always surfaces here.
+	return meta->features & ~enabled_features;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
