@@ -51,6 +51,12 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_astc4x4_rgba_srgb: case skr_tex_fmt_astc4x4_rgba:
 			w = 4; h = 4; bytes = 16; break;
 
+		// YUV 4:2:0 footprint per 2x2 region, mirroring the Vulkan table; WebGPU
+		// has no YUV format so creation still refuses these.
+		case skr_tex_fmt_nv12:
+		case skr_tex_fmt_yuv420p: w = 2; h = 2; bytes = 6;  break;
+		case skr_tex_fmt_p010:    w = 2; h = 2; bytes = 12; break;
+
 		default: break; // unsupported formats report 1x1x4; creation refuses them anyway
 	}
 	if (opt_out_block_width)     *opt_out_block_width     = w;

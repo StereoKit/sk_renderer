@@ -880,8 +880,12 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	// Zero out immediately
 	*out_tex = (skr_tex_t){0};
 
-	// YUV formats use a completely separate creation path
+	// The YUV path ignores flags and mip_count; warn on the ones a caller expects to work.
 	if (_skr_tex_fmt_is_yuv(format)) {
+		if (flags & skr_tex_flags_gen_mips)
+			skr_log(skr_log_warning, "skr_tex_create: YUV formats can't generate mipmaps; ignoring skr_tex_flags_gen_mips");
+		if (mip_count > 1)
+			skr_log(skr_log_warning, "skr_tex_create: YUV formats are single-mip; ignoring requested mip_count %d", mip_count);
 		return _skr_tex_create_yuv(format, sampler, size, opt_data, out_tex);
 	}
 
@@ -1331,6 +1335,13 @@ void skr_tex_set_sampler(skr_tex_t* ref_tex, skr_tex_sampler_t sampler) {
 skr_err_ skr_tex_set_data(skr_tex_t* ref_tex, const skr_tex_data_t* data) {
 	if (!ref_tex || !data || !data->data) return skr_err_invalid_parameter;
 	if (ref_tex->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+
+	// The generic upload issues a single COLOR-aspect copy, invalid for multi-plane
+	// YUV; its pixel data must be supplied at creation instead.
+	if (_skr_tex_fmt_is_yuv(ref_tex->format)) {
+		skr_log(skr_log_warning, "skr_tex_set_data: YUV textures can't be updated after creation; supply data via skr_tex_create");
+		return skr_err_unsupported;
+	}
 
 	return _skr_tex_upload_data(ref_tex, data);
 }
@@ -2232,6 +2243,12 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_rgba64f:       block_bytes = 8;  break;
 		case skr_tex_fmt_rgba128f:      block_bytes = 16; break;
 
+		// YUV 4:2:0 has no real block; a 2x2 texel region's total multi-plane byte
+		// footprint keeps size math correct (uploads still need the YUV path).
+		case skr_tex_fmt_nv12:
+		case skr_tex_fmt_yuv420p:       block_w = 2; block_h = 2; block_bytes = 6;  break;
+		case skr_tex_fmt_p010:          block_w = 2; block_h = 2; block_bytes = 12; break;
+
 		default:                        block_bytes = 0;  break;
 	}
 
@@ -2377,6 +2394,12 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 	if (update.view != VK_NULL_HANDLE) {
 		new_view = update.view;
 	} else {
+		// A recreated view can't carry this texture's YCbCr conversion, so YUV callers must supply update.view.
+		if (ref_tex->ycbcr_conversion != VK_NULL_HANDLE) {
+			skr_log(skr_log_warning, "skr_tex_update_external: YUV textures require a caller-supplied view");
+			return skr_err_unsupported;
+		}
+
 		VkFormat vk_format = skr_tex_fmt_to_native(ref_tex->format);
 
 		VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
@@ -3310,6 +3333,12 @@ typedef struct _skr_tex_readback_internal_t {
 skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t array_layer, skr_tex_readback_t* out_readback) {
 	if (!tex || !out_readback)        return skr_err_invalid_parameter;
 	if (tex->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+
+	// The COLOR-aspect copy below can't read multi-plane YUV (which is also never readable).
+	if (_skr_tex_fmt_is_yuv(tex->format)) {
+		skr_log(skr_log_critical, "skr_tex_readback: YUV multi-plane textures can't be read back");
+		return skr_err_unsupported;
+	}
 
 	// Check mip/layer bounds
 	if (mip_level >= tex->mip_levels || array_layer >= tex->layer_count) {
