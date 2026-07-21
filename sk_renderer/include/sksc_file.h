@@ -96,7 +96,43 @@ typedef enum {
 	skr_shader_lang_glsl,
 	skr_shader_lang_glsl_es,
 	skr_shader_lang_glsl_web,
+	skr_shader_lang_wgsl,     // v12: WebGPU Shading Language text (see webgpu-backend-plan.md)
 } skr_shader_lang_;
+
+// Current .sks container version written by skshaderc. Version must match
+// exactly to load — .sks files carry no back-compat by policy; recompile
+// shaders when this bumps.
+#define SKSC_FILE_VERSION 12
+
+// WGSL stages replace the SPIR-V ViewIndex builtin with a system-owned spec
+// constant named sk_view_index (default 0) using this reserved constant id —
+// browser WebGPU has no multiview, so the runtime renders one pass per array
+// layer and specializes the pipeline per view. User shaders must not declare
+// [[vk::constant_id(999)]]; skshaderc errors if they do when targeting WGSL.
+#define SKSC_WGSL_VIEW_INDEX_SPEC_ID 999
+
+// Bind-slot register shifts. HLSL register spaces collapse into one binding
+// namespace: a resource's meta slot is its register index plus the shift for
+// its register type. skshaderc applies these when compiling; both runtimes
+// use them to translate between raw register indices (e.g. global binds) and
+// meta slots.
+#define SKSC_SLOT_TEXTURE   100 // t registers (also merged samplers on Vulkan)
+#define SKSC_SLOT_READWRITE 200 // u registers (RW buffers/textures)
+#define SKSC_SLOT_INPUT_ATT 300 // input attachments, + [[vk::input_attachment_index]]
+#define SKSC_SLOT_SAMPLER   400 // standalone samplers (split-sampler WGSL stages)
+
+// sksc_shader_resource_t.shape bit layout (see the field's comment for the
+// per-register-type meaning of the top two bits)
+#define SKSC_SHAPE_DIM_MASK   0x07 // 0 = unreported
+#define SKSC_SHAPE_DIM_2D     1
+#define SKSC_SHAPE_DIM_3D     2
+#define SKSC_SHAPE_DIM_CUBE   3
+#define SKSC_SHAPE_DIM_1D     4
+#define SKSC_SHAPE_ARRAYED    0x08
+#define SKSC_SHAPE_MS         0x10
+#define SKSC_SHAPE_COMPARISON 0x20 // paired with a comparison sampler
+#define SKSC_SHAPE_WRITTEN    0x40 // storage images; QCOM image-processing sampler on sampled textures
+#define SKSC_SHAPE_READ       0x80 // storage images
 
 typedef enum {
 	sksc_result_unknown       =  0,
@@ -246,13 +282,33 @@ typedef struct {
 	uint32_t   element_size; // For StructuredBuffer<T>, the size of T in bytes
 	// Texture shape: bits 0-2 dimension (0 = unreported, 1 = 2D, 2 = 3D,
 	// 3 = cube, 4 = 1D), bit 3 arrayed, bit 4 multisampled, bit 5 paired with
-	// a comparison sampler, bit 6 the sampler serves QCOM image-processing ops
-	// (create it with VK_SAMPLER_CREATE_IMAGE_PROCESSING_BIT_QCOM)
+	// a comparison sampler. On sampled textures, bit 6 means the sampler serves
+	// QCOM image-processing ops (create it with
+	// VK_SAMPLER_CREATE_IMAGE_PROCESSING_BIT_QCOM); on storage images, bits
+	// 6/7 record write/read usage so WebGPU layouts can declare exact access
 	uint8_t    shape;
 	// SpvImageFormat of a storage image binding (0 = Unknown / not a storage
 	// image); Vulkan requires the bound view's format to match when declared
 	uint8_t    image_format;
 } sksc_shader_resource_t;
+
+// A standalone sampler binding (v12, WGSL stages only). The Vulkan path merges
+// HLSL SamplerState objects into combined image samplers, but WGSL requires
+// textures and samplers to stay separate, so WGSL stage blobs bind these as
+// their own entries. `slot` uses the same register-shift scheme as resources
+// (s register + 400). `paired_slot` names the texture resource this sampler
+// samples — the runtime applies that texture's sampler settings, matching
+// Vulkan's combined-sampler semantics. The Vulkan backend ignores this array.
+typedef struct {
+	char     name[32];
+	uint64_t name_hash;
+	uint16_t slot;        // WGSL @binding (s register + 400)
+	// of type skr_stage_
+	uint8_t  stage_bits;
+	uint8_t  _pad;
+	uint16_t paired_slot; // Bind slot of the texture resource this sampler samples (0xFFFF = unpaired)
+	uint16_t _pad2;
+} sksc_shader_sampler_t;
 
 // A specialization constant: [[vk::constant_id(1)]] const int LIGHT_COUNT = 4;
 // Values are 32-bit scalars; bools are reflected as int holding VkBool32.
@@ -283,11 +339,14 @@ typedef struct {
 	sksc_shader_resource_t     *resources;
 	skr_vert_component_t       *vertex_inputs;
 	sksc_shader_spec_constant_t*spec_constants;
+	sksc_shader_sampler_t      *samplers;      // v12: standalone samplers for WGSL stages (empty otherwise)
+	bool                        samplers_owned;// samplers is its own malloc (not carved from `buffers`); meta_free releases it
 	uint32_t                    buffer_count;
 	uint32_t                    resource_count;
 	int32_t                     global_buffer_id;
 	int32_t                     vertex_input_count;
 	uint32_t                    spec_constant_count;
+	uint32_t                    sampler_count; // v12
 	sksc_shader_ops_t           ops_vertex;
 	sksc_shader_ops_t           ops_pixel;
 	uint32_t                    wave_size;

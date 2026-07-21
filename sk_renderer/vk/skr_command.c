@@ -25,7 +25,7 @@ bool _skr_cmd_init() {
 ///////////////////////////////////////////////////////////////////////////////
 
 void _skr_cmd_shutdown() {
-	vkDeviceWaitIdle(_skr_vk.device);
+	_skr_device_wait_idle();
 
 	// Destroy thread command pools and per-thread command ring fences
 	mtx_lock(&_skr_vk.thread_pool_mutex);
@@ -319,6 +319,7 @@ void _skr_bind_descriptors(VkCommandBuffer cmd, VkDescriptorPool pool, VkPipelin
 
 _skr_cmd_ctx_t _skr_cmd_begin() {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
+	(void)pool; // only read by the asserts below
 	assert(pool);
 	assert(pool->ref_count == 0 && "Ref count should be 0 at batch start");
 

@@ -114,6 +114,18 @@ if(SKSHADERC_CROSS_COMPILING)
 				GROUP_EXECUTE GROUP_READ
 				WORLD_EXECUTE WORLD_READ)
 		endif()
+		# Web builds compile shaders to WGSL; a host tool from an SVSL-only
+		# build config has no WGSL target and would emit unloadable .sks files
+		if(EMSCRIPTEN)
+			file(STRINGS "${SKSHADERC_HOST_BIN}" _skshaderc_tint_probe REGEX "Tint couldn't read" LIMIT_COUNT 1)
+			if(NOT _skshaderc_tint_probe)
+				message(FATAL_ERROR
+					"The host skshaderc at ${SKSHADERC_HOST_BIN} was built without the WGSL "
+					"target (SKSHADERC_ENABLE_WGSL), which web builds require.\n"
+					"Build the native WebGPU config first — it installs a WGSL-capable tool:\n"
+					"    cmake -B build-webgpu -DSKR_USE_WEBGPU=ON && cmake --build build-webgpu")
+			endif()
+		endif()
 	endif()
 elseif(NOT SKSHADERC_USE_WINE)
 	message(STATUS "Native build: building skshaderc from source")
@@ -125,9 +137,9 @@ endif()
 # host binary during the build, and the resulting .sks/.h files are used at runtime.
 ###############################################################################
 
-if(ANDROID)
+if(ANDROID OR EMSCRIPTEN)
 	set(SKSHADERC_SKIP_BUILD TRUE)
-	message(STATUS "Android target: skipping skshaderc build (using host binary for shader compilation)")
+	message(STATUS "Cross target: skipping skshaderc build (using host binary for shader compilation)")
 else()
 	set(SKSHADERC_SKIP_BUILD FALSE)
 endif()
@@ -159,14 +171,34 @@ set_target_properties(skshaderc_lib PROPERTIES
 # of the binary) and instead writes raw .spv for -raw and omits SPIR-V comments
 # in -h. SKSC_HAS_GLSLANG and SKSC_HAS_SPIRV_TOOLS gate this in code.
 option(SKSHADERC_ENABLE_GLSLANG "Build skshaderc with the glslang (HLSL) shader compiler backend" ON)
+
+# Optional WGSL (WebGPU) target: '-t w' output via Tint's SPIR-V reader and
+# WGSL writer, built from the same pinned Dawn release the sk_renderer WebGPU
+# backend uses (see docs/webgpu-backend-plan.md). Needs the glslang backend
+# for the split-sampler compile it works from.
+option(SKSHADERC_ENABLE_WGSL "Build skshaderc with the Tint-based WGSL (WebGPU) shader target" ON)
+if(SKSHADERC_ENABLE_WGSL AND NOT SKSHADERC_ENABLE_GLSLANG)
+	message(WARNING "SKSHADERC_ENABLE_WGSL requires SKSHADERC_ENABLE_GLSLANG; disabling the WGSL target")
+	set(SKSHADERC_ENABLE_WGSL OFF)
+endif()
+
 if(SKSHADERC_ENABLE_GLSLANG)
+	# Tint's SPIR-V reader builds against SPIRV-Tools internals, so when the
+	# WGSL target is enabled, SPIRV-Headers/Tools follow the pinned Dawn
+	# release's DEPS (v20260713.082812) instead of the Vulkan SDK tag.
+	if(SKSHADERC_ENABLE_WGSL)
+		set(SKSC_SPIRV_HEADERS_URL https://github.com/KhronosGroup/SPIRV-Headers/archive/29981f65241605e08b0ede4cfeb999fe3b723c6a.zip)
+		set(SKSC_SPIRV_TOOLS_URL   https://github.com/KhronosGroup/SPIRV-Tools/archive/85f222ec591863853ea603ce190ea508c7255568.zip)
+	else()
+		set(SKSC_SPIRV_HEADERS_URL https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/${VULKAN_VERSION}.zip)
+		set(SKSC_SPIRV_TOOLS_URL   https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/${VULKAN_VERSION}.zip)
+	endif()
+
 	# SPIRV-Headers underpins both SPIRV-Tools and glslang.
 	message(STATUS "Fetching SPIRV-Headers...")
 	FetchContent_Declare( SPIRV-Headers
-		GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
-		GIT_TAG        ${VULKAN_VERSION}
-		GIT_SHALLOW    TRUE
-		GIT_PROGRESS   TRUE
+		URL ${SKSC_SPIRV_HEADERS_URL}
+		DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 	)
 	FetchContent_MakeAvailable(SPIRV-Headers)
 
@@ -175,10 +207,8 @@ if(SKSHADERC_ENABLE_GLSLANG)
 	# for meta compatability with HLSL compilers.
 	message(STATUS "Fetching SPIRV-Tools...")
 	FetchContent_Declare( SPIRV-Tools
-		GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
-		GIT_TAG        ${VULKAN_VERSION}
-		GIT_SHALLOW    TRUE
-		GIT_PROGRESS   TRUE
+		URL ${SKSC_SPIRV_TOOLS_URL}
+		DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 	)
 	set(SPIRV_SKIP_TESTS       ON  CACHE BOOL "")
 	set(SPIRV_SKIP_EXECUTABLES ON  CACHE BOOL "")
@@ -218,7 +248,67 @@ if(SKSHADERC_ENABLE_GLSLANG)
 	FetchContent_MakeAvailable(glslang)
 	target_link_libraries     (skshaderc_lib PUBLIC glslang SPIRV)
 	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_GLSLANG)
-	target_sources            (skshaderc_lib PRIVATE sksc_hlsl.cpp sksc_meta.cpp)
+	target_sources            (skshaderc_lib PRIVATE sksc_hlsl.cpp sksc_meta.cpp sksc_wgsl.cpp)
+endif()
+
+if(SKSHADERC_ENABLE_WGSL)
+	# Tint comes from the Dawn source tree at the pinned release. With every
+	# Dawn backend disabled, Dawn's root CMake only adds third_party +
+	# src/utils + src/tint — no code generators, no gigantic dependency fetch.
+	# SPIRV-Headers/Tools targets already exist (fetched above at Dawn's pins),
+	# so Dawn's third_party reuses them; abseil is populated here for it.
+	message(STATUS "Fetching abseil (for Tint)...")
+	FetchContent_Declare( dawn_abseil
+		URL https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp/+archive/88f6126f3dc8848ddf7901b6df3f741dc0a1f2c2.tar.gz
+		SOURCE_SUBDIR  use-dawns-add-subdirectory # populate only, dawn adds it
+	)
+	FetchContent_MakeAvailable(dawn_abseil)
+
+	message(STATUS "Fetching Dawn source (for Tint)...")
+	FetchContent_Declare( dawn_tint
+		URL https://github.com/google/dawn/archive/refs/tags/v20260713.082812.tar.gz
+	)
+
+	set(DAWN_ENABLE_D3D11      OFF CACHE BOOL "" FORCE)
+	set(DAWN_ENABLE_D3D12      OFF CACHE BOOL "" FORCE)
+	set(DAWN_ENABLE_METAL      OFF CACHE BOOL "" FORCE)
+	set(DAWN_ENABLE_NULL       OFF CACHE BOOL "" FORCE)
+	set(DAWN_ENABLE_DESKTOP_GL OFF CACHE BOOL "" FORCE)
+	set(DAWN_ENABLE_OPENGLES   OFF CACHE BOOL "" FORCE)
+	set(DAWN_ENABLE_VULKAN     OFF CACHE BOOL "" FORCE)
+	set(DAWN_USE_GLFW          OFF CACHE BOOL "" FORCE)
+	set(DAWN_USE_X11           OFF CACHE BOOL "" FORCE)
+	set(DAWN_USE_WAYLAND       OFF CACHE BOOL "" FORCE)
+	set(DAWN_BUILD_SAMPLES     OFF CACHE BOOL "" FORCE)
+	set(DAWN_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+	set(DAWN_BUILD_PROTOBUF    OFF CACHE BOOL "" FORCE)
+	set(DAWN_BUILD_MONOLITHIC_LIBRARY OFF CACHE STRING "" FORCE)
+	set(TINT_BUILD_SPV_READER     ON  CACHE BOOL "" FORCE)
+	set(TINT_BUILD_WGSL_READER    ON  CACHE BOOL "" FORCE)
+	set(TINT_BUILD_WGSL_WRITER    ON  CACHE BOOL "" FORCE)
+	set(TINT_BUILD_SPV_WRITER     OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_GLSL_WRITER    OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_GLSL_VALIDATOR OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_HLSL_WRITER    OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_MSL_WRITER     OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_NULL_WRITER    OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_IR_BINARY      OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_TESTS          OFF CACHE BOOL "" FORCE)
+	set(TINT_BUILD_CMD_TOOLS      OFF CACHE BOOL "" FORCE)
+	set(TINT_LIB_FUZZING_ENGINE_LINK_OPTIONS "" CACHE STRING "" FORCE)
+	set(DAWN_ABSEIL_DIR        "${dawn_abseil_SOURCE_DIR}"   CACHE PATH "" FORCE)
+	set(DAWN_SPIRV_HEADERS_DIR "${spirv-headers_SOURCE_DIR}" CACHE PATH "" FORCE)
+	set(DAWN_SPIRV_TOOLS_DIR   "${spirv-tools_SOURCE_DIR}"   CACHE PATH "" FORCE)
+
+	FetchContent_MakeAvailable(dawn_tint)
+
+	target_link_libraries     (skshaderc_lib PUBLIC libtint)
+	target_include_directories(skshaderc_lib PRIVATE
+		"${dawn_tint_SOURCE_DIR}"
+		"${dawn_tint_SOURCE_DIR}/include")
+	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_TINT)
+	# Tint's public headers need C++20
+	set_target_properties(skshaderc_lib PROPERTIES CXX_STANDARD 20)
 endif()
 
 # Optional SVSL backend. To build against an in-progress SVSL
@@ -291,8 +381,10 @@ endif() # NOT SKSHADERC_SKIP_BUILD
 # - Cross-compiling: use the pre-built host binary for shader compilation
 if(SKSHADERC_CROSS_COMPILING)
 	set(SKSHADERC_EXE_PATH "${SKSHADERC_HOST_BIN}" CACHE INTERNAL "Path to skshaderc executable (host binary for cross-compilation)")
+	set(SKSHADERC_DEPENDS  "${SKSHADERC_HOST_BIN}" CACHE INTERNAL "Extra DEPENDS so shaders recompile when skshaderc changes")
 else()
 	set(SKSHADERC_EXE_PATH $<TARGET_FILE:skshaderc> CACHE INTERNAL "Path to skshaderc executable")
+	set(SKSHADERC_DEPENDS  skshaderc                CACHE INTERNAL "Extra DEPENDS so shaders recompile when skshaderc changes")
 endif()
 # Note: WINE variable is set earlier when detecting Windows-on-Unix cross-compilation
 
@@ -309,7 +401,9 @@ if(NOT SKSHADERC_SKIP_BUILD)
 # skshaderc itself is up-to-date. This ensures bin/ is repopulated if deleted.
 add_custom_target(skshaderc_install ALL
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${SKSHADERC_TARGET_FOLDER}"
-	COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:skshaderc> "${SKSHADERC_TARGET_FOLDER}/"
+	# The install script refuses to replace a WGSL-capable tool with one that
+	# lacks the target — web cross-builds depend on the fuller tool staying put
+	COMMAND ${CMAKE_COMMAND} -DSKSHADERC_SRC=$<TARGET_FILE:skshaderc> -DSKSHADERC_DST_DIR=${SKSHADERC_TARGET_FOLDER} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/install_tool.cmake
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.distribute.txt" "${CMAKE_SOURCE_DIR}/bin/CMakeLists.txt"
 	DEPENDS skshaderc
 	COMMENT "Installing skshaderc to ${SKSHADERC_TARGET_FOLDER}"
@@ -334,7 +428,7 @@ function(SKSHADERC_COMPILE_ASSETS TARGET OUT_PATH COMMAND_STRING OUT_LIST)
 		add_custom_command(
 			OUTPUT ${COMPILED_SHADER}
 			COMMAND ${WINE} ${SKSHADERC_EXE_PATH} ${SKSHADERC_COMPILE_COMMANDS} ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
-			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
+			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} ${SKSHADERC_DEPENDS}
 			VERBATIM
 		)
 		list(APPEND SHADER_LIST ${SHADER})
@@ -358,6 +452,7 @@ function(SKSHADERC_COMPILE_HEADERS ADD_TARGET OUTPUT_FOLDER COMMAND_STRING)
 		add_custom_command(
 			OUTPUT ${OUTPUT_FOLDER}/${SHADER_NAME}.h
 			COMMAND ${WINE} ${SKSHADERC_EXE_PATH} ${SKSHADERC_COMPILE_COMMANDS} ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
+			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} ${SKSHADERC_DEPENDS}
 			VERBATIM
 		)
 		list(APPEND SHADER_LIST ${OUTPUT_FOLDER}/${SHADER_NAME}.h)

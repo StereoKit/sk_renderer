@@ -641,7 +641,6 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	// Create framebuffer - layered for cubemaps/arrays, cached for 2D
 	VkFramebuffer framebuffer   = VK_NULL_HANDLE;
 	VkImageView   temp_view     = VK_NULL_HANDLE;
-	uint32_t      draw_instances = 1;
 
 	if (is_cubemap || is_array) {
 		// Multiview rendering: single render pass broadcasts across all layers.

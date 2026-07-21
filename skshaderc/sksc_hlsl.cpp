@@ -72,8 +72,8 @@ const char* parse_glslang_error(const char* at) {
 	else if (parse_startswith(at, "WARNING: ")) { level = sksc_log_level_warn; curr += 9;}
 
 	bool has_line = false;
-	int32_t line;
-	int32_t col;
+	int32_t line = 0;
+	int32_t col  = 0; // '(line)' format errors carry no column
 
 	const char* numbers = curr;
 	// Check for 'col:line:' format line numbers
@@ -113,7 +113,7 @@ void log_shader_msgs(glslang::TShader *shader) {
 
 ///////////////////////////////////////////
 
-compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, const char** defines, int32_t define_count, sksc_shader_file_stage_t *out_stage) {
+compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, const char** defines, int32_t define_count, bool split_samplers, sksc_shader_file_stage_t *out_stage) {
 	TBuiltInResource default_resource = {};
 	EShMessages      messages         = EShMsgDefault;
 	EShMessages      messages_link    = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgDebugInfo);
@@ -133,9 +133,19 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	shader.setEnvInput        (glslang::EShSourceHlsl, stage, glslang::EShClientVulkan, 100);
 	shader.setEnvClient       (glslang::EShClientVulkan,      glslang::EShTargetVulkan_1_1);
 	shader.setEnvTarget       (glslang::EShTargetSpv,         glslang::EShTargetSpv_1_3);
-	shader.setEnvTargetHlslFunctionality1();
-	shader.setTextureSamplerTransformMode(EShTexSampTransUpgradeTextureRemoveSampler);
-	if (settings->debug) {
+	// WGSL has no combined image samplers, so the WGSL variant keeps textures
+	// and samplers separate; the Vulkan path merges them as always. The hlsl
+	// functionality extension only feeds semantic reflection on the Vulkan
+	// compile — Tint refuses modules that declare it, so the variant skips it.
+	if (!split_samplers) {
+		shader.setEnvTargetHlslFunctionality1();
+		shader.setTextureSamplerTransformMode(EShTexSampTransUpgradeTextureRemoveSampler);
+	}
+	// The split-sampler WGSL variant always compiles without debug info and
+	// with optimization: Tint rejects NonSemantic debug info, and the sampler
+	// pairing scan needs sampling code fully inlined.
+	bool debug = settings->debug && !split_samplers;
+	if (debug) {
 		shader.setDebugInfo (true);
 		shader.setSourceFile(filename);
 		shader.addSourceText(hlsl, strlen(hlsl));
@@ -214,12 +224,12 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	std::vector<unsigned int> spirv;
 	spv::SpvBuildLogger logger;
 	glslang::SpvOptions spvOptions;
-	spvOptions.generateDebugInfo                = settings->debug;
-	spvOptions.emitNonSemanticShaderDebugInfo   = settings->debug;
-	spvOptions.emitNonSemanticShaderDebugSource = settings->debug;
+	spvOptions.generateDebugInfo                = debug;
+	spvOptions.emitNonSemanticShaderDebugInfo   = debug;
+	spvOptions.emitNonSemanticShaderDebugSource = debug;
 	// Enable glslang's built-in SPIRV optimizer which includes HLSL-specific
 	// legalization passes (FixStorageClass, InterpolateFixup, CFGCleanup, etc.)
-	spvOptions.disableOptimizer                 = settings->debug || settings->optimize == 0;
+	spvOptions.disableOptimizer                 = debug || (settings->optimize == 0 && !split_samplers);
 	spvOptions.optimizeSize                     = settings->optimize == 1;
 	glslang::GlslangToSpv(*intermediate, spirv, &logger, &spvOptions);
 
@@ -260,33 +270,41 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 				new_binding = old_binding + 0;
 				break;
 				
-			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLER:
+				// s registers - merged into textures on the Vulkan path (+100);
+				// standalone in the split-sampler WGSL variant (+400)
+				new_binding = old_binding + (split_samplers ? SKSC_SLOT_SAMPLER : SKSC_SLOT_TEXTURE);
+				break;
+
+			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-				// t/s registers - shift by 100
-				new_binding = old_binding + 100;
+				// t registers
+				new_binding = old_binding + SKSC_SLOT_TEXTURE;
 				break;
 
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:
 				// Check if it's read-only (StructuredBuffer) or read-write (RWStructuredBuffer)
 				if (binding->resource_type == SPV_REFLECT_RESOURCE_FLAG_SRV) {
 					// StructuredBuffer - t register
-					new_binding = old_binding + 100;
+					new_binding = old_binding + SKSC_SLOT_TEXTURE;
 				} else {
 					// RWStructuredBuffer - u register
-					new_binding = old_binding + 200;
+					new_binding = old_binding + SKSC_SLOT_READWRITE;
 				}
 				break;
 				
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-				// u registers - shift by 200
-				new_binding = old_binding + 200;
+				// u registers
+				new_binding = old_binding + SKSC_SLOT_READWRITE;
 				break;
 
 			case SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-				// input attachments - shift by 300
-				new_binding = old_binding + 300;
+				// input attachments - slot 300 + the declared
+				// [[vk::input_attachment_index(N)]]. glslang's auto-mapper can
+				// give several unregistered SubpassInputs the same binding, so
+				// the attachment index is the only collision-free identity.
+				new_binding = SKSC_SLOT_INPUT_ATT + binding->input_attachment_index;
 				break;
 			default:break;
 		}
@@ -322,7 +340,7 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	// Run additional SPIRV optimization passes after binding remaps.
 	// glslang's optimizer handles HLSL-specific legalization, but we can
 	// squeeze out a bit more with the full performance/size passes.
-	if (settings->debug == false && settings->optimize > 0) {
+	if (!debug && (settings->optimize > 0 || split_samplers)) {
 		spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_1);
 		optimizer.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
 			printf("SPIRV optimization error: %s\n", m);

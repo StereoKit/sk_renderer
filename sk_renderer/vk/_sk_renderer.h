@@ -405,6 +405,10 @@ VkImageLayout         _skr_tex_attachment_layout            (const skr_tex_t*   
 void                  _skr_tex_transition_enqueue           (      skr_tex_t* ref_tex, uint8_t type); // Deferred texture transition queue (to avoid in-renderpass barriers) type: 0=shader_read, 1=storage
 void                  _skr_tex_transition_dequeue           (      skr_tex_t* ref_tex);               // Remove from deferred queue (called on texture destroy)
 
+// vkDeviceWaitIdle with every queue mutex held; the plain call implicitly
+// uses all queues and races worker-thread submits (skr_initialize.c)
+void                  _skr_device_wait_idle                 (void);
+
 // Command buffer management
 bool                  _skr_cmd_init                         (void);
 void                  _skr_cmd_shutdown                     (void);

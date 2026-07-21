@@ -57,7 +57,8 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	size_t vars_size    = sizeof(sksc_shader_var_t          ) * total_var_count;
 	size_t vinputs_size = sizeof(skr_vert_component_t       ) * meta->vertex_input_count;
 	size_t spec_size    = sizeof(sksc_shader_spec_constant_t) * meta->spec_constant_count;
-	size_t total_size   = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size;
+	size_t sampler_size = sizeof(sksc_shader_sampler_t      ) * meta->sampler_count;
+	size_t total_size   = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size + sampler_size;
 
 	if (total_size == 0) return;
 
@@ -71,11 +72,13 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	uint8_t                     *def_cursor  = block + buffers_size + res_size + vars_size;
 	skr_vert_component_t        *new_vinputs = (skr_vert_component_t       *)(block + buffers_size + res_size + vars_size + total_defaults_size);
 	sksc_shader_spec_constant_t *new_specs   = (sksc_shader_spec_constant_t*)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size);
+	sksc_shader_sampler_t       *new_samps   = (sksc_shader_sampler_t      *)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size);
 
-	memcpy(new_buffers, meta->buffers,        buffers_size);
-	memcpy(new_res,     meta->resources,      res_size);
-	memcpy(new_vinputs, meta->vertex_inputs,  vinputs_size);
-	memcpy(new_specs,   meta->spec_constants, spec_size);
+	if (buffers_size > 0) memcpy(new_buffers, meta->buffers,        buffers_size);
+	if (res_size     > 0) memcpy(new_res,     meta->resources,      res_size);
+	if (vinputs_size > 0) memcpy(new_vinputs, meta->vertex_inputs,  vinputs_size);
+	if (spec_size    > 0) memcpy(new_specs,   meta->spec_constants, spec_size);
+	if (sampler_size > 0) memcpy(new_samps,   meta->samplers,       sampler_size);
 
 	// Copy per-buffer vars and defaults, update pointers
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
@@ -103,12 +106,15 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	free(meta->resources);
 	free(meta->vertex_inputs);
 	free(meta->spec_constants);
+	free(meta->samplers);
 
 	// Point meta at the packed block
 	meta->buffers        = new_buffers;
 	meta->resources      = new_res;
 	meta->vertex_inputs  = new_vinputs;
 	meta->spec_constants = new_specs;
+	meta->samplers       = new_samps;
+	meta->samplers_owned = false;
 }
 #endif // SKSC_HAS_GLSLANG
 
@@ -156,6 +162,8 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 	skr_stage_ compile_stages[3] = { skr_stage_vertex, skr_stage_pixel, skr_stage_compute };
 	char*      entrypoints   [3] = { settings->vs_entrypoint, settings->ps_entrypoint, settings->cs_entrypoint };
+	uint64_t   stage_features[3] = {};
+	bool       stage_present [3] = {};
 
 	for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
 		if (entrypoints[i][0] == 0)
@@ -163,7 +171,7 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		// Build SPIRV
 		sksc_shader_file_stage_t spirv_stage  = {};
-		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], NULL, 0, &spirv_stage);
+		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], NULL, 0, false, &spirv_stage);
 		if (spirv_result == compile_result_fail) {
 			sksc_log(sksc_log_level_err, "SPIRV compile failed");
 			return false;
@@ -172,6 +180,10 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		// Extract metadata from the SPIRV
 		sksc_spirv_to_meta(&spirv_stage, &out_file->meta);
+		stage_present [i] = true;
+		stage_features[i] = spirv_stage.code_size >= 20
+			? sksc_spirv_features((const uint32_t*)spirv_stage.code, spirv_stage.code_size / 4)
+			: 0;
 
 		// Add it as a stage in our sks file
 		if (settings->target_langs[skr_shader_lang_spirv]) {
@@ -180,6 +192,34 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		if (!settings->target_langs[skr_shader_lang_spirv])
 			free(spirv_stage.code);
+	}
+
+	// WGSL stages for the WebGPU backend. Shaders using features browser
+	// WebGPU has no counterpart for get no WGSL blob, with a warning —
+	// multiview is NOT in that set, it lowers to the sk_view_index spec
+	// constant (see sksc_wgsl.cpp).
+	if (settings->target_langs[skr_shader_lang_wgsl]) {
+		const uint64_t unsupported_mask = sksc_wgsl_unsupported_features();
+
+		for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
+			if (!stage_present[i])
+				continue;
+			if (stage_features[i] & unsupported_mask) {
+				sksc_log(sksc_log_level_warn, "Skipping WGSL output for a stage: it uses features unavailable in browser WebGPU (subgroups/wave size/tile or QCOM image ops)");
+				continue;
+			}
+			// SubpassInput shaders pass through _wgsl_subpass_to_texture, which
+			// lowers them to plain textures fetched at the fragment coordinate
+
+			sksc_shader_file_stage_t wgsl_stage  = {};
+			compile_result_          wgsl_result = sksc_wgsl_compile_stage(filename, hlsl_text, settings, compile_stages[i], &out_file->meta, &wgsl_stage);
+			if (wgsl_result == compile_result_fail) {
+				sksc_log(sksc_log_level_err, "WGSL compile failed");
+				return false;
+			}
+			if (wgsl_result == compile_result_success)
+				stages.add(wgsl_stage);
+		}
 	}
 
 	sksc_meta_assign_defaults(ast_defaults, var_meta, &out_file->meta);
@@ -445,11 +485,26 @@ struct file_data_t {
 
 ///////////////////////////////////////////
 
+// Features browser WebGPU has no counterpart for — stages using any of these
+// get no WGSL blob. Multiview is NOT in the set; it lowers to the
+// sk_view_index spec constant (see sksc_wgsl.cpp).
+uint64_t sksc_wgsl_unsupported_features(void) {
+	return (1ull << sksc_feature_bit_subgroups)            |
+	       (1ull << sksc_feature_bit_wave_size)            |
+	       (1ull << sksc_feature_bit_tile_image)           |
+	       (1ull << sksc_feature_bit_qcom_sample_weighted) |
+	       (1ull << sksc_feature_bit_qcom_box_filter)      |
+	       (1ull << sksc_feature_bit_qcom_block_match)     |
+	       (1ull << sksc_feature_bit_qcom_image_proc2)     |
+	       (1ull << sksc_feature_bit_qcom_tile_shading);
+}
+
 // Device-feature mask: scans a SPIR-V blob's OpCapability/OpExtension
 // declarations (raw opcode numbers, like the op counting in sksc_meta.cpp)
 // and maps them onto sksc_feature_bit_ values. Declarations with no assigned
 // bit set sksc_feature_bit_unknown so runtimes never silently under-check.
-static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
+// Non-static: sksc_compile also uses this to gate the WGSL target.
+uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
 	// capability value → feature bit; one bit can cover several capabilities
 	static const struct { uint32_t cap; uint8_t bit; } cap_bits[] = {
 		{ 9,    sksc_feature_bit_float16 },          // Float16
@@ -493,6 +548,11 @@ static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) 
 	// bit 0xFF = the extension is known but sets no bit itself: its capabilities
 	// carry the precise per-op bits (image processing splits into three)
 	static const struct { const char *name; uint8_t bit; } ext_bits[] = {
+		// Reflection-only decorations from glslang's HLSL front end; every
+		// driver ignores them, so they gate nothing
+		{ "SPV_GOOGLE_hlsl_functionality1",      0xFF },
+		{ "SPV_GOOGLE_user_type",                0xFF },
+		{ "SPV_GOOGLE_decorate_string",          0xFF },
 		{ "SPV_KHR_8bit_storage",                sksc_feature_bit_storage8 },
 		{ "SPV_EXT_demote_to_helper_invocation", sksc_feature_bit_demote },
 		{ "SPV_EXT_shader_tile_image",           sksc_feature_bit_tile_image },
@@ -540,7 +600,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 11;
+	uint16_t version = SKSC_FILE_VERSION;
 	data.write(tag);
 	data.write(version);
 
@@ -559,6 +619,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	data.write(file->meta.resource_count);
 	data.write(file->meta.vertex_input_count);
 	data.write(file->meta.spec_constant_count);
+	data.write(file->meta.sampler_count); // v12
 	data.write(features);
 	data.write(features_reserved);
 
@@ -616,7 +677,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write(res->bind);
 		data.write(res->element_size);
 		uint16_t reserved = 0;
-		data.write(res->shape);        // 0 = unreported; reflection does not fill these yet
+		data.write(res->shape);
 		data.write(res->image_format);
 		data.write(reserved);
 	}
@@ -628,6 +689,14 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write(spec->default_value);
 		data.write(spec->type);
 		data.write(spec->stage_bits);
+	}
+
+	for (uint32_t i = 0; i < file->meta.sampler_count; i++) { // v12
+		sksc_shader_sampler_t *sampler = &file->meta.samplers[i];
+		data.write_fixed_str(sampler->name, sizeof(sampler->name));
+		data.write(sampler->slot);
+		data.write(sampler->stage_bits);
+		data.write(sampler->paired_slot);
 	}
 
 	for (uint32_t i = 0; i < file->stage_count; i++) {

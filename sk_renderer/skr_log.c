@@ -3,7 +3,7 @@
 // Copyright (c) 2025 Nick Klingensmith
 // Copyright (c) 2025 Qualcomm Technologies, Inc.
 
-#include "vk/_sk_renderer.h"
+#include "_skr_shared.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -29,7 +29,7 @@ void _default_log(skr_log_ level, const char *text) {
 		level == skr_log_critical ? "[skr:crit] " : "[skr:unkn] ";
 	
 	if (level == skr_log_critical) {
-		level = level;
+		// breakpoint anchor for critical logs
 	}
 	printf("%s%s\n", prefix, text);
 #endif

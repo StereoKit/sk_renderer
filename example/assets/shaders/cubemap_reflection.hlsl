@@ -5,7 +5,10 @@
 struct Inst {
 	float4x4 world;
 	float    roughness;  // 0 = smooth (mip 0), 1 = rough (highest mip)
-	float3   _pad;       // Matches the C-side padding to a 16-aligned stride
+	// Scalar padding, not float3: HLSL packs a float3 here at offset 68, but
+	// WGSL requires vec3 to be 16-aligned, which would push the stride to 96
+	// on WebGPU. Scalars land at 68/72/76 under both rule sets — stride 80.
+	float    _pad0, _pad1, _pad2;
 };
 StructuredBuffer<Inst> inst : register(t2, space0);
 

@@ -277,7 +277,7 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 void skr_surface_resize(skr_surface_t* ref_surface) {
 	if (!ref_surface) return;
 
-	vkDeviceWaitIdle(_skr_vk.device);
+	_skr_device_wait_idle();
 
 	// Destroy old image views and framebuffers
 	for (uint32_t i = 0; i < ref_surface->image_count; i++) {

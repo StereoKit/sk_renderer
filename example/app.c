@@ -21,6 +21,15 @@
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include <cimgui.h>
 
+// WebGPU render passes resolve only into same-sized targets, so render
+// targets can't round away from the surface size there; Vulkan keeps the
+// even rounding it has always used.
+#ifdef SKR_WEBGPU
+	#define APP_SIZE_ROUND(x) (x)
+#else
+	#define APP_SIZE_ROUND(x) ((x) & ~1)
+#endif
+
 const bool enable_offscreen       = false;
 const bool enable_bloom           = false;
 const bool enable_stereo          = true;
@@ -167,8 +176,8 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	skr_tex_sampler_t linear_clamp = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
 
 	// Apply render scale. Even dimensions required for MSAA.
-	int32_t render_w = (int32_t)(width  * app->render_scale) & ~1;
-	int32_t render_h = (int32_t)(height * app->render_scale) & ~1;
+	int32_t render_w = APP_SIZE_ROUND((int32_t)(width  * app->render_scale));
+	int32_t render_h = APP_SIZE_ROUND((int32_t)(height * app->render_scale));
 	if (render_w < 2) render_w = 2;
 	if (render_h < 2) render_h = 2;
 
@@ -818,8 +827,8 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 		if (igSliderFloat("Viewport Scale", &vs, 25.0f, 100.0f, "%.0f%%", 0)) app->viewport_scale = vs / 100.0f;
 	}
 	{
-		int32_t rw = (int32_t)(width  * app->render_scale) & ~1;
-		int32_t rh = (int32_t)(height * app->render_scale) & ~1;
+		int32_t rw = APP_SIZE_ROUND((int32_t)(width  * app->render_scale));
+		int32_t rh = APP_SIZE_ROUND((int32_t)(height * app->render_scale));
 		int32_t vw = (int32_t)(rw * app->viewport_scale) & ~1;
 		int32_t vh = (int32_t)(rh * app->viewport_scale) & ~1;
 		igText("Render: %d x %d, Viewport: %d x %d", rw, rh, vw, vh);

@@ -266,9 +266,10 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i                   ].bind = meta->buffers  [i].bind;
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
 		binds[i+meta->buffer_count].bind = meta->resources[i].bind;
-		// Shape bit 6: the shader uses QCOM image-processing ops on this texture,
-		// which require the dedicated IMAGE_PROCESSING sampler at descriptor time.
-		binds[i+meta->buffer_count].image_proc_sampler = (meta->resources[i].shape & (1 << 6)) != 0;
+		// Shape bit 6 on sampled textures: the shader uses QCOM image-processing
+		// ops, which require the dedicated IMAGE_PROCESSING sampler at descriptor
+		// time. On storage images the same bit records write usage instead.
+		binds[i+meta->buffer_count].image_proc_sampler = meta->resources[i].bind.register_type == skr_register_texture && (meta->resources[i].shape & SKSC_SHAPE_WRITTEN) != 0; // QCOM sampler bit on sampled textures
 	}
 
 	// Check if we have a buffer bound to the system buffer slot

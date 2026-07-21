@@ -221,7 +221,8 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			const char *targets = argv[i + 1];
 			size_t      len     = strlen(targets);
 			for (size_t i = 0; i < len; i++) {
-				if (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				if      (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				else if (targets[i] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
 				else { printf("Unrecognized shader language target '%c'\n", targets[i]); *exit = true; }
 			}
 			i++;
@@ -299,7 +300,10 @@ Options:
 			specific filename.
 	-t targets	Sets a list of shader language targets to generate. This is a
 			string of characters, where each character represents a language.
-			's' is d3d12 and vulkan spir-v. Default value is 's'.
+			's' is d3d12 and vulkan spir-v. 'w' is WebGPU WGSL (requires a
+			skshaderc built with SKSHADERC_ENABLE_WGSL). 'sw' emits both;
+			'w' alone makes a web-slim .sks with no SPIR-V blobs. Default
+			value is 's'.
 
 	target_file	This can be any filename, and can use the wildcard '*' to 
 			compile multiple files in the same call.
@@ -461,6 +465,7 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 			case skr_shader_lang_glsl_es:  lang = "glsl.es";  break;
 			case skr_shader_lang_glsl_web: lang = "glsl.web"; break;
 			case skr_shader_lang_hlsl:     lang = "hlsl";     break;
+			case skr_shader_lang_wgsl:     lang = "wgsl";     break;
 			// Without the SPIRV-Tools disassembler we emit the raw binary module.
 #ifdef SKSC_HAS_SPIRV_TOOLS
 			case skr_shader_lang_spirv:    lang = "spvasm";   break;

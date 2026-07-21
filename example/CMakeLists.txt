@@ -13,16 +13,29 @@ set(SKA_BUILD_EXAMPLES OFF CACHE BOOL "Disable sk_app examples" FORCE)
 if(ANDROID)
 	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
-message(STATUS "Fetching sk_app...")
-FetchContent_Declare(sk_app
-	GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-	GIT_TAG        v2026.3.11
-	GIT_SHALLOW    TRUE
-	GIT_PROGRESS   TRUE
-)
+# SKR_SK_APP_DIR points at a local sk_app checkout for development (e.g.
+# -DSKR_SK_APP_DIR=../sk_app, resolved against the top-level source dir);
+# empty — the default — fetches the pinned release. v2026.7.20+ carries the
+# WebGPU surface + web platform support the WebGPU backend needs.
+if(SKR_SK_APP_DIR)
+	get_filename_component(_skr_sk_app_dir "${SKR_SK_APP_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+	if(NOT EXISTS "${_skr_sk_app_dir}/CMakeLists.txt")
+		message(FATAL_ERROR "SKR_SK_APP_DIR (${_skr_sk_app_dir}) doesn't look like an sk_app checkout")
+	endif()
+	message(STATUS "Using sk_app from ${_skr_sk_app_dir}")
+	FetchContent_Declare(sk_app
+		SOURCE_DIR "${_skr_sk_app_dir}"
+	)
+else()
+	message(STATUS "Fetching sk_app v2026.7.20...")
+	FetchContent_Declare(sk_app
+		GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
+		GIT_TAG        v2026.7.20
+		GIT_SHALLOW    TRUE
+		GIT_PROGRESS   TRUE
+	)
+endif()
 FetchContent_MakeAvailable(sk_app)
-#set(sk_app_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../sk_app)
-#add_subdirectory(${sk_app_SOURCE_DIR} ${sk_app_SOURCE_DIR}/build)
 if(ANDROID)
 	set_target_properties(sk_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -53,8 +66,9 @@ FetchContent_Declare(cimgui
 )
 FetchContent_MakeAvailable(cimgui)
 
-# FFmpeg for video playback (Linux only for now)
-if(UNIX AND NOT ANDROID AND NOT APPLE)
+# FFmpeg for video playback (Linux only for now; the zero-copy path imports
+# VkImages, so it's Vulkan-backend only)
+if(UNIX AND NOT ANDROID AND NOT APPLE AND NOT SKR_USE_WEBGPU)
 	find_package(PkgConfig QUIET)
 	if(PkgConfig_FOUND)
 		pkg_check_modules(FFMPEG
@@ -114,6 +128,26 @@ set_target_properties(sk_renderer_test PROPERTIES
 
 if(UNIX AND NOT ANDROID)
 	target_link_libraries(sk_renderer_test PRIVATE m)
+endif()
+
+if(EMSCRIPTEN)
+	# The pre-init JS requests the WebGPU adapter/device before main() runs;
+	# EXIT_RUNTIME lets test runs report a real exit code through emrun
+	target_link_options(sk_renderer_test PRIVATE
+		"SHELL:--pre-js ${CMAKE_CURRENT_SOURCE_DIR}/web/pre.js"
+		"SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html"
+		-sEXIT_RUNTIME=1
+		# The scenes keep matrices/instance staging on the stack; emscripten's
+		# 64KB default is far below the 8MB native builds enjoy
+		-sSTACK_SIZE=2MB)
+	# Size pass: closure-compile the JS glue in MinSizeRel builds (pre.js uses
+	# quoted Module properties so the minifier can't break the boundary)
+	if(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+		target_link_options(sk_renderer_test PRIVATE --closure=1)
+	endif()
+	set_property(TARGET sk_renderer_test APPEND PROPERTY LINK_DEPENDS
+		"${CMAKE_CURRENT_SOURCE_DIR}/web/pre.js"
+		"${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html")
 endif()
 
 # Static link MinGW runtime when cross-compiling to Windows
@@ -202,14 +236,24 @@ endif()
 # Shader compilation
 ###############################################################################
 
-# Compile ImGui shader to header file (no debug info, embedded in binary)
-# Output goes to imgui_backend/ to keep all ImGui backend files together
-skshaderc_compile_headers(sk_renderer_test ${CMAKE_CURRENT_SOURCE_DIR}/imgui_backend "-o3 -e -t s"
+# Compile ImGui shader to header file (no debug info, embedded in binary).
+# Web builds carry WGSL only (web-slim); native WebGPU keeps SPIR-V alongside
+# for byte-compat with the Vulkan tooling.
+if(EMSCRIPTEN)
+	set(_skr_example_shader_targets "-t w")
+elseif(SKR_USE_WEBGPU)
+	set(_skr_example_shader_targets "-t sw")
+else()
+	set(_skr_example_shader_targets "-t s")
+endif()
+# Output goes to the build dir: the flags differ per backend (-t s vs -t sw),
+# so a source-tree copy would ping-pong between build configurations
+skshaderc_compile_headers(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/imgui_shader "-o3 -e ${_skr_example_shader_targets}"
 	imgui_backend/imgui.hlsl
 )
 
 # Compile other shaders to .sks files
-skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders "" _
+skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders "${_skr_example_shader_targets}" _
 	assets/shaders/bloom_composite.hlsl
 	assets/shaders/bloom_downsample.hlsl
 	assets/shaders/bloom_upsample.hlsl

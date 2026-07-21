@@ -1368,7 +1368,7 @@ static void _skr_tex_safe_transition_all_mips(skr_tex_t* ref_tex) {
 	_skr_cmd_release(ctx.cmd);
 }
 
-void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
+void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_filter_shader) {
 	if (!skr_tex_is_valid(ref_tex)) {
 		skr_log(skr_log_warning, "Cannot generate mipmaps for invalid texture");
 		return;
@@ -1383,8 +1383,8 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 	}
 
 	// Caller-supplied shader: trust them, use the render path.
-	if (opt_shader != NULL) {
-		_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, opt_shader);
+	if (opt_filter_shader != NULL) {
+		_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, opt_filter_shader);
 		return;
 	}
 

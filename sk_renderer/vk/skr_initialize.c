@@ -1142,10 +1142,19 @@ bool skr_init(skr_settings_t settings) {
 	return true;
 }
 
+// vkDeviceWaitIdle implicitly uses every queue, so it needs the same external
+// synchronization a submit does — take every queue mutex (aliased pointers all
+// resolve into this array) so worker-thread submits can't overlap the wait
+void _skr_device_wait_idle(void) {
+	for (int32_t i = 0; i < SKR_QUEUE_TYPE_COUNT; i++) mtx_lock  (&_skr_vk.queue_mutexes[i]);
+	vkDeviceWaitIdle(_skr_vk.device);
+	for (int32_t i = 0; i < SKR_QUEUE_TYPE_COUNT; i++) mtx_unlock(&_skr_vk.queue_mutexes[i]);
+}
+
 void skr_shutdown(void) {
 	if (!_skr_vk.initialized) return;
 
-	vkDeviceWaitIdle(_skr_vk.device);
+	_skr_device_wait_idle();
 
 	skr_tex_destroy(&_skr_vk.default_tex_white);
 	skr_tex_destroy(&_skr_vk.default_tex_gray);
