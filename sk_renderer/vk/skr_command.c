@@ -57,6 +57,10 @@ void _skr_cmd_shutdown() {
 		*thread = (_skr_vk_thread_t){0};
 	}
 	mtx_unlock(&_skr_vk.thread_pool_mutex);
+
+	// Each thread's pool index is a thread_local this loop can't reach. Reset
+	// the calling thread's so a later skr_init can re-register it.
+	_skr_thread_idx = -1;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

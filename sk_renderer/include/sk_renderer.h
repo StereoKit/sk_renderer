@@ -666,6 +666,34 @@ SKR_API uint32_t          skr_get_vk_video_decode_queue_family (void);  // UINT3
 SKR_API void              skr_get_vk_device_uuid               (uint8_t out_uuid[VK_UUID_SIZE]);
 SKR_API void              skr_vk_queue_lock                    (uint32_t queue_family);
 SKR_API void              skr_vk_queue_unlock                  (uint32_t queue_family);
+
+// Vulkan extension & feature requests. Register before skr_init; a request is
+// copied, persists across skr_shutdown/skr_init, and enables atomically when
+// all its extensions are present and every requested feature bit is supported,
+// queried before enabling. Feature structs merge across requests by sType on
+// VkDeviceCreateInfo.pNext; a `required` request that can't be met fails init.
+typedef struct skr_vk_feature_t {
+	const void* vk_struct; // VkPhysicalDevice*Features with sType set and desired bits VK_TRUE. Not VkPhysicalDeviceFeatures2.
+	int32_t     size;
+} skr_vk_feature_t;
+
+typedef struct skr_vk_request_t {
+	const char*             name;      // Handle for skr_vk_request_enabled, NULL = anonymous
+	bool                    required;  // Fail skr_init if this can't be satisfied
+	const char**            instance_extensions;
+	int32_t                 instance_extension_count;
+	const char**            device_extensions;
+	int32_t                 device_extension_count;
+	const skr_vk_feature_t* features;
+	int32_t                 feature_count;
+} skr_vk_request_t;
+
+SKR_API void              skr_vk_request                       (const skr_vk_request_t* request);
+SKR_API bool              skr_vk_request_enabled               (const char* name);
+// True if the extension was enabled at init, regardless of who requested it.
+SKR_API bool              skr_vk_ext_enabled                   (const char* extension_name);
+// vkGetDeviceProcAddr with vkGetInstanceProcAddr fallback, NULL if absent.
+SKR_API void*             skr_vk_get_function                  (const char* function_name);
 #endif
 
 #ifdef SKR_WEBGPU

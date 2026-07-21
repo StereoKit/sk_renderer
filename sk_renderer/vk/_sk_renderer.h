@@ -240,6 +240,11 @@ typedef struct {
 	// Capability system (runtime-queried feature support)
 	bool                     capabilities[skr_capability_max];
 
+	char**                   enabled_instance_exts;       // Copied enabled ext names, for skr_vk_ext_enabled
+	uint32_t                 enabled_instance_ext_count;
+	char**                   enabled_device_exts;         // Copied enabled ext names, for skr_vk_ext_enabled
+	uint32_t                 enabled_device_ext_count;
+
 	// Shader-support mask: bit (1 << sksc_feature_bit_) set iff that device
 	// feature is actually enabled at device creation. Compared against a
 	// shader meta's `features` by skr_shader_check_support. See skr_initialize.c
