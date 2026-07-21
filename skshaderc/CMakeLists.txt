@@ -114,14 +114,16 @@ if(SKSHADERC_CROSS_COMPILING)
 				GROUP_EXECUTE GROUP_READ
 				WORLD_EXECUTE WORLD_READ)
 		endif()
-		# Web builds compile shaders to WGSL; a host tool from an SVSL-only
-		# build config has no WGSL target and would emit unloadable .sks files
+		# Web builds compile shaders to WGSL, which comes solely from SVSL's
+		# native WGSL emitter; a host tool built without it would emit
+		# unloadable .sks files. The emitter embeds the reserved override
+		# name, so probe the binary for it.
 		if(EMSCRIPTEN)
-			file(STRINGS "${SKSHADERC_HOST_BIN}" _skshaderc_tint_probe REGEX "Tint couldn't read" LIMIT_COUNT 1)
-			if(NOT _skshaderc_tint_probe)
+			file(STRINGS "${SKSHADERC_HOST_BIN}" _skshaderc_wgsl_probe REGEX "sk_view_index" LIMIT_COUNT 1)
+			if(NOT _skshaderc_wgsl_probe)
 				message(FATAL_ERROR
-					"The host skshaderc at ${SKSHADERC_HOST_BIN} was built without the WGSL "
-					"target (SKSHADERC_ENABLE_WGSL), which web builds require.\n"
+					"The host skshaderc at ${SKSHADERC_HOST_BIN} was built without the SVSL "
+					"WGSL emitter (SVSL_ENABLE_WGSL), which web builds require.\n"
 					"Build the native WebGPU config first — it installs a WGSL-capable tool:\n"
 					"    cmake -B build-webgpu -DSKR_USE_WEBGPU=ON && cmake --build build-webgpu")
 			endif()
@@ -172,32 +174,19 @@ set_target_properties(skshaderc_lib PROPERTIES
 # in -h. SKSC_HAS_GLSLANG and SKSC_HAS_SPIRV_TOOLS gate this in code.
 option(SKSHADERC_ENABLE_GLSLANG "Build skshaderc with the glslang (HLSL) shader compiler backend" ON)
 
-# Optional WGSL (WebGPU) target: '-t w' output via Tint's SPIR-V reader and
-# WGSL writer, built from the same pinned Dawn release the sk_renderer WebGPU
-# backend uses (see docs/webgpu-backend-plan.md). Needs the glslang backend
-# for the split-sampler compile it works from.
-option(SKSHADERC_ENABLE_WGSL "Build skshaderc with the Tint-based WGSL (WebGPU) shader target" ON)
-if(SKSHADERC_ENABLE_WGSL AND NOT SKSHADERC_ENABLE_GLSLANG)
-	message(WARNING "SKSHADERC_ENABLE_WGSL requires SKSHADERC_ENABLE_GLSLANG; disabling the WGSL target")
-	set(SKSHADERC_ENABLE_WGSL OFF)
+# WebGPU targets compile every shader through SVSL: WGSL comes from SVSL's
+# native emitter, and keeping glslang out of these builds guarantees a .sks
+# never mixes compiler backends across its stages.
+if(SKR_USE_WEBGPU AND SKSHADERC_ENABLE_GLSLANG)
+	message(STATUS "WebGPU build: shaders compile through SVSL only, disabling the glslang backend")
+	set(SKSHADERC_ENABLE_GLSLANG OFF)
 endif()
 
 if(SKSHADERC_ENABLE_GLSLANG)
-	# Tint's SPIR-V reader builds against SPIRV-Tools internals, so when the
-	# WGSL target is enabled, SPIRV-Headers/Tools follow the pinned Dawn
-	# release's DEPS (v20260713.082812) instead of the Vulkan SDK tag.
-	if(SKSHADERC_ENABLE_WGSL)
-		set(SKSC_SPIRV_HEADERS_URL https://github.com/KhronosGroup/SPIRV-Headers/archive/29981f65241605e08b0ede4cfeb999fe3b723c6a.zip)
-		set(SKSC_SPIRV_TOOLS_URL   https://github.com/KhronosGroup/SPIRV-Tools/archive/85f222ec591863853ea603ce190ea508c7255568.zip)
-	else()
-		set(SKSC_SPIRV_HEADERS_URL https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/${VULKAN_VERSION}.zip)
-		set(SKSC_SPIRV_TOOLS_URL   https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/${VULKAN_VERSION}.zip)
-	endif()
-
 	# SPIRV-Headers underpins both SPIRV-Tools and glslang.
 	message(STATUS "Fetching SPIRV-Headers...")
 	FetchContent_Declare( SPIRV-Headers
-		URL ${SKSC_SPIRV_HEADERS_URL}
+		URL https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/${VULKAN_VERSION}.zip
 		DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 	)
 	FetchContent_MakeAvailable(SPIRV-Headers)
@@ -207,7 +196,7 @@ if(SKSHADERC_ENABLE_GLSLANG)
 	# for meta compatability with HLSL compilers.
 	message(STATUS "Fetching SPIRV-Tools...")
 	FetchContent_Declare( SPIRV-Tools
-		URL ${SKSC_SPIRV_TOOLS_URL}
+		URL https://github.com/KhronosGroup/SPIRV-Tools/archive/refs/tags/${VULKAN_VERSION}.zip
 		DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 	)
 	set(SPIRV_SKIP_TESTS       ON  CACHE BOOL "")
@@ -248,67 +237,7 @@ if(SKSHADERC_ENABLE_GLSLANG)
 	FetchContent_MakeAvailable(glslang)
 	target_link_libraries     (skshaderc_lib PUBLIC glslang SPIRV)
 	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_GLSLANG)
-	target_sources            (skshaderc_lib PRIVATE sksc_hlsl.cpp sksc_meta.cpp sksc_wgsl.cpp)
-endif()
-
-if(SKSHADERC_ENABLE_WGSL)
-	# Tint comes from the Dawn source tree at the pinned release. With every
-	# Dawn backend disabled, Dawn's root CMake only adds third_party +
-	# src/utils + src/tint — no code generators, no gigantic dependency fetch.
-	# SPIRV-Headers/Tools targets already exist (fetched above at Dawn's pins),
-	# so Dawn's third_party reuses them; abseil is populated here for it.
-	message(STATUS "Fetching abseil (for Tint)...")
-	FetchContent_Declare( dawn_abseil
-		URL https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp/+archive/88f6126f3dc8848ddf7901b6df3f741dc0a1f2c2.tar.gz
-		SOURCE_SUBDIR  use-dawns-add-subdirectory # populate only, dawn adds it
-	)
-	FetchContent_MakeAvailable(dawn_abseil)
-
-	message(STATUS "Fetching Dawn source (for Tint)...")
-	FetchContent_Declare( dawn_tint
-		URL https://github.com/google/dawn/archive/refs/tags/v20260713.082812.tar.gz
-	)
-
-	set(DAWN_ENABLE_D3D11      OFF CACHE BOOL "" FORCE)
-	set(DAWN_ENABLE_D3D12      OFF CACHE BOOL "" FORCE)
-	set(DAWN_ENABLE_METAL      OFF CACHE BOOL "" FORCE)
-	set(DAWN_ENABLE_NULL       OFF CACHE BOOL "" FORCE)
-	set(DAWN_ENABLE_DESKTOP_GL OFF CACHE BOOL "" FORCE)
-	set(DAWN_ENABLE_OPENGLES   OFF CACHE BOOL "" FORCE)
-	set(DAWN_ENABLE_VULKAN     OFF CACHE BOOL "" FORCE)
-	set(DAWN_USE_GLFW          OFF CACHE BOOL "" FORCE)
-	set(DAWN_USE_X11           OFF CACHE BOOL "" FORCE)
-	set(DAWN_USE_WAYLAND       OFF CACHE BOOL "" FORCE)
-	set(DAWN_BUILD_SAMPLES     OFF CACHE BOOL "" FORCE)
-	set(DAWN_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
-	set(DAWN_BUILD_PROTOBUF    OFF CACHE BOOL "" FORCE)
-	set(DAWN_BUILD_MONOLITHIC_LIBRARY OFF CACHE STRING "" FORCE)
-	set(TINT_BUILD_SPV_READER     ON  CACHE BOOL "" FORCE)
-	set(TINT_BUILD_WGSL_READER    ON  CACHE BOOL "" FORCE)
-	set(TINT_BUILD_WGSL_WRITER    ON  CACHE BOOL "" FORCE)
-	set(TINT_BUILD_SPV_WRITER     OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_GLSL_WRITER    OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_GLSL_VALIDATOR OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_HLSL_WRITER    OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_MSL_WRITER     OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_NULL_WRITER    OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_IR_BINARY      OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_TESTS          OFF CACHE BOOL "" FORCE)
-	set(TINT_BUILD_CMD_TOOLS      OFF CACHE BOOL "" FORCE)
-	set(TINT_LIB_FUZZING_ENGINE_LINK_OPTIONS "" CACHE STRING "" FORCE)
-	set(DAWN_ABSEIL_DIR        "${dawn_abseil_SOURCE_DIR}"   CACHE PATH "" FORCE)
-	set(DAWN_SPIRV_HEADERS_DIR "${spirv-headers_SOURCE_DIR}" CACHE PATH "" FORCE)
-	set(DAWN_SPIRV_TOOLS_DIR   "${spirv-tools_SOURCE_DIR}"   CACHE PATH "" FORCE)
-
-	FetchContent_MakeAvailable(dawn_tint)
-
-	target_link_libraries     (skshaderc_lib PUBLIC libtint)
-	target_include_directories(skshaderc_lib PRIVATE
-		"${dawn_tint_SOURCE_DIR}"
-		"${dawn_tint_SOURCE_DIR}/include")
-	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_TINT)
-	# Tint's public headers need C++20
-	set_target_properties(skshaderc_lib PROPERTIES CXX_STANDARD 20)
+	target_sources            (skshaderc_lib PRIVATE sksc_hlsl.cpp sksc_meta.cpp)
 endif()
 
 # Optional SVSL backend. To build against an in-progress SVSL
@@ -319,10 +248,14 @@ if(SKSHADERC_ENABLE_SVSL)
 	message(STATUS "Fetching SVSL...")
 	FetchContent_Declare( SVSL
 		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
-		GIT_TAG        v2026.7.17
+		GIT_TAG        v2026.7.21
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
+	# SVSL's WGSL backend is pure C text emission (still zero-dependency), and
+	# supplies skshaderc's whole '-t w' target — WebGPU builds have no other
+	# WGSL source.
+	set(SVSL_ENABLE_WGSL ON CACHE BOOL "" FORCE)
 	FetchContent_MakeAvailable(SVSL)
 	target_link_libraries     (skshaderc_lib PUBLIC svsl::svsl)
 	target_compile_definitions(skshaderc_lib PUBLIC SKSC_HAS_SVSL)

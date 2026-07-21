@@ -197,6 +197,9 @@ bool skr_init(skr_settings_t settings) {
 		VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,           // Video decode, and 64-bit access flags for tile-attachment deps
 		VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME,            // Prerequisite of VK_QCOM_tile_shading
 		VK_QCOM_TILE_SHADING_EXTENSION_NAME,               // On-tile attachment reads with apron (tile-local postfx kernels)
+		VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME, // Legacy instanced stereo: SV_RenderTargetArrayIndex from the vertex stage
+		VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,         // Float buffer/shared atomics (InterlockedAdd/Exchange on float)
+		VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME,       // Float atomic min/max (the same sksc feature bit covers both)
 
 #ifndef __ANDROID__
 		VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, // Push descriptors have performance overhead per call on Adreno?
@@ -609,6 +612,9 @@ bool skr_init(skr_settings_t settings) {
 	bool has_sync2_ext                  = false;
 	bool has_tile_props_ext             = false;
 	bool has_tile_shading_ext           = false;
+	bool has_output_layer_ext           = false;
+	bool has_atomic_float_ext           = false;
+	bool has_atomic_float2_ext          = false;
 	for (uint32_t i = 0; i < optional_device_ext_count && device_ext_count < 64; i++) {
 		if (_skr_ext_available(optional_device_exts[i], available_device_exts, available_device_ext_count)) {
 			device_exts[device_ext_count++] = optional_device_exts[i];
@@ -632,6 +638,9 @@ bool skr_init(skr_settings_t settings) {
 			if (strcmp(optional_device_exts[i], VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME       ) == 0) has_sync2_ext                        = true;
 			if (strcmp(optional_device_exts[i], VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME        ) == 0) has_tile_props_ext                   = true;
 			if (strcmp(optional_device_exts[i], VK_QCOM_TILE_SHADING_EXTENSION_NAME           ) == 0) has_tile_shading_ext                 = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME) == 0) has_output_layer_ext             = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME       ) == 0) has_atomic_float_ext             = true;
+			if (strcmp(optional_device_exts[i], VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME     ) == 0) has_atomic_float2_ext            = true;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 			if (strcmp(optional_device_exts[i], VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME      ) == 0) _skr_vk.has_external_memory_win32    = true;
 #endif
@@ -662,6 +671,11 @@ bool skr_init(skr_settings_t settings) {
 		.depthClamp                     = available_features.depthClamp,
 		.vertexPipelineStoresAndAtomics = available_features.vertexPipelineStoresAndAtomics,
 		.fragmentStoresAndAtomics       = available_features.fragmentStoresAndAtomics,
+		// shader-feature gates (sksc_feature_bit_*): enabled when available so
+		// the support mask below can advertise them
+		.geometryShader                  = available_features.geometryShader,
+		.shaderStorageImageExtendedFormats = available_features.shaderStorageImageExtendedFormats,
+		.shaderInt16                     = available_features.shaderInt16,
 	};
 
 	// Query availability of the chained pNext features we want to enable.
@@ -669,6 +683,15 @@ bool skr_init(skr_settings_t settings) {
 	// Vulkan 1.1+ features live in separate structs queried via vkGetPhysicalDeviceFeatures2.
 	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+	};
+	VkPhysicalDevice16BitStorageFeatures storage16_query = { // core-1.1 struct, always chainable
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+	};
+	VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+	};
+	VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomic_float2_query = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
 	};
 	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_query = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
@@ -719,6 +742,16 @@ bool skr_init(skr_settings_t settings) {
 	if (has_tile_shading_ext && has_tile_props_ext) {
 		tile_shading_query.pNext = features2_query.pNext;
 		features2_query.pNext    = &tile_shading_query;
+	}
+	storage16_query.pNext = features2_query.pNext;
+	features2_query.pNext = &storage16_query;
+	if (has_atomic_float_ext) {
+		atomic_float_query.pNext = features2_query.pNext;
+		features2_query.pNext    = &atomic_float_query;
+	}
+	if (has_atomic_float2_ext) {
+		atomic_float2_query.pNext = features2_query.pNext;
+		features2_query.pNext     = &atomic_float2_query;
 	}
 	vkGetPhysicalDeviceFeatures2(_skr_vk.physical_device, &features2_query);
 
@@ -886,6 +919,46 @@ bool skr_init(skr_settings_t settings) {
 	};
 	if (_skr_vk.has_qcom_tile_shading)
 		device_info.pNext = &tile_shading_features;
+
+	// 16-bit storage access (sksc_feature_bit_storage16); the struct is 1.1 core
+	bool enable_storage16 = storage16_query.storageBuffer16BitAccess &&
+	                        storage16_query.uniformAndStorageBuffer16BitAccess;
+	VkPhysicalDevice16BitStorageFeatures storage16_features = {
+		.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+		.pNext                              = (void*)device_info.pNext,
+		.storageBuffer16BitAccess           = VK_TRUE,
+		.uniformAndStorageBuffer16BitAccess = VK_TRUE,
+		.storagePushConstant16              = storage16_query.storagePushConstant16,
+	};
+	if (enable_storage16)
+		device_info.pNext = &storage16_features;
+
+	// Float buffer/shared atomics (sksc_feature_bit_float_atomics): the coarse
+	// bit promises exchange + add + min/max, so all of them must be enableable
+	// — min/max lives in VK_EXT_shader_atomic_float2's feature struct
+	bool enable_atomic_float = has_atomic_float_ext && has_atomic_float2_ext &&
+	                           atomic_float_query.shaderBufferFloat32Atomics &&
+	                           atomic_float_query.shaderSharedFloat32Atomics &&
+	                           atomic_float_query.shaderBufferFloat32AtomicAdd &&
+	                           atomic_float_query.shaderSharedFloat32AtomicAdd &&
+	                           atomic_float2_query.shaderBufferFloat32AtomicMinMax &&
+	                           atomic_float2_query.shaderSharedFloat32AtomicMinMax;
+	VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_features = {
+		.sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+		.pNext                        = (void*)device_info.pNext,
+		.shaderBufferFloat32Atomics   = VK_TRUE,
+		.shaderBufferFloat32AtomicAdd = VK_TRUE,
+		.shaderSharedFloat32Atomics   = VK_TRUE,
+		.shaderSharedFloat32AtomicAdd = VK_TRUE,
+	};
+	VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomic_float2_features = {
+		.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
+		.pNext                              = &atomic_float_features,
+		.shaderBufferFloat32AtomicMinMax    = VK_TRUE,
+		.shaderSharedFloat32AtomicMinMax    = VK_TRUE,
+	};
+	if (enable_atomic_float)
+		device_info.pNext = &atomic_float2_features;
 
 	// Create VkDevice - either via callback (for OpenXR enable2) or directly
 	if (settings.device_create_callback) {
@@ -1073,6 +1146,21 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_image_proc2;
 	if (_skr_vk.has_qcom_tile_shading)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_tile_shading;
+	// The extension has no feature struct — its presence is the feature. Note
+	// Vulkan forbids writing Layer inside a multiview render pass; that is a
+	// per-pass rule the legacy instanced-stereo path already respects.
+	if (has_output_layer_ext)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_output_layer;
+	if (device_features.geometryShader)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_geometry;
+	if (device_features.shaderStorageImageExtendedFormats)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_extended_formats;
+	if (device_features.shaderInt16)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_int16;
+	if (enable_storage16)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_storage16;
+	if (enable_atomic_float)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_float_atomics;
 
 	// QCOM image-processing ops (BoxFilterQCOM etc.) are only legal with a
 	// sampler created with the IMAGE_PROCESSING flag, and such a sampler's

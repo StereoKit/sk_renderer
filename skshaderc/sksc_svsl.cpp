@@ -5,10 +5,12 @@
 
 // Optional SVSL (SPIR-V Shading Language) backend for skshaderc. Compiled in
 // only when SKSHADERC_ENABLE_SVSL is set, which links libsvsl and defines
-// SKSC_HAS_SVSL. SVSL emits the very same SKS v9 container skshaderc writes, so
-// this path compiles the source, then loads SVSL's container bytes back through
-// sksc_shader_file_load_memory() to hand the rest of the pipeline (info dump,
-// header/skcs emit, sksc_build_file) an ordinary sksc_shader_file_t.
+// SKSC_HAS_SVSL. SVSL emits the very same SKS container skshaderc writes —
+// version in lockstep via the libsvsl pin, including native WGSL stages for
+// the '-t w' target (no Tint on this path) — so this compiles the source, then
+// loads SVSL's container bytes back through sksc_shader_file_load_memory() to
+// hand the rest of the pipeline (info dump, header/skcs emit, sksc_build_file)
+// an ordinary sksc_shader_file_t.
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -127,6 +129,22 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 	options.entry_compute = settings->cs_entrypoint[0] ? settings->cs_entrypoint : "";
 	options.opt_level     = opt_level;
 
+	// Container languages come straight from -t: SVSL serializes exactly the
+	// requested set (SPIR-V always compiles internally for the reflection
+	// metadata, so '-t w' still validates and reflects fully). WGSL emission is
+	// native — no Tint on this path; stages using features browser WebGPU can't
+	// express are skipped with a located warning, surfaced via the diagnostics
+	// forwarding below.
+	if (settings->target_langs[skr_shader_lang_spirv]) options.targets |= svsl_target_spirv;
+	if (settings->target_langs[skr_shader_lang_wgsl]) {
+		if (svsl_supports_wgsl()) options.targets |= svsl_target_wgsl;
+		else sksc_log(sksc_log_level_warn, "The WGSL target ('-t w') needs an skshaderc whose embedded libsvsl was built with SVSL_ENABLE_WGSL; emitting SPIR-V only");
+	}
+	if (options.targets == 0) {
+		sksc_log(sksc_log_level_err, "No emittable target language for '%s' (the SVSL backend can't produce the requested set)", filename);
+		return false;
+	}
+
 	svsl_source_t source = {};
 	source.text     = hlsl_text;
 	source.length   = -1;
@@ -172,81 +190,15 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 		return false;
 	}
 
-	// TEMPORARY v11 -> v12 container upgrade. The pinned SVSL (v2026.7.17)
-	// still writes SVSL_SKS_VERSION 11; v12 only added a sampler_count field
-	// (with sampler records that SVSL output never has). .sks loading is
-	// strictly version-matched everywhere — this shim exists only on the
-	// build-time SVSL bridge, in memory. DELETE when the SVSL pin bumps to a
-	// release writing v12.
-	const void *load_data = sks.data;
-	uint32_t    load_size = (uint32_t)sks.size;
-	uint8_t    *upgraded  = NULL;
-	if (load_size >= 286 && ((const uint8_t *)sks.data)[8] == 11) {
-		const uint32_t sampler_count_at = 10 + 4 + 256 + 4 * 4; // header, stage count, name, four counts
-		upgraded = (uint8_t *)malloc(load_size + sizeof(uint32_t));
-		memcpy(upgraded, sks.data, sampler_count_at);
-		upgraded[8] = SKSC_FILE_VERSION; upgraded[9] = 0;
-		memset(upgraded + sampler_count_at, 0, sizeof(uint32_t)); // sampler_count = 0
-		memcpy(upgraded + sampler_count_at + sizeof(uint32_t), (const uint8_t *)sks.data + sampler_count_at, load_size - sampler_count_at);
-		load_data = upgraded;
-		load_size += sizeof(uint32_t);
-	}
-
-	sksc_result_ load = sksc_shader_file_load_memory(load_data, load_size, out_file);
-	free(upgraded);
+	// The container already carries every requested language: SPIR-V and/or
+	// native WGSL stages plus the v12 standalone-sampler records (split
+	// samplers at s+400, statically paired) — nothing to transpile or reflect.
+	sksc_result_ load = sksc_shader_file_load_memory(sks.data, (uint32_t)sks.size, out_file);
 	svsl_result_free(result);
 
 	if (load != sksc_result_success) {
 		sksc_log(sksc_log_level_err, "Failed to read SVSL container output (%d)", (int)load);
 		return false;
 	}
-
-	// WGSL stages for the WebGPU backend: SVSL's SPIR-V feeds the same
-	// rewrite + Tint pipeline the glslang path uses (combined image samplers
-	// split on read, routed to the s+400 slots). Stages using features WebGPU
-	// can't express are skipped with a warning, exactly like the glslang path.
-#ifdef SKSC_HAS_TINT
-	if (settings->target_langs[skr_shader_lang_wgsl]) {
-		// The loaded meta is one packed allocation; sampler reflection grows
-		// meta->samplers with realloc, so give it a standalone copy first
-		if (out_file->meta.sampler_count > 0 && out_file->meta.samplers != NULL) {
-			sksc_shader_sampler_t *copy = (sksc_shader_sampler_t *)malloc(sizeof(sksc_shader_sampler_t) * out_file->meta.sampler_count);
-			memcpy(copy, out_file->meta.samplers, sizeof(sksc_shader_sampler_t) * out_file->meta.sampler_count);
-			out_file->meta.samplers       = copy;
-			out_file->meta.samplers_owned = true;
-		} else {
-			out_file->meta.samplers = NULL;
-		}
-
-		uint64_t unsupported_mask = sksc_wgsl_unsupported_features();
-		uint32_t spirv_count      = out_file->stage_count;
-		for (uint32_t i = 0; i < spirv_count; i++) {
-			sksc_shader_file_stage_t *stage = &out_file->stages[i];
-			if (stage->language != skr_shader_lang_spirv || stage->code_size < 20) continue;
-
-			uint64_t features = sksc_spirv_features((const uint32_t *)stage->code, stage->code_size / 4);
-			if (features & unsupported_mask) {
-				sksc_log(sksc_log_level_warn, "Skipping WGSL output for a stage: it uses features unavailable in browser WebGPU (subgroups/wave size/tile or QCOM image ops)");
-				continue;
-			}
-
-			sksc_shader_file_stage_t wgsl_stage = {};
-			compile_result_ wgsl_result = sksc_wgsl_from_spirv((const uint32_t *)stage->code, stage->code_size / 4,
-				stage->stage, &out_file->meta, &wgsl_stage);
-			if (wgsl_result == compile_result_fail) {
-				sksc_log(sksc_log_level_err, "WGSL compile failed");
-				return false;
-			}
-			if (wgsl_result == compile_result_success) {
-				out_file->stages = (sksc_shader_file_stage_t *)realloc(out_file->stages, sizeof(sksc_shader_file_stage_t) * (out_file->stage_count + 1));
-				out_file->stages[out_file->stage_count++] = wgsl_stage;
-				stage = NULL; // realloc may have moved the array
-			}
-		}
-	}
-#else
-	if (settings->target_langs[skr_shader_lang_wgsl])
-		sksc_log(sksc_log_level_warn, "The WGSL target ('-t w') needs a skshaderc built with SKSHADERC_ENABLE_WGSL (Tint)");
-#endif
 	return true;
 }

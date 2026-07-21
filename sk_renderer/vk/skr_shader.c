@@ -142,6 +142,8 @@ static const char* _skr_feature_bit_name(int32_t bit) {
 		case sksc_feature_bit_qcom_block_match:     return "textureBlockMatch (VK_QCOM_image_processing)";
 		case sksc_feature_bit_qcom_image_proc2:     return "VK_QCOM_image_processing2";
 		case sksc_feature_bit_qcom_tile_shading:    return "VK_QCOM_tile_shading";
+		case sksc_feature_bit_output_layer:         return "shaderOutputLayer (VK_EXT_shader_viewport_index_layer)";
+		case sksc_feature_bit_geometry:             return "geometryShader (fragment reads of the layer index)";
 		case sksc_feature_bit_unknown:           return "an unrecognized capability";
 		default:                                 return "an unknown feature";
 	}

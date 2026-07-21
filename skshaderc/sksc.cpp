@@ -156,14 +156,20 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 	}
 
 #ifdef SKSC_HAS_GLSLANG
+	// WGSL comes only from SVSL's native emitter, and a .sks never mixes
+	// compiler backends across its stages — so the glslang pipeline refuses
+	// the target outright rather than emitting a partial file.
+	if (settings->target_langs[skr_shader_lang_wgsl]) {
+		sksc_log(sksc_log_level_err, "The WGSL target ('-t w') is only available through the SVSL backend; compile '%s' with -svsl (or a .svsl source file)", filename);
+		return false;
+	}
+
 	array_t<sksc_shader_file_stage_t> stages       = {};
 	array_t<sksc_meta_item_t>         var_meta     = sksc_meta_find_defaults(hlsl_text);
 	array_t<sksc_ast_default_t>       ast_defaults = sksc_hlsl_find_initializers(hlsl_text);
 
 	skr_stage_ compile_stages[3] = { skr_stage_vertex, skr_stage_pixel, skr_stage_compute };
 	char*      entrypoints   [3] = { settings->vs_entrypoint, settings->ps_entrypoint, settings->cs_entrypoint };
-	uint64_t   stage_features[3] = {};
-	bool       stage_present [3] = {};
 
 	for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
 		if (entrypoints[i][0] == 0)
@@ -171,7 +177,7 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		// Build SPIRV
 		sksc_shader_file_stage_t spirv_stage  = {};
-		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], NULL, 0, false, &spirv_stage);
+		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], &spirv_stage);
 		if (spirv_result == compile_result_fail) {
 			sksc_log(sksc_log_level_err, "SPIRV compile failed");
 			return false;
@@ -180,10 +186,6 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		// Extract metadata from the SPIRV
 		sksc_spirv_to_meta(&spirv_stage, &out_file->meta);
-		stage_present [i] = true;
-		stage_features[i] = spirv_stage.code_size >= 20
-			? sksc_spirv_features((const uint32_t*)spirv_stage.code, spirv_stage.code_size / 4)
-			: 0;
 
 		// Add it as a stage in our sks file
 		if (settings->target_langs[skr_shader_lang_spirv]) {
@@ -192,34 +194,6 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		if (!settings->target_langs[skr_shader_lang_spirv])
 			free(spirv_stage.code);
-	}
-
-	// WGSL stages for the WebGPU backend. Shaders using features browser
-	// WebGPU has no counterpart for get no WGSL blob, with a warning —
-	// multiview is NOT in that set, it lowers to the sk_view_index spec
-	// constant (see sksc_wgsl.cpp).
-	if (settings->target_langs[skr_shader_lang_wgsl]) {
-		const uint64_t unsupported_mask = sksc_wgsl_unsupported_features();
-
-		for (size_t i = 0; i < sizeof(compile_stages)/sizeof(compile_stages[0]); i++) {
-			if (!stage_present[i])
-				continue;
-			if (stage_features[i] & unsupported_mask) {
-				sksc_log(sksc_log_level_warn, "Skipping WGSL output for a stage: it uses features unavailable in browser WebGPU (subgroups/wave size/tile or QCOM image ops)");
-				continue;
-			}
-			// SubpassInput shaders pass through _wgsl_subpass_to_texture, which
-			// lowers them to plain textures fetched at the fragment coordinate
-
-			sksc_shader_file_stage_t wgsl_stage  = {};
-			compile_result_          wgsl_result = sksc_wgsl_compile_stage(filename, hlsl_text, settings, compile_stages[i], &out_file->meta, &wgsl_stage);
-			if (wgsl_result == compile_result_fail) {
-				sksc_log(sksc_log_level_err, "WGSL compile failed");
-				return false;
-			}
-			if (wgsl_result == compile_result_success)
-				stages.add(wgsl_stage);
-		}
 	}
 
 	sksc_meta_assign_defaults(ast_defaults, var_meta, &out_file->meta);
@@ -485,26 +459,11 @@ struct file_data_t {
 
 ///////////////////////////////////////////
 
-// Features browser WebGPU has no counterpart for — stages using any of these
-// get no WGSL blob. Multiview is NOT in the set; it lowers to the
-// sk_view_index spec constant (see sksc_wgsl.cpp).
-uint64_t sksc_wgsl_unsupported_features(void) {
-	return (1ull << sksc_feature_bit_subgroups)            |
-	       (1ull << sksc_feature_bit_wave_size)            |
-	       (1ull << sksc_feature_bit_tile_image)           |
-	       (1ull << sksc_feature_bit_qcom_sample_weighted) |
-	       (1ull << sksc_feature_bit_qcom_box_filter)      |
-	       (1ull << sksc_feature_bit_qcom_block_match)     |
-	       (1ull << sksc_feature_bit_qcom_image_proc2)     |
-	       (1ull << sksc_feature_bit_qcom_tile_shading);
-}
-
 // Device-feature mask: scans a SPIR-V blob's OpCapability/OpExtension
 // declarations (raw opcode numbers, like the op counting in sksc_meta.cpp)
 // and maps them onto sksc_feature_bit_ values. Declarations with no assigned
 // bit set sksc_feature_bit_unknown so runtimes never silently under-check.
-// Non-static: sksc_compile also uses this to gate the WGSL target.
-uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
+static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
 	// capability value → feature bit; one bit can cover several capabilities
 	static const struct { uint32_t cap; uint8_t bit; } cap_bits[] = {
 		{ 9,    sksc_feature_bit_float16 },          // Float16
@@ -541,6 +500,8 @@ uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
 		{ 4486, sksc_feature_bit_qcom_block_match },     // TextureBlockMatchQCOM
 		{ 4498, sksc_feature_bit_qcom_image_proc2 },     // TextureBlockMatch2QCOM
 		{ 4495, sksc_feature_bit_qcom_tile_shading },    // TileShadingQCOM
+		{ 5254, sksc_feature_bit_output_layer },         // ShaderViewportIndexLayerEXT
+		{ 2,    sksc_feature_bit_geometry },             // Geometry (fragment reads of Layer)
 	};
 	// capabilities every Vulkan 1.1 runtime satisfies — no bit, never unknown
 	static const uint32_t baseline[] = { 1, 50, 43, 44, 40, 51 };
@@ -561,6 +522,7 @@ uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
 		{ "SPV_QCOM_image_processing",           0xFF },
 		{ "SPV_QCOM_image_processing2",          sksc_feature_bit_qcom_image_proc2 },
 		{ "SPV_QCOM_tile_shading",               sksc_feature_bit_qcom_tile_shading },
+		{ "SPV_EXT_shader_viewport_index_layer", sksc_feature_bit_output_layer },
 	};
 
 	uint64_t bits = 0;

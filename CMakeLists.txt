@@ -160,8 +160,7 @@ else() # webgpu
 		# Native WebGPU via Dawn's official prebuilt release binaries — building
 		# Dawn from source pulls a multi-gigabyte Chromium-style dependency
 		# tree, so don't. The same pinned release supplies emdawnwebgpu (web
-		# builds above) and Tint (skshaderc's WGSL emitter, source-built as a
-		# small subset later); keep all three on this one version anchor.
+		# builds above); keep both on this one version anchor.
 		set(SKR_DAWN_VERSION "v20260713.082812" CACHE STRING "Pinned Dawn release tag")
 		set(SKR_DAWN_COMMIT  "d8efac1b7b42d86e4d235686d4d824989d21369f" CACHE STRING "Commit hash in the pinned Dawn release's asset names")
 		if(WIN32)
@@ -261,11 +260,13 @@ endif()
 # Built-in shaders: compiled to embedded byte-array headers so they ship inside
 # the library binary. Used as fallbacks when blit-based mipgen isn't supported
 # for a given texture format (see skr_texture.c skr_tex_generate_mips).
-# WebGPU builds add WGSL blobs alongside the SPIR-V.
+# WebGPU builds add WGSL blobs alongside the SPIR-V. WGSL comes only from the
+# SVSL backend, so those builds pass -svsl — the host tool used by web
+# cross-builds may still carry glslang, and mixing backends isn't allowed.
 if(EMSCRIPTEN)
-	set(_skr_builtin_shader_args "-o3 -e -t w") # web-slim: WGSL only
+	set(_skr_builtin_shader_args "-o3 -e -svsl -t w") # web-slim: WGSL only
 elseif(SKR_USE_WEBGPU)
-	set(_skr_builtin_shader_args "-o3 -e -t sw")
+	set(_skr_builtin_shader_args "-o3 -e -svsl -t sw")
 else()
 	set(_skr_builtin_shader_args "-o3 -e -t s")
 endif()

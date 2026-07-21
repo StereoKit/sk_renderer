@@ -1,8 +1,8 @@
 # Installs a freshly built skshaderc into the shared bin/tools folder —
 # unless doing so would REPLACE a more capable tool with a lesser one.
 #
-# Different build configs produce different tools: an SVSL-only build
-# (SKSHADERC_ENABLE_GLSLANG=OFF) has no WGSL target, while web (Emscripten)
+# Different build configs produce different tools: a build without SVSL's
+# WGSL emitter (SVSL_ENABLE_WGSL) has no WGSL target, while web (Emscripten)
 # cross-builds depend on the installed host tool having it. Whichever native
 # build ran last used to win, silently breaking the next web build.
 #
@@ -15,12 +15,12 @@ endif()
 get_filename_component(_name "${SKSHADERC_SRC}" NAME)
 set(_dst "${SKSHADERC_DST_DIR}/${_name}")
 
-# The WGSL (Tint) backend leaves this diagnostic string in the binary; its
+# SVSL's WGSL emitter embeds the reserved override name in the binary; its
 # absence identifies a tool without the WGSL target
 function(_has_wgsl out_var binary)
 	set(${out_var} FALSE PARENT_SCOPE)
 	if(EXISTS "${binary}")
-		file(STRINGS "${binary}" _probe REGEX "Tint couldn't read" LIMIT_COUNT 1)
+		file(STRINGS "${binary}" _probe REGEX "sk_view_index" LIMIT_COUNT 1)
 		if(_probe)
 			set(${out_var} TRUE PARENT_SCOPE)
 		endif()

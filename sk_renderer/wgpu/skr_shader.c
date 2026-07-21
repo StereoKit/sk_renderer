@@ -21,7 +21,7 @@ static skr_shader_stage_t _skr_shader_file_create_stage(const sksc_shader_file_t
 
 		// Only multiview-using stages declare the override; pipelines may
 		// only pass constants that exist in the module. A plain substring
-		// probe is safe here because the input is Tint-generated WGSL — no
+		// probe is safe here because the input is SVSL-generated WGSL — no
 		// comments or string literals to false-positive on.
 		stage.has_view_index = strstr(code, "sk_view_index") != NULL;
 

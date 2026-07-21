@@ -224,6 +224,15 @@ typedef enum {
 	// tileShadingFragmentStage / tileShadingPerTileDispatch by stage; the render
 	// pass must be a tile shading render pass (VK_QCOM_tile_shading)
 	sksc_feature_bit_qcom_tile_shading    = 21,
+	// VK_EXT_shader_viewport_index_layer (the extension's presence is the
+	// feature; the 1.2-core equivalent is shaderOutputLayer):
+	// SV_RenderTargetArrayIndex written from the vertex stage — the legacy
+	// instanced-stereo pattern. Never usable inside a multiview render pass.
+	sksc_feature_bit_output_layer         = 22,
+	// VkPhysicalDeviceFeatures.geometryShader. Geometry shaders aren't in the
+	// language; in practice this means a fragment stage *reading*
+	// SV_RenderTargetArrayIndex, which SPIR-V 1.3 gates on Geometry.
+	sksc_feature_bit_geometry             = 23,
 	// a capability/extension with no assigned bit: fall back to parsing the
 	// SPIR-V's OpCapability/OpExtension lists before trusting this mask
 	sksc_feature_bit_unknown          = 63,

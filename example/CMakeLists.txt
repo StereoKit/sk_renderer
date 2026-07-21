@@ -238,11 +238,13 @@ endif()
 
 # Compile ImGui shader to header file (no debug info, embedded in binary).
 # Web builds carry WGSL only (web-slim); native WebGPU keeps SPIR-V alongside
-# for byte-compat with the Vulkan tooling.
+# for byte-compat with the Vulkan tooling. WGSL comes only from the SVSL
+# backend, so WebGPU targets pass -svsl (the web host tool may carry glslang,
+# and mixing backends isn't allowed).
 if(EMSCRIPTEN)
-	set(_skr_example_shader_targets "-t w")
+	set(_skr_example_shader_targets "-svsl -t w")
 elseif(SKR_USE_WEBGPU)
-	set(_skr_example_shader_targets "-t sw")
+	set(_skr_example_shader_targets "-svsl -t sw")
 else()
 	set(_skr_example_shader_targets "-t s")
 endif()

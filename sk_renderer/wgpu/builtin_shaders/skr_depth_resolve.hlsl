@@ -2,7 +2,7 @@
 // WebGPU-only helper: resolves a multisampled depth buffer to a single-sample
 // r32f color target so postfx shaders can read scene depth. WebGPU render
 // passes have no depth resolve, and postfx depth reads lower to plain texture
-// loads there anyway (see sksc_wgsl.cpp), so an r32f copy of sample 0 serves
+// loads there anyway (SVSL's WGSL emitter), so an r32f copy of sample 0 serves
 // exactly as well as a real depth attachment — this mirrors the Vulkan
 // backend's SAMPLE_ZERO on-tile depth resolve. The input attachment is
 // deliberately NOT named "depth" so the runtime binds it as the stage's

@@ -216,7 +216,7 @@ WGPUBindGroupLayout _skr_bind_layout_create(const sksc_shader_meta_t* meta, uint
 					entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
 				break;
 			case skr_register_input_attachment:
-				// Lowered to textureLoad-only textures (see sksc_wgsl.cpp);
+				// Lowered to textureLoad-only textures by SVSL's WGSL emitter;
 				// UnfilterableFloat accepts both color and depth format views
 				entry.texture = (WGPUTextureBindingLayout){
 					.sampleType    = WGPUTextureSampleType_UnfilterableFloat,
