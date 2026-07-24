@@ -149,17 +149,16 @@ static const char* _skr_feature_bit_name(int32_t bit) {
 	}
 }
 
-// Returns true if the current device can run this shader: every device feature
-// the shader's SPIR-V declared (meta->features) is enabled here, and any pinned
-// subgroup size is in range. skr_shader_create calls this before creating any
-// module — a false result means pipeline creation could never succeed, so the
-// shader comes back invalid. The feature-mask comparison is the device-agnostic
-// sksc_shader_meta_missing_features(); this wrapper feeds it the live device
-// mask, adds the numeric subgroup-size check, and logs the specifics as
-// warnings so the caller gets them even though the result is a plain bool.
+// Returns true if the device can run this shader. Gates only on requirements we
+// can confirm missing: known feature bits the device didn't enable, and a pinned
+// subgroup size out of range. The `unknown` bit is masked out — "unrecognized"
+// isn't "unsupported" (the app may have enabled the extension via skr_vk_ext_*,
+// or the compiler is simply older than this runtime), so it falls through to
+// pipeline creation. A false result means the shader comes back invalid.
 static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta) {
 	bool     supported = true;
-	uint64_t missing   = sksc_shader_meta_missing_features(meta, _skr_vk.enabled_features);
+	uint64_t missing   = sksc_shader_meta_missing_features(meta, _skr_vk.enabled_features)
+	                     & ~((uint64_t)1 << sksc_feature_bit_unknown);
 	if (missing != 0) {
 		supported = false;
 		for (int32_t bit = 0; bit < 64; bit++) {
