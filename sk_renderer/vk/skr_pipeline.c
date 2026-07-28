@@ -711,6 +711,12 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		return VK_NULL_HANDLE;
 	}
 
+	// Contents are undefined under both, but DONT_CARE still counts as a store
+	// *access* that races the subpass-boundary transition. NONE performs none.
+	VkAttachmentStoreOp discard_op = _skr_vk.has_store_op_none
+		? VK_ATTACHMENT_STORE_OP_NONE
+		: VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
 	// --- Attachment indices (assigned as we go) ---
 	int32_t color_idx         = -1;
 	int32_t resolve_idx       = -1;
@@ -727,7 +733,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.format         = key->color_format,
 			.samples        = key->samples,
 			.loadOp         = key->color_load_op,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE, // postfx reads via input attachment, no need to store
+			.storeOp        = discard_op, // postfx reads via input attachment, no need to store
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
@@ -745,11 +751,15 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.format         = key->resolve_format,
 			.samples        = VK_SAMPLE_COUNT_1_BIT,
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.storeOp        = resolve_is_final ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.storeOp        = resolve_is_final ? VK_ATTACHMENT_STORE_OP_STORE : discard_op,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			// Matches its last use as a postfx input. Any mismatch makes
+			// EndRenderPass transition it again, conflicting with its own store.
+			.finalLayout    = (!resolve_is_final && key->postfx_count > 0)
+				? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+				: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 	}
 
@@ -782,7 +792,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.format         = key->depth_format,
 			.samples        = VK_SAMPLE_COUNT_1_BIT,
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE, // transient, consumed as input
+			.storeOp        = discard_op, // transient, consumed as input
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -804,7 +814,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 				.format         = intermediate_format,
 				.samples        = VK_SAMPLE_COUNT_1_BIT,
 				.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE, // transient, consumed as input
+				.storeOp        = discard_op, // transient, consumed as input
 				.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 				.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -993,7 +1003,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// --- Subpass dependencies ---
-	VkSubpassDependency2 dependencies[SKR_POSTFX_MAX_SUBPASSES + 10]; // ≤3 external→0, N-1 chains, ≤2 subpass→external, per-intermediate external, per-postfx depth
+	VkSubpassDependency2 dependencies[SKR_POSTFX_MAX_SUBPASSES * 4 + 8]; // per subpass: chain, depth, intermediate-external, plus a few fixed
 	uint32_t dep_count = 0;
 
 	// External → subpass 0: color. The scene color/resolve here may be a
@@ -1047,6 +1057,20 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+		};
+	}
+
+	// Attachments first referenced by the last subpass transition at that
+	// boundary rather than at pass begin, so external→0 never covers them.
+	if (output_idx >= 0 && subpass_count > 1) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = VK_SUBPASS_EXTERNAL,
+			.dstSubpass    = subpass_count - 1,
+			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
 		};
 	}
 

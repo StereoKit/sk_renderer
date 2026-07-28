@@ -1677,6 +1677,10 @@ void skr_pass_submit(skr_pass_t* pass) {
 		_skr_tex_transition_notify_layout(final_output, (final_output->flags & skr_tex_flags_readable)
 			? _skr_tex_sample_layout    (final_output)
 			: _skr_tex_attachment_layout(final_output));
+		// The render pass leaves this in its input-attachment layout, so the
+		// notify at pass begin is stale by now.
+		if (use_msaa && resolve)
+			_skr_tex_transition_notify_layout(resolve, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 		// Defer-destroy the uncached framebuffer; intermediates return to the
 		// transient pool for reuse by later passes.

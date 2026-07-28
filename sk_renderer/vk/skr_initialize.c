@@ -231,6 +231,11 @@ static void _skr_register_internal_requests(void) {
 	_skr_ext_request(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);           // Sync FD export for frame fences (VK_KHR_external_fence is core 1.1)
 	_skr_ext_request(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);         // Postfx depth input attachments (per-reference aspect masks)
 	_skr_ext_request(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME); // Legacy instanced stereo: SV_RenderTargetArrayIndex from the vertex stage
+	// All three alias the same enum value, so any one of them will do. The 1.3
+	// core promotion is no help, since the instance targets Vulkan 1.1.
+	_skr_ext_request(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME);
+	_skr_ext_request(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);
+	_skr_ext_request(VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME);
 #ifndef __ANDROID__
 	_skr_ext_request(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); // Push descriptors have performance overhead per call on Adreno?
 #endif
@@ -1145,6 +1150,9 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_subgroup_size_control   = skr_vk_request_enabled("subgroup_size_control");
 	_skr_vk.has_ycbcr_conversion        = skr_vk_request_enabled("ycbcr_conversion");
 	_skr_vk.has_qcom_tile_shading       = skr_vk_request_enabled("qcom_tile_shading");
+	_skr_vk.has_store_op_none           = skr_vk_request_enabled(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME)
+	                                   || skr_vk_request_enabled(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME)
+	                                   || skr_vk_request_enabled(VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME);
 	_skr_vk.has_external_memory_win32   = false;
 	_skr_vk.has_android_hardware_buffer = false;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
