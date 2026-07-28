@@ -756,9 +756,30 @@ SKR_API skr_buffer_t*     skr_mesh_get_vertex_buffer       (const skr_mesh_t*   
 
 SKR_API skr_err_          skr_tex_create                   (skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampler_t sampler, skr_vec3i_t size, int32_t multisample, int32_t mip_count, const skr_tex_data_t* opt_data, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_copy              (const skr_tex_t*     src, skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample, skr_tex_t* out_tex);
+#ifdef SKR_WEBGPU
+// Wraps a WGPUTexture the caller owns - a WebXR projection layer's per-frame
+// texture, for instance. The texture is never released by skr_tex_destroy
+// unless owns_texture is set.
+typedef struct skr_tex_external_wgpu_info_t {
+	void*             texture;       // WGPUTexture
+	skr_tex_fmt_      format;
+	skr_tex_sampler_t sampler;
+	skr_vec3i_t       size;          // z = array layer count
+	int32_t           multisample;
+	bool              owns_texture;
+} skr_tex_external_wgpu_info_t;
+
+SKR_API skr_err_          skr_tex_create_external_wgpu     (skr_tex_external_wgpu_info_t info, skr_tex_t* out_tex);
+// Swaps in a new WGPUTexture, keeping the sampler and settings. Views are
+// rebuilt lazily. Intended for compositors that hand out a fresh texture every
+// frame (see XR_SKW_transient_swapchain_images), so it must stay cheap.
+SKR_API skr_err_          skr_tex_update_external_wgpu     (skr_tex_t* ref_tex, void* texture);
+#endif
+
+
 #ifdef SKR_VK
-// External texture import is Vulkan-only — the info structs embed Vulkan
-// handles, and no WebGPU equivalent exists (see skr_capability_external_*).
+// The remaining external imports are Vulkan-only — their info structs embed
+// Vulkan handles and OS-specific memory (see skr_capability_external_*).
 SKR_API skr_err_          skr_tex_create_external_vk       (skr_tex_external_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_gl       (skr_tex_external_gl_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_ahb      (skr_tex_external_ahb_info_t info, skr_tex_t* out_tex);

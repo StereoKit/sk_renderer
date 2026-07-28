@@ -219,6 +219,88 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	return skr_err_success;
 }
 
+
+///////////////////////////////////////////
+// External textures
+//
+// A compositor-owned WGPUTexture wrapped as an skr_tex_t. WebXR hands out a
+// fresh texture every frame, so the update path has to be allocation-free in
+// steady state - it releases the old views and lets them rebuild lazily rather
+// than rebuilding eagerly.
+///////////////////////////////////////////
+
+// Drops the cached views without touching the texture or sampler. Shared by
+// create (nothing to drop) and update (everything view-shaped is stale).
+static void _skr_tex_release_views(skr_tex_t* ref_tex) {
+	if (ref_tex->layer_views) {
+		for (uint32_t i = 0; i < ref_tex->layer_count; i++) {
+			if (ref_tex->layer_views[i]) {
+				wgpuTextureViewRelease(ref_tex->layer_views[i]);
+				ref_tex->layer_views[i] = NULL;
+			}
+		}
+	}
+	if (ref_tex->view) { wgpuTextureViewRelease(ref_tex->view); ref_tex->view = NULL; }
+}
+
+skr_err_ skr_tex_create_external_wgpu(skr_tex_external_wgpu_info_t info, skr_tex_t* out_tex) {
+	if (out_tex == NULL || info.texture == NULL) return skr_err_invalid_parameter;
+
+	memset(out_tex, 0, sizeof(*out_tex));
+	uint32_t layers = info.size.z > 0 ? (uint32_t)info.size.z : 1;
+
+	out_tex->texture          = (WGPUTexture)info.texture;
+	out_tex->size             = info.size;
+	out_tex->data_size        = info.size;
+	out_tex->format           = info.format;
+	// The array flag drives _skr_view_dimension. Without it a multi-layer
+	// texture gets a 2D view with arrayLayerCount > 1, which WebGPU rejects:
+	// "The dimension (TextureViewDimension::e2D) of the texture view is not
+	// compatible with the layer count (2)". Stereo XR swapchain images are
+	// always arrays, so this is the common case rather than an edge one.
+	out_tex->flags            = skr_tex_flags_writeable | (layers > 1 ? skr_tex_flags_array : 0);
+	out_tex->samples          = info.multisample > 0 ? (uint32_t)info.multisample : 1;
+	out_tex->mip_levels       = 1;
+	out_tex->layer_count      = layers;
+	out_tex->sampler_settings = info.sampler;
+	out_tex->is_external      = !info.owns_texture;
+
+	out_tex->view = wgpuTextureCreateView(out_tex->texture, &(WGPUTextureViewDescriptor){
+		.format          = _skr_tex_fmt_to_wgpu(info.format),
+		.dimension       = _skr_view_dimension(out_tex),
+		.mipLevelCount   = 1,
+		.arrayLayerCount = layers,
+		.aspect          = WGPUTextureAspect_All,
+	});
+	if (out_tex->view == NULL) return skr_err_device_error;
+
+	out_tex->sampler = _skr_sampler_create(info.sampler, 1);
+	if (info.sampler.sample_compare != skr_compare_none)
+		out_tex->sampler_compare = _skr_sampler_create_ex(info.sampler, 1);
+	return skr_err_success;
+}
+
+skr_err_ skr_tex_update_external_wgpu(skr_tex_t* ref_tex, void* texture) {
+	if (ref_tex == NULL || texture == NULL) return skr_err_invalid_parameter;
+	if (ref_tex->texture == (WGPUTexture)texture) return skr_err_success;   // nothing changed
+
+	_skr_tex_release_views(ref_tex);
+	if (ref_tex->texture && !ref_tex->is_external) wgpuTextureRelease(ref_tex->texture);
+	ref_tex->texture = (WGPUTexture)texture;
+
+	// The whole-resource view is needed every frame; layer views are rebuilt on
+	// demand by whoever renders to them, so the layer_views array is kept
+	// allocated and merely emptied.
+	ref_tex->view = wgpuTextureCreateView(ref_tex->texture, &(WGPUTextureViewDescriptor){
+		.format          = _skr_tex_fmt_to_wgpu(ref_tex->format),
+		.dimension       = _skr_view_dimension(ref_tex),
+		.mipLevelCount   = 1,
+		.arrayLayerCount = ref_tex->layer_count,
+		.aspect          = WGPUTextureAspect_All,
+	});
+	return ref_tex->view != NULL ? skr_err_success : skr_err_device_error;
+}
+
 skr_err_ skr_tex_create_copy(const skr_tex_t* src, skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample, skr_tex_t* out_tex) {
 	if (src == NULL || out_tex == NULL || src->texture == NULL) return skr_err_invalid_parameter;
 
