@@ -1,0 +1,220 @@
+//--name = postfx_halation
+//--base_thickness:range(0, 0.06) = 0.002
+//--coupling:range(0, 1)          = 0.45
+//--irradiation:range(0, 1)       = 0.17
+//--irr_radius:range(0, 0.02)     = 0.0003
+//--clip_knee:range(0, 1)         = 0.0
+//--clip_range                    = 24
+//--dye_absorb                    = 0.3,0.95,1.7,0
+
+// Convolves the scene's clipped highlights with a halation point spread
+// function and adds the result back over the scene. One blit over a readable
+// scene target, plain bilinear taps, so this mode runs everywhere.
+//
+// The PSF is derived rather than tuned. Light scattered forward out of the
+// emulsion enters the film base at angle t, crosses it, reflects off the back
+// surface and returns, exiting at a lateral offset r = h*tan(t), where h is
+// the round-trip base thickness. Feeding a Lambertian angular distribution
+// through that mapping (cos(t) weighting, solid angle 2*pi*sin(t)dt, ring area
+// 2*pi*r*dr) collapses to a strikingly simple radial falloff:
+//
+//     E(r) ~ R(t) * exp(-absorb / cos(t)) * cos(t)^4 / h^2,  cos(t) = h / sqrt(h^2 + r^2)
+//
+// Three things fall out of that, and they are what make the effect read as
+// halation rather than as a red bloom:
+//
+//  - cos^4: the halo is wide and flat-tailed, not gaussian.
+//  - R(t): the base/air interface is a ~4% Fresnel reflector below the
+//    critical angle (41.8 deg for n=1.5) and a *perfect* mirror above it. So
+//    the halo peaks in a ring near the critical radius instead of at the
+//    center — which is exactly how halation looks around a clipped highlight.
+//  - exp(-absorb/cos(t)): Beer-Lambert through the base and the anti-halation
+//    dye, path length h/cos(t). The dye absorbs long wavelengths least, so red
+//    survives the trip and blue does not. Nothing here tints the halo by hand;
+//    the color is what is left after absorption.
+//
+// That kernel alone is a ring with a hole in it — below the critical angle the
+// base reflects only ~4%, so nothing lands near the source and bright edges stay
+// razor sharp with a detached field behind them. Real film glow is two processes,
+// and this is only the far one. The near one is *irradiation*: light scattering
+// sideways within the emulsion itself, never reaching the base at all. It falls
+// off exponentially over a few pixels, and because its path through the dye is
+// short it is barely absorbed — so it stays near-white where halation is deep
+// red. That white-hot bleed fading outward into a red tail is what actually
+// reads as halation; `irradiation` splits the returned light between the two.
+//
+// Because the geometry depends only on r/h, the quadrature weights below are
+// pure constants — h moves the taps, never the weighting.
+//
+// 32 taps is far too few to sample a kernel this wide on its own: on a thin bright source
+// each tap lands as a displaced ghost copy rather than a blur, which is exactly
+// what bright text on black shows. So the taps are jittered per pixel — the
+// ring is rotated by a random angle and each ring's radius is drawn uniformly
+// by area from inside its own annulus. That doesn't reduce the error, it turns
+// it from a coherent ghost into grain, which reads as film grain rather than as
+// a bug. The estimator stays unbiased: blur the result and it converges on the
+// densely-sampled reference. The jitter is a pure function of pixel position,
+// so the grain is stable frame to frame and never shimmers.
+
+Texture2D    src_tex;  // t0, the rendered scene
+SamplerState src_smp;  // s0
+
+float4 dye_absorb;      // rgb absorbance through one round trip at normal incidence
+float  base_thickness;  // h, as a fraction of source height. The 35mm geometry it
+                        // came from (2 * 130um base / 18mm frame) works out to
+                        // 0.0144, which is far wider than it needs to be on screen
+                        // — this is a look knob now, not a film constant.
+float  coupling;        // fraction of highlight radiance scattered into the base at all.
+                        // This is the stock-dependent knob: a modern rem-jet backed
+                        // negative sits near 0.1, one without a working anti-halation
+                        // layer (the look people mean by "halation") runs 0.5 and up.
+float  irradiation;     // share of the returned light that scatters inside the
+                        // emulsion (near, near-white) rather than off the base
+                        // (far, red). This is the "glowiness" knob.
+float  irr_radius;      // 1/e falloff of that near lobe, as a fraction of height
+float  clip_knee;       // recorded luminance where highlights begin clipping
+float  clip_range;      // how much brighter a fully clipped pixel really was
+float2 source_size;     // scene target dimensions, for pixel -> uv
+
+// Far-field annulus bounds in units of h, squared — the radius is drawn as
+// sqrt(lerp(r2_inner, r2_outer, u)), uniform by *area* inside the annulus, so
+// the taps cover it evenly instead of clustering toward the middle. The bounds
+// are 0.894, 1.6, 2.6, 4.0, the first landing exactly on the critical angle
+// (41.8 deg). Everything inside 0.894h used to be a fourth ring carrying the
+// sub-critical 4% Fresnel term; the irradiation lobe now occupies that ground
+// with a far stronger process, so those 8 taps are better spent there.
+#define RING0_R2 float2(0.799236, 2.56)
+#define RING1_R2 float2(2.56,     6.76)
+#define RING2_R2 float2(6.76,    16.0 )
+
+// Optical path length through the base per annulus, 1/cos(t) = sqrt(1 + r*r).
+#define RING0_PATH 1.63695
+#define RING1_PATH 2.37908
+#define RING2_PATH 3.51852
+
+// Quadrature weights: cos(t)^4 * annulus_area * reflectance, renormalized to sum
+// to 1 across the three surviving annuli so `coupling` still means total energy
+// returned. cos(t)^4 is evaluated once per annulus at its equal-area midpoint
+// rather than per tap, which is what lets the jittered radius stay free of any
+// extra math.
+#define RING0_W 0.56159
+#define RING1_W 0.30026
+#define RING2_W 0.13815
+
+// The near lobe's dye path, relative to one normal-incidence round trip. Light
+// that never crossed the base barely meets the anti-halation dye at all.
+#define IRR_PATH 0.25
+
+struct psIn {
+	float4 pos : SV_POSITION;
+};
+
+// Interleaved gradient noise — one mad and two fracs, no trig, and it spreads
+// well over the small neighbourhoods the halo averages across. `k` decorrelates
+// the two draws (tap angle vs tap radius).
+float ign(float2 p, float k) {
+	p += k * float2(5.588238, 2.13763);
+	return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+// Complex multiply: composes the fixed per-ring stagger with the per-pixel
+// jitter rotation, so the two never need a second sincos between them.
+float2 rot_mul(float2 a, float2 b) {
+	return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+psIn vs(uint id : SV_VertexID) {
+	psIn o;
+	float2 uv = float2(id & 2, (id << 1) & 2);
+	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+
+// Emission at one tap. Physically every pixel emits into the base, but in an
+// LDR buffer that's unusable: values clamp at 1, and a midtone's halo sits far
+// below the noise floor anyway. What matters is the radiance hidden *above* the
+// clip point, so this reconstructs it — recorded values approaching 1 stand in
+// for a much wider range of true radiances, growing quadratically toward the
+// clip point to approximate the tone curve's compression there.
+//
+// Color is carried through rather than reduced to a scalar: the halo of a warm
+// highlight starts warm, and the dye absorption tints it from there.
+float3 halo_tap(float2 uv) {
+	float3 c      = src_tex.Sample(src_smp, uv).rgb;
+	float  lum    = dot(c, float3(0.2126, 0.7152, 0.0722));
+	float  excess = saturate((lum - clip_knee) / max(1.0 - clip_knee, 1e-4));
+	return c * (excess * excess);
+}
+
+// Eight taps evenly spaced around one ring, the whole ring turned by `rot`
+// (cos, sin). Successive rings get different rotations so the 32 taps land on
+// 32 distinct angles rather than stacking into 8 spokes.
+float3 halo_ring(float2 uv, float2 radius_uv, float2 rot) {
+	// Rotating the 45-degree base directions by `rot` is a pair of muls each,
+	// cheaper than a per-ring sincos, and the diagonals share |0.70711|.
+	float2 a = float2( rot.x,                      rot.y                     );
+	float2 b = float2( 0.70711 * (rot.x - rot.y),  0.70711 * (rot.y + rot.x) );
+	float2 c = float2(-rot.y,                      rot.x                     );
+	float2 d = float2(-0.70711 * (rot.x + rot.y),  0.70711 * (rot.x - rot.y) );
+
+	float3 sum = halo_tap(uv + a * radius_uv)
+	           + halo_tap(uv + b * radius_uv)
+	           + halo_tap(uv + c * radius_uv)
+	           + halo_tap(uv + d * radius_uv)
+	           + halo_tap(uv - a * radius_uv)
+	           + halo_tap(uv - b * radius_uv)
+	           + halo_tap(uv - c * radius_uv)
+	           + halo_tap(uv - d * radius_uv);
+	return sum * 0.125;
+}
+
+float4 ps(psIn input) : SV_TARGET {
+	// The scene target can be larger than the active viewport, so uvs come from
+	// pixel position over the full texture size, not [0,1] across the blit.
+	float2 uv = input.pos.xy / source_size;
+
+	// h in pixels, then in uv. Tying it to height keeps the halo the same size
+	// on screen at any render scale, the way film halation scales with frame
+	// size rather than with resolution.
+	float  h_px = base_thickness * source_size.y;
+	float2 h_uv = h_px / source_size;
+
+	// Per-pixel jitter: one rotation shared by every ring (the fixed 11.25 degree
+	// per-ring stagger still spreads them across a stratum), and two radial draws
+	// — one picks each annulus radius, both together drive the near lobe.
+	float  angle = ign(input.pos.xy, 0.0) * 6.2831853;
+	float2 jit   = float2(cos(angle), sin(angle));
+	float  u     = ign(input.pos.xy, 1.0);
+	float  u2    = ign(input.pos.xy, 2.0);
+
+	// Near field. Radius is drawn from the 2D exponential scatter profile
+	// directly: -s*ln(u*u2) is Gamma(2, s) distributed, which is exactly the
+	// radial density of exp(-r/s) over the plane, so every tap carries the same
+	// weight and no per-tap falloff math is needed.
+	float  irr_px = -(irr_radius * source_size.y) * log(max(u * u2, 1e-4));
+	float3 near   = halo_ring(uv, irr_px / source_size, jit);
+
+	// Far field: one ring of taps per annulus, each rotated 11.25 deg past the last.
+	float3 ring0 = halo_ring(uv, h_uv * sqrt(lerp(RING0_R2.x, RING0_R2.y, u)), rot_mul(float2(0.98079, 0.19509), jit));
+	float3 ring1 = halo_ring(uv, h_uv * sqrt(lerp(RING1_R2.x, RING1_R2.y, u)), rot_mul(float2(0.92388, 0.38268), jit));
+	float3 ring2 = halo_ring(uv, h_uv * sqrt(lerp(RING2_R2.x, RING2_R2.y, u)), rot_mul(float2(0.83147, 0.55557), jit));
+
+	// Beer-Lambert transmission per lobe, per channel: absorbance times the path
+	// that lobe's light took. The near lobe's short path is why it stays white.
+	float3 tn = exp(-dye_absorb.rgb * IRR_PATH);
+	float3 t0 = exp(-dye_absorb.rgb * RING0_PATH);
+	float3 t1 = exp(-dye_absorb.rgb * RING1_PATH);
+	float3 t2 = exp(-dye_absorb.rgb * RING2_PATH);
+
+	float  far  = 1.0 - irradiation;
+	float3 halo = near  * (tn * irradiation)
+	            + ring0 * (t0 * (RING0_W * far))
+	            + ring1 * (t1 * (RING1_W * far))
+	            + ring2 * (t2 * (RING2_W * far));
+
+	// Halation re-exposes the emulsion on top of what it already recorded, so
+	// this is additive — the light in the halo never belonged to the direct
+	// image and none of it is taken back out.
+	float3 scene = src_tex.Sample(src_smp, uv).rgb;
+	return float4(scene + halo * (coupling * clip_range), 1);
+}
