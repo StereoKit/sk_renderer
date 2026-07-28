@@ -1290,28 +1290,32 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 	};
 
 	// Subpass dependencies
-	// Use TOP_OF_PIPE for clears to avoid unnecessary execution dependency on
-	// prior fragment/color work. loadOp=CLEAR discards previous contents so
-	// there's no data hazard with earlier passes.
+	// srcStageMask must cover the implicit initialLayout transition, not just the
+	// loadOp. loadOp=CLEAR discards previous *contents*, but the transition is
+	// itself a full-image write that happens inside this dependency — so a
+	// TOP_OF_PIPE source (which orders against nothing) leaves it unsynchronized
+	// against both the acquire semaphore and the prior frame's storeOp.
+	// Each dependency sources from the stage matching its own attachment type, so
+	// depth work doesn't get serialized behind unrelated color work, or vice versa.
 	VkSubpassDependency dependencies[4];
 	uint32_t dep_count = 0;
 
 	dependencies[dep_count++] = (VkSubpassDependency){
 		.srcSubpass    = VK_SUBPASS_EXTERNAL,
 		.dstSubpass    = 0,
-		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
-			? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-			: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.srcAccessMask = 0,
+		// The transition/loadOp write is WAW against the prior frame's storeOp on
+		// the same image, so this needs a memory dependency, not just execution.
+		.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	};
 	dependencies[dep_count++] = (VkSubpassDependency){
 		.srcSubpass    = VK_SUBPASS_EXTERNAL,
 		.dstSubpass    = 0,
-		.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // Depth always clears, no prior dependency needed
+		.srcStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 		.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-		.srcAccessMask = 0,
+		.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 	};
 
