@@ -1,9 +1,8 @@
 # Android build. Needs ANDROID_HOME set, a JDK for APK signing, and the
 # platform matching the example's MIN_SDK for the compile jar
-# (`sdkmanager "platforms;android-29"`). Cross-compiling uses the pre-built
-# host skshaderc from bin/tools/ for shader compilation — run a native build
-# first so it exists and is current (a stale one emits old SKS containers the
-# runtime refuses):
+# (`sdkmanager "platforms;android-29"`). Android can't run its own shader
+# compiler, so the build makes a host skshaderc inside the build folder and
+# compiles shaders with that. The first build of a fresh folder pays for it:
 #
 #   export ANDROID_NDK=$ANDROID_HOME/ndk/25.2.9519653   # or whichever is installed
 #   cmake -B build-android \
@@ -88,8 +87,8 @@ endfunction()
 if(SKR_BUILD_SKSHADERC)
 	# skshaderc handles cross-compilation internally:
 	# - Native builds: builds skshaderc from source and uses it for shaders
-	# - Cross-compiling: builds skshaderc for target, but uses pre-built host
-	#   binary from bin/tools/ for shader compilation
+	# - Cross-compiling: builds a second, host-targeted skshaderc to compile
+	#   shaders with, since the target one can't run here
 	add_subdirectory(skshaderc)
 endif()
 
