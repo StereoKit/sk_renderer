@@ -131,6 +131,15 @@ if(SKSHADERC_CROSS_COMPILING AND SKSHADERC_BUILD_HOST_TOOL AND NOT SKSHADERC_HOS
 		# Picks the backends the target build expects: WebGPU gets SVSL with the
 		# WGSL emitter, everything else keeps glslang.
 		"-DSKR_USE_WEBGPU=${SKR_USE_WEBGPU}")
+	# A parent project may have picked backends itself (e.g. SVSL-only, which
+	# skips the expensive glslang build). Mirror any explicit choice; undefined
+	# means the sub-build keeps its own defaults.
+	if(DEFINED SKSHADERC_ENABLE_GLSLANG)
+		list(APPEND _HOST_TOOL_ARGS "-DSKSHADERC_ENABLE_GLSLANG=${SKSHADERC_ENABLE_GLSLANG}")
+	endif()
+	if(DEFINED SKSHADERC_ENABLE_SVSL)
+		list(APPEND _HOST_TOOL_ARGS "-DSKSHADERC_ENABLE_SVSL=${SKSHADERC_ENABLE_SVSL}")
+	endif()
 	if(FETCHCONTENT_SOURCE_DIR_SVSL) # honor an in-progress local SVSL checkout
 		list(APPEND _HOST_TOOL_ARGS "-DFETCHCONTENT_SOURCE_DIR_SVSL=${FETCHCONTENT_SOURCE_DIR_SVSL}")
 	endif()
