@@ -159,7 +159,7 @@ static bool main_frame(void* user_data) {
 	// every mode transition — regression for stale cached framebuffers.
 	if (s->cycle_resolve) {
 		int32_t step = s->frame_count / 4;
-		app_set_resolve_mode(s->app, (step & 1) ? (step / 2) % 7 : 0);
+		app_set_resolve_mode(s->app, (step & 1) ? (step / 2) % app_resolve_mode_count() : 0);
 	}
 
 	// Exit after N frames in test mode, or advance to next scene in testall mode

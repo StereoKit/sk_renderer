@@ -24,9 +24,19 @@ typedef struct {
 	int32_t                          ref_count;
 } _skr_pipeline_material_slot_t;
 
+// A VkRenderPass and the key that built it. subpass_index is not part of a
+// VkRenderPass's identity, so object keys always have subpass_index == 0.
 typedef struct {
 	skr_pipeline_renderpass_key_t    key;
 	VkRenderPass                     render_pass;
+	int32_t                          ref_count;  // Number of slots pointing here
+} _skr_pipeline_renderpass_object_t;
+
+// A cache slot is (renderpass identity + subpass_index), and its index is the
+// renderpass axis of the pipelines 3D array.
+typedef struct {
+	skr_pipeline_renderpass_key_t    key;         // Full key, including subpass_index
+	int32_t                          object_idx;  // Index into renderpass_objects
 	int32_t                          ref_count;
 } _skr_pipeline_renderpass_slot_t;
 
@@ -36,17 +46,16 @@ typedef struct {
 } _skr_pipeline_vertformat_slot_t;
 
 typedef struct {
-	_skr_pipeline_material_slot_t*   materials;
-	_skr_pipeline_renderpass_slot_t* renderpasses;
-	_skr_pipeline_vertformat_slot_t* vertformats;
-	VkPipeline*                      pipelines;       // 3D array: [material][renderpass][vertformat]
-	int32_t                          material_count;
-	int32_t                          material_capacity;
-	int32_t                          renderpass_count;
-	int32_t                          renderpass_capacity;
-	int32_t                          vertformat_count;
-	int32_t                          vertformat_capacity;
-	mtx_t                            mutex;           // Thread safety for cache access
+	_skr_pipeline_material_slot_t*     materials;
+	_skr_pipeline_renderpass_slot_t*   renderpasses;
+	_skr_pipeline_renderpass_object_t* renderpass_objects;
+	_skr_pipeline_vertformat_slot_t*   vertformats;
+	VkPipeline*                        pipelines;       // 3D array: [material][renderpass][vertformat]
+	int32_t                            material_capacity;
+	int32_t                            renderpass_capacity;
+	int32_t                            renderpass_object_capacity;
+	int32_t                            vertformat_capacity;
+	mtx_t                              mutex;           // Thread safety for cache access
 } _skr_pipeline_cache_t;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -163,19 +172,16 @@ void _skr_pipeline_shutdown(void) {
 		_skr_free(_skr_pipeline_cache.materials);
 	}
 
-	// Destroy render passes (shared handles may appear in multiple slots)
-	if (_skr_pipeline_cache.renderpasses) {
-		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
-			VkRenderPass rp = _skr_pipeline_cache.renderpasses[r].render_pass;
-			if (_skr_pipeline_cache.renderpasses[r].ref_count <= 0 || rp == VK_NULL_HANDLE) continue;
-
-			vkDestroyRenderPass(_skr_vk.device, rp, NULL);
-			// Null out any other slots sharing this handle to avoid double-free
-			for (int32_t j = r + 1; j < _skr_pipeline_cache.renderpass_capacity; j++) {
-				if (_skr_pipeline_cache.renderpasses[j].render_pass == rp)
-					_skr_pipeline_cache.renderpasses[j].render_pass = VK_NULL_HANDLE;
-			}
+	// Destroy render passes, each handle lives in exactly one object entry
+	if (_skr_pipeline_cache.renderpass_objects) {
+		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_object_capacity; r++) {
+			VkRenderPass rp = _skr_pipeline_cache.renderpass_objects[r].render_pass;
+			if (_skr_pipeline_cache.renderpass_objects[r].ref_count > 0 && rp != VK_NULL_HANDLE)
+				vkDestroyRenderPass(_skr_vk.device, rp, NULL);
 		}
+		_skr_free(_skr_pipeline_cache.renderpass_objects);
+	}
+	if (_skr_pipeline_cache.renderpasses) {
 		_skr_free(_skr_pipeline_cache.renderpasses);
 	}
 
@@ -242,10 +248,6 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 	_skr_pipeline_cache.materials[free_slot].layout            = _skr_pipeline_create_layout(_skr_pipeline_cache.materials[free_slot].descriptor_layout);
 	_skr_pipeline_cache.materials[free_slot].ref_count         = 1;
 
-	if (free_slot >= _skr_pipeline_cache.material_count) {
-		_skr_pipeline_cache.material_count = free_slot + 1;
-	}
-
 	// Generate and set debug name for pipeline layout
 	char name[256];
 	const char* shader_name = key->shader->meta.name[0] ? key->shader->meta.name : "unknown";
@@ -286,34 +288,31 @@ static void _skr_pipeline_grow_renderpasses(_skr_pipeline_cache_t* ref_cache, in
 	ref_cache->renderpass_capacity = new_capacity;
 }
 
-// Compare two renderpass keys ignoring subpass_index. Keys that match on all
-// other fields describe the same VkRenderPass — subpass_index only affects
-// which subpass a pipeline targets within that renderpass. Derived from the
-// same memcmp the exact lookup uses, so a new key field is never left out of
-// one comparison but not the other.
-static bool _skr_renderpass_key_matches_base(const skr_pipeline_renderpass_key_t* a, const skr_pipeline_renderpass_key_t* b) {
-	skr_pipeline_renderpass_key_t base_a = *a;
-	skr_pipeline_renderpass_key_t base_b = *b;
-	base_a.subpass_index = 0;
-	base_b.subpass_index = 0;
-	return memcmp(&base_a, &base_b, sizeof(base_a)) == 0;
+// Object indices are not a pipeline array axis, unlike slot indices, so this
+// grows independently of the pipelines 3D array.
+static void _skr_pipeline_grow_renderpass_objects(_skr_pipeline_cache_t* ref_cache, int32_t min_capacity) {
+	if (min_capacity <= ref_cache->renderpass_object_capacity) return;
+
+	int32_t old_capacity = ref_cache->renderpass_object_capacity;
+	int32_t new_capacity = old_capacity == 0 ? 4 : old_capacity * 2;
+	while (new_capacity < min_capacity) {
+		new_capacity *= 2;
+	}
+
+	ref_cache->renderpass_objects = _skr_realloc(ref_cache->renderpass_objects, new_capacity * sizeof(_skr_pipeline_renderpass_object_t));
+	memset(&ref_cache->renderpass_objects[old_capacity], 0, (new_capacity - old_capacity) * sizeof(_skr_pipeline_renderpass_object_t));
+
+	ref_cache->renderpass_object_capacity = new_capacity;
 }
 
 // Unlocked version - caller must hold the mutex via _skr_pipeline_lock()
 int32_t _skr_pipeline_register_renderpass_unlocked(const skr_pipeline_renderpass_key_t* key) {
-	// Find existing or free slot
-	int32_t free_slot  = -1;
-	int32_t share_slot = -1; // Slot with same base key (different subpass_index) to share VkRenderPass from
+	int32_t free_slot = -1;
 	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_capacity; i++) {
 		if (_skr_pipeline_cache.renderpasses[i].ref_count > 0) {
-			// Exact match (including subpass_index): reuse this slot entirely
 			if (memcmp(&_skr_pipeline_cache.renderpasses[i].key, key, sizeof(skr_pipeline_renderpass_key_t)) == 0) {
 				_skr_pipeline_cache.renderpasses[i].ref_count++;
 				return i;
-			}
-			// Base match: candidate to borrow the VkRenderPass from
-			if (share_slot == -1 && _skr_renderpass_key_matches_base(&_skr_pipeline_cache.renderpasses[i].key, key)) {
-				share_slot = i;
 			}
 		} else if (free_slot == -1) {
 			free_slot = i;
@@ -326,19 +325,37 @@ int32_t _skr_pipeline_register_renderpass_unlocked(const skr_pipeline_renderpass
 		_skr_pipeline_grow_renderpasses(&_skr_pipeline_cache, free_slot + 1);
 	}
 
-	// Register new slot. Share the VkRenderPass if another slot with the same
-	// base key already exists (different subpass_index, same renderpass object).
-	_skr_pipeline_cache.renderpasses[free_slot].key       = *key;
-	_skr_pipeline_cache.renderpasses[free_slot].ref_count = 1;
-	if (share_slot >= 0) {
-		_skr_pipeline_cache.renderpasses[free_slot].render_pass = _skr_pipeline_cache.renderpasses[share_slot].render_pass;
+	// Find or create the VkRenderPass object shared by every subpass_index
+	skr_pipeline_renderpass_key_t obj_key = *key;
+	obj_key.subpass_index = 0;
+	int32_t object_idx = -1;
+	int32_t free_obj   = -1;
+	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_object_capacity; i++) {
+		if (_skr_pipeline_cache.renderpass_objects[i].ref_count > 0) {
+			if (memcmp(&_skr_pipeline_cache.renderpass_objects[i].key, &obj_key, sizeof(skr_pipeline_renderpass_key_t)) == 0) {
+				object_idx = i;
+				break;
+			}
+		} else if (free_obj == -1) {
+			free_obj = i;
+		}
+	}
+	if (object_idx >= 0) {
+		_skr_pipeline_cache.renderpass_objects[object_idx].ref_count++;
 	} else {
-		_skr_pipeline_cache.renderpasses[free_slot].render_pass = _skr_pipeline_create_renderpass(key);
+		if (free_obj == -1) {
+			free_obj = _skr_pipeline_cache.renderpass_object_capacity;
+			_skr_pipeline_grow_renderpass_objects(&_skr_pipeline_cache, free_obj + 1);
+		}
+		_skr_pipeline_cache.renderpass_objects[free_obj].key         = obj_key;
+		_skr_pipeline_cache.renderpass_objects[free_obj].render_pass = _skr_pipeline_create_renderpass(&obj_key);
+		_skr_pipeline_cache.renderpass_objects[free_obj].ref_count   = 1;
+		object_idx = free_obj;
 	}
 
-	if (free_slot >= _skr_pipeline_cache.renderpass_count) {
-		_skr_pipeline_cache.renderpass_count = free_slot + 1;
-	}
+	_skr_pipeline_cache.renderpasses[free_slot].key        = *key;
+	_skr_pipeline_cache.renderpasses[free_slot].object_idx = object_idx;
+	_skr_pipeline_cache.renderpasses[free_slot].ref_count  = 1;
 
 	return free_slot;
 }
@@ -372,6 +389,8 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 	// Destroy material resources
 	_skr_cmd_destroy_pipeline_layout      (NULL, _skr_pipeline_cache.materials[material_idx].layout);
 	_skr_cmd_destroy_descriptor_set_layout(NULL, _skr_pipeline_cache.materials[material_idx].descriptor_layout);
+	_skr_pipeline_cache.materials[material_idx].layout            = VK_NULL_HANDLE;
+	_skr_pipeline_cache.materials[material_idx].descriptor_layout = VK_NULL_HANDLE;
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
@@ -395,20 +414,18 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 		}
 	}
 
-	// Only destroy VkRenderPass if no other slot shares the same handle
-	VkRenderPass rp = _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
-	bool shared = false;
-	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_capacity; i++) {
-		if (i == renderpass_idx) continue;
-		if (_skr_pipeline_cache.renderpasses[i].ref_count > 0 && _skr_pipeline_cache.renderpasses[i].render_pass == rp) {
-			shared = true;
-			break;
+	// Release the slot's object; the last slot out destroys the VkRenderPass
+	int32_t object_idx = _skr_pipeline_cache.renderpasses[renderpass_idx].object_idx;
+	if (object_idx >= 0 && object_idx < _skr_pipeline_cache.renderpass_object_capacity) {
+		_skr_pipeline_renderpass_object_t* obj = &_skr_pipeline_cache.renderpass_objects[object_idx];
+		obj->ref_count--;
+		if (obj->ref_count <= 0) {
+			if (obj->render_pass != VK_NULL_HANDLE)
+				_skr_cmd_destroy_render_pass(NULL, obj->render_pass);
+			obj->render_pass = VK_NULL_HANDLE;
 		}
 	}
-	if (!shared) {
-		_skr_cmd_destroy_render_pass(NULL, rp);
-	}
-	_skr_pipeline_cache.renderpasses[renderpass_idx].render_pass = VK_NULL_HANDLE;
+	_skr_pipeline_cache.renderpasses[renderpass_idx].object_idx = -1;
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
@@ -493,10 +510,6 @@ int32_t _skr_pipeline_register_vertformat_unlocked(skr_vert_type_t vert_type) {
 	_skr_pipeline_cache.vertformats[free_slot].vert_type  = vert_type;
 	_skr_pipeline_cache.vertformats[free_slot].ref_count  = 1;
 
-	if (free_slot >= _skr_pipeline_cache.vertformat_count) {
-		_skr_pipeline_cache.vertformat_count = free_slot + 1;
-	}
-
 	return free_slot;
 }
 
@@ -572,7 +585,10 @@ VkRenderPass _skr_pipeline_get_renderpass(int32_t renderpass_idx) {
 	if (renderpass_idx < 0 || renderpass_idx >= _skr_pipeline_cache.renderpass_capacity) return VK_NULL_HANDLE;
 	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count <= 0)                 return VK_NULL_HANDLE;
 
-	return _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
+	int32_t object_idx = _skr_pipeline_cache.renderpasses[renderpass_idx].object_idx;
+	if (object_idx < 0 || object_idx >= _skr_pipeline_cache.renderpass_object_capacity)  return VK_NULL_HANDLE;
+
+	return _skr_pipeline_cache.renderpass_objects[object_idx].render_pass;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -687,11 +703,11 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	bool use_msaa      = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
 	bool has_color     = key->color_format != VK_FORMAT_UNDEFINED;
 	bool has_depth     = key->depth_format != VK_FORMAT_UNDEFINED;
-	bool reads_depth   = key->postfx_reads_depth && has_depth;
+	bool reads_depth   = (key->flags & skr_rp_flag_postfx_reads_depth) && has_depth;
 	// MS-declared postfx depth reads the MSAA attachment directly, so no
 	// resolve attachment and no 1x transient - the depth input reference below
 	// falls through to depth_idx exactly as it does in a single-sample pass.
-	bool resolve_depth = reads_depth && key->samples > VK_SAMPLE_COUNT_1_BIT && !key->postfx_depth_ms;
+	bool resolve_depth = reads_depth && key->samples > VK_SAMPLE_COUNT_1_BIT && !(key->flags & skr_rp_flag_postfx_depth_ms);
 
 	if (reads_depth && !_skr_vk.has_create_renderpass2) {
 		skr_log(skr_log_critical, "PostFX depth read requires VK_KHR_create_renderpass2");
@@ -734,7 +750,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 
 	// [1] Resolve attachment (for MSAA) — resolved result, then input for postfx
 	// When resolve-only (no postfx), this IS the final output and must be stored.
-	bool resolve_is_final = use_msaa && key->has_resolve_subpass && key->postfx_count == 0;
+	// A resolve subpass implies MSAA, so this never falls through to the
+	// postfx_output_format read in the final-output block below.
+	bool resolve_is_final = use_msaa && (key->flags & skr_rp_flag_resolve_subpass) && key->postfx_count == 0;
 	if (use_msaa) {
 		resolve_idx = (int32_t)attachment_count;
 		attachments[attachment_count++] = (VkAttachmentDescription2){
@@ -841,7 +859,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// --- Build subpass descriptions ---
-	uint32_t resolve_subpass_count = key->has_resolve_subpass ? 1 : 0;
+	uint32_t resolve_subpass_count = (key->flags & skr_rp_flag_resolve_subpass) ? 1 : 0;
 	uint32_t subpass_count = 1 + resolve_subpass_count + key->postfx_count;
 
 	VkImageAspectFlags depth_aspect = has_depth
@@ -892,13 +910,13 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		.stencilResolveMode             = VK_RESOLVE_MODE_NONE,
 		.pDepthStencilResolveAttachment = &depth_resolve_ref,
 	};
-	bool use_auto_resolve = use_msaa && !key->has_resolve_subpass;
+	bool use_auto_resolve = use_msaa && !(key->flags & skr_rp_flag_resolve_subpass);
 	// Tile shading apron: the subpasses that *produce* the tile data (geometry,
 	// and manual resolve below) rasterize into the apron border so a later
 	// tile-attachment read finds valid neighbors at tile edges. The reading
 	// postfx subpasses do NOT get the bit — their fragments only run on real
 	// tile pixels, keeping every read within tile + apron.
-	VkSubpassDescriptionFlags apron_flag = (key->tile_shading && (key->tile_apron[0] | key->tile_apron[1]))
+	VkSubpassDescriptionFlags apron_flag = ((key->flags & skr_rp_flag_tile_shading) && (key->tile_apron[0] | key->tile_apron[1]))
 		? VK_SUBPASS_DESCRIPTION_TILE_SHADING_APRON_BIT_QCOM : 0;
 	subpasses[0] = (VkSubpassDescription2){
 		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
@@ -916,7 +934,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	// Reads MSAA color as multisampled input attachment, writes 1x resolved output.
 	// No depth — frees tile memory after geometry subpass.
 	uint32_t next_sp = 1;
-	if (key->has_resolve_subpass) {
+	if (key->flags & skr_rp_flag_resolve_subpass) {
 		input_refs[1][0] = (VkAttachmentReference2){
 			.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 			.attachment = (uint32_t)color_idx,
@@ -931,7 +949,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 		subpasses[1] = (VkSubpassDescription2){
 			.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-			.flags                   = apron_flag | (key->use_custom_resolve_flags
+			.flags                   = apron_flag | ((key->flags & skr_rp_flag_custom_resolve)
 				? (VK_SUBPASS_DESCRIPTION_FRAGMENT_REGION_BIT_QCOM | VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM)
 				: 0),
 			.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -945,7 +963,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// PostFX subpasses: read previous output (and optionally depth) as input attachments
-	int32_t prev_color_attachment = (use_msaa || key->has_resolve_subpass) ? resolve_idx : color_idx;
+	int32_t prev_color_attachment = (use_msaa || (key->flags & skr_rp_flag_resolve_subpass)) ? resolve_idx : color_idx;
 	int32_t depth_input_attachment = resolve_depth ? depth_resolve_idx : depth_idx;
 
 	for (uint32_t p = 0; p < key->postfx_count; p++) {
@@ -1073,7 +1091,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	// pixel-granular — exactly what makes the neighborhood reads legal.
 	VkMemoryBarrier2 tile_read_barriers[SKR_POSTFX_MAX_SUBPASSES];
 	for (uint32_t s = 0; s + 1 < subpass_count; s++) {
-		if (key->tile_shading) {
+		if (key->flags & skr_rp_flag_tile_shading) {
 			tile_read_barriers[s] = (VkMemoryBarrier2){
 				.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
 				.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1084,7 +1102,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		}
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			.pNext           = key->tile_shading ? &tile_read_barriers[s] : NULL,
+			.pNext           = (key->flags & skr_rp_flag_tile_shading) ? &tile_read_barriers[s] : NULL,
 			.srcSubpass      = s,
 			.dstSubpass      = s + 1,
 			.srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1158,7 +1176,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		.flags         = VK_TILE_SHADING_RENDER_PASS_ENABLE_BIT_QCOM,
 		.tileApronSize = { key->tile_apron[0], key->tile_apron[1] },
 	};
-	if (key->tile_shading) {
+	if (key->flags & skr_rp_flag_tile_shading) {
 		tile_shading_info.pNext = (void*)render_pass_info.pNext;
 		render_pass_info.pNext  = &tile_shading_info;
 	}
@@ -1208,9 +1226,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 
 	char name[256];
 	snprintf(name, sizeof(name), "rpass_%s%s%s%u_",
-		key->has_resolve_subpass ? "resolve_" : "",
-		key->use_custom_resolve_flags ? "cr_" : "",
-		key->postfx_reads_depth ? "din_" : "",
+		(key->flags & skr_rp_flag_resolve_subpass)    ? "resolve_" : "",
+		(key->flags & skr_rp_flag_custom_resolve)     ? "cr_"      : "",
+		(key->flags & skr_rp_flag_postfx_reads_depth) ? "din_"     : "",
 		key->postfx_count);
 	_skr_append_renderpass_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
@@ -1220,7 +1238,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 
 static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpass_key_t* key) {
 	// Multi-subpass path for postfx and/or manual resolve
-	if (key->postfx_count > 0 || key->has_resolve_subpass)
+	if (key->postfx_count > 0 || (key->flags & skr_rp_flag_resolve_subpass))
 		return _skr_pipeline_create_multisubpass_renderpass(key);
 
 	VkAttachmentDescription attachments[3];
@@ -1457,7 +1475,7 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 	const skr_pipeline_renderpass_key_t* rp_key    = &_skr_pipeline_cache.renderpasses[renderpass_idx].key;
 	const skr_vert_type_t*               vert_type = &_skr_pipeline_cache.vertformats [vertformat_idx].vert_type;
 	const VkPipelineLayout               layout    =  _skr_pipeline_cache.materials   [material_idx  ].layout;
-	const VkRenderPass                   rp        =  _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
+	const VkRenderPass                   rp        =  _skr_pipeline_get_renderpass(renderpass_idx);
 
 	// One specialization info is shared by both stages; Vulkan ignores map
 	// entries whose constantID isn't present in a stage's module.

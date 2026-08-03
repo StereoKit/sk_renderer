@@ -41,6 +41,8 @@ enum resolve_mode_ {
 	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
 	resolve_mode_oled_subpixel,  // OLED subpixel-aware resolve (Texture2DMS, separate pass)
 	resolve_mode_depth_fog,      // Postfx reads depth as input attachment (on-tile resolved under MSAA)
+	resolve_mode_depth_fog_ms,   // Same fog, but depth is SubpassInputMS, so the pass skips the depth
+	                             // resolve entirely. MSAA only, the shader can't run in a 1x pass
 	resolve_mode_fog_scatter,    // Depth fog + light scatter: on-tile density prepass (postfx, depth
 	                             // never stored), then a VK_QCOM_image_processing box-filter blit
 	                             // whose kernel widens with the density packed in alpha
@@ -50,7 +52,10 @@ enum resolve_mode_ {
 	                             // with a derived per-wavelength PSF. No extensions.
 	resolve_mode_max,
 };
-const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX", "Depth Fog + Scatter (QCOM)", "Fog Scatter On-Tile (QCOM)", "Halation Blit" };
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX", "Depth Fog PostFX (MS depth)", "Depth Fog + Scatter (QCOM)", "Fog Scatter On-Tile (QCOM)", "Halation Blit" };
+// The mode combo walks this array to resolve_mode_max, so a missing name is an
+// out of bounds read rather than a blank entry.
+_Static_assert(sizeof(resolve_mode_names) / sizeof(resolve_mode_names[0]) == resolve_mode_max, "resolve_mode_names needs an entry per resolve_mode_");
 
 // Application state
 struct app_t {
@@ -90,6 +95,8 @@ struct app_t {
 	skr_material_t postfx_mat2;  // Second invert for the chained mode — two inverts ≈ identity
 	skr_shader_t   depth_fog_shader;
 	skr_material_t depth_fog_mat;
+	skr_shader_t   depth_fog_ms_shader; // Same shader with SubpassInputMS depth, MSAA passes only
+	skr_material_t depth_fog_ms_mat;
 	// Fog + scatter pair: density prepass (postfx subpass, keeps depth on-tile)
 	// + a scatter blit. The blit prefers the VK_QCOM_image_processing box
 	// filter and falls back to plain 9-tap sampling when the device lacks it.
@@ -371,6 +378,13 @@ app_t* app_create(int32_t start_scene) {
 			.depth_test = skr_compare_always,
 		}, &app->depth_fog_mat);
 	}
+	app->depth_fog_ms_shader = su_shader_load("shaders/postfx_depth_fog_ms.hlsl.sks", "postfx_depth_fog_ms");
+	if (skr_shader_is_valid(&app->depth_fog_ms_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->depth_fog_ms_shader,
+			.depth_test = skr_compare_always,
+		}, &app->depth_fog_ms_mat);
+	}
 	// Fog + scatter: the density prepass is an ordinary postfx; the scatter
 	// blit prefers BoxFilterQCOM. skr_shader_create refuses shaders the device
 	// can't run (VK_QCOM_image_processing here), so an invalid result routes
@@ -514,6 +528,10 @@ void app_destroy(app_t* app) {
 		skr_material_destroy(&app->depth_fog_mat);
 		skr_shader_destroy(&app->depth_fog_shader);
 	}
+	if (skr_shader_is_valid(&app->depth_fog_ms_shader)) {
+		skr_material_destroy(&app->depth_fog_ms_mat);
+		skr_shader_destroy(&app->depth_fog_ms_shader);
+	}
 	// The fog materials only exist when their shaders passed the device gate
 	if (skr_material_is_valid(&app->fog_density_mat))  skr_material_destroy(&app->fog_density_mat);
 	if (skr_material_is_valid(&app->fog_scatter_mat))  skr_material_destroy(&app->fog_scatter_mat);
@@ -577,6 +595,10 @@ int32_t app_scene_count(app_t* app) {
 void app_set_resolve_mode(app_t* app, int32_t mode) {
 	if (!app || mode < 0 || mode >= resolve_mode_max) return;
 	app->resolve_mode = mode;
+}
+
+int32_t app_resolve_mode_count(void) {
+	return resolve_mode_max;
 }
 
 void app_set_msaa(app_t* app, int32_t samples) {
@@ -712,6 +734,8 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// final_output   = render_target when !needs_upscale, else upscale_src
 	bool use_chain_postfx   = (app->resolve_mode == resolve_mode_chain_postfx)  && skr_material_is_valid(&app->postfx_mat) && skr_material_is_valid(&app->postfx_mat2);
 	bool use_depth_fog      = (app->resolve_mode == resolve_mode_depth_fog)     && skr_material_is_valid(&app->depth_fog_mat);
+	// SubpassInputMS has no 1x form, so this mode is only offered under MSAA
+	bool use_depth_fog_ms   = (app->resolve_mode == resolve_mode_depth_fog_ms)  && app->msaa > 1 && skr_material_is_valid(&app->depth_fog_ms_mat);
 	// Gate on the support flag, not just material validity — the material is
 	// never created on devices without VK_QCOM_image_processing, and the mode
 	// must fall back to plain rendering there.
@@ -720,7 +744,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// Halation is not a postfx: it needs neighbours, so it reads the finished
 	// scene as a texture in a blit rather than a pixel-local subpass.
 	bool use_halation       = (app->resolve_mode == resolve_mode_halation)      && skr_material_is_valid(&app->halation_mat);
-	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog || use_fog_scatter || use_fog_tile;
+	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog || use_depth_fog_ms || use_fog_scatter || use_fog_tile;
 	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
 	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
 	bool use_oled_subpixel  = (app->resolve_mode == resolve_mode_oled_subpixel) && app->msaa > 1 && skr_material_is_valid(&app->oled_resolve_mat);
@@ -795,6 +819,8 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		skr_pass_add_postfx(&pass, &app->fog_density_mat);
 	else if (use_depth_fog)
 		skr_pass_add_postfx(&pass, &app->depth_fog_mat);
+	else if (use_depth_fog_ms)
+		skr_pass_add_postfx(&pass, &app->depth_fog_ms_mat);
 	else if (use_postfx)
 		skr_pass_add_postfx(&pass, &app->postfx_mat);
 	if (use_chain_postfx)

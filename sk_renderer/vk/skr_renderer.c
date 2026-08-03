@@ -1347,9 +1347,12 @@ void skr_pass_submit(skr_pass_t* pass) {
 		.depth_format        = has_depth ? skr_tex_fmt_to_native(depth->format) : VK_FORMAT_UNDEFINED,
 		.resolve_format      = use_msaa  ? skr_tex_fmt_to_native(resolve->format) : VK_FORMAT_UNDEFINED,
 		.samples             = samples,
-		.postfx_reads_depth  = postfx_reads_depth,
-		.postfx_depth_ms     = postfx_reads_depth && postfx_depth_ms,
-		.tile_shading        = pass_tile_shading,
+		.flags               = (postfx_reads_depth                    ? skr_rp_flag_postfx_reads_depth : 0)
+		                     | (postfx_reads_depth && postfx_depth_ms ? skr_rp_flag_postfx_depth_ms    : 0)
+		                     | (pass_tile_shading                     ? skr_rp_flag_tile_shading       : 0)
+		                     | (has_resolve                           ? skr_rp_flag_resolve_subpass    : 0)
+		                     | (has_resolve && pass->postfx_count == 0 && _skr_vk.has_custom_resolve
+		                                                              ? skr_rp_flag_custom_resolve     : 0),
 		.tile_apron          = { (uint8_t)tile_apron[0], (uint8_t)tile_apron[1] },
 		.depth_store_op      = (has_depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op       = _skr_color_load_op(pass->clear),
@@ -1358,8 +1361,6 @@ void skr_pass_submit(skr_pass_t* pass) {
 		.subpass_index       = 0,
 		.postfx_count        = (uint8_t)pass->postfx_count,
 		.postfx_output_format = skr_tex_fmt_to_native(final_output->format),
-		.has_resolve_subpass      = has_resolve,
-		.use_custom_resolve_flags = has_resolve && pass->postfx_count == 0 && _skr_vk.has_custom_resolve,
 		.final_color_layout       = (final_output->flags & skr_tex_flags_readable)
 			? _skr_tex_sample_layout(final_output) : 0,
 		.final_resolve_layout     = (use_msaa && has_resolve && pass->postfx_count == 0 && (resolve->flags & skr_tex_flags_readable))
