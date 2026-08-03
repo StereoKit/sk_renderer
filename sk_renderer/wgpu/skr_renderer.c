@@ -302,7 +302,9 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 			.view          = color ? _skr_tex_layer_view(color, bit) : NULL,
 			.depthSlice    = WGPU_DEPTH_SLICE_UNDEFINED,
 			.resolveTarget = opt_resolve ? _skr_tex_layer_view(opt_resolve, bit) : NULL,
-			.loadOp        = (clear & skr_clear_color) ? WGPULoadOp_Clear : WGPULoadOp_Load,
+			// WebGPU has no discard load-op, and Load is the expensive one here
+			// just as on Vulkan, so discard maps to Clear, not Load.
+			.loadOp        = (clear & (skr_clear_color | skr_clear_color_discard)) ? WGPULoadOp_Clear : WGPULoadOp_Load,
 			.storeOp       = (color && opt_resolve && !(color->flags & skr_tex_flags_readable)) ? WGPUStoreOp_Discard : WGPUStoreOp_Store,
 			.clearValue    = { clear_color.x, clear_color.y, clear_color.z, clear_color.w },
 		};

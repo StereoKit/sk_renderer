@@ -288,27 +288,15 @@ static void _skr_pipeline_grow_renderpasses(_skr_pipeline_cache_t* ref_cache, in
 
 // Compare two renderpass keys ignoring subpass_index. Keys that match on all
 // other fields describe the same VkRenderPass — subpass_index only affects
-// which subpass a pipeline targets within that renderpass.
+// which subpass a pipeline targets within that renderpass. Derived from the
+// same memcmp the exact lookup uses, so a new key field is never left out of
+// one comparison but not the other.
 static bool _skr_renderpass_key_matches_base(const skr_pipeline_renderpass_key_t* a, const skr_pipeline_renderpass_key_t* b) {
-	return a->color_format             == b->color_format
-	    && a->depth_format             == b->depth_format
-	    && a->resolve_format           == b->resolve_format
-	    && a->samples                  == b->samples
-	    && a->depth_store_op           == b->depth_store_op
-	    && a->color_load_op            == b->color_load_op
-	    && a->view_mask                == b->view_mask
-	    && a->correlation_mask         == b->correlation_mask
-	    && a->postfx_count             == b->postfx_count
-	    && a->has_resolve_subpass      == b->has_resolve_subpass
-	    && a->use_custom_resolve_flags == b->use_custom_resolve_flags
-	    && a->postfx_reads_depth       == b->postfx_reads_depth
-	    && a->tile_shading             == b->tile_shading
-	    && a->tile_apron[0]            == b->tile_apron[0]
-	    && a->tile_apron[1]            == b->tile_apron[1]
-	    && a->postfx_output_format     == b->postfx_output_format
-	    && a->final_color_layout       == b->final_color_layout
-	    && a->final_resolve_layout     == b->final_resolve_layout
-	    && a->final_depth_layout       == b->final_depth_layout;
+	skr_pipeline_renderpass_key_t base_a = *a;
+	skr_pipeline_renderpass_key_t base_b = *b;
+	base_a.subpass_index = 0;
+	base_b.subpass_index = 0;
+	return memcmp(&base_a, &base_b, sizeof(base_a)) == 0;
 }
 
 // Unlocked version - caller must hold the mutex via _skr_pipeline_lock()
@@ -700,7 +688,10 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	bool has_color     = key->color_format != VK_FORMAT_UNDEFINED;
 	bool has_depth     = key->depth_format != VK_FORMAT_UNDEFINED;
 	bool reads_depth   = key->postfx_reads_depth && has_depth;
-	bool resolve_depth = reads_depth && key->samples > VK_SAMPLE_COUNT_1_BIT;
+	// MS-declared postfx depth reads the MSAA attachment directly, so no
+	// resolve attachment and no 1x transient - the depth input reference below
+	// falls through to depth_idx exactly as it does in a single-sample pass.
+	bool resolve_depth = reads_depth && key->samples > VK_SAMPLE_COUNT_1_BIT && !key->postfx_depth_ms;
 
 	if (reads_depth && !_skr_vk.has_create_renderpass2) {
 		skr_log(skr_log_critical, "PostFX depth read requires VK_KHR_create_renderpass2");

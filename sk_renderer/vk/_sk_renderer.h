@@ -46,10 +46,14 @@ typedef struct {
 	bool                  postfx_reads_depth;       // Postfx subpasses get depth as an input attachment; under
 	                                                // MSAA the geometry subpass also resolves depth on-tile
 	                                                // (VK_KHR_depth_stencil_resolve) so postfx reads 1x depth
+	bool                  postfx_depth_ms;          // ...unless the postfx shader declared depth as SubpassInputMS,
+	                                                // in which case the MSAA depth is referenced directly and the
+	                                                // on-tile resolve + its 1x transient are skipped entirely
 	bool                  tile_shading;             // VK_QCOM_tile_shading pass: a postfx shader reads an
 	                                                // attachment as a tile attachment (neighborhood reads on-tile)
 	uint8_t               tile_apron[2];            // VkRenderPassTileShadingCreateInfoQCOM::tileApronSize, from
 	                                                // the postfx shader's //--apron meta, clamped to maxApronSize
+	uint8_t               _pad[3];                  // Keeps the single-byte group a multiple of 4 (see below)
 	VkFormat              postfx_output_format;     // Format of the final postfx output attachment
 	VkImageLayout         final_color_layout;       // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_resolve_layout;     // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
@@ -59,7 +63,7 @@ typedef struct {
 // must have no padding holes — every byte a named field, single-byte fields in
 // groups of 4/8. The assert trips when a new field breaks that; re-pack (or add
 // explicit pad bytes) rather than letting uninitialized padding poison dedup.
-_Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must stay padding-free for memcmp dedup");
+_Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 60, "renderpass key must stay padding-free for memcmp dedup");
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
 #define skr_MAX_COMMAND_RING    8   // Number of command buffers per thread

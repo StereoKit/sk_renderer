@@ -279,6 +279,14 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 	_skr_vk.flight_idx = _skr_vk.frame % SKR_MAX_FRAMES_IN_FLIGHT;
 }
 
+// Clear wins over discard, a missing bit still means LOAD. Anything but LOAD
+// gets initialLayout=UNDEFINED, so discard also drops the pre-pass barrier.
+static VkAttachmentLoadOp _skr_color_load_op(skr_clear_ clear) {
+	if (clear & skr_clear_color)         return VK_ATTACHMENT_LOAD_OP_CLEAR;
+	if (clear & skr_clear_color_discard) return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	return VK_ATTACHMENT_LOAD_OP_LOAD;
+}
+
 void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask) {
 	// Require at least one attachment (color or depth)
 	if (!color && !depth) return;
@@ -311,7 +319,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		.resolve_format  = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT) ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
 		.samples         = color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT),
 		.depth_store_op  = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-		.color_load_op   = (clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+		.color_load_op   = _skr_color_load_op(clear),
 		.view_mask        = view_mask,
 		.correlation_mask = correlation_mask,
 		.final_color_layout   = (color && (color->flags & skr_tex_flags_readable))
@@ -1249,34 +1257,57 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 	// Depth becomes a postfx input attachment when any postfx shader declares
 	// an input attachment named "depth". Under MSAA the geometry subpass also
-	// resolves depth on-tile so postfx always reads single-sample depth.
+	// resolves depth on-tile so postfx reads single-sample depth - unless the
+	// shader opted into reading the raw samples itself (see postfx_depth_ms).
 	VkSampleCountFlagBits samples = has_color ? color->samples : (has_depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT);
+	// A shader may declare depth as SubpassInput (1x) or SubpassInputMS. The MS
+	// form reads the MSAA depth attachment directly, skipping the on-tile
+	// resolve and its transient - cheaper, but the shader is then locked to
+	// MSAA passes. ms_votes/nonms_votes catch a chain that disagrees with
+	// itself, since one attachment reference has to serve every postfx subpass.
 	bool postfx_reads_depth = false;
+	bool postfx_depth_ms    = false;
 	if (has_depth) {
-		for (uint32_t p = 0; p < pass->postfx_count && !postfx_reads_depth; p++) {
+		uint32_t ms_votes = 0, nonms_votes = 0;
+		for (uint32_t p = 0; p < pass->postfx_count; p++) {
 			skr_material_t* mat = pass->postfx[p];
 			if (!mat || !skr_material_is_valid(mat)) continue;
 			const sksc_shader_meta_t* meta = &mat->key.shader->meta;
 			for (uint32_t r = 0; r < meta->resource_count; r++) {
 				if (meta->resources[r].bind.register_type == skr_register_input_attachment &&
-				    strcmp(meta->resources[r].name, "depth") == 0) { postfx_reads_depth = true; break; }
+				    strcmp(meta->resources[r].name, "depth") == 0) {
+					postfx_reads_depth = true;
+					if (meta->resources[r].shape & SKSC_SHAPE_MS) ms_votes   += 1;
+					else                                          nonms_votes += 1;
+					break;
+				}
 			}
 		}
+		if (ms_votes > 0 && nonms_votes > 0) {
+			skr_log(skr_log_critical, "PostFX chain mixes SubpassInput and SubpassInputMS depth reads - all depth-reading postfx shaders in a chain must agree");
+			postfx_reads_depth = false;
+		}
+		postfx_depth_ms = ms_votes > 0;
 	}
 	if (postfx_reads_depth) {
 		if (!_skr_vk.has_create_renderpass2) {
 			skr_log(skr_log_critical, "PostFX depth read requires VK_KHR_create_renderpass2, which this device lacks");
 			postfx_reads_depth = false;
-		} else if (samples > VK_SAMPLE_COUNT_1_BIT && !_skr_vk.has_depth_stencil_resolve) {
+		} else if (postfx_depth_ms && samples == VK_SAMPLE_COUNT_1_BIT) {
+			// A resource type can't be swapped at pipeline creation, so an
+			// MS-declared shader simply can't run against a 1x pass.
+			skr_log(skr_log_critical, "PostFX declares depth as SubpassInputMS, but this pass is single-sample - use SubpassInput, or render this pass with MSAA");
+			postfx_reads_depth = false;
+		} else if (samples > VK_SAMPLE_COUNT_1_BIT && !postfx_depth_ms && !_skr_vk.has_depth_stencil_resolve) {
 			skr_log(skr_log_critical, "PostFX depth read with MSAA requires VK_KHR_depth_stencil_resolve, which this device lacks");
 			postfx_reads_depth = false;
 		} else if (_skr_format_has_stencil(skr_tex_fmt_to_native(depth->format))) {
 			skr_log(skr_log_critical, "PostFX depth read requires a stencil-free depth format");
 			postfx_reads_depth = false;
-		} else if (samples == VK_SAMPLE_COUNT_1_BIT && !(depth->flags & skr_tex_flags_input_attachment)) {
-			// Under MSAA, postfx reads the pooled resolve transient instead,
-			// so only the direct 1x read needs the usage flag on the caller's
-			// depth texture.
+		} else if ((samples == VK_SAMPLE_COUNT_1_BIT || postfx_depth_ms) && !(depth->flags & skr_tex_flags_input_attachment)) {
+			// Both direct paths (1x, and MSAA via SubpassInputMS) reference the
+			// caller's depth texture as an input attachment, so it needs the
+			// usage flag. The resolving path reads the pooled transient instead.
 			skr_log(skr_log_critical, "PostFX depth read requires the depth texture be created with skr_tex_flags_input_attachment");
 			postfx_reads_depth = false;
 		}
@@ -1317,10 +1348,11 @@ void skr_pass_submit(skr_pass_t* pass) {
 		.resolve_format      = use_msaa  ? skr_tex_fmt_to_native(resolve->format) : VK_FORMAT_UNDEFINED,
 		.samples             = samples,
 		.postfx_reads_depth  = postfx_reads_depth,
+		.postfx_depth_ms     = postfx_reads_depth && postfx_depth_ms,
 		.tile_shading        = pass_tile_shading,
 		.tile_apron          = { (uint8_t)tile_apron[0], (uint8_t)tile_apron[1] },
 		.depth_store_op      = (has_depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-		.color_load_op       = (pass->clear & skr_clear_color) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+		.color_load_op       = _skr_color_load_op(pass->clear),
 		.view_mask           = view_mask,
 		.correlation_mask    = correlation,
 		.subpass_index       = 0,
@@ -1383,7 +1415,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	}
 
 	// Pooled 1x transient the geometry subpass resolves depth into for postfx
-	if (postfx_reads_depth && samples > VK_SAMPLE_COUNT_1_BIT) {
+	if (postfx_reads_depth && samples > VK_SAMPLE_COUNT_1_BIT && !postfx_depth_ms) {
 		depth_resolve_tex = _skr_transient_acquire(rp_key.depth_format, (int32_t)render_width, (int32_t)render_height, view_count, true);
 		if (!depth_resolve_tex) {
 			skr_log(skr_log_critical, "skr_pass_submit: failed to acquire depth resolve target");

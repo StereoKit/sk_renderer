@@ -367,12 +367,15 @@ typedef enum skr_capability_ {
 	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
+// Attachment load behavior. Omitting a bit means LOAD, the most expensive
+// option, a full attachment load plus a barrier to make that load valid.
 typedef enum skr_clear_ {
-	skr_clear_none    = 0,
-	skr_clear_color   = 1 << 0,
-	skr_clear_depth   = 1 << 1,
-	skr_clear_stencil = 1 << 2,
-	skr_clear_all     = skr_clear_color | skr_clear_depth | skr_clear_stencil,
+	skr_clear_none          = 0,
+	skr_clear_color         = 1 << 0,
+	skr_clear_depth         = 1 << 1,
+	skr_clear_stencil       = 1 << 2,
+	skr_clear_color_discard = 1 << 3, // Start with undefined color instead of loading. Cheapest for an attachment the pass fully covers. Ignored if skr_clear_color is set, and depth has no equivalent, it always clears.
+	skr_clear_all           = skr_clear_color | skr_clear_depth | skr_clear_stencil,
 } skr_clear_;
 
 typedef enum skr_acquire_ {
