@@ -245,31 +245,38 @@ skr_err_ skr_surface_create(void* vk_surface_khr, skr_surface_t* out_surface) {
 void skr_surface_destroy(skr_surface_t* ref_surface) {
 	if (!ref_surface) return;
 
-	//vkDeviceWaitIdle(_skr_vk.device);
+	// Callers destroy the native window as soon as this returns, so the
+	// swapchain and surface can't go on a command ring to be destroyed later.
+	_skr_device_wait_idle();
+	skr_destroy_list_t list = _skr_destroy_list_create();
 
 	// Destroy per-frame synchronization objects
 	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++)
-		_skr_cmd_destroy_semaphore(NULL, ref_surface->semaphore_acquire[i]);
+		_skr_cmd_destroy_semaphore(&list, ref_surface->semaphore_acquire[i]);
 
 	// Destroy per-image synchronization objects
 	if (ref_surface->semaphore_submit) {
 		for (uint32_t i = 0; i < ref_surface->image_count; i++)
-			_skr_cmd_destroy_semaphore(NULL, ref_surface->semaphore_submit[i]);
+			_skr_cmd_destroy_semaphore(&list, ref_surface->semaphore_submit[i]);
 		_skr_free(ref_surface->semaphore_submit);
 	}
 
 	// Destroy image views and cached framebuffers
 	if (ref_surface->images) {
 		for (uint32_t i = 0; i < ref_surface->image_count; i++) {
-			_skr_cmd_destroy_framebuffer(NULL, ref_surface->images[i].framebuffer);
-			_skr_cmd_destroy_framebuffer(NULL, ref_surface->images[i].framebuffer_depth);
-			_skr_cmd_destroy_image_view (NULL, ref_surface->images[i].view);
+			_skr_cmd_destroy_framebuffer(&list, ref_surface->images[i].framebuffer);
+			_skr_cmd_destroy_framebuffer(&list, ref_surface->images[i].framebuffer_depth);
+			_skr_cmd_destroy_image_view (&list, ref_surface->images[i].view);
 		}
 		_skr_free(ref_surface->images);
 	}
 
-	_skr_cmd_destroy_surface  (NULL, ref_surface->surface  );
-	_skr_cmd_destroy_swapchain(NULL, ref_surface->swapchain);
+	// Executes LIFO, so the surface outlives the swapchain
+	_skr_cmd_destroy_surface  (&list, ref_surface->surface  );
+	_skr_cmd_destroy_swapchain(&list, ref_surface->swapchain);
+
+	_skr_destroy_list_execute(&list);
+	_skr_destroy_list_free   (&list);
 
 	*ref_surface = (skr_surface_t){0};
 }
