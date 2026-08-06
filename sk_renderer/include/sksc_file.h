@@ -101,8 +101,9 @@ typedef enum {
 
 // Current .sks container version written by skshaderc. Version must match
 // exactly to load — .sks files carry no back-compat by policy; recompile
-// shaders when this bumps.
-#define SKSC_FILE_VERSION 12
+// shaders when this bumps. SMOL-V stage blobs carry no version of their own, so
+// a change to that encoding bumps this too (smolv.h).
+#define SKSC_FILE_VERSION 13
 
 // WGSL stages replace the SPIR-V ViewIndex builtin with a system-owned spec
 // constant named sk_view_index (default 0) using this reserved constant id —

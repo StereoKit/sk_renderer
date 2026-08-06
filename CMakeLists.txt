@@ -211,6 +211,7 @@ target_sources(sk_renderer PRIVATE
 	sk_renderer/include/sk_renderer.h
 	sk_renderer/skr_log.c
 	sk_renderer/sksc_file.c
+	sk_renderer/smolv.c
 )
 if(NOT SKR_USE_WEBGPU)
 	target_sources(sk_renderer PRIVATE

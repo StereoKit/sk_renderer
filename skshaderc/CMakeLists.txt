@@ -337,7 +337,7 @@ if(SKSHADERC_ENABLE_SVSL)
 	message(STATUS "Fetching SVSL...")
 	FetchContent_Declare( SVSL
 		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
-		GIT_TAG        v2026.7.21
+		GIT_TAG        v2026.8.6
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
@@ -363,6 +363,7 @@ target_sources(skshaderc_lib PRIVATE
 	miniz.cpp
 	miniz.h
 	../sk_renderer/sksc_file.c
+	../sk_renderer/smolv.c
 )
 target_include_directories(skshaderc_lib PUBLIC
 	${CMAKE_CURRENT_SOURCE_DIR}

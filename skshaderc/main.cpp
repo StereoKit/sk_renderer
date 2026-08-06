@@ -171,6 +171,19 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 	result.shaderc.silent_info   = false;
 	result.shaderc.silent_warn   = false;
 
+	// The option loop below stops at argc-1 to leave the shader file, so help
+	// needs its own pass or a lone '--help' is read as a filename.
+	for (int32_t i=1; i<argc; i++) {
+		if (strcmp(argv[i], "-help") == 0 ||
+			strcmp(argv[i], "-?"   ) == 0 ||
+			strcmp(argv[i], "--help") == 0 ||
+			strcmp(argv[i], "/?"   ) == 0) {
+			*exit = true;
+			show_usage();
+			return result;
+		}
+	}
+
 	// Get the inlcude folder
 	file_dir(argv[argc-1], result.shaderc.folder, sizeof(result.shaderc.folder));
 
@@ -197,11 +210,7 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		         strcmp(argv[i], "-O2") == 0) result.shaderc.optimize = 2;
 		else if (strcmp(argv[i], "-o3") == 0 ||
 		         strcmp(argv[i], "-O3") == 0) result.shaderc.optimize = 3;
-		else if (strcmp(argv[i], "-help" ) == 0 ||
-		         strcmp(argv[i], "-?" ) == 0 ||
-		         strcmp(argv[i], "--help" ) == 0 ||
-		         strcmp(argv[i], "/?" ) == 0 ) *exit = true;
-		else if (strcmp(argv[i], "-cs") == 0 && i<argc-1) { strncpy(result.shaderc.cs_entrypoint, argv[i+1], sizeof(result.shaderc.cs_entrypoint)); i++; }
+		else if (strcmp(argv[i], "-cs") == 0 && i<argc-1){ strncpy(result.shaderc.cs_entrypoint, argv[i+1], sizeof(result.shaderc.cs_entrypoint)); i++; }
 		else if (strcmp(argv[i], "-vs") == 0 && i<argc-1) { strncpy(result.shaderc.vs_entrypoint, argv[i+1], sizeof(result.shaderc.vs_entrypoint)); i++; }
 		else if (strcmp(argv[i], "-ps") == 0 && i<argc-1) { strncpy(result.shaderc.ps_entrypoint, argv[i+1], sizeof(result.shaderc.ps_entrypoint)); i++; }
 		else if (strcmp(argv[i], "-i" ) == 0 && i<argc-1) {
@@ -257,7 +266,9 @@ Usage: skshaderc [options] target_file
 
 Options:
 	-h		Output a C header file with a byte array instead of a binary file.
-	-z		Zips and compresses output data with miniz
+	-z		Zips and compresses output data with miniz. SPIR-V stages are
+			always stored in the more compressible SMOL-V form, which
+			makes this a much bigger win than it is on raw SPIR-V.
 	-raw		Outputs the raw shader stage data as additional files in the same
 			directory. Useful for debugging shader transpilation.
 	-sk		This outputs a StereoKit compatible C# file for the shader, and
@@ -376,7 +387,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		// Turn the shader data into a binary file
 		void*    sks_data;
 		uint32_t sks_size;
-		sksc_build_file(&file, &sks_data, &sks_size);
+		sksc_build_file(&file, settings->shaderc.debug, &sks_data, &sks_size);
 		
 		// Zip data
 		bool err = false;
