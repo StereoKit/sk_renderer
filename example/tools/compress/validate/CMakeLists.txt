@@ -17,7 +17,9 @@ target_include_directories(astc_validate PRIVATE
 	${stb_SOURCE_DIR}
 )
 
-target_link_libraries(astc_validate PRIVATE m)
+if(UNIX)
+	target_link_libraries(astc_validate PRIVATE m)
+endif()
 
 # Match the project's C standard so we don't surprise with compiler quirks.
 set_target_properties(astc_validate PROPERTIES

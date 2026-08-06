@@ -6,8 +6,8 @@
 
 ///////////////////////////////////////////////////////////////////////////////
 // skr_tex_fmt_ <-> WGPUTextureFormat. Formats WebGPU has no equivalent for
-// (PVRTC, ATC, ETC1, YUV multi-plane, packed depth16s8/24s8 variants beyond
-// Depth24PlusStencil8) map to Undefined and report unsupported.
+// (PVRTC, ATC, HDR ASTC, YUV multi-plane, packed depth16s8/24s8 variants
+// beyond Depth24PlusStencil8) map to Undefined and report unsupported.
 
 WGPUTextureFormat _skr_tex_fmt_to_wgpu(skr_tex_fmt_ format) {
 	switch (format) {
@@ -69,6 +69,10 @@ WGPUTextureFormat _skr_tex_fmt_to_wgpu(skr_tex_fmt_ format) {
 		case skr_tex_fmt_bc7_rgba_srgb: return WGPUTextureFormat_BC7RGBAUnormSrgb;
 		case skr_tex_fmt_bc7_rgba:      return WGPUTextureFormat_BC7RGBAUnorm;
 
+		// ETC1 data is a bit-exact subset of ETC2 RGB8, same as the Vulkan
+		// backend's ETC2_R8G8B8 mapping
+		case skr_tex_fmt_etc1_rgb:      return WGPUTextureFormat_ETC2RGB8Unorm;
+		case skr_tex_fmt_etc1_rgb_srgb: return WGPUTextureFormat_ETC2RGB8UnormSrgb;
 		case skr_tex_fmt_etc2_rgba_srgb:return WGPUTextureFormat_ETC2RGBA8UnormSrgb;
 		case skr_tex_fmt_etc2_rgba:     return WGPUTextureFormat_ETC2RGBA8Unorm;
 		case skr_tex_fmt_etc2_r11:      return WGPUTextureFormat_EACR11Unorm;
@@ -76,6 +80,10 @@ WGPUTextureFormat _skr_tex_fmt_to_wgpu(skr_tex_fmt_ format) {
 
 		case skr_tex_fmt_astc4x4_rgba_srgb: return WGPUTextureFormat_ASTC4x4UnormSrgb;
 		case skr_tex_fmt_astc4x4_rgba:      return WGPUTextureFormat_ASTC4x4Unorm;
+		case skr_tex_fmt_astc6x6_rgba_srgb: return WGPUTextureFormat_ASTC6x6UnormSrgb;
+		case skr_tex_fmt_astc6x6_rgba:      return WGPUTextureFormat_ASTC6x6Unorm;
+		// astc8x8_rgba_hdr stays Undefined: WebGPU's texture-compression-astc
+		// feature is LDR-only; the spec has no HDR ASTC at all
 
 		default:                        return WGPUTextureFormat_Undefined;
 	}
@@ -123,12 +131,16 @@ skr_tex_fmt_ _skr_tex_fmt_from_wgpu(WGPUTextureFormat format) {
 		case WGPUTextureFormat_BC6HRGBFloat:          return skr_tex_fmt_bc6h_rgbf;
 		case WGPUTextureFormat_BC7RGBAUnormSrgb:      return skr_tex_fmt_bc7_rgba_srgb;
 		case WGPUTextureFormat_BC7RGBAUnorm:          return skr_tex_fmt_bc7_rgba;
+		case WGPUTextureFormat_ETC2RGB8Unorm:         return skr_tex_fmt_etc1_rgb;
+		case WGPUTextureFormat_ETC2RGB8UnormSrgb:     return skr_tex_fmt_etc1_rgb_srgb;
 		case WGPUTextureFormat_ETC2RGBA8UnormSrgb:    return skr_tex_fmt_etc2_rgba_srgb;
 		case WGPUTextureFormat_ETC2RGBA8Unorm:        return skr_tex_fmt_etc2_rgba;
 		case WGPUTextureFormat_EACR11Unorm:           return skr_tex_fmt_etc2_r11;
 		case WGPUTextureFormat_EACRG11Unorm:          return skr_tex_fmt_etc2_rg11;
 		case WGPUTextureFormat_ASTC4x4UnormSrgb:      return skr_tex_fmt_astc4x4_rgba_srgb;
 		case WGPUTextureFormat_ASTC4x4Unorm:          return skr_tex_fmt_astc4x4_rgba;
+		case WGPUTextureFormat_ASTC6x6UnormSrgb:      return skr_tex_fmt_astc6x6_rgba_srgb;
+		case WGPUTextureFormat_ASTC6x6Unorm:          return skr_tex_fmt_astc6x6_rgba;
 		default:                                      return skr_tex_fmt_none;
 	}
 }

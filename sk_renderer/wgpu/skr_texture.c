@@ -38,7 +38,8 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_bc1_rgb_srgb: case skr_tex_fmt_bc1_rgb:
 		case skr_tex_fmt_bc1_rgba_srgb: case skr_tex_fmt_bc1_rgba:
 		case skr_tex_fmt_bc4_r: case skr_tex_fmt_bc4_rsn:
-		case skr_tex_fmt_etc1_rgb: case skr_tex_fmt_etc2_r11:
+		case skr_tex_fmt_etc1_rgb: case skr_tex_fmt_etc1_rgb_srgb:
+		case skr_tex_fmt_etc2_r11:
 			w = 4; h = 4; bytes = 8; break;
 
 		case skr_tex_fmt_bc2_rgba_srgb: case skr_tex_fmt_bc2_rgba:
@@ -50,6 +51,12 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_etc2_rg11:
 		case skr_tex_fmt_astc4x4_rgba_srgb: case skr_tex_fmt_astc4x4_rgba:
 			w = 4; h = 4; bytes = 16; break;
+
+		case skr_tex_fmt_astc6x6_rgba_srgb: case skr_tex_fmt_astc6x6_rgba:
+			w = 6; h = 6; bytes = 16; break;
+
+		case skr_tex_fmt_astc8x8_rgba_hdr:
+			w = 8; h = 8; bytes = 16; break;
 
 		// YUV 4:2:0 footprint per 2x2 region, mirroring the Vulkan table; WebGPU
 		// has no YUV format so creation still refuses these.
@@ -361,6 +368,69 @@ skr_err_ skr_tex_set_data(skr_tex_t* ref_tex, const skr_tex_data_t* data) {
 		WGPUExtent3D extent = { extent_w, extent_h, depth };
 		wgpuQueueWriteTexture(_skr_wgpu.queue, &dest, src, (size_t)(slice_size * depth), &layout, &extent);
 		src += slice_size * depth;
+	}
+	return skr_err_success;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// GPU-side upload of a tightly packed mip chain, same contract as the Vulkan
+// backend: whole blocks, mip-major, layers consecutive within each mip.
+// Copies record on the shared encoder, after any compute that filled the
+// buffer.
+//
+// Buffer-to-texture copies need a 256-multiple bytesPerRow, which the packed
+// tail of a mip chain rarely is. Single-block-row copies are exempt from the
+// rule, so unaligned mips copy one block row at a time. Only mips narrower
+// than 256/block_bytes blocks take that path, and those have few rows.
+
+skr_err_ skr_tex_set_buffer(skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint32_t base_mip, uint32_t mip_count) {
+	if (ref_tex == NULL || ref_tex->texture == NULL || buffer == NULL || buffer->buffer == NULL) return skr_err_invalid_parameter;
+	if (mip_count == 0) return skr_err_invalid_parameter;
+	if (base_mip + mip_count > ref_tex->mip_levels) {
+		skr_log(skr_log_warning, "skr_tex_set_buffer: mip range [%u, %u) exceeds texture mip count %u",
+			base_mip, base_mip + mip_count, ref_tex->mip_levels);
+		return skr_err_invalid_parameter;
+	}
+
+	uint32_t block_w, block_h, block_bytes;
+	skr_tex_fmt_block_info(ref_tex->format, &block_w, &block_h, &block_bytes);
+
+	// Like skr_tex_set_data, layout follows the authored dimensions
+	// (data_size, not the block-rounded physical size); extents cover whole blocks
+	skr_vec3i_t        base    = ref_tex->data_size.x > 0 ? ref_tex->data_size : ref_tex->size;
+	bool               is_3d   = (ref_tex->flags & skr_tex_flags_3d) != 0;
+	WGPUCommandEncoder encoder = _skr_cmd_get();
+	uint64_t           offset  = 0;
+	for (uint32_t m = 0; m < mip_count; m++) {
+		uint32_t    mip       = base_mip + m;
+		skr_vec3i_t mip_size  = skr_tex_calc_mip_dimensions(base, mip);
+		uint32_t    blocks_x  = ((uint32_t)mip_size.x + block_w - 1) / block_w;
+		uint32_t    blocks_y  = ((uint32_t)mip_size.y + block_h - 1) / block_h;
+		uint32_t    row_bytes = blocks_x * block_bytes;
+		uint32_t    depth     = is_3d ? (uint32_t)mip_size.z : ref_tex->layer_count;
+		uint64_t    slice     = (uint64_t)row_bytes * blocks_y;
+
+		if (row_bytes % 256 == 0) {
+			WGPUTexelCopyBufferInfo from = {
+				.layout = { .offset = offset, .bytesPerRow = row_bytes, .rowsPerImage = blocks_y },
+				.buffer = buffer->buffer };
+			WGPUTexelCopyTextureInfo to = { .texture = ref_tex->texture, .mipLevel = mip, .origin = { 0, 0, 0 } };
+			WGPUExtent3D extent = { blocks_x * block_w, blocks_y * block_h, depth };
+			wgpuCommandEncoderCopyBufferToTexture(encoder, &from, &to, &extent);
+		} else {
+			for (uint32_t d = 0; d < depth; d++)
+			for (uint32_t row = 0; row < blocks_y; row++) {
+				WGPUTexelCopyBufferInfo from = {
+					.layout = { .offset       = offset + (uint64_t)d * slice + (uint64_t)row * row_bytes,
+					            .bytesPerRow  = WGPU_COPY_STRIDE_UNDEFINED,
+					            .rowsPerImage = WGPU_COPY_STRIDE_UNDEFINED },
+					.buffer = buffer->buffer };
+				WGPUTexelCopyTextureInfo to = { .texture = ref_tex->texture, .mipLevel = mip, .origin = { 0, row * block_h, d } };
+				WGPUExtent3D extent = { blocks_x * block_w, block_h, 1 };
+				wgpuCommandEncoderCopyBufferToTexture(encoder, &from, &to, &extent);
+			}
+		}
+		offset += slice * depth;
 	}
 	return skr_err_success;
 }
@@ -708,7 +778,7 @@ bool skr_tex_fmt_is_supported(skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t
 
 	bool is_bc   = format >= skr_tex_fmt_bc1_rgb_srgb    && format <= skr_tex_fmt_bc7_rgba;
 	bool is_etc  = format >= skr_tex_fmt_etc1_rgb        && format <= skr_tex_fmt_etc2_rg11;
-	bool is_astc = format >= skr_tex_fmt_astc4x4_rgba_srgb && format <= skr_tex_fmt_astc4x4_rgba;
+	bool is_astc = format >= skr_tex_fmt_astc4x4_rgba_srgb && format <= skr_tex_fmt_astc8x8_rgba_hdr;
 	if (is_bc   && !_skr_wgpu.feat_bc)   return false;
 	if (is_etc  && !_skr_wgpu.feat_etc2) return false;
 	if (is_astc && !_skr_wgpu.feat_astc) return false;
