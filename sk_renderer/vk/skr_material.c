@@ -264,7 +264,13 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	}
 	skr_material_bind_t* binds = _skr_bind_pool_get(out_material->bind_start);
 	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i                   ].bind = meta->buffers  [i].bind;
-	for (uint32_t i = 0; i < meta->resource_count; i++) binds[i+meta->buffer_count].bind = meta->resources[i].bind;
+	for (uint32_t i = 0; i < meta->resource_count; i++) {
+		binds[i+meta->buffer_count].bind = meta->resources[i].bind;
+		// Shape bit 6 on sampled textures: the shader uses QCOM image-processing
+		// ops, which require the dedicated IMAGE_PROCESSING sampler at descriptor
+		// time. On storage images the same bit records write usage instead.
+		binds[i+meta->buffer_count].image_proc_sampler = meta->resources[i].bind.register_type == skr_register_texture && (meta->resources[i].shape & SKSC_SHAPE_WRITTEN) != 0; // QCOM sampler bit on sampled textures
+	}
 
 	// Check if we have a buffer bound to the system buffer slot
 	out_material->has_system_buffer = false;
@@ -325,7 +331,9 @@ void skr_material_set_pipeline(skr_material_t* ref_material, skr_material_info_t
 }
 
 bool skr_material_is_valid(const skr_material_t* material) {
-	return material && material->pipeline_material_idx >= 0;
+	// The shader check matters for zero-initialized materials that were never
+	// created: pipeline_material_idx is 0 there, which reads as a valid index.
+	return material && material->key.shader != NULL && material->pipeline_material_idx >= 0;
 }
 
 void skr_material_destroy(skr_material_t* ref_material) {
@@ -662,8 +670,15 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			// the descriptor agree by construction. The producer of an external
 			// texture is responsible for transitioning it to this layout before
 			// any draw that samples it.
+			// Image-processing bindings (BoxFilterQCOM etc.) are only legal with
+			// the dedicated IMAGE_PROCESSING sampler, never the texture's own.
+			// The fallback to tex->sampler only happens when the device lacks the
+			// extension — in which case skr_shader_check_support already failed
+			// this shader and the pipeline is expected to be rejected anyway.
+			VkSampler sampler = (binds[i].image_proc_sampler && _skr_vk.sampler_image_proc != VK_NULL_HANDLE)
+				? _skr_vk.sampler_image_proc : tex->sampler;
 			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
-				.sampler     = tex->sampler,
+				.sampler     = sampler,
 				.imageView   = tex->view,
 				.imageLayout = _skr_tex_sample_layout(tex),
 			};
@@ -746,6 +761,39 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 				.dstBinding      = slot,
 				.descriptorCount = 1,
 				.descriptorType  = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+				.pImageInfo      = &ref_image_infos[*ref_image_ct],
+			};
+			(*ref_write_ct)++;
+			(*ref_image_ct)++;
+		} break;
+		case skr_register_tile_sampled:      // [tile_attachment] Texture2D — VK_QCOM_tile_shading
+		case skr_register_tile_storage: {    // [tile_attachment] RWTexture2D
+			if (*ref_write_ct >= write_max || *ref_image_ct >= image_max) continue;
+
+			skr_tex_t* tex = binds[i].texture;
+			if (!tex) return (int32_t)i;
+
+			// The bound image must be an attachment of the current tile shading
+			// render pass, and the descriptor layout must match the image's
+			// layout during the reading subpass. Sampled: the postfx chain also
+			// references it as an input attachment there, which puts it in
+			// SHADER_READ_ONLY_OPTIMAL — the same layout _skr_tex_sample_layout
+			// reports for a readable color texture. Storage: storage-image
+			// descriptors require GENERAL unconditionally
+			// (VUID-VkWriteDescriptorSet-descriptorType-04152), so the caller
+			// must keep the attachment in GENERAL across the reading subpass.
+			bool sampled = register_type == skr_register_tile_sampled;
+			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
+				.sampler     = sampled ? tex->sampler : VK_NULL_HANDLE,
+				.imageView   = tex->view,
+				.imageLayout = sampled ? _skr_tex_sample_layout(tex) : VK_IMAGE_LAYOUT_GENERAL,
+			};
+			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
+				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstBinding      = slot,
+				.descriptorCount = 1,
+				.descriptorType  = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+				                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 				.pImageInfo      = &ref_image_infos[*ref_image_ct],
 			};
 			(*ref_write_ct)++;

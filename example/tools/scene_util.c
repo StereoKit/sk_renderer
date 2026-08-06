@@ -686,6 +686,7 @@ typedef struct _su_load_request_t {
 
 typedef struct {
 	thrd_t thread;
+	bool   thread_ok; // false where threads don't exist (web) — loads run synchronously
 	mtx_t  queue_mutex;
 	bool   running;
 
@@ -699,6 +700,7 @@ static _su_asset_loader_t _su_loader = {0};
 // Forward declarations
 static void _su_gltf_load_sync(su_gltf_t* gltf);
 static void _su_gltf_mark_loader_done(su_gltf_t* gltf);
+static void _su_load_request_run(_su_load_request_t request);
 
 static int32_t _su_loader_thread(void* arg) {
 	(void)arg;
@@ -722,16 +724,10 @@ static int32_t _su_loader_thread(void* arg) {
 		mtx_unlock(&_su_loader.queue_mutex);
 
 		if (has_request) {
-			switch (request.type) {
-			case _su_load_type_gltf:
-				_su_gltf_load_sync((su_gltf_t*)request.asset);
-				// Publish completion (after every write to the asset) so
-				// su_gltf_destroy can safely free it. Done here in the caller,
-				// not inside _su_gltf_load_sync, so it also covers that
-				// function's early failure returns.
-				_su_gltf_mark_loader_done((su_gltf_t*)request.asset);
-				break;
-			}
+			// Completion publishing (after every write to the asset, so
+			// su_gltf_destroy can safely free it) happens inside the runner,
+			// covering the load function's early failure returns too.
+			_su_load_request_run(request);
 		} else {
 			// Sleep briefly to avoid busy-waiting
 			thrd_sleep(&(struct timespec){.tv_nsec = 10000000}, NULL);  // 10ms
@@ -743,7 +739,23 @@ static int32_t _su_loader_thread(void* arg) {
 	return 0;
 }
 
+static void _su_load_request_run(_su_load_request_t request) {
+	switch (request.type) {
+	case _su_load_type_gltf:
+		_su_gltf_load_sync((su_gltf_t*)request.asset);
+		_su_gltf_mark_loader_done((su_gltf_t*)request.asset);
+		break;
+	}
+}
+
 static void _su_loader_enqueue(_su_load_type_ type, void* asset) {
+	// No loader thread (single-threaded web build): load right here. A frame
+	// hitch, but assets still arrive.
+	if (!_su_loader.thread_ok) {
+		_su_load_request_run((_su_load_request_t){ .type = type, .asset = asset });
+		return;
+	}
+
 	mtx_lock(&_su_loader.queue_mutex);
 
 	int32_t next_head = (_su_loader.request_head + 1) % SU_MAX_PENDING_LOADS;
@@ -768,12 +780,15 @@ void su_initialize(su_file_read_fn file_read_callback, void* user_data) {
 	// Initialize vertex types
 	_su_vertex_types_init();
 
-	// Start asset loading thread
+	// Start asset loading thread. Threadless builds (the web) fall back to
+	// synchronous loading at enqueue time.
 	mtx_init(&_su_loader.queue_mutex, mtx_plain);
 	_su_loader.running      = true;
 	_su_loader.request_head = 0;
 	_su_loader.request_tail = 0;
-	thrd_create(&_su_loader.thread, _su_loader_thread, NULL);
+	_su_loader.thread_ok    = thrd_create(&_su_loader.thread, _su_loader_thread, NULL) == thrd_success;
+	if (!_su_loader.thread_ok)
+		su_log(su_log_info, "Asset loader thread unavailable; assets will load synchronously");
 
 	su_log(su_log_info, "Scene utilities initialized");
 }
@@ -781,7 +796,7 @@ void su_initialize(su_file_read_fn file_read_callback, void* user_data) {
 void su_shutdown(void) {
 	// Stop loading thread
 	_su_loader.running = false;
-	thrd_join(_su_loader.thread, NULL);
+	if (_su_loader.thread_ok) thrd_join(_su_loader.thread, NULL);
 	mtx_destroy(&_su_loader.queue_mutex);
 
 	su_log(su_log_info, "Scene utilities shut down");

@@ -63,7 +63,7 @@ bool                write_file    (const char *filename, void *file_data, size_t
 bool                write_file_txt(const char *filename, void *file_data, size_t file_size);
 bool                write_header  (const char *filename, void *file_data, size_t file_size, bool zipped, const sksc_shader_file_t *shader_file);
 bool                write_skcs    (const char *filename, void *file_data, size_t file_size, const char* original_name, sksc_shader_file_t *file);
-bool                write_stages  (const sksc_shader_file_t *file, const char *folder, bool trailing_slash, const char *name_ext);
+bool                write_stages  (const sksc_shader_file_t *file, const char *folder, const char *trailing_slash, const char *name_ext);
 void                compile_file  (const char *filename, compiler_settings_t *settings);
 void                iterate_dir   (const char *directory_path, void *callback_data, void (*on_item)(void *callback_data, const char *name, bool file));
 compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit); 
@@ -221,7 +221,8 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			const char *targets = argv[i + 1];
 			size_t      len     = strlen(targets);
 			for (size_t i = 0; i < len; i++) {
-				if (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				if      (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				else if (targets[i] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
 				else { printf("Unrecognized shader language target '%c'\n", targets[i]); *exit = true; }
 			}
 			i++;
@@ -299,7 +300,10 @@ Options:
 			specific filename.
 	-t targets	Sets a list of shader language targets to generate. This is a
 			string of characters, where each character represents a language.
-			's' is d3d12 and vulkan spir-v. Default value is 's'.
+			's' is d3d12 and vulkan spir-v. 'w' is WebGPU WGSL, emitted
+			natively by the SVSL backend (the glslang pipeline refuses it).
+			'sw' emits both; 'w' alone makes a web-slim .sks with no SPIR-V
+			blobs. Default value is 's'.
 
 	target_file	This can be any filename, and can use the wildcard '*' to 
 			compile multiple files in the same call.
@@ -442,7 +446,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 
 ///////////////////////////////////////////
 
-bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trailing_slash, const char *name_ext) {
+bool write_stages(const sksc_shader_file_t *file, const char *folder, const char *trailing_slash, const char *name_ext) {
 	bool result = true;
 
 #ifdef SKSC_HAS_SPIRV_TOOLS
@@ -461,6 +465,7 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 			case skr_shader_lang_glsl_es:  lang = "glsl.es";  break;
 			case skr_shader_lang_glsl_web: lang = "glsl.web"; break;
 			case skr_shader_lang_hlsl:     lang = "hlsl";     break;
+			case skr_shader_lang_wgsl:     lang = "wgsl";     break;
 			// Without the SPIRV-Tools disassembler we emit the raw binary module.
 #ifdef SKSC_HAS_SPIRV_TOOLS
 			case skr_shader_lang_spirv:    lang = "spvasm";   break;
@@ -473,7 +478,7 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 			case skr_stage_pixel:   stage_name = "pixel";   break;
 			case skr_stage_vertex:  stage_name = "vertex";  break;
 		}
-		snprintf(sub_filename, sizeof(sub_filename), "%s%s%s.%s.%s", folder, trailing_slash ? "":"/", name_ext, stage_name, lang);
+		snprintf(sub_filename, sizeof(sub_filename), "%s%s%s.%s.%s", folder, trailing_slash, name_ext, stage_name, lang);
 
 		if (stage->language == skr_shader_lang_spirv) {
 #ifdef SKSC_HAS_SPIRV_TOOLS

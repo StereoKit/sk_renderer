@@ -432,7 +432,12 @@ VkBufferUsageFlags _skr_to_vk_buffer_usage(skr_buffer_type_ type) {
 	if (type & skr_buffer_type_vertex)   flags |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 	if (type & skr_buffer_type_index)    flags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 	if (type & skr_buffer_type_constant) flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-	if (type & skr_buffer_type_storage)  flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	// skr_compute_execute_indirect dispatches straight off a storage buffer, and
+	// there's no separate indirect type to key off of, so every storage buffer
+	// carries the bit (VUID-vkCmdDispatchIndirect-buffer-02708). TRANSFER_SRC is
+	// the same story for skr_tex_set_buffer, which copies compute output straight
+	// into an image (VUID-vkCmdCopyBufferToImage-srcBuffer-00174).
+	if (type & skr_buffer_type_storage)  flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	return flags;
 }
 

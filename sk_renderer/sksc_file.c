@@ -52,6 +52,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->resource_count,      &bytes[at], sizeof(meta->resource_count     )); at += sizeof(meta->resource_count);
 	memcpy(&meta->vertex_input_count,  &bytes[at], sizeof(meta->vertex_input_count )); at += sizeof(meta->vertex_input_count);
 	memcpy(&meta->spec_constant_count, &bytes[at], sizeof(meta->spec_constant_count)); at += sizeof(meta->spec_constant_count);
+	memcpy(&meta->sampler_count,       &bytes[at], sizeof(meta->sampler_count      )); at += sizeof(meta->sampler_count);
 	memcpy(&meta->features,            &bytes[at], sizeof(meta->features));            at += sizeof(meta->features);
 	memcpy(&meta->features_reserved,   &bytes[at], sizeof(meta->features_reserved));   at += sizeof(meta->features_reserved);
 
@@ -62,6 +63,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	memcpy(&meta->ops_pixel.tex_read,      &bytes[at], sizeof(meta->ops_pixel.tex_read));      at += sizeof(meta->ops_pixel.tex_read);
 	memcpy(&meta->ops_pixel.dynamic_flow,  &bytes[at], sizeof(meta->ops_pixel.dynamic_flow));  at += sizeof(meta->ops_pixel.dynamic_flow);
 	memcpy(&meta->wave_size,               &bytes[at], sizeof(meta->wave_size));               at += sizeof(meta->wave_size);
+	memcpy(&meta->tile_apron,              &bytes[at], sizeof(meta->tile_apron));              at += sizeof(meta->tile_apron);
 
 	// --- Pass 1: scan buffer section to accumulate var/defaults totals ---
 	uint32_t buffer_section_start = at;
@@ -97,13 +99,15 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	size_t vars_size     = sizeof(sksc_shader_var_t          ) * total_var_count;
 	size_t vinputs_size  = sizeof(skr_vert_component_t       ) * meta->vertex_input_count;
 	size_t spec_size     = sizeof(sksc_shader_spec_constant_t) * meta->spec_constant_count;
-	size_t total_size    = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size;
+	size_t sampler_size  = sizeof(sksc_shader_sampler_t      ) * meta->sampler_count;
+	size_t total_size    = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size + sampler_size;
 
 	if (total_size == 0) {
 		meta->buffers        = NULL;
 		meta->resources      = NULL;
 		meta->vertex_inputs  = NULL;
 		meta->spec_constants = NULL;
+		meta->samplers       = NULL;
 		return at;
 	}
 
@@ -114,6 +118,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 	meta->resources      = (sksc_shader_resource_t     *)(block + buffers_size);
 	meta->vertex_inputs  = (skr_vert_component_t       *)(block + buffers_size + res_size + vars_size + total_defaults_size);
 	meta->spec_constants = (sksc_shader_spec_constant_t*)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size);
+	meta->samplers       = (sksc_shader_sampler_t      *)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size);
 	uint8_t *vars_cursor     = block + buffers_size + res_size;
 	uint8_t *defaults_cursor = block + buffers_size + res_size + vars_size;
 
@@ -191,6 +196,15 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 		spec->name_hash = skr_hash(spec->name);
 	}
 
+	for (uint32_t i = 0; i < meta->sampler_count; i++) {
+		sksc_shader_sampler_t *sampler = &meta->samplers[i];
+		memcpy( sampler->name,        &bytes[at], sizeof(sampler->name       )); at += sizeof(sampler->name       );
+		memcpy(&sampler->slot,        &bytes[at], sizeof(sampler->slot       )); at += sizeof(sampler->slot       );
+		memcpy(&sampler->stage_bits,  &bytes[at], sizeof(sampler->stage_bits )); at += sizeof(sampler->stage_bits );
+		memcpy(&sampler->paired_slot, &bytes[at], sizeof(sampler->paired_slot)); at += sizeof(sampler->paired_slot);
+		sampler->name_hash = skr_hash(sampler->name);
+	}
+
 	return at;
 }
 
@@ -199,7 +213,7 @@ static uint32_t _sksc_load_meta(const uint8_t *bytes, uint32_t at, sksc_shader_m
 sksc_result_ sksc_shader_file_load_memory(const void *data, uint32_t size, sksc_shader_file_t *out_file) {
 	uint16_t file_version = 0;
 	if (!sksc_shader_file_verify(data, size, &file_version, NULL, 0)) return sksc_result_bad_format;
-	if (file_version != 10)                                           return sksc_result_old_version;
+	if (file_version != SKSC_FILE_VERSION)                            return sksc_result_old_version; // exact match only — no .sks back-compat by policy
 
 	const uint8_t *bytes = (uint8_t*)data;
 	uint32_t at = 10;
@@ -261,6 +275,17 @@ skr_bind_t sksc_shader_meta_get_bind(const sksc_shader_meta_t *meta, const char 
 
 ///////////////////////////////////////////////////////////////////////////////
 
+uint64_t sksc_shader_meta_missing_features(const sksc_shader_meta_t *meta, uint64_t enabled_features) {
+	if (meta == NULL) return 0;
+	// Every requirement bit the shader declared that the capability mask doesn't
+	// advertise. The compiler sets sksc_feature_bit_unknown when it saw a
+	// capability it couldn't classify; a capability mask must never claim that
+	// bit, so an unverifiable requirement always surfaces here.
+	return meta->features & ~enabled_features;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 int32_t sksc_shader_meta_get_var_count(const sksc_shader_meta_t *meta) {
 	return meta->global_buffer_id != -1
 		? (int32_t)meta->buffers[meta->global_buffer_id].var_count
@@ -301,7 +326,9 @@ const sksc_shader_var_t *sksc_shader_meta_get_var_info(const sksc_shader_meta_t 
 void sksc_shader_meta_free(sksc_shader_meta_t *ref_meta) {
 	if (!ref_meta) return;
 	// All sub-arrays (resources, vertex_inputs, per-buffer vars/defaults)
-	// are carved from the single allocation starting at buffers.
+	// are carved from the single allocation starting at buffers. The compiler
+	// paths can grow samplers as a standalone allocation, marked by the flag.
+	if (ref_meta->samplers_owned) free(ref_meta->samplers);
 	free(ref_meta->buffers);
 	*ref_meta = (sksc_shader_meta_t){0};
 }

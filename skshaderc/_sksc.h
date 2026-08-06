@@ -26,7 +26,7 @@ struct sksc_ast_default_t {
 
 void                        sksc_glslang_init          ();
 void                        sksc_glslang_shutdown      ();
-compile_result_             sksc_hlsl_to_spirv         (const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, const char** defines, int32_t define_count, sksc_shader_file_stage_t *out_stage);
+compile_result_             sksc_hlsl_to_spirv         (const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, sksc_shader_file_stage_t *out_stage);
 
 array_t<sksc_ast_default_t> sksc_hlsl_find_initializers(const char *hlsl_text);
 bool                        sksc_hlsl_to_bytecode      (const char *filename, const char *hlsl_text, const sksc_settings_t *settings, skr_stage_ type, sksc_shader_file_stage_t *out_stage);

@@ -28,6 +28,17 @@ extern "C" {
 	#define SKR_API
 #endif
 
+// The graphics backend is a build-time choice, normally propagated by CMake as
+// a PUBLIC compile definition (SKR_VK or SKR_WEBGPU). When neither is defined,
+// such as when these headers are consumed without the CMake target, default to
+// Vulkan.
+#if !defined(SKR_VK) && !defined(SKR_WEBGPU)
+	#define SKR_VK
+#endif
+#if defined(SKR_VK) && defined(SKR_WEBGPU)
+	#error "SKR_VK and SKR_WEBGPU are mutually exclusive, pick one backend"
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 
 typedef struct skr_vec2_t {
@@ -352,8 +363,10 @@ typedef enum skr_log_ {
 	skr_log_critical,
 } skr_log_;
 
+// Capability queries. The external_* and vk_video entries are Vulkan concepts
+// and always report false on the WebGPU backend.
 typedef enum skr_capability_ {
-	skr_capability_external_vk,           // Same-device VkImage import (always true)
+	skr_capability_external_vk,           // Same-device VkImage import (always true on Vulkan)
 	skr_capability_external_gl,           // GL interop via external memory FD/Win32
 	skr_capability_external_ahb,          // Android Hardware Buffer
 	skr_capability_external_dma,          // DMA-BUF via VK_EXT_external_memory_dma_buf
@@ -362,12 +375,15 @@ typedef enum skr_capability_ {
 	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
+// Attachment load behavior. Omitting a bit means LOAD, the most expensive
+// option, a full attachment load plus a barrier to make that load valid.
 typedef enum skr_clear_ {
-	skr_clear_none    = 0,
-	skr_clear_color   = 1 << 0,
-	skr_clear_depth   = 1 << 1,
-	skr_clear_stencil = 1 << 2,
-	skr_clear_all     = skr_clear_color | skr_clear_depth | skr_clear_stencil,
+	skr_clear_none          = 0,
+	skr_clear_color         = 1 << 0,
+	skr_clear_depth         = 1 << 1,
+	skr_clear_stencil       = 1 << 2,
+	skr_clear_color_discard = 1 << 3, // Start with undefined color instead of loading. Cheapest for an attachment the pass fully covers. Ignored if skr_clear_color is set, and depth has no equivalent, it always clears.
+	skr_clear_all           = skr_clear_color | skr_clear_depth | skr_clear_stencil,
 } skr_clear_;
 
 typedef enum skr_acquire_ {
@@ -437,6 +453,7 @@ typedef enum skr_gpu_ {
 	skr_gpu_video      = 1 << 2,  // GPU with hardware video decode support
 } skr_gpu_;
 
+#ifdef SKR_VK
 // Callback info returned from device_init_callback
 // Allows external systems (e.g., OpenXR) to specify device requirements
 // after VkInstance is created but before VkDevice is created.
@@ -483,6 +500,7 @@ typedef struct skr_device_create_info_t {
 // user_data: User-provided context pointer
 // Returns: Created VkDevice, or NULL on failure
 typedef void* (*skr_device_create_callback_t)(skr_device_create_info_t* create_info, void* user_data);
+#endif // SKR_VK
 
 // Bind slot configuration for shader/renderer coordination.
 // These values must match between skshaderc and sk_renderer.
@@ -510,6 +528,17 @@ typedef struct skr_settings_t {
 	const char** required_extensions;
 	uint32_t     required_extension_count;
 
+#ifdef SKR_WEBGPU
+	// WebGPU pre-initialization. On web, JS must acquire the GPUDevice before
+	// main() runs (browsers can never block), and pass it in here — wgpu_device
+	// is mandatory on web. On native builds all three may be NULL, and
+	// sk_renderer requests an adapter/device itself.
+	void*        wgpu_instance;   // WGPUInstance (required when wgpu_device is set)
+	void*        wgpu_adapter;    // WGPUAdapter, optional
+	void*        wgpu_device;     // WGPUDevice — mandatory on web, optional on native
+#endif
+
+#ifdef SKR_VK
 	// Instance creation callback (optional, for OpenXR XR_KHR_vulkan_enable2 etc.)
 	// If provided, called instead of vkCreateInstance to allow external systems
 	// to create the VkInstance (e.g., via xrCreateVulkanInstanceKHR).
@@ -527,6 +556,7 @@ typedef struct skr_settings_t {
 	// to create the VkDevice (e.g., via xrCreateVulkanDeviceKHR).
 	skr_device_create_callback_t device_create_callback;
 	void*                        device_create_user_data;
+#endif // SKR_VK
 
 	void*      (*malloc_func) (size_t size);
 	void*      (*calloc_func) (size_t count, size_t size);
@@ -630,12 +660,11 @@ typedef struct skr_pass_t {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// While this project is primarily Vulkan, the option to add backends in the
-// future would be nice. WebGPU or D3D12 could be targets. However, we don't
-// want to introduce pointer indirection to core graphics assets! We risk a bit
-// of API bleed by letting each backend define its own structs, but gain the
+// While this project is primarily Vulkan, backends are selectable at build
+// time (SKR_VK / SKR_WEBGPU, see the top of this header). We don't want to
+// introduce pointer indirection to core graphics assets! We risk a bit of API
+// bleed by letting each backend define its own structs, but gain the
 // flexibility to manage the memory our structures use.
-#define SKR_VK
 #ifdef SKR_VK
 #include "../vk/skr_vulkan.h"
 SKR_API VkInstance        skr_get_vk_instance              (void);
@@ -648,6 +677,42 @@ SKR_API uint32_t          skr_get_vk_video_decode_queue_family (void);  // UINT3
 SKR_API void              skr_get_vk_device_uuid               (uint8_t out_uuid[VK_UUID_SIZE]);
 SKR_API void              skr_vk_queue_lock                    (uint32_t queue_family);
 SKR_API void              skr_vk_queue_unlock                  (uint32_t queue_family);
+
+// Vulkan extension & feature requests. Register before skr_init; a request is
+// copied, persists across skr_shutdown/skr_init, and enables atomically when
+// all its extensions are present and every requested feature bit is supported,
+// queried before enabling. Feature structs merge across requests by sType on
+// VkDeviceCreateInfo.pNext; a `required` request that can't be met fails init.
+typedef struct skr_vk_feature_t {
+	const void* vk_struct; // VkPhysicalDevice*Features with sType set and desired bits VK_TRUE. Not VkPhysicalDeviceFeatures2.
+	int32_t     size;
+} skr_vk_feature_t;
+
+typedef struct skr_vk_request_t {
+	const char*             name;      // Handle for skr_vk_request_enabled, NULL = anonymous
+	bool                    required;  // Fail skr_init if this can't be satisfied
+	const char**            instance_extensions;
+	int32_t                 instance_extension_count;
+	const char**            device_extensions;
+	int32_t                 device_extension_count;
+	const skr_vk_feature_t* features;
+	int32_t                 feature_count;
+} skr_vk_request_t;
+
+SKR_API void              skr_vk_request                       (const skr_vk_request_t* request);
+SKR_API bool              skr_vk_request_enabled               (const char* name);
+// True if the extension was enabled at init, regardless of who requested it.
+SKR_API bool              skr_vk_ext_enabled                   (const char* extension_name);
+// vkGetDeviceProcAddr with vkGetInstanceProcAddr fallback, NULL if absent.
+SKR_API void*             skr_vk_get_function                  (const char* function_name);
+#endif
+
+#ifdef SKR_WEBGPU
+#include "../wgpu/skr_webgpu.h"
+SKR_API WGPUInstance      skr_get_wgpu_instance            (void);
+SKR_API WGPUAdapter       skr_get_wgpu_adapter             (void);
+SKR_API WGPUDevice        skr_get_wgpu_device              (void);
+SKR_API WGPUQueue         skr_get_wgpu_queue               (void);
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -659,6 +724,10 @@ SKR_API void              skr_thread_shutdown              (void);
 SKR_API bool              skr_thread_is_initialized        (void);
 SKR_API bool              skr_is_capable                   (skr_capability_ capability);
 
+// Futures track GPU work completion. skr_future_check is a non-blocking poll
+// and is always safe. skr_future_wait blocks until completion — on the WebGPU
+// backend under WASM, blocking is impossible in a browser, so skr_future_wait
+// is a hard error there; structure web code around skr_future_check instead.
 SKR_API skr_future_t      skr_future_get                   (void);
 SKR_API bool              skr_future_check                 (const skr_future_t* future);
 SKR_API void              skr_future_wait                  (const skr_future_t* future);
@@ -698,11 +767,15 @@ SKR_API skr_buffer_t*     skr_mesh_get_vertex_buffer       (const skr_mesh_t*   
 
 SKR_API skr_err_          skr_tex_create                   (skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampler_t sampler, skr_vec3i_t size, int32_t multisample, int32_t mip_count, const skr_tex_data_t* opt_data, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_copy              (const skr_tex_t*     src, skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample, skr_tex_t* out_tex);
+#ifdef SKR_VK
+// External texture import is Vulkan-only — the info structs embed Vulkan
+// handles, and no WebGPU equivalent exists (see skr_capability_external_*).
 SKR_API skr_err_          skr_tex_create_external_vk       (skr_tex_external_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_gl       (skr_tex_external_gl_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_ahb      (skr_tex_external_ahb_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_dma      (skr_tex_external_dma_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_update_external          (      skr_tex_t* ref_tex, skr_tex_external_update_t update);
+#endif
 SKR_API bool              skr_tex_is_valid                 (const skr_tex_t*     tex);
 SKR_API void              skr_tex_destroy                  (      skr_tex_t* ref_tex);
 SKR_API skr_err_          skr_tex_copy                     (const skr_tex_t*     src, skr_tex_t* dst, uint32_t src_mip, uint32_t src_layer, uint32_t dst_mip, uint32_t dst_layer, uint32_t layer_count);
@@ -728,7 +801,10 @@ SKR_API uint32_t          skr_tex_calc_mip_count           (skr_vec3i_t size);
 SKR_API skr_vec3i_t       skr_tex_calc_mip_dimensions      (skr_vec3i_t base_size, uint32_t mip_level);
 SKR_API uint64_t          skr_tex_calc_mip_size            (skr_tex_fmt_ format, skr_vec3i_t base_size, uint32_t mip_level);
 
-SKR_API skr_err_          skr_surface_create               (void* vk_surface_khr, skr_surface_t* out_surface);
+// native_surface is a VkSurfaceKHR under SKR_VK, a WGPUSurface under
+// SKR_WEBGPU. Ownership transfers to the renderer either way: the caller's
+// reference is consumed, and skr_surface_destroy releases it.
+SKR_API skr_err_          skr_surface_create               (void* native_surface, skr_surface_t* out_surface);
 SKR_API bool              skr_surface_is_valid             (const skr_surface_t*     surface);
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
 SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
@@ -777,7 +853,9 @@ SKR_API void              skr_render_list_add_indexed      (skr_render_list_t* r
 
 SKR_API void              skr_renderer_frame_begin         (void);
 SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_surfaces, uint32_t count);  // Submit frame with surface synchronization
+#ifdef SKR_VK
 SKR_API int32_t           skr_renderer_frame_fence_fd      (void);  // Sync FD for the calling thread's most recent submission; call on the frame-submitting thread to get the frame fence. Caller closes it; -1 if unsupported or nothing submitted
+#endif
 SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);

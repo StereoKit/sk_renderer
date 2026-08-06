@@ -669,15 +669,19 @@ static void _run_gpu_sort(scene_gaussian_splat_t* scene, float3 cam_pos) {
 		skr_compute_set_param(&scene->sort_scan,      "e_radixShift", sksc_shader_var_uint, 1, &radix_shift);
 		skr_compute_set_param(&scene->sort_downsweep, "e_radixShift", sksc_shader_var_uint, 1, &radix_shift);
 
-		// Set buffer bindings for ping-pong
+		// Set buffer bindings for ping-pong. Upsweep only reads b_sort, but its
+		// b_alt still has to swap along — WebGPU rejects the same buffer bound
+		// at two writable bindings, even unused ones.
 		if (is_even) {
 			skr_compute_set_buffer(&scene->sort_upsweep,   "b_sort",        &scene->sort_keys_a);
+			skr_compute_set_buffer(&scene->sort_upsweep,   "b_alt",         &scene->sort_keys_b);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sort",        &scene->sort_keys_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_alt",         &scene->sort_keys_b);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sortPayload", &scene->sort_payload_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_altPayload",  &scene->sort_payload_b);
 		} else {
 			skr_compute_set_buffer(&scene->sort_upsweep,   "b_sort",        &scene->sort_keys_b);
+			skr_compute_set_buffer(&scene->sort_upsweep,   "b_alt",         &scene->sort_keys_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sort",        &scene->sort_keys_b);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_alt",         &scene->sort_keys_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sortPayload", &scene->sort_payload_b);

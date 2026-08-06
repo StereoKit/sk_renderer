@@ -1,0 +1,80 @@
+//--name = postfx_fog_tile
+//--apron = 4
+//--fog_color:color = 0.15,0.2,0.25,1
+//--fog_density     = 0.08
+//--scatter_max     = 4
+//--fog_max         = 0.8
+
+#include "common.hlsli"
+
+// Depth-based fog with light scatter, entirely on-tile (VK_QCOM_tile_shading):
+// depth comes in pixel-local as an input attachment (on-tile resolved under
+// MSAA), and the scene color is read as a tile attachment — neighborhood reads
+// straight from tile memory, with the //--apron guaranteeing neighbors exist
+// at tile edges. Nothing is stored to DRAM between the scene and the fog.
+// The scatter kernel is a 3x3 tap cross whose spread grows with fog density,
+// capped at scatter_max = the apron size — reads past the apron are undefined.
+// Compare with postfx_fog_scatter.svsl, the resolve-then-filter version of the
+// same effect (VK_QCOM_image_processing, wider kernel, one extra pass).
+// Requires VK_QCOM_tile_shading — gate on skr_shader_check_support().
+
+[tile_attachment] Texture2D<float4> color; // t0, auto-bound by the pass to the scene target
+SamplerState smp;                          // s0, fuses with color
+
+[[vk::input_attachment_index(1)]] SubpassInput<float> depth;
+
+float4 fog_color;
+float  fog_density;
+float  scatter_max;  // widest tap spread in texels; must stay <= //--apron
+float  fog_max;      // hard ceiling on fog density so distant geometry never fully vanishes
+float2 source_size;  // scene target dimensions, for pixel → uv
+
+struct psIn {
+	float4 pos : SV_POSITION;
+};
+
+psIn vs(uint id : SV_VertexID) {
+	psIn o;
+	float2 uv = float2(id & 2, (id << 1) & 2);
+	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+
+[non_coherent_tile_reads_qcom]
+float4 ps(psIn input) : SV_TARGET {
+	float d = depth.SubpassLoad();
+
+	// Reconstruct view-space distance from [0,1] depth using the projection the
+	// scene was rendered with (system buffer), mirroring cubemap_skybox's
+	// clip→view mul — so the fog can never drift from the camera the way a
+	// hardcoded near/far would. Touches only clip z/w, so projection_inv[0] is
+	// correct even under multiview.
+	float4 vpos = mul(float4(0, 0, d, 1), projection_inv[0]);
+	float  dist = -vpos.z / vpos.w;
+
+	// Exponential-squared (GL_EXP2) fog: density = 1 - exp(-(dist*fog_density)^2),
+	// capped at fog_max. The squared term keeps the foreground crisp and pushes
+	// the ramp into the distance. The cap also bounds the tap spread below,
+	// matching the scatter modes where the capped prepass density narrows the
+	// kernel.
+	float fog_amt = dist * fog_density;
+	float density = min(1.0 - saturate(exp(-fog_amt * fog_amt)), fog_max);
+
+	// 3x3 box taps, spread scaling with density. Linear filtering between
+	// texels keeps the fractional spread smooth.
+	float2 uv     = input.pos.xy / source_size;
+	float2 step   = (density * scatter_max) / source_size;
+	float4 acc =
+		  color.Sample(smp, uv + float2(-step.x, -step.y))
+		+ color.Sample(smp, uv + float2(      0, -step.y))
+		+ color.Sample(smp, uv + float2( step.x, -step.y))
+		+ color.Sample(smp, uv + float2(-step.x,       0))
+		+ color.Sample(smp, uv)
+		+ color.Sample(smp, uv + float2( step.x,       0))
+		+ color.Sample(smp, uv + float2(-step.x,  step.y))
+		+ color.Sample(smp, uv + float2(      0,  step.y))
+		+ color.Sample(smp, uv + float2( step.x,  step.y));
+	float4 scatter = acc / 9.0;
+
+	return float4(lerp(scatter.rgb, fog_color.rgb, density), 1);
+}

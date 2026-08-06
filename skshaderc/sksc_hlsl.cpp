@@ -72,8 +72,8 @@ const char* parse_glslang_error(const char* at) {
 	else if (parse_startswith(at, "WARNING: ")) { level = sksc_log_level_warn; curr += 9;}
 
 	bool has_line = false;
-	int32_t line;
-	int32_t col;
+	int32_t line = 0;
+	int32_t col  = 0; // '(line)' format errors carry no column
 
 	const char* numbers = curr;
 	// Check for 'col:line:' format line numbers
@@ -113,7 +113,7 @@ void log_shader_msgs(glslang::TShader *shader) {
 
 ///////////////////////////////////////////
 
-compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, const char** defines, int32_t define_count, sksc_shader_file_stage_t *out_stage) {
+compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, sksc_shader_file_stage_t *out_stage) {
 	TBuiltInResource default_resource = {};
 	EShMessages      messages         = EShMsgDefault;
 	EShMessages      messages_link    = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgDebugInfo);
@@ -135,7 +135,8 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	shader.setEnvTarget       (glslang::EShTargetSpv,         glslang::EShTargetSpv_1_3);
 	shader.setEnvTargetHlslFunctionality1();
 	shader.setTextureSamplerTransformMode(EShTexSampTransUpgradeTextureRemoveSampler);
-	if (settings->debug) {
+	bool debug = settings->debug;
+	if (debug) {
 		shader.setDebugInfo (true);
 		shader.setSourceFile(filename);
 		shader.addSourceText(hlsl, strlen(hlsl));
@@ -148,14 +149,6 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	shader.setShiftBinding    (glslang::EResUav,     200); // u registers (UAVs)
 
 	shader.setStrings         (shader_strings, 1);
-
-	std::string preamble;
-	if (define_count > 0) {
-		for (int32_t i = 0; i < define_count; i++) {
-			preamble += "#define " + std::string(defines[i]) + "\n";
-		}
-		shader.setPreamble(preamble.c_str());
-	}
 
 	// Setup includer
 	SkscIncluder includer;
@@ -214,12 +207,12 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	std::vector<unsigned int> spirv;
 	spv::SpvBuildLogger logger;
 	glslang::SpvOptions spvOptions;
-	spvOptions.generateDebugInfo                = settings->debug;
-	spvOptions.emitNonSemanticShaderDebugInfo   = settings->debug;
-	spvOptions.emitNonSemanticShaderDebugSource = settings->debug;
+	spvOptions.generateDebugInfo                = debug;
+	spvOptions.emitNonSemanticShaderDebugInfo   = debug;
+	spvOptions.emitNonSemanticShaderDebugSource = debug;
 	// Enable glslang's built-in SPIRV optimizer which includes HLSL-specific
 	// legalization passes (FixStorageClass, InterpolateFixup, CFGCleanup, etc.)
-	spvOptions.disableOptimizer                 = settings->debug || settings->optimize == 0;
+	spvOptions.disableOptimizer                 = debug || settings->optimize == 0;
 	spvOptions.optimizeSize                     = settings->optimize == 1;
 	glslang::GlslangToSpv(*intermediate, spirv, &logger, &spvOptions);
 
@@ -260,33 +253,40 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 				new_binding = old_binding + 0;
 				break;
 				
-			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLER:
+				// s registers - merged into textures (+100)
+				new_binding = old_binding + SKSC_SLOT_TEXTURE;
+				break;
+
+			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-				// t/s registers - shift by 100
-				new_binding = old_binding + 100;
+				// t registers
+				new_binding = old_binding + SKSC_SLOT_TEXTURE;
 				break;
 
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:
 				// Check if it's read-only (StructuredBuffer) or read-write (RWStructuredBuffer)
 				if (binding->resource_type == SPV_REFLECT_RESOURCE_FLAG_SRV) {
 					// StructuredBuffer - t register
-					new_binding = old_binding + 100;
+					new_binding = old_binding + SKSC_SLOT_TEXTURE;
 				} else {
 					// RWStructuredBuffer - u register
-					new_binding = old_binding + 200;
+					new_binding = old_binding + SKSC_SLOT_READWRITE;
 				}
 				break;
 				
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-				// u registers - shift by 200
-				new_binding = old_binding + 200;
+				// u registers
+				new_binding = old_binding + SKSC_SLOT_READWRITE;
 				break;
 
 			case SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-				// input attachments - shift by 300
-				new_binding = old_binding + 300;
+				// input attachments - slot 300 + the declared
+				// [[vk::input_attachment_index(N)]]. glslang's auto-mapper can
+				// give several unregistered SubpassInputs the same binding, so
+				// the attachment index is the only collision-free identity.
+				new_binding = SKSC_SLOT_INPUT_ATT + binding->input_attachment_index;
 				break;
 			default:break;
 		}
@@ -322,7 +322,7 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	// Run additional SPIRV optimization passes after binding remaps.
 	// glslang's optimizer handles HLSL-specific legalization, but we can
 	// squeeze out a bit more with the full performance/size passes.
-	if (settings->debug == false && settings->optimize > 0) {
+	if (!debug && settings->optimize > 0) {
 		spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_1);
 		optimizer.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
 			printf("SPIRV optimization error: %s\n", m);

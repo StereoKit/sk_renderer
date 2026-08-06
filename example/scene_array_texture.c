@@ -84,8 +84,8 @@ static scene_t* _scene_array_texture_create(void) {
 	skr_tex_set_name(&scene->checkerboard_texture, "checkerboard");
 
 	// Create 2-layer array texture (rendered target) - will be created in resize
-	scene->array_render_target.image = VK_NULL_HANDLE;
-	scene->depth_buffer.image        = VK_NULL_HANDLE;
+	scene->array_render_target = (skr_tex_t){0};
+	scene->depth_buffer        = (skr_tex_t){0};
 
 	// Bind textures to materials
 	skr_material_set_tex(&scene->cube_material, "tex", &scene->checkerboard_texture);

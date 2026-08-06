@@ -78,10 +78,13 @@ typedef struct skr_tex_t {
 	VkImage                image;
 	VkDeviceMemory         memory;
 	VkImageView            view;
-	VkFramebuffer          framebuffer;            // Cached framebuffer (color only, no depth)
-	VkFramebuffer          framebuffer_depth;      // Cached framebuffer (color + depth, if last used with depth)
-	VkRenderPass           framebuffer_pass;       // Render pass the color-only framebuffer was created for
-	VkRenderPass           framebuffer_depth_pass; // Render pass the depth framebuffer was created for
+	VkFramebuffer          framebuffer;             // Cached framebuffer (color only, no depth)
+	VkFramebuffer          framebuffer_depth;       // Cached framebuffer (color + depth, if last used with depth)
+	VkRenderPass           framebuffer_pass;        // Render pass the color-only framebuffer was created for
+	VkRenderPass           framebuffer_depth_pass;  // Render pass the depth framebuffer was created for
+	uint64_t               framebuffer_views;       // Fingerprint of the views the cached framebuffer was built
+	uint64_t               framebuffer_depth_views; // from — other attachments can be destroyed while the cache
+	                                                // target survives, so the render pass alone under-keys the cache
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;
@@ -208,6 +211,10 @@ typedef struct  {
 	skr_bind_t bind;
 	uint32_t   buffer_offset; // Offset within buffer (for bump-allocated buffers)
 	uint32_t   buffer_range;  // Range to bind (0 = use buffer->size)
+	// The shader samples this texture with QCOM image-processing ops
+	// (BoxFilterQCOM etc., meta shape bit 6) — descriptor writes must bind
+	// _skr_vk.sampler_image_proc instead of the texture's own sampler.
+	bool       image_proc_sampler;
 } skr_material_bind_t;
 
 // Internal key struct for pipeline-affecting material parameters only.

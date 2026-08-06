@@ -5,10 +5,12 @@
 
 // Optional SVSL (SPIR-V Shading Language) backend for skshaderc. Compiled in
 // only when SKSHADERC_ENABLE_SVSL is set, which links libsvsl and defines
-// SKSC_HAS_SVSL. SVSL emits the very same SKS v9 container skshaderc writes, so
-// this path compiles the source, then loads SVSL's container bytes back through
-// sksc_shader_file_load_memory() to hand the rest of the pipeline (info dump,
-// header/skcs emit, sksc_build_file) an ordinary sksc_shader_file_t.
+// SKSC_HAS_SVSL. SVSL emits the very same SKS container skshaderc writes —
+// version in lockstep via the libsvsl pin, including native WGSL stages for
+// the '-t w' target (no Tint on this path) — so this compiles the source, then
+// loads SVSL's container bytes back through sksc_shader_file_load_memory() to
+// hand the rest of the pipeline (info dump, header/skcs emit, sksc_build_file)
+// an ordinary sksc_shader_file_t.
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -127,6 +129,22 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 	options.entry_compute = settings->cs_entrypoint[0] ? settings->cs_entrypoint : "";
 	options.opt_level     = opt_level;
 
+	// Container languages come straight from -t: SVSL serializes exactly the
+	// requested set (SPIR-V always compiles internally for the reflection
+	// metadata, so '-t w' still validates and reflects fully). WGSL emission is
+	// native — no Tint on this path; stages using features browser WebGPU can't
+	// express are skipped with a located warning, surfaced via the diagnostics
+	// forwarding below.
+	if (settings->target_langs[skr_shader_lang_spirv]) options.targets |= svsl_target_spirv;
+	if (settings->target_langs[skr_shader_lang_wgsl]) {
+		if (svsl_supports_wgsl()) options.targets |= svsl_target_wgsl;
+		else sksc_log(sksc_log_level_warn, "The WGSL target ('-t w') needs an skshaderc whose embedded libsvsl was built with SVSL_ENABLE_WGSL; emitting SPIR-V only");
+	}
+	if (options.targets == 0) {
+		sksc_log(sksc_log_level_err, "No emittable target language for '%s' (the SVSL backend can't produce the requested set)", filename);
+		return false;
+	}
+
 	svsl_source_t source = {};
 	source.text     = hlsl_text;
 	source.length   = -1;
@@ -172,6 +190,9 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 		return false;
 	}
 
+	// The container already carries every requested language: SPIR-V and/or
+	// native WGSL stages plus the v12 standalone-sampler records (split
+	// samplers at s+400, statically paired) — nothing to transpile or reflect.
 	sksc_result_ load = sksc_shader_file_load_memory(sks.data, (uint32_t)sks.size, out_file);
 	svsl_result_free(result);
 

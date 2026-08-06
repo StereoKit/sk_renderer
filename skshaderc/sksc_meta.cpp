@@ -15,7 +15,7 @@
 
 void sksc_line_col (const char *from_text, const char *at, int32_t *out_line, int32_t *out_column);
 int  strcmp_nocase (char const *a, char const *b);
-void parse_semantic(const char* str, char* out_str, int32_t* out_idx);
+void parse_semantic(const char* str, char* out_str, size_t out_size, int32_t* out_idx);
 
 ///////////////////////////////////////////
 // HLSL Source Initializer Parser        //
@@ -220,7 +220,6 @@ array_t<sksc_ast_default_t> sksc_hlsl_find_initializers(const char *hlsl_text) {
 		}
 
 		// We found a type, now parse: type name = initializer;
-		const char *type_start = c;
 		c += type_len;
 		// Skip dimension suffixes like 2, 3, 4, 2x2, 3x3, 4x4
 		while (*c && ((*c >= '0' && *c <= '9') || *c == 'x')) c++;
@@ -403,6 +402,23 @@ static void _sksc_spirv_scan_spec_constants(const sksc_shader_file_stage_t *spir
 
 ///////////////////////////////////////////
 
+// Encode spirv-reflect image traits into sksc_shader_resource_t.shape:
+// bits 0-2 dimension (1 = 2D, 2 = 3D, 3 = cube, 4 = 1D), bit 3 arrayed,
+// bit 4 multisampled, bit 5 depth-comparison
+static uint8_t _sksc_image_shape(const SpvReflectImageTraits *image) {
+	uint8_t shape;
+	switch (image->dim) {
+		case SpvDim1D:   shape = 4; break;
+		case SpvDim3D:   shape = 2; break;
+		case SpvDimCube: shape = 3; break;
+		default:         shape = 1; break; // 2D, SubpassData, Rect
+	}
+	if (image->arrayed)    shape |= SKSC_SHAPE_ARRAYED;
+	if (image->ms)         shape |= SKSC_SHAPE_MS;
+	if (image->depth == 1) shape |= SKSC_SHAPE_COMPARISON;
+	return shape;
+}
+
 bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *ref_meta) {
 	// Create reflection data
 	SpvReflectShaderModule module;
@@ -576,6 +592,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			tex->bind.slot          = binding->binding;
 			tex->bind.stage_bits   |= spirv_stage->stage;
 			tex->bind.register_type = skr_register_texture;
+			tex->shape             |= _sksc_image_shape(&binding->image);
 			strncpy(tex->name, name, sizeof(tex->name));
 		}
 	}
@@ -596,6 +613,8 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			tex->bind.slot          = binding->binding;
 			tex->bind.stage_bits   |= spirv_stage->stage;
 			tex->bind.register_type = skr_register_readwrite_tex;
+			tex->shape             |= _sksc_image_shape(&binding->image);
+			tex->image_format       = (uint8_t)binding->image.image_format;
 			strncpy(tex->name, name, sizeof(tex->name));
 		}
 	}
@@ -666,6 +685,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			res->bind.slot          = binding->binding;
 			res->bind.stage_bits   |= spirv_stage->stage;
 			res->bind.register_type = skr_register_input_attachment;
+			res->shape             |= _sksc_image_shape(&binding->image);
 			strncpy(res->name, name, sizeof(res->name));
 		}
 	}
@@ -704,7 +724,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			
 			char    semantic[64];
 			int32_t semantic_idx = 0;
-			parse_semantic(semantic_str, semantic, &semantic_idx);
+			parse_semantic(semantic_str, semantic, sizeof(semantic), &semantic_idx);
 
 			if (strlen(semantic) > 3 &&
 				tolower(semantic[0]) == 's' &&
@@ -814,15 +834,16 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 
 ///////////////////////////////////////////
 
-void parse_semantic(const char* str, char* out_str, int32_t* out_idx) {
+void parse_semantic(const char* str, char* out_str, size_t out_size, int32_t* out_idx) {
 	const char *curr  = str;
 	char*       write = out_str;
+	char*       end   = out_str + out_size - 1;
 	int         idx   = 0;
 	while (*curr != 0) {
 		if (*curr>='0' && *curr<='9') {
 			idx  = idx * 10;
 			idx += (*curr) - '0';
-		} else {
+		} else if (write < end) {
 			*write = *curr;
 			write++;
 		}

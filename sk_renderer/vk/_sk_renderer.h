@@ -24,6 +24,19 @@ void  _skr_free   (void* ptr);
 // Internal state
 ///////////////////////////////////////////////////////////////////////////////
 
+// Boolean renderpass features, packed into skr_pipeline_renderpass_key_t.flags
+// so a new boolean costs no struct layout churn.
+typedef enum {
+	skr_rp_flag_resolve_subpass    = 1 << 0, // Manual MSAA resolve subpass between geometry and postfx
+	skr_rp_flag_custom_resolve     = 1 << 1, // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
+	skr_rp_flag_postfx_reads_depth = 1 << 2, // Postfx subpasses get depth as an input attachment. Under MSAA,
+	                                         // geometry resolves depth on-tile (VK_KHR_depth_stencil_resolve)
+	skr_rp_flag_postfx_depth_ms    = 1 << 3, // ...unless the postfx shader declared depth as SubpassInputMS,
+	                                         // which reads MSAA depth directly and skips that on-tile resolve
+	skr_rp_flag_tile_shading       = 1 << 4, // VK_QCOM_tile_shading pass: a postfx shader reads an
+	                                         // attachment as a tile attachment (neighborhood reads on-tile)
+} skr_rp_flag_;
+
 typedef struct {
 	VkFormat              color_format;
 	VkFormat              depth_format;
@@ -41,13 +54,19 @@ typedef struct {
 	                                        // content. Single-view (view_mask=0x1) should use 0x1.
 	uint8_t               subpass_index;    // 0 for geometry, 1+ for resolve/postfx subpasses
 	uint8_t               postfx_count;     // 0 = single-subpass (legacy), 1+ = multi-subpass with postfx
-	bool                  has_resolve_subpass;      // Manual MSAA resolve subpass between geometry and postfx
-	bool                  use_custom_resolve_flags; // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
+	uint8_t               tile_apron[2];    // VkRenderPassTileShadingCreateInfoQCOM::tileApronSize, from
+	                                        // the postfx shader's //--apron meta, clamped to maxApronSize
+	uint32_t              flags;            // skr_rp_flag_* bits
 	VkFormat              postfx_output_format;     // Format of the final postfx output attachment
 	VkImageLayout         final_color_layout;       // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_resolve_layout;     // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_depth_layout;       // 0 or DEPTH_STENCIL_ATTACHMENT_OPTIMAL = default; DEPTH_STENCIL_READ_ONLY = readable
 } skr_pipeline_renderpass_key_t;
+// The renderpass cache deduplicates by memcmp over this struct, so its layout
+// must have no padding holes — every byte a named field, single-byte fields in
+// groups of 4/8. The assert trips when a new field breaks that; re-pack (or add
+// explicit pad bytes) rather than letting uninitialized padding poison dedup.
+_Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must stay padding-free for memcmp dedup");
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
 #define skr_MAX_COMMAND_RING    8   // Number of command buffers per thread
@@ -205,7 +224,21 @@ typedef struct {
 	bool                     has_video_decode;            // VK_KHR_video_decode_queue + related extensions
 	bool                     has_ycbcr_conversion;        // VkPhysicalDeviceSamplerYcbcrConversionFeatures::samplerYcbcrConversion
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
+	bool                     has_create_renderpass2;      // VK_KHR_create_renderpass2
+	bool                     has_depth_stencil_resolve;   // VK_KHR_depth_stencil_resolve (implies create_renderpass2)
+	bool                     has_store_op_none;           // VK_ATTACHMENT_STORE_OP_NONE, from any of the KHR/EXT/QCOM extensions
+	bool                     has_subpass_merge_feedback;  // VK_EXT_subpass_merge_feedback + feature bit
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
+	bool                     has_qcom_image_proc;         // VK_QCOM_image_processing + all three feature bits, plus its
+	                                                      // SPIR-V 1.4 prerequisites (VK_KHR_spirv_1_4 + shader_float_controls)
+	                                                      // and VK_KHR_format_feature_flags2
+	bool                     has_qcom_tile_shading;       // VK_QCOM_tile_shading fragment-stage set (tileShading,
+	                                                      // fragmentStage, colorAttachments, sampledAttachments, apron)
+	                                                      // + VK_QCOM_tile_properties + synchronization2 + renderpass2
+	uint32_t                 max_tile_apron;              // VkPhysicalDeviceTileShadingPropertiesQCOM::maxApronSize
+	VkSampler                sampler_image_proc;          // The one legal QCOM image-processing sampler config (nearest,
+	                                                      // clamp-to-edge, lod 0); bound in place of the texture's own
+	                                                      // sampler on bindings whose meta shape declares bit 6
 	uint32_t                 min_subgroup_size;           // From VkPhysicalDeviceSubgroupSizeControlPropertiesEXT
 	uint32_t                 max_subgroup_size;
 	VkShaderStageFlags       required_subgroup_size_stages; // Stages that allow VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
@@ -214,6 +247,17 @@ typedef struct {
 
 	// Capability system (runtime-queried feature support)
 	bool                     capabilities[skr_capability_max];
+
+	char**                   enabled_instance_exts;       // Copied enabled ext names, for skr_vk_ext_enabled
+	uint32_t                 enabled_instance_ext_count;
+	char**                   enabled_device_exts;         // Copied enabled ext names, for skr_vk_ext_enabled
+	uint32_t                 enabled_device_ext_count;
+
+	// Shader-support mask: bit (1 << sksc_feature_bit_) set iff that device
+	// feature is actually enabled at device creation. Compared against a
+	// shader meta's `features` by skr_shader_check_support. See skr_initialize.c
+	// where it's built, and keep it in sync as new features get enabled.
+	uint64_t                 enabled_features;
 
 	// Memory allocators
 	void*                  (*malloc_func) (size_t size);
@@ -373,6 +417,10 @@ VkImageLayout         _skr_tex_sample_layout                (const skr_tex_t*   
 VkImageLayout         _skr_tex_attachment_layout            (const skr_tex_t*     tex); // Canonical layout for using a texture as a render-pass attachment (color vs depth, picked from aspect_mask)
 void                  _skr_tex_transition_enqueue           (      skr_tex_t* ref_tex, uint8_t type); // Deferred texture transition queue (to avoid in-renderpass barriers) type: 0=shader_read, 1=storage
 void                  _skr_tex_transition_dequeue           (      skr_tex_t* ref_tex);               // Remove from deferred queue (called on texture destroy)
+
+// vkDeviceWaitIdle with every queue mutex held; the plain call implicitly
+// uses all queues and races worker-thread submits (skr_initialize.c)
+void                  _skr_device_wait_idle                 (void);
 
 // Command buffer management
 bool                  _skr_cmd_init                         (void);
