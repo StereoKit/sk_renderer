@@ -129,12 +129,16 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 	options.entry_compute = settings->cs_entrypoint[0] ? settings->cs_entrypoint : "";
 	options.opt_level     = opt_level;
 
-	// Container languages come straight from -t: SVSL serializes exactly the
-	// requested set (SPIR-V always compiles internally for the reflection
-	// metadata, so '-t w' still validates and reflects fully). WGSL emission is
-	// native — no Tint on this path; stages using features browser WebGPU can't
-	// express are skipped with a located warning, surfaced via the diagnostics
-	// forwarding below.
+	// One language per container: the target is fixed before preprocessing so
+	// TARGET_SPIRV/TARGET_WGSL can vary the source, and a container carries a
+	// single reflection table.
+	if (settings->target_langs[skr_shader_lang_spirv] && settings->target_langs[skr_shader_lang_wgsl]) {
+		sksc_log(sksc_log_level_err, "'-t sw' isn't supported: a .sks carries one language. Compile '%s' twice, with '-t s' and '-t w'", filename);
+		return false;
+	}
+	// SPIR-V always compiles internally for the reflection metadata, so '-t w'
+	// still validates and reflects fully. WGSL emission is native (no Tint here),
+	// and stages browser WebGPU can't express are skipped with a located warning.
 	if (settings->target_langs[skr_shader_lang_spirv]) options.targets |= svsl_target_spirv;
 	if (settings->target_langs[skr_shader_lang_wgsl]) {
 		if (svsl_supports_wgsl()) options.targets |= svsl_target_wgsl;

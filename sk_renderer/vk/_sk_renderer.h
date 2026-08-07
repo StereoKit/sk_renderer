@@ -229,6 +229,7 @@ typedef struct {
 	bool                     has_store_op_none;           // VK_ATTACHMENT_STORE_OP_NONE, from any of the KHR/EXT/QCOM extensions
 	bool                     has_subpass_merge_feedback;  // VK_EXT_subpass_merge_feedback + feature bit
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
+	bool                     has_storage_without_format;  // shaderStorageImage(Write+Read)WithoutFormat, for format Unknown storage access
 	bool                     has_qcom_image_proc;         // VK_QCOM_image_processing + all three feature bits, plus its
 	                                                      // SPIR-V 1.4 prerequisites (VK_KHR_spirv_1_4 + shader_float_controls)
 	                                                      // and VK_KHR_format_feature_flags2

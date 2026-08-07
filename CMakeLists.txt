@@ -260,13 +260,12 @@ endif()
 # Built-in shaders: compiled to embedded byte-array headers so they ship inside
 # the library binary. Used as fallbacks when blit-based mipgen isn't supported
 # for a given texture format (see skr_texture.c skr_tex_generate_mips).
-# WebGPU builds add WGSL blobs alongside the SPIR-V. WGSL comes only from the
-# SVSL backend, so those builds pass -svsl — the host tool used by web
-# cross-builds may still carry glslang, and mixing backends isn't allowed.
-if(EMSCRIPTEN)
-	set(_skr_builtin_shader_args "-o3 -e -svsl -t w") # web-slim: WGSL only
-elseif(SKR_USE_WEBGPU)
-	set(_skr_builtin_shader_args "-o3 -e -svsl -t sw")
+# A container carries one language, so the target follows the backend. WGSL
+# comes only from the SVSL backend, so those builds pass -svsl; the host tool
+# for web cross-builds may still carry glslang, and mixing backends isn't
+# allowed.
+if(SKR_USE_WEBGPU) # includes EMSCRIPTEN, which forces it ON above
+	set(_skr_builtin_shader_args "-o3 -e -svsl -t w")
 else()
 	set(_skr_builtin_shader_args "-o3 -e -t s")
 endif()

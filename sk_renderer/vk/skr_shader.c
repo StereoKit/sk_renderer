@@ -38,6 +38,7 @@ void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 
 static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const sksc_shader_file_t* file, skr_stage_ stage_type) {
 	for (uint32_t i = 0; i < file->stage_count; i++) {
+		if (file->stages[i].language != skr_shader_lang_spirv) continue;
 		if (file->stages[i].stage == stage_type && file->stages[i].code_size > 0)
 			return _skr_shader_stage_create(device, file->stages[i].code, file->stages[i].code_size, stage_type);
 	}
@@ -87,6 +88,18 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 		}
 		skr_log(skr_log_critical, "Failed to load shader file: %s", extra);
 		return err;
+	}
+
+	// A container carries one language, so a file built for another backend has
+	// nothing this device can run; without this its stages would reach
+	// vkCreateShaderModule as text.
+	bool has_spirv = false;
+	for (uint32_t i = 0; i < file.stage_count; i++)
+		if (file.stages[i].language == skr_shader_lang_spirv) has_spirv = true;
+	if (!has_spirv) {
+		skr_log(skr_log_critical, "Shader '%s' has no SPIR-V stages, compile it with skshaderc '-t s'", file.meta.name);
+		sksc_shader_file_destroy(&file);
+		return skr_err_unsupported;
 	}
 
 	// Device-support gate, before any VkShaderModule exists: a shader whose

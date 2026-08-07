@@ -66,16 +66,15 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 	for (uint32_t i = 0; i < file.stage_count; i++)
 		if (file.stages[i].language == skr_shader_lang_wgsl) has_wgsl = true;
 	if (!has_wgsl) {
-		skr_log(skr_log_critical, "Shader '%s' has no WGSL stages — compile it with skshaderc '-t sw' (or the shader uses features WebGPU can't express)", file.meta.name);
+		skr_log(skr_log_critical, "Shader '%s' has no WGSL stages, compile it with skshaderc '-t w' (or the shader uses features WebGPU can't express)", file.meta.name);
 		sksc_shader_file_destroy(&file);
 		return skr_err_unsupported;
 	}
 
-	// A stage present in another language but missing from WGSL was skipped at
-	// compile time (a construct WGSL can't express, e.g. a vertex stage writing
-	// storage buffers). The shader can't run as authored, so creation fails —
-	// which routes apps into the same fallback paths an unsupported Vulkan
-	// feature would (e.g. the fog scatter QCOM -> taps fallback).
+	// If a container does carry another language, a stage missing from WGSL was
+	// skipped at compile time (a construct WGSL can't express, like a vertex
+	// stage writing storage buffers), so creation fails and apps take the same
+	// fallback path an unsupported Vulkan feature would give them.
 	for (uint32_t i = 0; i < file.stage_count; i++) {
 		if (file.stages[i].language == skr_shader_lang_wgsl) continue;
 		bool stage_has_wgsl = false;

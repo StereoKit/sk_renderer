@@ -1178,8 +1178,10 @@ bool skr_init(skr_settings_t settings) {
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
 
 	// Track feature availability
-	_skr_vk.has_depth_clamp          = available_features.depthClamp;
-	_skr_vk.has_fill_mode_non_solid  = available_features.fillModeNonSolid;
+	_skr_vk.has_depth_clamp            = available_features.depthClamp;
+	_skr_vk.has_fill_mode_non_solid    = available_features.fillModeNonSolid;
+	_skr_vk.has_storage_without_format = available_features.shaderStorageImageWriteWithoutFormat
+	                                  && available_features.shaderStorageImageReadWithoutFormat;
 
 	// Enable features we need (only if available)
 	VkPhysicalDeviceFeatures device_features = {
@@ -1194,6 +1196,10 @@ bool skr_init(skr_settings_t settings) {
 		.geometryShader                  = available_features.geometryShader,
 		.shaderStorageImageExtendedFormats = available_features.shaderStorageImageExtendedFormats,
 		.shaderInt16                     = available_features.shaderInt16,
+		// sksc compiles RWTextures with SPIR-V format Unknown (DXC-style), so
+		// storage image access is gated on the WithoutFormat pair.
+		.shaderStorageImageWriteWithoutFormat = available_features.shaderStorageImageWriteWithoutFormat,
+		.shaderStorageImageReadWithoutFormat  = available_features.shaderStorageImageReadWithoutFormat,
 	};
 
 	// Query multiview properties (and subgroup size limits if supported)
@@ -1459,6 +1465,8 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_geometry;
 	if (device_features.shaderStorageImageExtendedFormats)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_extended_formats;
+	if (_skr_vk.has_storage_without_format) // Read/write to unknown format textures in SPIRV
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_formatless;
 	if (device_features.shaderInt16)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_int16;
 	if (enable_storage16)

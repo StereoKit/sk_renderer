@@ -135,6 +135,9 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	shader.setEnvTarget       (glslang::EShTargetSpv,         glslang::EShTargetSpv_1_3);
 	shader.setEnvTargetHlslFunctionality1();
 	shader.setTextureSamplerTransformMode(EShTexSampTransUpgradeTextureRemoveSampler);
+	// RWTextures get SPIR-V format Unknown instead of one inferred from the
+	// template (float4 to Rgba32f), like DXC; needs the WithoutFormat features.
+	shader.setNoStorageFormat(true);
 	bool debug = settings->debug;
 	if (debug) {
 		shader.setDebugInfo (true);
