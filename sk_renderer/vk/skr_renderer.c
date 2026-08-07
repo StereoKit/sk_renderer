@@ -1407,6 +1407,15 @@ void skr_pass_submit(skr_pass_t* pass) {
 	uint32_t render_width  = has_color ? color->size.x : (has_depth ? depth->size.x : 0);
 	uint32_t render_height = has_color ? color->size.y : (has_depth ? depth->size.y : 0);
 
+	// Resolve and postfx cover what the geometry drew, so fullscreen shader uv
+	// spans the viewport. An unset viewport means the whole attachment.
+	skr_rect_t  fx_viewport = pass->viewport.w > 0 || pass->viewport.h > 0
+		? pass->viewport
+		: (skr_rect_t ){ 0, 0, (float)render_width, (float)render_height };
+	skr_recti_t fx_scissor  = pass->scissor.w > 0 || pass->scissor.h > 0
+		? pass->scissor
+		: (skr_recti_t){ 0, 0, (int32_t)render_width, (int32_t)render_height };
+
 	for (uint32_t i = 0; i < intermediate_count; i++) {
 		intermediates[i] = _skr_transient_acquire(intermediate_format, (int32_t)render_width, (int32_t)render_height, view_count, false);
 		if (!intermediates[i]) {
@@ -1614,8 +1623,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 				vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 				// Flipped viewport, matching every other pass — fullscreen
 				// shaders use the canonical negated-y vertex formula
-				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)render_height, (float)render_width, -(float)render_height, 0.0f, 1.0f});
-				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {render_width, render_height}});
+				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){fx_viewport.x, fx_viewport.y + fx_viewport.h, fx_viewport.w, -fx_viewport.h, 0.0f, 1.0f});
+				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{fx_scissor.x, fx_scissor.y}, {(uint32_t)fx_scissor.w, (uint32_t)fx_scissor.h}});
 
 				_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
 				                      _skr_pipeline_get_layout(resolve_mat->pipeline_material_idx),
@@ -1688,8 +1697,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 				vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 				// Flipped viewport, matching every other pass — fullscreen
 				// shaders use the canonical negated-y vertex formula
-				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)render_height, (float)render_width, -(float)render_height, 0.0f, 1.0f});
-				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {render_width, render_height}});
+				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){fx_viewport.x, fx_viewport.y + fx_viewport.h, fx_viewport.w, -fx_viewport.h, 0.0f, 1.0f});
+				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{fx_scissor.x, fx_scissor.y}, {(uint32_t)fx_scissor.w, (uint32_t)fx_scissor.h}});
 
 				_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
 				                      _skr_pipeline_get_layout(postfx_mat->pipeline_material_idx),

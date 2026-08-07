@@ -904,7 +904,7 @@ static skr_material_t* _skr_depth_resolve_material(void) {
 // Inputs bind per layer so stereo/layered postfx reads its own layer.
 // Returns false when the stage couldn't draw, so the caller can pass the
 // chain input through instead of leaving the target unwritten.
-static bool _skr_lowered_stage(skr_tex_t* target, skr_material_t* material, skr_tex_t* input_color, skr_tex_t* input_depth, const void* system_data, uint32_t system_data_size) {
+static bool _skr_lowered_stage(skr_tex_t* target, skr_material_t* material, skr_tex_t* input_color, skr_tex_t* input_depth, const skr_recti_t* opt_bounds, const void* system_data, uint32_t system_data_size) {
 	if (!skr_material_is_valid(material) || material->pipeline_material_idx < 0) return false;
 	bool drew = false;
 
@@ -941,8 +941,9 @@ static bool _skr_lowered_stage(skr_tex_t* target, skr_material_t* material, skr_
 		if (pipeline == NULL) { wgpuBindGroupRelease(bind_group); break; }
 
 		WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(_skr_wgpu.device, NULL);
-		// Clear load op: the fullscreen triangle covers everything anyway
-		_skr_fullscreen_pass(encoder, _skr_tex_layer_view(target, layer), WGPULoadOp_Clear, NULL, pipeline, bind_group, dyn_offsets, dyn_count);
+		// Clear load op: the triangle covers the bounds, and the clear takes
+		// care of anything outside them
+		_skr_fullscreen_pass(encoder, _skr_tex_layer_view(target, layer), WGPULoadOp_Clear, opt_bounds, pipeline, bind_group, dyn_offsets, dyn_count);
 		WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, NULL);
 		wgpuCommandEncoderRelease(encoder);
 		wgpuQueueSubmit(_skr_wgpu.queue, 1, &cmd);
@@ -1007,6 +1008,11 @@ void skr_pass_submit(skr_pass_t* pass) {
 	uint32_t    system_data_size = pass->draw_count > 0 ? pass->draws[0].system_data_size : 0;
 	skr_tex_fmt_ chain_fmt = final_output->format;
 
+	// Resolve and postfx cover what the geometry drew, so fullscreen shader uv
+	// spans the scissor. An unset scissor means the whole attachment.
+	skr_recti_t        fx_bounds     = pass->scissor;
+	const skr_recti_t* fx_bounds_opt = fx_bounds.w > 0 || fx_bounds.h > 0 ? &fx_bounds : NULL;
+
 	// Geometry stage. Without a manual resolve material, MSAA hardware-resolves
 	// straight into the first chain input; with one, the MSAA color itself is
 	// the resolve stage's (multisampled) input.
@@ -1030,7 +1036,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	if (postfx_depth && depth && depth->samples > 1) {
 		skr_material_t* resolve_mat = _skr_depth_resolve_material();
 		depth_resolve_out   = resolve_mat ? _skr_transient_acquire(skr_tex_fmt_r32f, depth->size.x, depth->size.y, layers) : NULL;
-		if (depth_resolve_out && _skr_lowered_stage(depth_resolve_out, resolve_mat, depth, NULL, NULL, 0)) {
+		if (depth_resolve_out && _skr_lowered_stage(depth_resolve_out, resolve_mat, depth, NULL, fx_bounds_opt, NULL, 0)) {
 			postfx_depth = depth_resolve_out;
 		} else {
 			static bool warned = false;
@@ -1043,7 +1049,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	if (has_resolve_mat) {
 		skr_tex_t* target = postfx_count > 0 ? _skr_transient_acquire(chain_fmt, color->size.x, color->size.y, layers) : final_output;
 		if (!target) return;
-		_skr_lowered_stage(target, pass->resolve_material, cur, NULL, system_data, system_data_size);
+		_skr_lowered_stage(target, pass->resolve_material, cur, NULL, fx_bounds_opt, system_data, system_data_size);
 		cur = target;
 	}
 
@@ -1056,7 +1062,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 			skr_log(skr_log_critical, "skr_pass_submit: the postfx chain would read and write the same texture; set postfx_output (or use MSAA + resolve)");
 			break;
 		}
-		if (!_skr_lowered_stage(target, postfx[p], cur, postfx_depth, system_data, system_data_size) &&
+		if (!_skr_lowered_stage(target, postfx[p], cur, postfx_depth, fx_bounds_opt, system_data, system_data_size) &&
 		    cur->format == target->format && cur->samples == target->samples) {
 			skr_tex_copy(cur, target, 0, 0, 0, 0, cur->layer_count < target->layer_count ? cur->layer_count : target->layer_count);
 			_skr_cmd_submit(); // later stages read `target` through their own submissions
