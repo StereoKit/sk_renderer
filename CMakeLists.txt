@@ -28,6 +28,7 @@ list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # Build options
 option(SKR_BUILD_SKSHADERC "Build skshaderc shader compiler" ON)
+option(SKR_BUILD_KTX2 "Build the sk_ktx2 KTX2/Basis Universal transcoder" ON)
 option(SKR_BUILD_EXAMPLES "Build sk_renderer example application" ON)
 option(SKR_BUILD_XR_EXAMPLE "Build OpenXR example application (Linux/Windows only)" OFF)
 set(SKR_SK_APP_DIR "" CACHE PATH "Local sk_app checkout for the example (empty = fetch the pinned release)")
@@ -90,6 +91,16 @@ if(SKR_BUILD_SKSHADERC)
 	# - Cross-compiling: builds a second, host-targeted skshaderc to compile
 	#   shaders with, since the target one can't run here
 	add_subdirectory(skshaderc)
+endif()
+
+###############################################################################
+# sk_ktx2 transcoder
+###############################################################################
+
+# Deliberately independent of sk_renderer: it's pure C11 with no GPU work, so
+# StereoKit can link it directly and its conformance runner works headless.
+if(SKR_BUILD_KTX2)
+	add_subdirectory(sk_ktx2)
 endif()
 
 ###############################################################################
