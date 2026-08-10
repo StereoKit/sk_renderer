@@ -181,6 +181,7 @@ typedef struct skr_tex_external_ahb_info_t {
 typedef struct skr_surface_t {
 	VkSurfaceKHR   surface;
 	VkSwapchainKHR swapchain;
+	VkFence        present_fence[SKR_MAX_FRAMES_IN_FLIGHT]; // Signals when that slot's present retires; all null without maintenance1
 	skr_tex_t*     images;
 	uint32_t       image_count;
 	uint32_t       current_image;

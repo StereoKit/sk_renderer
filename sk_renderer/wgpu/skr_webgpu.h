@@ -88,10 +88,7 @@ typedef struct skr_surface_t {
 	WGPUSurface    surface;
 	skr_tex_t      current;       // Wraps the surface's current frame texture between next_tex/present
 	uint32_t       frame_idx;
-	// WebGPU surfaces can't query their window's size, so the app sets `size`
-	// before calling skr_surface_resize (initial size is set at create time
-	// from the first configure default)
-	skr_vec2i_t    size;
+	skr_vec2i_t    size;          // Extent the surface is configured at, from create/resize
 	uint32_t       format;        // WGPUTextureFormat the surface is configured with
 	// Format frame views are created with. Differs from `format` on the web:
 	// canvases only configure base (non-sRGB) formats, and the sRGB encode

@@ -316,6 +316,24 @@ static void _skr_register_internal_requests(void) {
 		.feature_count          = 1,
 	});
 
+	// Present fences make swapchain teardown exact: a present's semaphore
+	// waits and image use are otherwise unobservable, and surface resize must
+	// fall back to a full device idle before destroying the old swapchain.
+	// Promoted to KHR, but drivers keep advertising the EXT spelling.
+	skr_vk_request(&(skr_vk_request_t){
+		.name                     = "swapchain_maintenance1",
+		.instance_extensions      = (const char*[]){ VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+		                                             VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME },
+		.instance_extension_count = 2,
+		.device_extensions        = (const char*[]){ VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME },
+		.device_extension_count   = 1,
+		.features                 = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT){
+			.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+			.swapchainMaintenance1 = VK_TRUE,
+		}, sizeof(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT) } },
+		.feature_count            = 1,
+	});
+
 	// QCOM image processing: each op family is its own feature and sksc bit, so
 	// each is its own request. The shaders are SPIR-V 1.4, hence the ext chain.
 	const char* image_proc_exts[] = {
@@ -1146,6 +1164,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_external_fence_fd       = skr_vk_request_enabled(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
 	_skr_vk.has_create_renderpass2      = skr_vk_request_enabled(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
 	_skr_vk.has_depth_stencil_resolve   = skr_vk_request_enabled("depth_stencil_resolve");
+	_skr_vk.has_present_fence           = skr_vk_request_enabled("swapchain_maintenance1");
 	_skr_vk.has_subpass_merge_feedback  = skr_vk_request_enabled("subpass_merge_feedback");
 	_skr_vk.has_subgroup_size_control   = skr_vk_request_enabled("subgroup_size_control");
 	_skr_vk.has_ycbcr_conversion        = skr_vk_request_enabled("ycbcr_conversion");

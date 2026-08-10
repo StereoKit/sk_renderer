@@ -226,6 +226,7 @@ typedef struct {
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
 	bool                     has_create_renderpass2;      // VK_KHR_create_renderpass2
 	bool                     has_depth_stencil_resolve;   // VK_KHR_depth_stencil_resolve (implies create_renderpass2)
+	bool                     has_present_fence;           // VK_EXT_swapchain_maintenance1, fences observe present completion
 	bool                     has_store_op_none;           // VK_ATTACHMENT_STORE_OP_NONE, from any of the KHR/EXT/QCOM extensions
 	bool                     has_subpass_merge_feedback;  // VK_EXT_subpass_merge_feedback + feature bit
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature

@@ -28,15 +28,24 @@ static VkSurfaceFormatKHR _skr_find_surface_format(const VkSurfaceFormatKHR* for
 
 // Helper to create/recreate swapchain and allocate resources
 static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys_device, uint32_t graphics_queue_family, skr_surface_t* ref_surface, VkSwapchainKHR old_swapchain) {
-	// Get surface capabilities
-	VkSurfaceCapabilitiesKHR capabilities;
-	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_device, ref_surface->surface, &capabilities);
+	// Get surface capabilities. An unchecked failure here leaves the whole
+	// struct uninitialized, and every value below is read from it.
+	VkSurfaceCapabilitiesKHR capabilities = {0};
+	VkResult caps_result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_device, ref_surface->surface, &capabilities);
+	SKR_VK_CHECK_RET(caps_result, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", false);
 
-	// Get surface formats
-	uint32_t            format_count;
+	// Get surface formats. The count from the first call is the driver's total,
+	// so it has to be clamped to the array before the second call fills it.
+	uint32_t            format_count = 0;
 	VkSurfaceFormatKHR  formats[64];
 	vkGetPhysicalDeviceSurfaceFormatsKHR(phys_device, ref_surface->surface, &format_count, NULL);
+	if (format_count > sizeof(formats) / sizeof(formats[0]))
+		format_count = sizeof(formats) / sizeof(formats[0]);
 	vkGetPhysicalDeviceSurfaceFormatsKHR(phys_device, ref_surface->surface, &format_count, formats);
+	if (format_count == 0) {
+		skr_log(skr_log_critical, "Surface reports no formats");
+		return false;
+	}
 
 	// Choose format based on platform preference
 	// Android/mobile: prefer RGBA for native GPU ordering
@@ -59,10 +68,12 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 
 	VkSurfaceFormatKHR surface_format = _skr_find_surface_format(formats, format_count, preferred_formats, sizeof(preferred_formats) / sizeof(preferred_formats[0]));
 
-	// Get present modes
-	uint32_t         present_mode_count;
+	// Get present modes, clamped to the array as above
+	uint32_t         present_mode_count = 0;
 	VkPresentModeKHR present_modes[16];
 	vkGetPhysicalDeviceSurfacePresentModesKHR(phys_device, ref_surface->surface, &present_mode_count, NULL);
+	if (present_mode_count > sizeof(present_modes) / sizeof(present_modes[0]))
+		present_mode_count = sizeof(present_modes) / sizeof(present_modes[0]);
 	vkGetPhysicalDeviceSurfacePresentModesKHR(phys_device, ref_surface->surface, &present_mode_count, present_modes);
 
 	// Choose present mode: prefer FIFO_RELAXED (vsync but tolerant of missed
@@ -76,12 +87,24 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		}
 	}
 
-	// Determine extent
+	// Determine extent. A currentExtent of UINT32_MAX means the surface cannot
+	// report a size and the client picks one; Wayland always answers this way,
+	// the same as WebGPU. The app pushes the window size into ref_surface->size
+	// for exactly this case, so prefer that over any invented default.
 	VkExtent2D extent = capabilities.currentExtent;
 	if (extent.width == UINT32_MAX) {
-		// If current extent is undefined, use a default size
-		extent.width  = 1280;
-		extent.height = 720;
+		if (ref_surface->size.x > 0 && ref_surface->size.y > 0) {
+			extent.width  = (uint32_t)ref_surface->size.x;
+			extent.height = (uint32_t)ref_surface->size.y;
+		} else {
+			extent.width  = 1280;
+			extent.height = 720;
+		}
+		// The chosen size still has to satisfy the surface's own limits
+		if (extent.width  < capabilities.minImageExtent.width ) extent.width  = capabilities.minImageExtent.width;
+		if (extent.height < capabilities.minImageExtent.height) extent.height = capabilities.minImageExtent.height;
+		if (extent.width  > capabilities.maxImageExtent.width ) extent.width  = capabilities.maxImageExtent.width;
+		if (extent.height > capabilities.maxImageExtent.height) extent.height = capabilities.maxImageExtent.height;
 	}
 
 	// Handle minimized window (0x0 extent)
@@ -117,7 +140,8 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 	VkResult vr = vkCreateSwapchainKHR(device, &swapchain_info, NULL, &swapchain);
 	SKR_VK_CHECK_RET(vr, "vkCreateSwapchainKHR", false);
 
-	// Destroy old swapchain if provided
+	// The caller waited the surface quiet (present fences, or device idle on
+	// the fallback path), so the retired old swapchain can go right away.
 	if (old_swapchain != VK_NULL_HANDLE) {
 		vkDestroySwapchainKHR(device, old_swapchain, NULL);
 	}
@@ -201,11 +225,15 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 	return true;
 }
 
-skr_err_ skr_surface_create(void* vk_surface_khr, skr_surface_t* out_surface) {
+skr_err_ skr_surface_create(void* vk_surface_khr, skr_vec2i_t size, skr_surface_t* out_surface) {
 	if (!out_surface) return skr_err_invalid_parameter;
 
 	// Zero out immediately
 	*out_surface = (skr_surface_t){0};
+
+	// Only consulted when the surface cannot report its own extent, which is
+	// Wayland. The swapchain overwrites this with the extent it settled on.
+	out_surface->size = size;
 
 	if (!skr_is_capable(skr_capability_presentation)) {
 		skr_log(skr_log_critical, "skr_surface_create: VK_KHR_surface/VK_KHR_swapchain not available (headless?)");
@@ -219,8 +247,10 @@ skr_err_ skr_surface_create(void* vk_surface_khr, skr_surface_t* out_surface) {
 	VkBool32 present_support = VK_FALSE;
 	vkGetPhysicalDeviceSurfaceSupportKHR(_skr_vk.physical_device, _skr_vk.present_queue_family, vk_surface, &present_support);
 	if (!present_support) {
+		// The caller created this VkSurfaceKHR and still owns it on failure.
+		// Destroying it here left the caller holding a dangling handle, which
+		// became a double free once it ran its own cleanup.
 		skr_log(skr_log_critical, "Surface doesn't support presentation");
-		vkDestroySurfaceKHR(_skr_vk.instance, vk_surface, NULL);
 		return skr_err_unsupported;
 	}
 
@@ -228,7 +258,6 @@ skr_err_ skr_surface_create(void* vk_surface_khr, skr_surface_t* out_surface) {
 
 	// Create swapchain using helper
 	if (!_skr_surface_create_swapchain(_skr_vk.device, _skr_vk.physical_device, _skr_vk.graphics_queue_family, out_surface, VK_NULL_HANDLE)) {
-		vkDestroySurfaceKHR(_skr_vk.instance, vk_surface, NULL);
 		*out_surface = (skr_surface_t){0};
 		return skr_err_device_error;
 	}
@@ -239,7 +268,33 @@ skr_err_ skr_surface_create(void* vk_surface_khr, skr_surface_t* out_surface) {
 		vkCreateSemaphore(_skr_vk.device, &semaphore_info, NULL, &out_surface->semaphore_acquire[i]);
 	}
 
+	// Present fences, when the driver has them; created signaled so the
+	// wait-before-reuse in skr_surface_present passes on the first frames.
+	if (_skr_vk.has_present_fence) {
+		VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+		for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
+			vkCreateFence(_skr_vk.device, &fence_info, NULL, &out_surface->present_fence[i]);
+		}
+	}
+
 	return skr_err_success;
+}
+
+// Blocks until every present this surface has issued is fully retired, which
+// is what makes destroying its swapchain or reusing its semaphores legal. The
+// fences observe that exactly; without them a device idle is the only option,
+// heavy and, for the presentation engine's semaphore use, only approximate.
+static void _skr_surface_wait_presents(skr_surface_t* ref_surface) {
+	if (!_skr_vk.has_present_fence) {
+		_skr_device_wait_idle();
+		return;
+	}
+	VkFence  fences[SKR_MAX_FRAMES_IN_FLIGHT];
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
+		if (ref_surface->present_fence[i] != VK_NULL_HANDLE) fences[count++] = ref_surface->present_fence[i];
+	}
+	if (count > 0) vkWaitForFences(_skr_vk.device, count, fences, VK_TRUE, UINT64_MAX);
 }
 
 void skr_surface_destroy(skr_surface_t* ref_surface) {
@@ -248,11 +303,14 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 	// Callers destroy the native window as soon as this returns, so the
 	// swapchain and surface can't go on a command ring to be destroyed later.
 	_skr_device_wait_idle();
+	_skr_surface_wait_presents(ref_surface);
 	skr_destroy_list_t list = _skr_destroy_list_create();
 
 	// Destroy per-frame synchronization objects
-	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++)
+	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
 		_skr_cmd_destroy_semaphore(&list, ref_surface->semaphore_acquire[i]);
+		_skr_cmd_destroy_fence    (&list, ref_surface->present_fence   [i]);
+	}
 
 	// Destroy per-image synchronization objects
 	if (ref_surface->semaphore_submit) {
@@ -281,10 +339,23 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 	*ref_surface = (skr_surface_t){0};
 }
 
-void skr_surface_resize(skr_surface_t* ref_surface) {
+void skr_surface_resize(skr_surface_t* ref_surface, skr_vec2i_t size) {
 	if (!ref_surface) return;
 
-	_skr_device_wait_idle();
+	// Only consulted when the surface cannot report its own extent. The
+	// swapchain overwrites this with the extent it settled on.
+	ref_surface->size = size;
+
+	// Only this surface's in-flight frames reference the views destroyed
+	// below, so they are all that needs waiting on. A device-wide idle here
+	// turned every step of an interactive resize into a full pipeline drain.
+	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++)
+		skr_future_wait(&ref_surface->frame_future[i]);
+
+	// The old swapchain's presents must also be retired before it and its
+	// semaphores can be recycled; the newest is a frame old, so in practice
+	// its fence has long signaled and this does not block.
+	_skr_surface_wait_presents(ref_surface);
 
 	// Destroy old image views and framebuffers
 	for (uint32_t i = 0; i < ref_surface->image_count; i++) {
@@ -295,13 +366,27 @@ void skr_surface_resize(skr_surface_t* ref_surface) {
 	}
 
 	// Recreate swapchain using helper (old swapchain will be destroyed by helper)
-	_skr_surface_create_swapchain(_skr_vk.device, _skr_vk.physical_device, _skr_vk.graphics_queue_family, ref_surface, ref_surface->swapchain);
+	if (!_skr_surface_create_swapchain(_skr_vk.device, _skr_vk.physical_device, _skr_vk.graphics_queue_family, ref_surface, ref_surface->swapchain)) {
+		// The views above are already gone, so anything still counting on
+		// image_count would be handing out null handles.
+		skr_log(skr_log_critical, "skr_surface_resize: failed to rebuild the swapchain");
+		ref_surface->image_count = 0;
+	}
 }
 
-skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_tex) {
+skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, skr_tex_t** out_tex) {
 	if (!ref_surface || !out_tex) return skr_acquire_error;
 
 	*out_tex = NULL;
+
+	// A zero size is a minimized window, with nothing to acquire
+	if (size.x <= 0 || size.y <= 0) return skr_acquire_not_ready;
+
+	// The caller's size is the only resize signal for surfaces that report no
+	// extent of their own (Wayland): acquire succeeds forever at the stale
+	// size there, while the compositor scales the result.
+	if (size.x != ref_surface->size.x || size.y != ref_surface->size.y)
+		return skr_acquire_needs_resize;
 
 	// Check if the surface needs to be recreated before touching any per-frame
 	// state. Some drivers (e.g. Adreno) do not return VK_SUBOPTIMAL_KHR on
@@ -309,10 +394,9 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_te
 	// Polling capabilities is the only reliable cross-driver way to detect
 	// this.
 	{
-		VkSurfaceCapabilitiesKHR caps;
-		vkGetPhysicalDeviceSurfaceCapabilitiesKHR(_skr_vk.physical_device, ref_surface->surface, &caps);
-
-		if ( caps.currentExtent.width  != UINT32_MAX &&
+		VkSurfaceCapabilitiesKHR caps = {0};
+		if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(_skr_vk.physical_device, ref_surface->surface, &caps) == VK_SUCCESS &&
+		     caps.currentExtent.width  != UINT32_MAX &&
 		    (caps.currentExtent.width  != (uint32_t)ref_surface->size.x ||
 		     caps.currentExtent.height != (uint32_t)ref_surface->size.y))
 			return skr_acquire_needs_resize;
@@ -384,10 +468,23 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_te
 skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 	if (!ref_surface) return skr_acquire_error;
 
+	// This slot's fence is from SKR_MAX_FRAMES_IN_FLIGHT presents ago, so the
+	// wait is a formality; once attached, the fence pins down exactly when the
+	// presentation engine is done with the image and semaphore.
+	VkSwapchainPresentFenceInfoEXT fence_info = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT };
+	VkFence fence = ref_surface->present_fence[ref_surface->frame_idx];
+	if (fence != VK_NULL_HANDLE) {
+		vkWaitForFences(_skr_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+		vkResetFences  (_skr_vk.device, 1, &fence);
+		fence_info.swapchainCount = 1;
+		fence_info.pFences        = &fence;
+	}
+
 	// Just present - all command buffer work happened before frame_end!
 	mtx_lock(_skr_vk.present_queue_mutex);
 	VkResult result = vkQueuePresentKHR(_skr_vk.present_queue, &(VkPresentInfoKHR){
 		.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		.pNext              = fence != VK_NULL_HANDLE ? &fence_info : NULL,
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores    = &ref_surface->semaphore_submit[ref_surface->current_image],
 		.swapchainCount     = 1,

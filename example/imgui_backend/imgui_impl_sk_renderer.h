@@ -14,6 +14,10 @@ struct ImDrawData;
 struct skr_tex_t;
 
 bool ImGui_ImplSkRenderer_Init    (void);
+
+// Rebuilds the font atlas texture from ImGui's current fonts. Call after
+// re-rasterizing fonts, which a DPI change requires.
+bool ImGui_ImplSkRenderer_CreateFontsTexture(void);
 void ImGui_ImplSkRenderer_Shutdown(void);
 void ImGui_ImplSkRenderer_NewFrame(void);
 

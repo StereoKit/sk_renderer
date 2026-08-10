@@ -801,14 +801,12 @@ SKR_API uint32_t          skr_tex_calc_mip_count           (skr_vec3i_t size);
 SKR_API skr_vec3i_t       skr_tex_calc_mip_dimensions      (skr_vec3i_t base_size, uint32_t mip_level);
 SKR_API uint64_t          skr_tex_calc_mip_size            (skr_tex_fmt_ format, skr_vec3i_t base_size, uint32_t mip_level);
 
-// native_surface is a VkSurfaceKHR under SKR_VK, a WGPUSurface under
-// SKR_WEBGPU. Ownership transfers to the renderer either way: the caller's
-// reference is consumed, and skr_surface_destroy releases it.
-SKR_API skr_err_          skr_surface_create               (void* native_surface, skr_surface_t* out_surface);
+
+SKR_API skr_err_          skr_surface_create               (void* native_surface, skr_vec2i_t size, skr_surface_t* out_surface);
 SKR_API bool              skr_surface_is_valid             (const skr_surface_t*     surface);
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
-SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
-SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_tex_t** out_tex);
+SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface, skr_vec2i_t size);
+SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_vec2i_t size, skr_tex_t** out_tex);
 SKR_API skr_acquire_      skr_surface_present              (      skr_surface_t* ref_surface);
 SKR_API skr_vec2i_t       skr_surface_get_size             (const skr_surface_t*     surface);
 

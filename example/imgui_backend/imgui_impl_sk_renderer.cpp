@@ -40,6 +40,47 @@ static bool ImGui_ImplSkRenderer_CreateVertexFormat(skr_vert_type_t* out_vertex_
 }
 
 // Initialize backend
+// Rebuilds the atlas texture from whatever fonts ImGui currently holds. Needed
+// after a DPI change, where fonts are re-rasterized at the new scale.
+extern "C" bool ImGui_ImplSkRenderer_CreateFontsTexture() {
+	ImGuiIO&                    io = ImGui::GetIO();
+	ImGui_ImplSkRenderer_Data*  bd = (ImGui_ImplSkRenderer_Data*)io.BackendRendererUserData;
+	if (!bd) return false;
+
+	unsigned char* pixels;
+	int            width, height;
+	io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+
+	skr_tex_sampler_t font_sampler = {
+		.sample         = skr_tex_sample_linear,
+		.address        = skr_tex_address_clamp,
+		.sample_compare = skr_compare_never,
+	};
+
+	skr_tex_t      replacement = {};
+	skr_tex_data_t font_data   = {.data = pixels, .mip_count = 1, .layer_count = 1};
+	if (skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, font_sampler,
+					   (skr_vec3i_t){width, height, 1}, 1, 1, &font_data, &replacement) != skr_err_success) {
+		return false;
+	}
+	skr_tex_set_name(&replacement, "ImGui Font Atlas");
+
+	// The old texture may still be referenced by frames in flight
+	if (io.Fonts->TexID != 0) {
+		skr_future_t pending = skr_future_get();
+		skr_future_wait(&pending);
+		skr_tex_destroy(&bd->font_texture);
+	}
+	bd->font_texture = replacement;
+	io.Fonts->SetTexID((ImTextureID)&bd->font_texture);
+
+	// The material only exists once Init has finished its first pass
+	if (skr_material_is_valid(&bd->material)) {
+		skr_material_set_tex(&bd->material, "texture0", &bd->font_texture);
+	}
+	return true;
+}
+
 extern "C" bool ImGui_ImplSkRenderer_Init() {
 	ImGuiIO& io = ImGui::GetIO();
 	IM_ASSERT(io.BackendRendererUserData == nullptr && "Already initialized!");
@@ -68,29 +109,13 @@ extern "C" bool ImGui_ImplSkRenderer_Init() {
 	skr_shader_set_name(&bd->shader, "ImGui");
 
 	// Create font atlas texture
-	unsigned char* pixels;
-	int width, height;
-	io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
-
-	skr_tex_sampler_t font_sampler = {
-		.sample        = skr_tex_sample_linear,
-		.address       = skr_tex_address_clamp,
-		.sample_compare = skr_compare_never,
-	};
-
-	skr_tex_data_t font_data = {.data = pixels, .mip_count = 1, .layer_count = 1};
-	if (skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, font_sampler,
-					   (skr_vec3i_t){width, height, 1}, 1, 1, &font_data, &bd->font_texture) != skr_err_success) {
+	if (!ImGui_ImplSkRenderer_CreateFontsTexture()) {
 		skr_shader_destroy(&bd->shader);
 		skr_vert_type_destroy(&bd->vertex_type);
 		free(bd);
 		io.BackendRendererUserData = nullptr;
 		return false;
 	}
-	skr_tex_set_name(&bd->font_texture, "ImGui Font Atlas");
-
-	// Store texture ID in ImGui
-	io.Fonts->SetTexID((ImTextureID)&bd->font_texture);
 
 	// Create material with alpha blending
 	skr_material_create((skr_material_info_t){
