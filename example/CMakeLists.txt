@@ -30,7 +30,7 @@ else()
 	message(STATUS "Fetching sk_app v2026.7.20...")
 	FetchContent_Declare(sk_app
 		GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-		GIT_TAG        v2026.7.20
+		GIT_TAG        v2026.8.10
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
