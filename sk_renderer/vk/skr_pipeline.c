@@ -249,7 +249,7 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 	_skr_pipeline_cache.materials[free_slot].ref_count         = 1;
 
 	// Generate and set debug name for pipeline layout
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	const char* shader_name = key->shader->meta.name[0] ? key->shader->meta.name : "unknown";
 	snprintf(name, sizeof(name), "layout_%s_", shader_name);
 	_skr_append_material_config(name, sizeof(name), key);
@@ -968,7 +968,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 
 	for (uint32_t p = 0; p < key->postfx_count; p++) {
 		uint32_t sp      = next_sp + p;
-		bool     is_last = (p == key->postfx_count - 1);
+		bool     is_last = (p + 1 == key->postfx_count);
 
 		// InputAttachmentIndex 0: previous color
 		input_refs[sp][0] = (VkAttachmentReference2){
@@ -1224,7 +1224,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		if (render_pass == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 	}
 
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	snprintf(name, sizeof(name), "rpass_%s%s%s%u_",
 		(key->flags & skr_rp_flag_resolve_subpass)    ? "resolve_" : "",
 		(key->flags & skr_rp_flag_custom_resolve)     ? "cr_"      : "",
@@ -1404,7 +1404,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass", VK_NULL_HANDLE);
 
 	// Generate debug name based on render pass configuration
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	snprintf(name, sizeof(name), "rpass_");
 	_skr_append_renderpass_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
@@ -1710,18 +1710,18 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 	};
 
 	// Build debug name before creation so it's available for error logging
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	const char* shader_name = mat_key->shader->meta.name[0]
 		? mat_key->shader->meta.name
 		: "shader";
 
 	snprintf(name, sizeof(name), "pipeline_%s_(", shader_name);
-	_skr_append_material_config(name, sizeof(name), mat_key);
-	strcat(name, ")_(");
+	_skr_append_material_config  (name, sizeof(name), mat_key);
+	_skr_append_str              (name, sizeof(name), ")_(");
 	_skr_append_renderpass_config(name, sizeof(name), rp_key);
-	strcat(name, ")_(");
+	_skr_append_str              (name, sizeof(name), ")_(");
 	_skr_append_vertex_format    (name, sizeof(name), vert_type->components, vert_type->component_count);
-	strcat(name, ")");
+	_skr_append_str              (name, sizeof(name), ")");
 
 	VkPipeline pipeline;
 	VkResult   result = vkCreateGraphicsPipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &pipeline);

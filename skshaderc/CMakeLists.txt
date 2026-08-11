@@ -25,7 +25,14 @@
 # generator for the path to the skshaderc compiler executable
 # file.
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.19)
+
+# Set again here rather than inherited: skshaderc is also a standalone project,
+# and the cmake_minimum_required above resets policies for this scope either way.
+if(POLICY CMP0135)
+	cmake_policy(SET CMP0135 NEW)
+endif()
+
 project(skshaderc VERSION 1.0 DESCRIPTION "Shader compiler for sk_renderer")
 
 ###############################################################################
@@ -252,8 +259,12 @@ set(VULKAN_VERSION vulkan-sdk-1.4.328.1) # Most of our dependencies here use the
 add_library(skshaderc_lib STATIC)
 
 set_target_properties(skshaderc_lib PROPERTIES
+	C_STANDARD 11
+	C_STANDARD_REQUIRED ON
 	CXX_STANDARD 11
 	CXX_STANDARD_REQUIRED ON)
+
+skr_target_warnings(skshaderc_lib)
 
 # Optional glslang backend: HLSL -> SPIR-V via glslang, optimized with the
 # SPIRV-Tools optimizer and reflected with SPIRV-Reflect. glslang also pulls in
@@ -376,6 +387,8 @@ target_include_directories(skshaderc_lib PUBLIC
 
 add_executable(skshaderc main.cpp)
 target_link_libraries(skshaderc PRIVATE skshaderc_lib)
+
+skr_target_warnings(skshaderc)
 
 # Static link MinGW runtime when cross-compiling to Windows
 if(MINGW)

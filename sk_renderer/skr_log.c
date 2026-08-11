@@ -15,7 +15,7 @@
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void _default_log(skr_log_ level, const char *text) {
+static void _default_log(skr_log_ level, const char *text) {
 #ifdef __ANDROID__
 	android_LogPriority priority = 
 		level == skr_log_info     ? ANDROID_LOG_INFO  :

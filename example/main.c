@@ -223,10 +223,6 @@ static bool main_frame(void* user_data) {
 				}
 				break;
 
-			case ska_event_window_resized:
-				app_surface_resize(s->window, &s->surface);
-				break;
-
 			default:
 				break;
 		}
@@ -249,6 +245,16 @@ static bool main_frame(void* user_data) {
 		return true;
 	}
 
+	// Reconcile the swapchain size here rather than per resized event: an
+	// interactive drag queues configures faster than rebuilds retire them.
+	skr_vec2i_t drawable = {0};
+	ska_window_get_drawable_size(s->window, &drawable.x, &drawable.y);
+	if (drawable.x > 0 && drawable.y > 0) {
+		skr_vec2i_t current = skr_surface_get_size(&s->surface);
+		if (drawable.x != current.x || drawable.y != current.y)
+			skr_surface_resize(&s->surface, drawable);
+	}
+
 	// Calculate delta time
 	double current_time = ska_time_get_elapsed_s();
 	float  delta_time   = (float)(current_time - s->last_time);
@@ -268,8 +274,6 @@ static bool main_frame(void* user_data) {
 	igRender();
 
 	// Get next swapchain image (vsync blocking happens here via vkAcquireNextImageKHR)
-	skr_vec2i_t drawable = {0};
-	ska_window_get_drawable_size(s->window, &drawable.x, &drawable.y);
 	skr_tex_t*   target         = NULL;
 	skr_acquire_ acquire_result = skr_surface_next_tex(&s->surface, drawable, &target);
 

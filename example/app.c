@@ -617,7 +617,7 @@ void app_key_press(app_t* app, app_key_ key) {
 	}
 }
 
-void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_target) {
+static void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_target) {
 	if (!app) return;
 
 	// Destroy old render targets

@@ -20,11 +20,47 @@
 #
 #   # Filtered logcat for the app
 #   adb logcat -v color --uid `adb shell pm list package -U net.stereokit.renderer_test | cut -d ":" -f3`
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.19)
+
+# Stamp URL downloads with their extraction time, so bumping a dependency's URL
+# rebuilds what depends on it. Guarded because the policy only exists in 3.24+,
+# and cmake_minimum_required above leaves it unset.
+if(POLICY CMP0135)
+	cmake_policy(SET CMP0135 NEW)
+endif()
+
 project(sk_renderer VERSION 0.1.0)
 
 # Add custom cmake modules (includes headers-only FindVulkan for cross-compilation)
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# Warning level for first-party targets. PRIVATE so consumers of the headers
+# don't inherit it, and not -Werror: vendored dependencies and platform SDK
+# headers compile in the same tree. The suppressions below are categories this
+# codebase hits by design rather than by accident.
+function(skr_target_warnings target)
+	if(MSVC)
+		target_compile_options(${target} PRIVATE
+			/W4
+			/wd4100 # unreferenced formal parameter: callback signatures are fixed
+			/wd4127 # conditional expression is constant
+			/wd4201 # nameless struct/union, used throughout Vulkan and OpenXR headers
+			/wd4204 # non-constant aggregate initializer
+			/wd4221)# aggregate initialized from the address of an automatic
+	else()
+		target_compile_options(${target} PRIVATE
+			-Wall -Wextra
+			-Wvla                          # MSVC has no VLAs at all, so catch them here
+			-Wno-unused-parameter          # callback signatures are fixed
+			-Wno-missing-field-initializers # designated init of Vulkan/OpenXR structs
+			# A non-static function with no prototype is invisible to
+			# -fvisibility=hidden and to __declspec(dllexport), so an export
+			# that drifts out of a header goes quiet until link time.
+			$<$<COMPILE_LANGUAGE:C>:-Wmissing-prototypes>
+			$<$<COMPILE_LANGUAGE:C>:-Wstrict-prototypes>
+			$<$<COMPILE_LANGUAGE:C>:-Wshadow>)
+	endif()
+endfunction()
 
 # Build options
 option(SKR_BUILD_SKSHADERC "Build skshaderc shader compiler" ON)
@@ -118,6 +154,8 @@ endif()
 set_target_properties(sk_renderer PROPERTIES
 	C_STANDARD 11
 	C_STANDARD_REQUIRED ON)
+
+skr_target_warnings(sk_renderer)
 
 # If we are building skshaderc, then sk_renderer should make skshaderc build
 # first. This allows consuming projects to use skshaderc's compile functions.

@@ -153,9 +153,17 @@ static bool _init_vulkan_hwcontext(
 	}
 	vk_ctx->nb_qf = nb_qf;
 
-	// Lock/unlock callbacks for thread-safe queue submission
+	// Lock/unlock callbacks for thread-safe queue submission. Deprecated by
+	// FFmpeg, but still the only hook available on the versions we support.
+#if defined(__GNUC__) || defined(__clang__)
+	#pragma GCC diagnostic push
+	#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 	vk_ctx->lock_queue   = _ff_lock_queue;
 	vk_ctx->unlock_queue = _ff_unlock_queue;
+#if defined(__GNUC__) || defined(__clang__)
+	#pragma GCC diagnostic pop
+#endif
 
 	// Enabled device extensions - stored in caller's array so FFmpeg can
 	// access them after this function returns (FFmpeg keeps the pointer)
@@ -178,8 +186,13 @@ static bool _init_vulkan_hwcontext(
 	vkGetPhysicalDeviceFeatures2(vk_ctx->phys_dev, &features2);
 	vk_ctx->device_features = features2;
 
-	// Deprecated queue family fields (FFmpeg compat)
+	// Deprecated queue family fields (FFmpeg compat). Setting them is the point
+	// here, so the deprecation notice is silenced rather than acted on.
 #ifdef FF_API_VULKAN_FIXED_QUEUES
+#if defined(__GNUC__) || defined(__clang__)
+	#pragma GCC diagnostic push
+	#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 	vk_ctx->queue_family_index        = (int)gfx_family;
 	vk_ctx->nb_graphics_queues        = 1;
 	vk_ctx->queue_family_tx_index     = (int)tx_family;
@@ -188,6 +201,9 @@ static bool _init_vulkan_hwcontext(
 	vk_ctx->nb_comp_queues            = 1;
 	vk_ctx->queue_family_decode_index = (decode_family != UINT32_MAX) ? (int)decode_family : -1;
 	vk_ctx->nb_decode_queues          = (decode_family != UINT32_MAX) ? 1 : 0;
+#if defined(__GNUC__) || defined(__clang__)
+	#pragma GCC diagnostic pop
+#endif
 #endif
 
 	int ret = av_hwdevice_ctx_init(hw_device_ctx);

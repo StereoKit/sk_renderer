@@ -117,12 +117,13 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	TBuiltInResource default_resource = {};
 	EShMessages      messages         = EShMsgDefault;
 	EShMessages      messages_link    = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgDebugInfo);
-	EShLanguage      stage;
+	EShLanguage      stage = EShLangVertex;
 	const char*      entry = "na";
 	switch(type) {
 		case skr_stage_vertex:  stage = EShLangVertex;   entry = settings->vs_entrypoint; break;
 		case skr_stage_pixel:   stage = EShLangFragment; entry = settings->ps_entrypoint; break;
 		case skr_stage_compute: stage = EShLangCompute;  entry = settings->cs_entrypoint; break;
+		default: sksc_log(sksc_log_level_err, "Unknown shader stage %d", (int)type); return compile_result_fail;
 	}
 
 	// Create the shader and set options

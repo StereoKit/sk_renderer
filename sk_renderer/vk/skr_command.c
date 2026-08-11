@@ -17,14 +17,14 @@ thread_local int32_t _skr_thread_idx = -1;
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool _skr_cmd_init() {
+bool _skr_cmd_init(void) {
 	memset(_skr_vk.thread_pools, 0, sizeof(_skr_vk.thread_pools));
 	return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void _skr_cmd_shutdown() {
+void _skr_cmd_shutdown(void) {
 	_skr_device_wait_idle();
 
 	// Destroy thread command pools and per-thread command ring fences
@@ -65,7 +65,7 @@ void _skr_cmd_shutdown() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-_skr_vk_thread_t* _skr_cmd_get_thread() {
+_skr_vk_thread_t* _skr_cmd_get_thread(void) {
 	if (_skr_thread_idx >= 0) {
 		return &_skr_vk.thread_pools[_skr_thread_idx];
 	}
@@ -74,7 +74,7 @@ _skr_vk_thread_t* _skr_cmd_get_thread() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_thread_init() {
+void skr_thread_init(void) {
 	// Already initialized for this thread
 	if (_skr_thread_idx >= 0) {
 		skr_log(skr_log_critical, "Thread already initialized with index %d", _skr_thread_idx);
@@ -127,13 +127,13 @@ void skr_thread_init() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool skr_thread_is_initialized() {
+bool skr_thread_is_initialized(void) {
 	return _skr_thread_idx >= 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_thread_shutdown() {
+void skr_thread_shutdown(void) {
 	if (_skr_thread_idx < 0) {
 		skr_log(skr_log_warning, "Thread not initialized, nothing to shutdown");
 		return;
@@ -321,7 +321,7 @@ void _skr_bind_descriptors(VkCommandBuffer cmd, VkDescriptorPool pool, VkPipelin
 
 ///////////////////////////////////////////////////////////////////////////////
 
-_skr_cmd_ctx_t _skr_cmd_begin() {
+_skr_cmd_ctx_t _skr_cmd_begin(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	(void)pool; // only read by the asserts below
 	assert(pool);
@@ -353,7 +353,7 @@ bool _skr_cmd_try_get_active(_skr_cmd_ctx_t* out_ctx) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-_skr_cmd_ctx_t _skr_cmd_acquire() {
+_skr_cmd_ctx_t _skr_cmd_acquire(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
 
@@ -401,7 +401,7 @@ void _skr_cmd_release(VkCommandBuffer buffer) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-VkCommandBuffer _skr_cmd_end() {
+VkCommandBuffer _skr_cmd_end(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
 
@@ -468,7 +468,7 @@ skr_future_t _skr_cmd_end_submit(const VkSemaphore* wait_semaphores, uint32_t wa
 // Future API - for GPU/CPU synchronization
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_future_t skr_future_get() {
+skr_future_t skr_future_get(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 
 	// Invalid future if not on an initialized thread
@@ -548,11 +548,11 @@ void skr_future_wait(const skr_future_t* future) {
 // Command Batching API - for grouping multiple GPU operations
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_cmd_begin() {
+void skr_cmd_begin(void) {
 	_skr_cmd_acquire();
 }
 
-skr_future_t skr_cmd_end() {
+skr_future_t skr_cmd_end(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool && pool->ref_count > 0 && "Unbalanced skr_cmd_begin/end");
 
@@ -569,12 +569,12 @@ skr_future_t skr_cmd_end() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool skr_cmd_is_active() {
+bool skr_cmd_is_active(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	return pool && pool->ref_count > 0;
 }
 
-skr_future_t skr_cmd_flush() {
+skr_future_t skr_cmd_flush(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
 

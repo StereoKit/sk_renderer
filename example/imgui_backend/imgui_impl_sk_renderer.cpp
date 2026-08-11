@@ -165,6 +165,7 @@ extern "C" void ImGui_ImplSkRenderer_Shutdown() {
 extern "C" void ImGui_ImplSkRenderer_NewFrame() {
 	ImGui_ImplSkRenderer_Data* bd = ImGui_ImplSkRenderer_GetBackendData();
 	IM_ASSERT(bd != nullptr && "Backend not initialized!");
+	IM_UNUSED(bd);
 }
 
 // Resize mesh if needed

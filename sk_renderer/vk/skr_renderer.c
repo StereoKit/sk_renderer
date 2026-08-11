@@ -191,7 +191,7 @@ static void _skr_flush_pending_compute_barrier(VkCommandBuffer cmd) {
 	_skr_vk.pending_compute_barrier = false;
 }
 
-void skr_renderer_frame_begin() {
+void skr_renderer_frame_begin(void) {
 	_skr_vk.in_frame = true;
 
 	// Start a command buffer batch for this frame
@@ -435,7 +435,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	_skr_cmd_release(cmd);
 }
 
-void skr_renderer_end_pass() {
+void skr_renderer_end_pass(void) {
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
 	vkCmdEndRenderPass(cmd);
 
@@ -1064,7 +1064,7 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	// Draw
 	if (skr_buffer_is_valid(&mesh->index_buffer)) {
 		vkCmdBindIndexBuffer(cmd, mesh->index_buffer.buffer, 0, mesh->ind_format_vk);
-		uint32_t draw_index_count = index_count > 0 ? index_count : mesh->ind_count;
+		uint32_t draw_index_count = index_count > 0 ? (uint32_t)index_count : mesh->ind_count;
 		vkCmdDrawIndexed(cmd, draw_index_count, instance_count, first_index, vertex_offset, 0);
 	} else {
 		vkCmdDraw(cmd, mesh->vert_count, instance_count, 0, 0);
@@ -1073,7 +1073,7 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	_skr_cmd_release(cmd);
 }
 
-uint64_t skr_renderer_get_gpu_time_us() {
+uint64_t skr_renderer_get_gpu_time_us(void) {
 	// Return timing from most recently completed frame
 	uint32_t read_flight = (_skr_vk.flight_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
 
@@ -1089,7 +1089,7 @@ uint64_t skr_renderer_get_gpu_time_us() {
 	return (uint64_t)(time_ns / 1000.0f);
 }
 
-uint64_t skr_renderer_get_cpu_time_us() {
+uint64_t skr_renderer_get_cpu_time_us(void) {
 	// Return CPU timing from most recently completed frame
 	uint32_t read_flight = (_skr_vk.flight_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
 
@@ -1403,6 +1403,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	uint32_t   intermediate_count = pass->postfx_count > 1 ? pass->postfx_count - 1 : 0;
 	skr_tex_t* intermediates[SKR_PASS_MAX_POSTFX] = {0};
 	skr_tex_t* depth_resolve_tex = NULL;
+	skr_tex_t* scene_transient   = NULL;
 
 	uint32_t render_width  = has_color ? color->size.x : (has_depth ? depth->size.x : 0);
 	uint32_t render_height = has_color ? color->size.y : (has_depth ? depth->size.y : 0);
@@ -1440,7 +1441,6 @@ void skr_pass_submit(skr_pass_t* pass) {
 	// transient — the original target then only receives the final postfx
 	// write. Note this can't preserve previous target contents, so a LOAD
 	// color op renders over undefined data here.
-	skr_tex_t* scene_transient = NULL;
 	if (pass->postfx_count > 0) {
 		skr_tex_t* scene_src = use_msaa ? resolve : color;
 		if (scene_src && (scene_src == final_output || !(scene_src->flags & skr_tex_flags_input_attachment))) {

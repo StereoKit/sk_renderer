@@ -13,7 +13,7 @@
 // Shader stage creation
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_data, uint32_t shader_size, skr_stage_ type) {
+static skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_data, uint32_t shader_size, skr_stage_ type) {
 	skr_shader_stage_t stage = {0};
 	stage.type               = type;
 
@@ -29,7 +29,7 @@ skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_
 	return stage;
 }
 
-void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
+static void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 	if (!ref_stage) return;
 
 	_skr_cmd_destroy_shader_module(NULL, ref_stage->shader);
@@ -50,7 +50,7 @@ static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const s
 // Shader creation
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, skr_shader_stage_t v_shader,
+static skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, skr_shader_stage_t v_shader,
                                        skr_shader_stage_t p_shader, skr_shader_stage_t c_shader) {
 	skr_shader_t shader  = {0};
 	if (meta) shader.meta = *meta;

@@ -489,9 +489,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL _skr_vk_debug_callback(
 
 	skr_log(level, "[Vulkan:%s:%d] %s", severity_str, callback_data->messageIdNumber, callback_data->pMessage);
 
-	if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-		severity_str = severity_str;
-	}
 	return VK_FALSE;
 }
 

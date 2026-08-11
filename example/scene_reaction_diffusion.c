@@ -106,7 +106,6 @@ static scene_t* _scene_reaction_diffusion_create(void) {
 	skr_compute_create(&scene->compute_sh, (skr_compute_info_t){0}, &scene->compute_pong);
 
 	// Create compute resources
-	typedef struct { float x, y; } float2;
 	float2* initial_data = malloc(scene->sim_size * scene->sim_size * sizeof(float2));
 	for (int y = 0; y < scene->sim_size; y++) {
 		for (int x = 0; x < scene->sim_size; x++) {

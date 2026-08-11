@@ -348,10 +348,6 @@ VkDescriptorSetLayout _skr_shader_make_layout               (VkDevice device, bo
 void                  _skr_shader_resolve_spec_constants    (const sksc_shader_meta_t* meta, const skr_spec_constant_t* specs, uint32_t spec_count, uint32_t out_values[SKR_MAX_SPEC_CONSTANTS]);
 const VkSpecializationInfo* _skr_shader_make_spec_info      (const sksc_shader_meta_t* meta, const uint32_t* spec_values, VkSpecializationMapEntry out_entries[SKR_MAX_SPEC_CONSTANTS], VkSpecializationInfo* out_info);
 
-// Format helpers
-bool                  _skr_format_has_stencil               (VkFormat format);
-bool                  _skr_format_is_depth                  (VkFormat format);
-
 // Timing helpers
 uint64_t              _skr_time_get_ns                      (void);
 
@@ -385,6 +381,7 @@ void                  _skr_render_list_sort                 (skr_render_list_t* 
 
 // Debug
 void                  _skr_set_debug_name                   (VkDevice device, VkObjectType type, uint64_t handle, const char* name);
+void                  _skr_append_str                       (char* ref_str, size_t str_size, const char* text);
 void                  _skr_append_vertex_format             (char* ref_str, size_t str_size, const skr_vert_component_t* components, uint32_t component_count);
 const char*           _skr_semantic_name                    (skr_semantic_ semantic);
 void                  _skr_append_material_config           (char* ref_str, size_t str_size, const _skr_pipeline_material_key_t* mat_key);

@@ -126,6 +126,8 @@ set_target_properties(sk_renderer_test PROPERTIES
 	CXX_STANDARD_REQUIRED ON
 )
 
+skr_target_warnings(sk_renderer_test)
+
 if(UNIX AND NOT ANDROID)
 	target_link_libraries(sk_renderer_test PRIVATE m)
 endif()

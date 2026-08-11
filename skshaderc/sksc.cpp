@@ -345,10 +345,12 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 		info.append("|--Spec Constants--");
 		for (uint32_t i = 0; i < meta->spec_constant_count; i++) {
 			sksc_shader_spec_constant_t *spec = &meta->spec_constants[i];
+			float   as_float; memcpy(&as_float, &spec->default_value, sizeof(as_float));
+			int32_t as_int;   memcpy(&as_int,   &spec->default_value, sizeof(as_int));
 			switch (spec->type) {
-			case sksc_shader_var_float: info.append("|  [%u] %-15s: float = %.3g", spec->constant_id, spec->name, *(float   *)&spec->default_value); break;
-			case sksc_shader_var_uint:  info.append("|  [%u] %-15s: uint  = %u",   spec->constant_id, spec->name, spec->default_value);              break;
-			default:                    info.append("|  [%u] %-15s: int   = %d",   spec->constant_id, spec->name, *(int32_t *)&spec->default_value); break;
+			case sksc_shader_var_float: info.append("|  [%u] %-15s: float = %.3g", spec->constant_id, spec->name, as_float);            break;
+			case sksc_shader_var_uint:  info.append("|  [%u] %-15s: uint  = %u",   spec->constant_id, spec->name, spec->default_value); break;
+			default:                    info.append("|  [%u] %-15s: int   = %d",   spec->constant_id, spec->name, as_int);              break;
 			}
 		}
 	}

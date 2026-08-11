@@ -387,6 +387,8 @@ typedef struct {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+SKSC_API uint64_t                 skr_hash                        (const char *string);
+
 SKSC_API bool                     sksc_shader_file_verify         (const void *file_memory, uint32_t file_size, uint16_t *out_version, char *out_name, uint32_t out_name_size);
 SKSC_API sksc_result_             sksc_shader_file_load_memory    (const void *file_memory, uint32_t file_size, sksc_shader_file_t *out_file);
 SKSC_API void                     sksc_shader_file_destroy        (sksc_shader_file_t *ref_file);

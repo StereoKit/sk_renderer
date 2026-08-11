@@ -78,7 +78,7 @@ static bool _sksc_load_meta(const uint8_t *bytes, uint32_t size, uint32_t *ref_a
 		meta->sampler_count       > size || meta->vertex_input_count < 0) return false;
 
 	// --- Pass 1: scan buffer section to accumulate var/defaults totals ---
-	uint32_t buffer_section_start = at;
+	uint64_t buffer_section_start = at;
 	uint32_t total_var_count      = 0;
 	uint64_t total_defaults_size  = 0;
 

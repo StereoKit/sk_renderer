@@ -99,7 +99,7 @@ int main(int argc, const char **argv) {
 
 	
 #if defined(_WIN32)
-	for (size_t i = 1; i < argc; i++) {
+	for (int32_t i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 ||
 			strcmp(argv[i], "-i") == 0) { // Skip trying to compile paths
 			i++;
@@ -119,7 +119,7 @@ int main(int argc, const char **argv) {
 		}
 	}
 #else
-	for (size_t i = 1; i < argc; i++) {
+	for (int32_t i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 ||
 			strcmp(argv[i], "-i") == 0) { // Skip trying to compile paths
 			i++;
@@ -210,9 +210,9 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		         strcmp(argv[i], "-O2") == 0) result.shaderc.optimize = 2;
 		else if (strcmp(argv[i], "-o3") == 0 ||
 		         strcmp(argv[i], "-O3") == 0) result.shaderc.optimize = 3;
-		else if (strcmp(argv[i], "-cs") == 0 && i<argc-1){ strncpy(result.shaderc.cs_entrypoint, argv[i+1], sizeof(result.shaderc.cs_entrypoint)); i++; }
-		else if (strcmp(argv[i], "-vs") == 0 && i<argc-1) { strncpy(result.shaderc.vs_entrypoint, argv[i+1], sizeof(result.shaderc.vs_entrypoint)); i++; }
-		else if (strcmp(argv[i], "-ps") == 0 && i<argc-1) { strncpy(result.shaderc.ps_entrypoint, argv[i+1], sizeof(result.shaderc.ps_entrypoint)); i++; }
+		else if (strcmp(argv[i], "-cs") == 0 && i<argc-1){ strncpy(result.shaderc.cs_entrypoint, argv[i+1], sizeof(result.shaderc.cs_entrypoint) - 1); i++; }
+		else if (strcmp(argv[i], "-vs") == 0 && i<argc-1) { strncpy(result.shaderc.vs_entrypoint, argv[i+1], sizeof(result.shaderc.vs_entrypoint) - 1); i++; }
+		else if (strcmp(argv[i], "-ps") == 0 && i<argc-1) { strncpy(result.shaderc.ps_entrypoint, argv[i+1], sizeof(result.shaderc.ps_entrypoint) - 1); i++; }
 		else if (strcmp(argv[i], "-i" ) == 0 && i<argc-1) {
 			size_t len = strlen(argv[i + 1]) + 1;
 			result.shaderc.include_folder_ct += 1;
@@ -247,9 +247,9 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 
 	// If no entrypoints were provided, then these are the defaults!
 	if (result.shaderc.ps_entrypoint[0] == 0 && result.shaderc.vs_entrypoint[0] == 0 && result.shaderc.cs_entrypoint[0] == 0) {
-		strncpy(result.shaderc.ps_entrypoint, "ps", sizeof(result.shaderc.ps_entrypoint));
-		strncpy(result.shaderc.vs_entrypoint, "vs", sizeof(result.shaderc.vs_entrypoint));
-		strncpy(result.shaderc.cs_entrypoint, "cs", sizeof(result.shaderc.cs_entrypoint));
+		strncpy(result.shaderc.ps_entrypoint, "ps", sizeof(result.shaderc.ps_entrypoint) - 1);
+		strncpy(result.shaderc.vs_entrypoint, "vs", sizeof(result.shaderc.vs_entrypoint) - 1);
+		strncpy(result.shaderc.cs_entrypoint, "cs", sizeof(result.shaderc.cs_entrypoint) - 1);
 	}
 
 	if (*exit) {
@@ -428,7 +428,6 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 				else         sksc_log(sksc_log_level_err,  "Failed to write file! %s", abs_file);
 			}
 			if (settings->output_raw_shaders) {
-				char* abs_file = path_absolute(new_filename_cs);
 				bool  success  = write_stages(&file, dest_folder, trailing_slash, name_ext);
 
 				if (success) sksc_log(sksc_log_level_info, "Compiled raw files successfully to %s", dest_folder);
@@ -926,7 +925,7 @@ void file_name(const char *file, char *out_name, size_t name_size) {
 	while (*end != '.' && end != start) end--;
 	if    (end == start) end = file + len;
 
-	for (int32_t i=0; start+i != end && i<name_size; i++) {
+	for (size_t i=0; start+i != end && i<name_size; i++) {
 		out_name[i] = start[i];
 	}
 	size_t last = end - start;
@@ -944,7 +943,7 @@ void file_name_ext(const char *file, char *out_name, size_t name_size) {
 	while (*start != '\\' && *start != '/' && start != file) start--;
 	if    (*start == '\\' || *start == '/') start++;
 
-	for (int32_t i=0; start+i != end && i<name_size; i++) {
+	for (size_t i=0; start+i != end && i<name_size; i++) {
 		out_name[i] = start[i];
 	}
 	size_t last = end - start;
@@ -960,7 +959,14 @@ void file_dir(const char *file, char *out_path, size_t path_size) {
 
 	while (*end != '\\' && *end != '/' && end != file) end--;
 
-	for (int32_t i=0; file+i <= end && i<path_size; i++) {
+	// No separator means a bare filename, its folder is the cwd. Without this
+	// the copy below emits the name's first character as a phantom folder.
+	if (end == file && *end != '\\' && *end != '/') {
+		snprintf(out_path, path_size, "./");
+		return;
+	}
+
+	for (size_t i=0; file+i <= end && i<path_size; i++) {
 		out_path[i] = file[i];
 	}
 	size_t last = (end - file)+1;

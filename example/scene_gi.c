@@ -1526,7 +1526,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 	igText("Light");
 	igSliderFloat("Angle",     &scene->light_angle,     0.0f, 360.0f, "%.0f deg", 0);
 	igSliderFloat("Elevation", &scene->light_elevation, -1, 1,  "%.2f",     0);
-	igColorEdit3("Color", &scene->light_color.x, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+	igColorEdit3("Color", (float*)&scene->light_color, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 
 	igSeparator();
 

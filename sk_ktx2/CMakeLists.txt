@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.19)
 project(sk_ktx2 VERSION 0.1.0 DESCRIPTION "KTX2 / Basis Universal transcoder in C11")
 
 # Standing alone, an unset CMAKE_BUILD_TYPE means no optimization at all, which
@@ -53,8 +53,13 @@ if(SK_KTX2_DECODE_UNCOMPRESSED)
 	target_compile_definitions(sk_ktx2 PUBLIC SK_KTX2_DECODE_UNCOMPRESSED)
 endif()
 
-if(NOT MSVC)
-	target_compile_options(sk_ktx2 PRIVATE -fvisibility=hidden -Wall -Wextra)
+# Spelled out rather than shared with sk_renderer's helper so this stays
+# buildable as a standalone project.
+if(MSVC)
+	target_compile_options(sk_ktx2 PRIVATE /W4 /wd4100 /wd4127 /wd4204 /wd4221)
+else()
+	target_compile_options(sk_ktx2 PRIVATE -fvisibility=hidden -Wall -Wextra
+		-Wno-unused-parameter)
 endif()
 
 if(SK_KTX2_BUILD_TESTS)

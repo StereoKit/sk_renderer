@@ -739,7 +739,6 @@ SKR_API bool              skr_cmd_is_active                (void);
 
 SKR_API void              skr_callback_log                 (void (*callback)(skr_log_ level, const char* text));
 SKR_API void              skr_log                          (skr_log_ level, const char* text, ...);
-SKR_API uint64_t          skr_hash                         (const char *string);
 
 SKR_API skr_err_          skr_buffer_create                (const void *opt_data, uint32_t size_count, uint32_t size_stride, skr_buffer_type_ type, skr_use_ use, skr_buffer_t *out_buffer);
 SKR_API void              skr_buffer_destroy               (      skr_buffer_t* ref_buffer);
