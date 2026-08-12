@@ -35,6 +35,13 @@ endif()
 
 project(skshaderc VERSION 1.0 DESCRIPTION "Shader compiler for sk_renderer")
 
+# skr_target_warnings comes from sk_renderer's root when this is a subdirectory,
+# but the cross-compile host tool below configures skshaderc standalone, with no
+# sk_renderer scope to inherit it from.
+if(NOT COMMAND skr_target_warnings)
+	include("${CMAKE_CURRENT_LIST_DIR}/../cmake/skr_warnings.cmake")
+endif()
+
 ###############################################################################
 # Cross-compilation detection
 # When cross-compiling, we use a pre-built host binary to compile shaders,
