@@ -633,7 +633,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		_skr_barrier_batch_flush(&batch, ctx.cmd);
 	}
 
-	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 		writes,       sizeof(writes      )/sizeof(writes      [0]),
 		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
@@ -897,7 +897,7 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		// Material texture and buffer binds (using inlined bind_start/bind_count)
 		_skr_bind_pool_lock();
 		const skr_material_bind_t* binds = _skr_bind_pool_get(item->bind_start);
-		int32_t fail_idx = _skr_material_add_writes(binds, item->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+		int32_t fail_idx = _skr_material_add_writes(binds, item->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 			writes,       sizeof(writes      )/sizeof(writes      [0]),
 			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
@@ -1023,7 +1023,7 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 
 	_skr_bind_pool_lock();
-	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
+	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 		writes,       sizeof(writes      )/sizeof(writes      [0]),
 		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
@@ -1204,6 +1204,7 @@ static int32_t _skr_build_material_descriptors(
 	_skr_bind_pool_lock();
 	skr_material_bind_t* mat_binds = _skr_bind_pool_get(mat->bind_start);
 	int32_t fail_idx = _skr_material_add_writes(mat_binds, mat->bind_count,
+		(skr_stage_)(skr_stage_vertex | skr_stage_pixel),
 		ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 		writes,       write_max,
 		buffer_infos, buffer_max,

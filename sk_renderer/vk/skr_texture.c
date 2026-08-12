@@ -1829,6 +1829,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_bind_pool_lock();
 		int32_t fail_idx = _skr_material_add_writes(
 			_skr_bind_pool_get(material.bind_start), material.bind_count,
+			(skr_stage_)(skr_stage_vertex | skr_stage_pixel),
 			ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
 			writes,       sizeof(writes      )/sizeof(writes      [0]),
 			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),

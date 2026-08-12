@@ -578,10 +578,15 @@ const char* _skr_material_bind_name(const sksc_shader_meta_t* meta, int32_t bind
 	return "unknown";
 }
 
-int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct) {
+int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct) {
  	for (uint32_t i = 0; i < bind_ct; i++) {
 		int32_t       slot          = binds[i].bind.slot;
 		skr_register_ register_type = binds[i].bind.register_type;
+
+		// Resources outside the pipeline's stages get no descriptor: a graphics
+		// bind must not write a vs/ps/cs shader's compute-only storage image
+		// (often holding a storage-less default texture), and vice versa.
+		if ((binds[i].bind.stage_bits & stage_mask) == 0) continue;
 
 		bool skip = false;
 		for (int32_t s = 0; s < ignore_ct; s++) {
