@@ -550,6 +550,7 @@ bool skr_init(skr_settings_t settings) {
 
 	_skr_bind_pool_init();
 	_skr_sampler_cache_init();
+	_skr_mipgen_materials_init();
 	_skr_scratch_pool_init();
 	_skr_transient_pool_init();
 
@@ -1462,6 +1463,9 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_image_atomics;
 	if (_skr_vk.has_subgroup_size_control)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_wave_size;
+	// The bit is joint read+write; both features are near-universal together.
+	if (_skr_vk.has_storage_without_format)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_formatless;
 	if (enable_sample_weighted)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_sample_weighted;
 	if (enable_box_filter)
@@ -1568,6 +1572,7 @@ void skr_shutdown(void) {
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_2d);
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_cube);
 
+	_skr_mipgen_materials_shutdown(); // Builtin entries died with their shaders above; this drops app-shader ones
 	_skr_scratch_pool_shutdown();   // Free pooled mipgen scratch textures before command shutdown
 	_skr_transient_pool_shutdown(); // Free pooled transient postfx attachments before command shutdown
 

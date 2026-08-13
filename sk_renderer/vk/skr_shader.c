@@ -207,6 +207,8 @@ bool skr_shader_is_valid(const skr_shader_t* shader) {
 void skr_shader_destroy(skr_shader_t* ref_shader) {
 	if (!ref_shader) return;
 
+	_skr_mipgen_material_release(ref_shader);
+
 	_skr_shader_stage_destroy(&ref_shader->vertex_stage);
 	_skr_shader_stage_destroy(&ref_shader->pixel_stage);
 	_skr_shader_stage_destroy(&ref_shader->compute_stage);

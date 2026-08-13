@@ -367,6 +367,10 @@ void                  _skr_bind_pool_unlock                 (void);            /
 // Sampler cache management
 void                  _skr_sampler_cache_init               (void);
 void                  _skr_sampler_cache_shutdown           (void);
+void                  _skr_mipgen_materials_init            (void);
+void                  _skr_mipgen_materials_shutdown        (void);
+void                  _skr_mipgen_material_release          (const skr_shader_t* shader);
+void                  _skr_shader_param_write               (const sksc_shader_meta_t* meta, void* param_buffer, uint32_t param_buffer_size, const char* name, sksc_shader_var_ type, uint32_t count, const void* data);
 VkSampler             _skr_sampler_cache_acquire            (skr_tex_sampler_t settings);  // Get or create sampler, increment ref
 void                  _skr_sampler_cache_release            (skr_tex_sampler_t settings);  // Decrement ref, destroy if zero
 
