@@ -257,62 +257,70 @@ static void _skr_register_internal_requests(void) {
 
 	// Multiview is required for stereo/XR rendering. It's core 1.1 but still a
 	// feature flag, so a 1.1 device can report it unsupported.
+	// Feature structs here are static const: the feature compare walks raw
+	// dwords including tail padding, and only static storage guarantees the
+	// padding is zero (stack compound literals leave it as garbage on MSVC).
+	static const VkPhysicalDeviceMultiviewFeatures multiview_features = {
+		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+		.multiview = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name          = "multiview",
 		.required      = true,
-		.features      = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceMultiviewFeatures){
-			.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
-			.multiview = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceMultiviewFeatures) } },
+		.features      = (skr_vk_feature_t[]){ { &multiview_features, sizeof(multiview_features) } },
 		.feature_count = 1,
 	});
 
 	// YCbCr conversion for YUV/NV12 textures and AHB external memory. Core 1.1
 	// struct, but some drivers lack the feature (older Mesa lavapipe).
+	static const VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
+		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.samplerYcbcrConversion = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                       = "ycbcr_conversion",
-		.features                   = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSamplerYcbcrConversionFeatures){
-			.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
-			.samplerYcbcrConversion = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSamplerYcbcrConversionFeatures) } },
-		.feature_count              = 1,
+		.name          = "ycbcr_conversion",
+		.features      = (skr_vk_feature_t[]){ { &ycbcr_features, sizeof(ycbcr_features) } },
+		.feature_count = 1,
 	});
 
 	// Subgroup size control lets compute pipelines request a specific subgroup
 	// size at pipeline creation time (the Vulkan analog of HLSL [WaveSize(N)]).
+	static const VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_features = {
+		.sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+		.subgroupSizeControl = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                    = "subgroup_size_control",
-		.device_extensions       = (const char*[]){ VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME },
-		.device_extension_count  = 1,
-		.features                = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSubgroupSizeControlFeaturesEXT){
-			.sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
-			.subgroupSizeControl = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSubgroupSizeControlFeaturesEXT) } },
-		.feature_count           = 1,
+		.name                   = "subgroup_size_control",
+		.device_extensions      = (const char*[]){ VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &subgroup_size_features, sizeof(subgroup_size_features) } },
+		.feature_count          = 1,
 	});
 
 	// Reports whether drivers actually merge the postfx subpass chain
+	static const VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT subpass_merge_features = {
+		.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
+		.subpassMergeFeedback = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                     = "subpass_merge_feedback",
-		.device_extensions        = (const char*[]){ VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME },
-		.device_extension_count   = 1,
-		.features                 = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT){
-			.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
-			.subpassMergeFeedback = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT) } },
-		.feature_count            = 1,
+		.name                   = "subpass_merge_feedback",
+		.device_extensions      = (const char*[]){ VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &subpass_merge_features, sizeof(subpass_merge_features) } },
+		.feature_count          = 1,
 	});
 
 	// Synchronization2 is required by video decode and by tile shading's
 	// tile-attachment dependencies; enabled whenever the device offers it.
+	static const VkPhysicalDeviceSynchronization2Features sync2_features = {
+		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+		.synchronization2 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "sync2",
 		.device_extensions      = (const char*[]){ VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME },
 		.device_extension_count = 1,
-		.features               = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSynchronization2Features){
-			.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-			.synchronization2   = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSynchronization2Features) } },
+		.features               = (skr_vk_feature_t[]){ { &sync2_features, sizeof(sync2_features) } },
 		.feature_count          = 1,
 	});
 
@@ -320,6 +328,10 @@ static void _skr_register_internal_requests(void) {
 	// waits and image use are otherwise unobservable, and surface resize must
 	// fall back to a full device idle before destroying the old swapchain.
 	// Promoted to KHR, but drivers keep advertising the EXT spelling.
+	static const VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_maint_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+		.swapchainMaintenance1 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                     = "swapchain_maintenance1",
 		.instance_extensions      = (const char*[]){ VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
@@ -327,10 +339,7 @@ static void _skr_register_internal_requests(void) {
 		.instance_extension_count = 2,
 		.device_extensions        = (const char*[]){ VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME },
 		.device_extension_count   = 1,
-		.features                 = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT){
-			.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
-			.swapchainMaintenance1 = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT) } },
+		.features                 = (skr_vk_feature_t[]){ { &swapchain_maint_features, sizeof(swapchain_maint_features) } },
 		.feature_count            = 1,
 	});
 
@@ -342,34 +351,41 @@ static void _skr_register_internal_requests(void) {
 		VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
 		VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,
 	};
+	static const VkPhysicalDeviceImageProcessingFeaturesQCOM sample_weighted_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.textureSampleWeighted = VK_TRUE,
+	};
+	static const VkPhysicalDeviceImageProcessingFeaturesQCOM box_filter_features = {
+		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.textureBoxFilter = VK_TRUE,
+	};
+	static const VkPhysicalDeviceImageProcessingFeaturesQCOM block_match_features = {
+		.sType             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.textureBlockMatch = VK_TRUE,
+	};
+	static const VkPhysicalDeviceImageProcessing2FeaturesQCOM block_match2_features = {
+		.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM,
+		.textureBlockMatch2 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                     = "qcom_sample_weighted",
-		.device_extensions        = image_proc_exts,
-		.device_extension_count   = 4,
-		.features                 = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-			.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-			.textureSampleWeighted = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) } },
-		.feature_count            = 1,
+		.name                   = "qcom_sample_weighted",
+		.device_extensions      = image_proc_exts,
+		.device_extension_count = 4,
+		.features               = (skr_vk_feature_t[]){ { &sample_weighted_features, sizeof(sample_weighted_features) } },
+		.feature_count          = 1,
 	});
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "qcom_box_filter",
 		.device_extensions      = image_proc_exts,
 		.device_extension_count = 4,
-		.features               = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-			.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-			.textureBoxFilter   = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) } },
+		.features               = (skr_vk_feature_t[]){ { &box_filter_features, sizeof(box_filter_features) } },
 		.feature_count          = 1,
 	});
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "qcom_block_match",
 		.device_extensions      = image_proc_exts,
 		.device_extension_count = 4,
-		.features               = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-			.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-			.textureBlockMatch  = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) } },
+		.features               = (skr_vk_feature_t[]){ { &block_match_features, sizeof(block_match_features) } },
 		.feature_count          = 1,
 	});
 	// The Window/Gather block-match variants layer on VK_QCOM_image_processing2
@@ -383,19 +399,21 @@ static void _skr_register_internal_requests(void) {
 		                                           VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME },
 		.device_extension_count = 5,
 		.features               = (skr_vk_feature_t[]){
-			{ &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-				.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-				.textureBlockMatch  = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) },
-			{ &(VkPhysicalDeviceImageProcessing2FeaturesQCOM){
-				.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM,
-				.textureBlockMatch2 = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceImageProcessing2FeaturesQCOM) } },
+			{ &block_match_features,  sizeof(block_match_features)  },
+			{ &block_match2_features, sizeof(block_match2_features) } },
 		.feature_count          = 2,
 	});
 
 	// Fragment-stage tile shading: reading color attachments as sampled tile
 	// attachments with an apron. Needs sync2's 64-bit access flags + renderpass2.
+	static const VkPhysicalDeviceTileShadingFeaturesQCOM tile_shading_features = {
+		.sType                         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM,
+		.tileShading                   = VK_TRUE,
+		.tileShadingFragmentStage      = VK_TRUE,
+		.tileShadingColorAttachments   = VK_TRUE,
+		.tileShadingSampledAttachments = VK_TRUE,
+		.tileShadingApron              = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "qcom_tile_shading",
 		.device_extensions      = (const char*[]){ VK_QCOM_TILE_SHADING_EXTENSION_NAME,
@@ -404,61 +422,55 @@ static void _skr_register_internal_requests(void) {
 		                                           VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME },
 		.device_extension_count = 4,
 		.features               = (skr_vk_feature_t[]){
-			{ &(VkPhysicalDeviceTileShadingFeaturesQCOM){
-				.sType                         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM,
-				.tileShading                   = VK_TRUE,
-				.tileShadingFragmentStage      = VK_TRUE,
-				.tileShadingColorAttachments   = VK_TRUE,
-				.tileShadingSampledAttachments = VK_TRUE,
-				.tileShadingApron              = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceTileShadingFeaturesQCOM) },
-			{ &(VkPhysicalDeviceSynchronization2Features){
-				.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-				.synchronization2 = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceSynchronization2Features) } },
+			{ &tile_shading_features, sizeof(tile_shading_features) },
+			{ &sync2_features,        sizeof(sync2_features)        } },
 		.feature_count          = 2,
 	});
 
 	// 16-bit storage access (sksc_feature_bit_storage16). The push-constant bit
 	// is a separate opportunistic request, devices commonly lack just that one.
+	static const VkPhysicalDevice16BitStorageFeatures storage16_features = {
+		.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+		.storageBuffer16BitAccess           = VK_TRUE,
+		.uniformAndStorageBuffer16BitAccess = VK_TRUE,
+	};
+	static const VkPhysicalDevice16BitStorageFeatures storage16_push_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+		.storagePushConstant16 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                                   = "storage16",
-		.features                               = (skr_vk_feature_t[]){ { &(VkPhysicalDevice16BitStorageFeatures){
-			.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-			.storageBuffer16BitAccess           = VK_TRUE,
-			.uniformAndStorageBuffer16BitAccess = VK_TRUE,
-		}, sizeof(VkPhysicalDevice16BitStorageFeatures) } },
-		.feature_count                          = 1,
+		.name          = "storage16",
+		.features      = (skr_vk_feature_t[]){ { &storage16_features, sizeof(storage16_features) } },
+		.feature_count = 1,
 	});
 	skr_vk_request(&(skr_vk_request_t){
-		.name                      = "storage16_push",
-		.features                  = (skr_vk_feature_t[]){ { &(VkPhysicalDevice16BitStorageFeatures){
-			.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-			.storagePushConstant16 = VK_TRUE,
-		}, sizeof(VkPhysicalDevice16BitStorageFeatures) } },
-		.feature_count             = 1,
+		.name          = "storage16_push",
+		.features      = (skr_vk_feature_t[]){ { &storage16_push_features, sizeof(storage16_push_features) } },
+		.feature_count = 1,
 	});
 
 	// Float atomics (sksc_feature_bit_float_atomics): the coarse bit promises
 	// exchange + add + min/max, and min/max lives in atomic_float2's struct.
+	static const VkPhysicalDeviceShaderAtomicFloatFeaturesEXT float_atomic_features = {
+		.sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+		.shaderBufferFloat32Atomics   = VK_TRUE,
+		.shaderBufferFloat32AtomicAdd = VK_TRUE,
+		.shaderSharedFloat32Atomics   = VK_TRUE,
+		.shaderSharedFloat32AtomicAdd = VK_TRUE,
+	};
+	static const VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT float_atomic2_features = {
+		.sType                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
+		.shaderBufferFloat32AtomicMinMax = VK_TRUE,
+		.shaderSharedFloat32AtomicMinMax = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "float_atomics",
 		.device_extensions      = (const char*[]){ VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
 		                                           VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME },
 		.device_extension_count = 2,
 		.features               = (skr_vk_feature_t[]){
-			{ &(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT){
-				.sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
-				.shaderBufferFloat32Atomics   = VK_TRUE,
-				.shaderBufferFloat32AtomicAdd = VK_TRUE,
-				.shaderSharedFloat32Atomics   = VK_TRUE,
-				.shaderSharedFloat32AtomicAdd = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT) },
-			{ &(VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT){
-				.sType                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
-				.shaderBufferFloat32AtomicMinMax = VK_TRUE,
-				.shaderSharedFloat32AtomicMinMax = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT) } },
+			{ &float_atomic_features,  sizeof(float_atomic_features)  },
+			{ &float_atomic2_features, sizeof(float_atomic2_features) } },
 		.feature_count          = 2,
 	});
 }
@@ -1089,11 +1101,18 @@ bool skr_init(skr_settings_t settings) {
 			while (feat_queries[q].stype != want->sType) q++;
 			const uint32_t* want_bits = (const uint32_t*)((const uint8_t*)want                 + feat_header);
 			const uint32_t* have_bits = (const uint32_t*)((const uint8_t*)feat_queries[q].data + feat_header);
-			for (int32_t b = 0; b < (feat->size - feat_header) / 4; b++) {
+			const int32_t feat_dwords = (feat->size - feat_header) / 4;
+			for (int32_t b = 0; b < feat_dwords; b++) {
 				if (want_bits[b] == VK_TRUE && have_bits[b] != VK_TRUE) {
 					snprintf(req->missing_feature, sizeof(req->missing_feature), "feature bit %d of sType %u", b, (uint32_t)want->sType);
 					req->missing = req->missing_feature;
 					req->enabled = false;
+					// sizeof rounds a struct's bool payload up to an even dword
+					// count, so for odd counts the last dword is tail padding. A
+					// request failing there is likely uninitialized caller memory.
+					if (b == feat_dwords - 1)
+						skr_log(skr_log_warning, "Request '%s': failing bit %d is the last dword of sType %u, which may be uninitialized struct padding; feature structs must be fully zeroed before setting bits",
+							req->name ? req->name : "(anonymous)", b, (uint32_t)want->sType);
 					break;
 				}
 			}

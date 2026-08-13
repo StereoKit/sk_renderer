@@ -683,6 +683,11 @@ SKR_API void              skr_vk_queue_unlock                  (uint32_t queue_f
 // all its extensions are present and every requested feature bit is supported,
 // queried before enabling. Feature structs merge across requests by sType on
 // VkDeviceCreateInfo.pNext; a `required` request that can't be met fails init.
+//
+// Feature structs are compared as raw VkBool32 dwords, tail padding included,
+// so every byte must be zeroed before setting bits. Partial initialization
+// only zeroes named fields on some compilers (MSVC leaves padding as stack
+// garbage); use a static const struct or memset, not a stack compound literal.
 typedef struct skr_vk_feature_t {
 	const void* vk_struct; // VkPhysicalDevice*Features with sType set and desired bits VK_TRUE. Not VkPhysicalDeviceFeatures2.
 	int32_t     size;
