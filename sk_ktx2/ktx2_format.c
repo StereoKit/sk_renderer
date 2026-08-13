@@ -136,8 +136,7 @@ ktx2_result_ ktx2_plan(const ktx2_reader_t* reader, ktx2_context_t* context,
 	if (reader->source != ktx2_source_etc1s && reader->source != ktx2_source_uastc_ldr_4x4)
 		return ktx2_result_unsupported;
 	if (!reader->channels_known)                                    return ktx2_result_unsupported;
-	if (reader->layer_count != 0 || reader->face_count != 1 || reader->depth != 0)
-		return ktx2_result_unsupported;                             // L1 is 2D only
+	if (reader->depth != 0)                                         return ktx2_result_unsupported; // no 3D
 	if (reader->source == ktx2_source_etc1s && reader->supercompression != 1)
 		return ktx2_result_unsupported;
 	if (reader->source == ktx2_source_uastc_ldr_4x4 && reader->supercompression != 0 && reader->supercompression != 2)
@@ -158,39 +157,51 @@ ktx2_result_ ktx2_plan(const ktx2_reader_t* reader, ktx2_context_t* context,
 #endif
 
 	uint32_t height = reader->height ? reader->height : 1;
-	size_t   total  = 0;
+	uint32_t layers = reader->layer_count ? reader->layer_count : 1;
+	uint32_t images = layers * reader->face_count; // per level
+	uint64_t total  = 0;
 	for (uint32_t level = 0; level < reader->level_stored; level++)
-		total += ktx2_level_bytes(format, ktx2_mip_size(reader->width, level), ktx2_mip_size(height, level));
+		total += (uint64_t)ktx2_level_bytes(format, ktx2_mip_size(reader->width, level), ktx2_mip_size(height, level)) * images;
+
+	uint64_t scratch = 0;
+	if (reader->source == ktx2_source_etc1s) {
+		uint32_t blocks_x = ktx2_blocks(reader->width);
+		uint32_t blocks_y = ktx2_blocks(height);
+		// Codebooks, the largest slice's block indices, then two rows of endpoint
+		// predictors. Images decode one at a time, so layers and faces add nothing.
+		// The Huffman allowance covers what is live at once: codebook tables are
+		// reclaimed before slice tables are read, so this is a peak.
+		uint32_t slices = reader->sample_count == 2 ? 2 : 1;
+		scratch =
+			  (uint64_t)reader->endpoint_count * sizeof(ktx2_endpoint_t)
+			+ (uint64_t)reader->selector_count * sizeof(ktx2_selector_t)
+			+ (uint64_t)KTX2_HUFF_TABLES_LIVE  * KTX2_HUFF_MAX_SYMS * (sizeof(uint16_t) + sizeof(uint8_t))
+			+ (uint64_t)blocks_x * blocks_y    * sizeof(uint32_t) * slices
+			+ (uint64_t)blocks_x * 2           * sizeof(ktx2_block_pred_t)
+			+ 256; // alignment slack across the individual allocations
+		// The fit tables live on the context now - identical for every file, and
+		// rebuilding them cost more than transcoding a small texture.
+	} else if (reader->supercompression == 2) {
+		// A level inflates whole, every image in it sharing one Zstd frame, so
+		// scratch holds the largest: mip 0 for a block format, times its images.
+		// Sized from geometry, not from uncompressed_bytes, which is whatever the
+		// file says; the transcode rejects a level that disagrees.
+		scratch = (uint64_t)ktx2_blocks(reader->width) * ktx2_blocks(height)
+		        * KTX2_UASTC_BLOCK_BYTES * images;
+	}
+
+	// One image is bounded by KTX2_MAX_DIMENSION, so its size_t math is safe, but
+	// layers and faces multiply the totals past what a 32-bit size_t can name.
+#if SIZE_MAX < UINT64_MAX
+	if (total > (uint64_t)SIZE_MAX || scratch > (uint64_t)SIZE_MAX)
+		return ktx2_result_unsupported;
+#endif
 
 	out_plan->reader        = reader;
 	out_plan->context       = context;
 	out_plan->format        = format;
 	out_plan->mip_count     = (int32_t)reader->level_stored;
-	out_plan->data_bytes    = total;
-	out_plan->scratch_bytes = 0;
-
-	if (reader->source == ktx2_source_etc1s) {
-		uint32_t blocks_x = ktx2_blocks(reader->width);
-		uint32_t blocks_y = ktx2_blocks(height);
-		// Codebooks, the largest slice's block indices, then two rows of endpoint
-		// predictors. The Huffman allowance covers what is live at once: codebook
-		// tables are reclaimed before slice tables are read, so this is a peak.
-		uint32_t slices = reader->sample_count == 2 ? 2 : 1;
-		out_plan->scratch_bytes =
-			  (size_t)reader->endpoint_count * sizeof(ktx2_endpoint_t)
-			+ (size_t)reader->selector_count * sizeof(ktx2_selector_t)
-			+ (size_t)KTX2_HUFF_TABLES_LIVE  * KTX2_HUFF_MAX_SYMS * (sizeof(uint16_t) + sizeof(uint8_t))
-			+ (size_t)blocks_x * blocks_y    * sizeof(uint32_t) * slices
-			+ (size_t)blocks_x * 2           * sizeof(ktx2_block_pred_t)
-			+ 256; // alignment slack across the individual allocations
-		// The fit tables live on the context now - identical for every file, and
-		// rebuilding them cost more than transcoding a small texture.
-	} else if (reader->supercompression == 2) {
-		// A level inflates whole, so scratch holds the largest - always mip 0 for a
-		// block format. Sized from geometry, not from uncompressed_bytes, which is
-		// whatever the file says; the transcode rejects a level that disagrees.
-		out_plan->scratch_bytes = (size_t)ktx2_blocks(reader->width) * ktx2_blocks(height)
-		                        * KTX2_UASTC_BLOCK_BYTES;
-	}
+	out_plan->data_bytes    = (size_t)total;
+	out_plan->scratch_bytes = (size_t)scratch;
 	return ktx2_result_success;
 }

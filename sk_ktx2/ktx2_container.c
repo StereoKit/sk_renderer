@@ -71,18 +71,11 @@ static uint32_t _full_mip_count(uint32_t width, uint32_t height) {
 	return count;
 }
 
-// Keeps the 2D-only assumption out of the container: this collapses to `level`
-// for 2D, but a cubemap's six imageDescs still parse, so the glTF check can
-// reject it with a diagnostic rather than calling the file corrupt. 64-bit
-// because layerCount is unbounded, and overflow would pass a bogus SGD length.
+// 64-bit so a hostile layer count could never wrap the SGD length check, even
+// though ktx2_open caps layerCount well below where that would matter.
 static uint64_t _image_count(const ktx2_reader_t* reader) {
 	uint64_t layers = reader->layer_count ? reader->layer_count : 1;
 	return (uint64_t)reader->level_stored * layers * reader->face_count;
-}
-
-static uint32_t _image_index(const ktx2_reader_t* reader, uint32_t level, uint32_t layer, uint32_t face) {
-	uint32_t layers = reader->layer_count ? reader->layer_count : 1;
-	return (level * layers + layer) * reader->face_count + face;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -245,7 +238,7 @@ static ktx2_result_ _parse_sgd_basis(ktx2_reader_t* ref_reader, uint64_t offset,
 	for (uint32_t level = 0; level < ref_reader->level_stored; level++) {
 	for (uint32_t layer = 0; layer < layers;                  layer++) {
 	for (uint32_t face  = 0; face  < ref_reader->face_count;  face ++) {
-		uint32_t       image     = _image_index(ref_reader, level, layer, face);
+		uint32_t       image     = ktx2_image_index(ref_reader, level, layer, face);
 		const uint8_t* desc      = ref_reader->sgd_image_descs + (size_t)image * KTX2_IMAGE_DESC_BYTES;
 		uint64_t       rgb_at    = ktx2_rd_u32(desc + 4);
 		uint64_t       rgb_bytes = ktx2_rd_u32(desc + 8);
@@ -293,7 +286,9 @@ ktx2_result_ ktx2_open(const void* data, size_t bytes, ktx2_reader_t* out_reader
 	if (out_reader->width == 0)                                       return ktx2_result_corrupt;
 	if (out_reader->face_count != 1 && out_reader->face_count != 6)   return ktx2_result_corrupt;
 	if (out_reader->face_count == 6 && out_reader->width != out_reader->height) return ktx2_result_corrupt;
+	if (out_reader->face_count == 6 && out_reader->depth != 0)        return ktx2_result_corrupt;
 	if (out_reader->height == 0 && out_reader->depth != 0)            return ktx2_result_corrupt;
+	if (out_reader->layer_count > KTX2_MAX_LAYERS)                    return ktx2_result_unsupported;
 	if (out_reader->supercompression > 3)                             return ktx2_result_unsupported;
 	if (out_reader->level_count > KTX2_MAX_LEVELS)                    return ktx2_result_unsupported;
 	// Without this a file can name dimensions whose product overflows a size_t,

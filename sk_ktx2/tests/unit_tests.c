@@ -9,6 +9,9 @@
 #include "sk_ktx2.h"
 #include "host_zstd.h"
 #include "synthetic_ktx2.h"
+#ifdef SK_KTX2_UASTC
+	#include "uastc_vectors.h"
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -111,6 +114,7 @@ static void test_mutations(void) {
 		{ "levelCount 99",         40,           4, 99,     ktx2_result_unsupported, 0 },
 		{ "levelCount past full",  40,           4, 4,      ktx2_result_corrupt,     0 },
 		{ "supercompression 9",    44,           4, 9,      ktx2_result_unsupported, 0 },
+		{ "layerCount past cap",   32,           4, 100000, ktx2_result_unsupported, 0 },
 		// Without the cap, the scratch sizing and the slice decoder agree on a
 		// wrapped figure and the decode writes past its buffer.
 		{ "width past the cap",    20,           4, 70000,  ktx2_result_unsupported, 0 },
@@ -155,6 +159,131 @@ static void test_mutations(void) {
 	}
 }
 
+// Arrays and cubemaps: the container parses them, the plan sizes them per image,
+// and glTF policy still refuses them. The slices here are zeroes, so the
+// transcode is only required to fail cleanly, never to produce pixels.
+static void test_array_cubemap(void) {
+	static const struct { uint32_t layers, faces; } shapes[] = { {2, 1}, {0, 6}, {2, 6} };
+
+	for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+		uint8_t       buffer[SYNTH_IMAGES_MAX_BYTES];
+		ktx2_reader_t reader;
+		size_t        bytes  = synth_build_images(buffer, shapes[i].layers, shapes[i].faces);
+		int32_t       layers = (int32_t)(shapes[i].layers ? shapes[i].layers : 1);
+		size_t        images = (size_t)layers * shapes[i].faces;
+
+		ktx2_result_ result = ktx2_open(buffer, bytes, &reader);
+		CHECK(result == ktx2_result_success, "%ux%u images should open, got '%s'",
+			shapes[i].layers, shapes[i].faces, ktx2_result_str(result));
+		if (result != ktx2_result_success) continue;
+
+		ktx2_info_t info = ktx2_get_info(&reader);
+		CHECK(info.layer_count == layers,                "expected %d layers, got %d", layers, info.layer_count);
+		CHECK(info.face_count  == (int32_t)shapes[i].faces, "expected %u faces, got %d", shapes[i].faces, info.face_count);
+
+		CHECK(ktx2_check_gltf_basisu(&reader) == ktx2_result_not_gltf_conformant,
+			"KHR_texture_basisu forbids arrays and cubemaps");
+
+		ktx2_plan_t plan;
+		result = ktx2_plan(&reader, &k_host_context, ktx2_caps_etc2, &plan);
+		CHECK(result == ktx2_result_success,        "plan should accept it, got '%s'", ktx2_result_str(result));
+		CHECK(plan.data_bytes == images * 8,        "expected %zu bytes, got %zu", images * 8, plan.data_bytes);
+
+		uint8_t output[12 * 8];
+		result = ktx2_transcode(&plan, output, plan.data_bytes, NULL);
+		CHECK(result != ktx2_result_success, "zeroed codebooks should not decode");
+	}
+
+	// A cubemap with depth is nonsense the spec forbids outright.
+	uint8_t       buffer[SYNTH_IMAGES_MAX_BYTES];
+	ktx2_reader_t reader;
+	size_t        bytes = synth_build_images(buffer, 0, 6);
+	synth_u32(buffer, 28, 1); // pixelDepth on a cubemap
+	CHECK(ktx2_open(buffer, bytes, &reader) == ktx2_result_corrupt, "a cubemap with depth should be corrupt");
+}
+
+#ifdef SK_KTX2_UASTC
+// Two layers carrying two different spec blocks. UASTC needs no codebooks, so
+// this transcode succeeds outright, and differing outputs prove each image was
+// read from its own offset rather than the first image repeated.
+static void test_uastc_array(void) {
+	static const uint8_t blocks[2][16] = {
+		{ 0x08, 0x18, 0x43, 0x67, 0x57, 0x4F, 0xB0, 0x8A, 0x5E, 0xB4, 0x62, 0x35, 0x42, 0xE2, 0x0E, 0x22 },
+		{ 0xF1, 0xF0, 0x18, 0x8F, 0xE4, 0x6B, 0x3C, 0x3A, 0x90, 0xFB, 0x89, 0x5D, 0x56, 0x82, 0x9B, 0x6C },
+	};
+	uint8_t       buffer[SYNTH_UASTC_MAX_BYTES];
+	ktx2_reader_t reader;
+	size_t        bytes = synth_build_uastc(buffer, 4, 2, 1, 1, blocks[0]);
+
+	ktx2_result_ result = ktx2_open(buffer, bytes, &reader);
+	CHECK(result == ktx2_result_success, "UASTC array should open, got '%s'", ktx2_result_str(result));
+	if (result != ktx2_result_success) return;
+
+	ktx2_info_t info = ktx2_get_info(&reader);
+	CHECK(info.source      == ktx2_source_uastc_ldr_4x4, "expected UASTC, got %s", ktx2_source_str(info.source));
+	CHECK(info.layer_count == 2,                         "expected 2 layers, got %d", info.layer_count);
+
+	ktx2_plan_t plan;
+	result = ktx2_plan(&reader, &k_host_context, ktx2_caps_astc_ldr, &plan);
+	CHECK(result == ktx2_result_success, "plan should accept it, got '%s'", ktx2_result_str(result));
+	if (result != ktx2_result_success) return;
+	CHECK(plan.data_bytes == 32, "expected 32 bytes, got %zu", plan.data_bytes);
+
+	uint8_t output[32];
+	result = ktx2_transcode(&plan, output, sizeof(output), NULL);
+	CHECK(result == ktx2_result_success, "transcode should succeed, got '%s'", ktx2_result_str(result));
+	CHECK(memcmp(output, output + 16, 16) != 0, "distinct layers decoded to identical blocks");
+}
+
+// The stride case where an indexing bug would hide: mips and multiple images at
+// once, every image distinct spec blocks. Proven by reference rather than
+// goldens: each image sliced from the array output must equal the same blocks
+// transcoded as a plain 2D mip chain.
+static void test_uastc_mipped_images(void) {
+	// 8x8, two layers of six faces, two levels. Mip 0 is four blocks per image
+	// (vectors 0..47), mip 1 one (vectors 48..59), level-major layer-then-face.
+	uint8_t       buffer[SYNTH_UASTC_MAX_BYTES];
+	ktx2_reader_t reader;
+	size_t        bytes = synth_build_uastc(buffer, 8, 2, 6, 2, k_uastc_vector_blocks[0]);
+	CHECK(bytes != 0, "the mipped array should fit the builder");
+
+	ktx2_result_ result = ktx2_open(buffer, bytes, &reader);
+	CHECK(result == ktx2_result_success, "mipped array should open, got '%s'", ktx2_result_str(result));
+	if (result != ktx2_result_success) return;
+
+	ktx2_plan_t plan;
+	result = ktx2_plan(&reader, &k_host_context, ktx2_caps_astc_ldr, &plan);
+	CHECK(result == ktx2_result_success, "plan should accept it, got '%s'", ktx2_result_str(result));
+	if (result != ktx2_result_success) return;
+	CHECK(plan.data_bytes == 12 * 64 + 12 * 16, "expected 960 bytes, got %zu", plan.data_bytes);
+
+	uint8_t array_out[12 * 64 + 12 * 16];
+	result = ktx2_transcode(&plan, array_out, sizeof(array_out), NULL);
+	CHECK(result == ktx2_result_success, "transcode should succeed, got '%s'", ktx2_result_str(result));
+	if (result != ktx2_result_success) return;
+
+	for (int32_t image = 0; image < 12; image++) {
+		uint8_t flat_blocks[5 * 16];
+		memcpy(flat_blocks,      k_uastc_vector_blocks[image * 4], 4 * 16);
+		memcpy(flat_blocks + 64, k_uastc_vector_blocks[48 + image],    16);
+
+		uint8_t       flat_file[SYNTH_UASTC_MAX_BYTES];
+		uint8_t       flat_out [64 + 16];
+		ktx2_reader_t flat_reader;
+		ktx2_plan_t   flat_plan;
+		size_t        flat_bytes = synth_build_uastc(flat_file, 8, 0, 1, 2, flat_blocks);
+		if (ktx2_open(flat_file, flat_bytes, &flat_reader)                            != ktx2_result_success ||
+		    ktx2_plan(&flat_reader, &k_host_context, ktx2_caps_astc_ldr, &flat_plan)  != ktx2_result_success ||
+		    ktx2_transcode(&flat_plan, flat_out, sizeof(flat_out), NULL)              != ktx2_result_success) {
+			CHECK(false, "2D reference for image %d failed", image);
+			continue;
+		}
+		CHECK(memcmp(array_out + image * 64,           flat_out,      64) == 0, "image %d mip 0 misplaced", image);
+		CHECK(memcmp(array_out + 12 * 64 + image * 16, flat_out + 64, 16) == 0, "image %d mip 1 misplaced", image);
+	}
+}
+#endif
+
 // Every prefix must be rejected and none may read out of bounds; run under ASan
 // for it to mean anything. Truncation is what a fixed corpus cannot enumerate.
 static void test_truncation(void) {
@@ -184,6 +313,11 @@ int main(void) {
 	test_format_table();
 	test_context_prepare();
 	test_mutations();
+	test_array_cubemap();
+#ifdef SK_KTX2_UASTC
+	test_uastc_array();
+	test_uastc_mipped_images();
+#endif
 	test_truncation();
 	test_rejects_foreign();
 

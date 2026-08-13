@@ -142,37 +142,55 @@ static void craft_tables(bw_t* out_bw, uint32_t delta_syms, uint32_t selector_sy
 	bw_put(out_bw, history_size, 13);
 }
 
-static void craft_build(craft_t* out_file, uint32_t width, uint32_t height,
-                        const bw_t* endpoints, const bw_t* selectors, const bw_t* tables, const bw_t* slice) {
+// A minimal valid slice for any geometry, written from the decoder's grammar:
+// one pred symbol per 2x2 group on even rows, 0xFF making every block
+// delta-code, then per block a zero delta (endpoint 0) and raw selector 0, so
+// no block depends on a neighbour and any block count decodes.
+static void craft_slice(bw_t* out_slice, uint32_t blocks_x, uint32_t blocks_y) {
+	bw_init(out_slice);
+	for (uint32_t y = 0; y < blocks_y; y++) {
+	for (uint32_t x = 0; x < blocks_x; x++) {
+		if ((x & 1) == 0 && (y & 1) == 0) bw_symbol(out_slice, 0xFF, BITS_PRED);
+		bw_symbol(out_slice, 0, BITS_COLOR);
+		bw_symbol(out_slice, 0, BITS_SELECTOR);
+	}}
+}
+
+// `slices` holds one slice per level; every image of a level points its desc at
+// that whole slice, which the SGD bounds checks permit: identical bytes in,
+// identical blocks out, per image. A longer level index moves the DFD and
+// everything after it, which is why the offsets are computed rather than fixed.
+static void craft_build_mips(craft_t* out_file, uint32_t width, uint32_t height,
+                             uint32_t layer_count, uint32_t face_count, uint32_t level_count,
+                             const bw_t* endpoints, const bw_t* selectors, const bw_t* tables,
+                             const bw_t* slices) {
 	static const uint8_t k_identifier[12] = {
 		0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
 	};
 	uint32_t endpoint_bytes = bw_bytes(endpoints);
 	uint32_t selector_bytes = bw_bytes(selectors);
 	uint32_t table_bytes    = bw_bytes(tables);
-	uint32_t slice_bytes    = bw_bytes(slice);
+	uint32_t per_level      = (layer_count ? layer_count : 1) * face_count;
+	uint32_t images         = per_level * level_count;
 
-	size_t dfd   = 104;
-	size_t sgd   = dfd + 44;
-	size_t sgd_bytes  = 20 + 20 + endpoint_bytes + selector_bytes + table_bytes;
-	size_t level = (sgd + sgd_bytes + 7) & ~(size_t)7;
+	size_t dfd       = 80 + (size_t)level_count * 24;
+	size_t sgd       = dfd + 44;
+	size_t sgd_bytes = 20 + (size_t)images * 20 + endpoint_bytes + selector_bytes + table_bytes;
+	size_t at        = (sgd + sgd_bytes + 7) & ~(size_t)7;
 
 	memset(out_file, 0, sizeof(*out_file));
 	memcpy(out_file->data, k_identifier, sizeof(k_identifier));
 	wr32(out_file->data, 16, 1);      // typeSize
 	wr32(out_file->data, 20, width);
 	wr32(out_file->data, 24, height);
-	wr32(out_file->data, 36, 1);      // faceCount
-	wr32(out_file->data, 40, 1);      // levelCount
+	wr32(out_file->data, 32, layer_count);
+	wr32(out_file->data, 36, face_count);
+	wr32(out_file->data, 40, level_count);
 	wr32(out_file->data, 44, 1);      // supercompressionScheme = BasisLZ
 	wr32(out_file->data, 48, (uint32_t)dfd);
 	wr32(out_file->data, 52, 44);
 	wr64(out_file->data, 64, sgd);
 	wr64(out_file->data, 72, sgd_bytes);
-
-	wr64(out_file->data, 80,      level);
-	wr64(out_file->data, 80 +  8, slice_bytes);
-	wr64(out_file->data, 80 + 16, slice_bytes);
 
 	wr32(out_file->data, dfd,     44);
 	wr32(out_file->data, dfd + 8, 40u << 16);
@@ -191,16 +209,32 @@ static void craft_build(craft_t* out_file, uint32_t width, uint32_t height,
 	wr32(out_file->data, sgd +  8, selector_bytes);
 	wr32(out_file->data, sgd + 12, table_bytes);
 	wr32(out_file->data, sgd + 16, 0);
-	wr32(out_file->data, sgd + 24, 0);           // rgbSliceByteOffset
-	wr32(out_file->data, sgd + 28, slice_bytes); // rgbSliceByteLength
+	for (uint32_t level = 0; level < level_count; level++) {
+	for (uint32_t image = 0; image < per_level;   image++) {
+		size_t desc = sgd + 20 + ((size_t)level * per_level + image) * 20;
+		wr32(out_file->data, desc + 4, 0);                        // rgbSliceByteOffset
+		wr32(out_file->data, desc + 8, bw_bytes(&slices[level])); // rgbSliceByteLength
+	}}
 
-	size_t at = sgd + 40;
-	memcpy(out_file->data + at, endpoints->data, endpoint_bytes); at += endpoint_bytes;
-	memcpy(out_file->data + at, selectors->data, selector_bytes); at += selector_bytes;
-	memcpy(out_file->data + at, tables->data,    table_bytes);
-	memcpy(out_file->data + level, slice->data,  slice_bytes);
+	size_t blob = sgd + 20 + (size_t)images * 20;
+	memcpy(out_file->data + blob, endpoints->data, endpoint_bytes); blob += endpoint_bytes;
+	memcpy(out_file->data + blob, selectors->data, selector_bytes); blob += selector_bytes;
+	memcpy(out_file->data + blob, tables->data,    table_bytes);
 
-	out_file->bytes = level + slice_bytes;
+	for (uint32_t level = 0; level < level_count; level++) {
+		uint32_t slice_bytes = bw_bytes(&slices[level]);
+		wr64(out_file->data, 80 + (size_t)level * 24,      at);
+		wr64(out_file->data, 80 + (size_t)level * 24 +  8, slice_bytes);
+		wr64(out_file->data, 80 + (size_t)level * 24 + 16, slice_bytes);
+		memcpy(out_file->data + at, slices[level].data, slice_bytes);
+		at += slice_bytes;
+	}
+	out_file->bytes = at;
+}
+
+static void craft_build(craft_t* out_file, uint32_t width, uint32_t height,
+                        const bw_t* endpoints, const bw_t* selectors, const bw_t* tables, const bw_t* slice) {
+	craft_build_mips(out_file, width, height, 0, 1, 1, endpoints, selectors, tables, slice);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -387,6 +421,54 @@ static void case_dimension_amplification(void) {
 	}
 }
 
+// Open, plan against ETC2 caps, and transcode, expecting exactly `out_bytes`
+// of output. Returns false on any refusal, so callers report one failure.
+static bool craft_transcode(const craft_t* file, uint8_t* out_data, size_t out_bytes) {
+	ktx2_reader_t reader;
+	ktx2_plan_t   plan;
+	if (ktx2_open(file->data, file->bytes, &reader)                    != ktx2_result_success) return false;
+	if (ktx2_plan(&reader, &k_host_context, ktx2_caps_etc2, &plan)     != ktx2_result_success) return false;
+	if (plan.data_bytes != out_bytes)                                                          return false;
+	return ktx2_transcode(&plan, out_data, out_bytes, NULL) == ktx2_result_success;
+}
+
+// A mipped cubemap, each level's six imageDescs sharing that level's slice. The
+// write cursor is proven by reference rather than inspection: every face sliced
+// out of the cubemap output must equal the same slices transcoded as a plain 2D
+// mip chain. This is the stride case a single-level or single-image file cannot
+// reach: an indexing bug that swaps or overlaps images has to fail it.
+static void case_cubemap_mips(void) {
+	bw_t endpoints, selectors, tables;
+	craft_endpoints(&endpoints);
+	craft_selectors(&selectors);
+	craft_tables(&tables, CRAFT_ENDPOINTS, CRAFT_SELECTORS + 8 + 1, 8);
+
+	bw_t slices[2];
+	craft_slice(&slices[0], 2, 2); // 8x8 mip 0
+	craft_slice(&slices[1], 1, 1); // 4x4 mip 1
+
+	craft_t cube, flat;
+	craft_build_mips(&cube, 8, 8, 0, 6, 2, &endpoints, &selectors, &tables, slices);
+	craft_build_mips(&flat, 8, 8, 0, 1, 2, &endpoints, &selectors, &tables, slices);
+
+	const char* name = "mipped cubemap vs 2D reference";
+	uint8_t cube_out[6 * 32 + 6 * 8]; // etc1: mip 0 is four blocks per face, mip 1 one
+	uint8_t flat_out[32 + 8];
+	if (!craft_transcode(&cube, cube_out, sizeof(cube_out)) ||
+	    !craft_transcode(&flat, flat_out, sizeof(flat_out))) {
+		printf("  FAIL  %s did not transcode\n", name); g_failures++; return;
+	}
+
+	for (int32_t face = 0; face < 6; face++) {
+		if (memcmp(cube_out + face * 32,         flat_out,      32) != 0 ||
+		    memcmp(cube_out + 6 * 32 + face * 8, flat_out + 32,  8) != 0) {
+			printf("  FAIL  %s: face %d differs\n", name, face);
+			g_failures++; return;
+		}
+	}
+	printf("  %-34s six faces match the 2D reference\n", name);
+}
+
 int main(void) {
 	printf("Crafted ETC1S bitstreams:\n");
 	case_pred_repeat_overflow();
@@ -396,6 +478,7 @@ int main(void) {
 	case_history_index_past_size();
 	case_truncated_slice();
 	case_dimension_amplification();
+	case_cubemap_mips();
 
 	if (g_failures == 0) printf("craft: all cases returned cleanly\n");
 	else                 printf("%d failure(s)\n", g_failures);

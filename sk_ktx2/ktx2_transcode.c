@@ -146,34 +146,40 @@ static ktx2_result_ _transcode_etc1s(const ktx2_plan_t* plan, uint8_t* out_data,
 	const ktx2_gray_fit_t*  fits = needs_gray ? ktx2_context_gray(plan->context) : NULL;
 	const ktx2_bc1_table_t* bc1  = needs_bc1  ? ktx2_context_bc1 (plan->context) : NULL;
 
-	size_t written = 0;
+	uint32_t layers  = reader->layer_count ? reader->layer_count : 1;
+	size_t   written = 0;
 	for (uint32_t level = 0; level < reader->level_stored; level++) {
 		uint32_t level_w  = ktx2_mip_size(reader->width, level);
 		uint32_t level_h  = ktx2_mip_size(height,        level);
 		uint32_t level_bx = ktx2_blocks(level_w);
 		uint32_t level_by = ktx2_blocks(level_h);
+		const uint8_t* level_at = reader->data + reader->levels[level].offset;
 
-		// 2D only, so the image index and the level index are the same thing.
-		const uint8_t* desc      = reader->sgd_image_descs + (size_t)level * KTX2_IMAGE_DESC_BYTES;
-		uint32_t       rgb_at    = ktx2_rd_u32(desc +  4);
-		uint32_t       rgb_bytes = ktx2_rd_u32(desc +  8);
-		uint32_t       aux_at    = ktx2_rd_u32(desc + 12);
-		uint32_t       aux_bytes = ktx2_rd_u32(desc + 16);
-		const uint8_t* level_at  = reader->data + reader->levels[level].offset;
+		// The file's layer-then-face order within a level is the output's own, so
+		// walking images in file order packs them.
+		for (uint32_t layer = 0; layer < layers;             layer++) {
+		for (uint32_t face  = 0; face  < reader->face_count; face ++) {
+			uint32_t       image     = ktx2_image_index(reader, level, layer, face);
+			const uint8_t* desc      = reader->sgd_image_descs + (size_t)image * KTX2_IMAGE_DESC_BYTES;
+			uint32_t       rgb_at    = ktx2_rd_u32(desc +  4);
+			uint32_t       rgb_bytes = ktx2_rd_u32(desc +  8);
+			uint32_t       aux_at    = ktx2_rd_u32(desc + 12);
+			uint32_t       aux_bytes = ktx2_rd_u32(desc + 16);
 
-		result = ktx2_etc1s_decode_slice(&etc1s, level_at + rgb_at, rgb_bytes, level_bx, level_by, slice_blocks);
-		if (result != ktx2_result_success) return result;
-
-		if (two_slices) {
-			result = ktx2_etc1s_decode_slice(&etc1s, level_at + aux_at, aux_bytes, level_bx, level_by, second_blocks);
+			result = ktx2_etc1s_decode_slice(&etc1s, level_at + rgb_at, rgb_bytes, level_bx, level_by, slice_blocks);
 			if (result != ktx2_result_success) return result;
-		}
 
-		result = _write_blocks(&etc1s, fits, bc1, slice_blocks, second_blocks, level_bx, level_by,
-			plan->format, level_w, level_h, out_data + written);
-		if (result != ktx2_result_success) return result;
+			if (two_slices) {
+				result = ktx2_etc1s_decode_slice(&etc1s, level_at + aux_at, aux_bytes, level_bx, level_by, second_blocks);
+				if (result != ktx2_result_success) return result;
+			}
 
-		written += ktx2_level_bytes(plan->format, level_w, level_h);
+			result = _write_blocks(&etc1s, fits, bc1, slice_blocks, second_blocks, level_bx, level_by,
+				plan->format, level_w, level_h, out_data + written);
+			if (result != ktx2_result_success) return result;
+
+			written += ktx2_level_bytes(plan->format, level_w, level_h);
+		}}
 	}
 	return ktx2_result_success;
 }
@@ -190,23 +196,27 @@ static ktx2_result_ _transcode_uastc(const ktx2_plan_t* plan, uint8_t* out_data,
 		return ktx2_result_unsupported;
 
 	uint32_t height = reader->height ? reader->height : 1;
+	uint32_t layers = reader->layer_count ? reader->layer_count : 1;
+	uint32_t images = layers * reader->face_count; // per level
 
-	// One buffer reused across levels: each is an independent Zstd frame, and mip
-	// 0 is the largest level of any block format.
+	// One buffer reused across levels: each is an independent Zstd frame holding
+	// all of its images, and mip 0 is the largest level of any block format.
 	uint8_t* inflated = NULL;
 	if (reader->supercompression == 2) {
-		size_t largest = (size_t)ktx2_blocks(reader->width) * ktx2_blocks(height) * KTX2_UASTC_BLOCK_BYTES;
+		size_t largest = (size_t)ktx2_blocks(reader->width) * ktx2_blocks(height)
+		               * KTX2_UASTC_BLOCK_BYTES * images;
 		inflated = (uint8_t*)ktx2_arena_alloc(ref_arena, largest);
 		if (ref_arena->exhausted) return ktx2_result_buffer_too_small;
 	}
 
 	size_t written = 0;
 	for (uint32_t level = 0; level < reader->level_stored; level++) {
-		uint32_t level_w  = ktx2_mip_size(reader->width, level);
-		uint32_t level_h  = ktx2_mip_size(height,        level);
-		uint32_t level_bx = ktx2_blocks(level_w);
-		uint32_t level_by = ktx2_blocks(level_h);
-		uint64_t need     = (uint64_t)level_bx * level_by * KTX2_UASTC_BLOCK_BYTES;
+		uint32_t level_w     = ktx2_mip_size(reader->width, level);
+		uint32_t level_h     = ktx2_mip_size(height,        level);
+		uint32_t level_bx    = ktx2_blocks(level_w);
+		uint32_t level_by    = ktx2_blocks(level_h);
+		size_t   image_bytes = (size_t)level_bx * level_by * KTX2_UASTC_BLOCK_BYTES;
+		uint64_t need        = (uint64_t)image_bytes * images;
 
 		const uint8_t* src   = reader->data + reader->levels[level].offset;
 		uint64_t       avail = reader->levels[level].bytes;
@@ -224,54 +234,60 @@ static ktx2_result_ _transcode_uastc(const ktx2_plan_t* plan, uint8_t* out_data,
 		}
 		if (avail < need) return ktx2_result_corrupt;
 
-		for (uint32_t block_y = 0; block_y < level_by; block_y++) {
-			for (uint32_t block_x = 0; block_x < level_bx; block_x++) {
-				size_t       block = (size_t)block_y * level_bx + block_x;
-				ktx2_uastc_t unpacked;
-				ktx2_uastc_unpack(src + block * 16, &unpacked);
+		// Images within a level pack tightly in layer-then-face order, which is
+		// also the output's order, so both sides advance one image at a time.
+		for (uint32_t image = 0; image < images; image++) {
+			const uint8_t* image_src = src + (size_t)image * image_bytes;
 
-				switch (plan->format) {
-				case ktx2_fmt_astc4x4_rgba:
-				case ktx2_fmt_astc4x4_rgba_srgb:
-					ktx2_uastc_write_astc(&unpacked, out_data + written + block * 16);
-					break;
+			for (uint32_t block_y = 0; block_y < level_by; block_y++) {
+				for (uint32_t block_x = 0; block_x < level_bx; block_x++) {
+					size_t       block = (size_t)block_y * level_bx + block_x;
+					ktx2_uastc_t unpacked;
+					ktx2_uastc_unpack(image_src + block * 16, &unpacked);
 
-				case ktx2_fmt_bc7_rgba:
-				case ktx2_fmt_bc7_rgba_srgb:
-					ktx2_uastc_write_bc7(&unpacked, out_data + written + block * 16);
-					break;
+					switch (plan->format) {
+					case ktx2_fmt_astc4x4_rgba:
+					case ktx2_fmt_astc4x4_rgba_srgb:
+						ktx2_uastc_write_astc(&unpacked, out_data + written + block * 16);
+						break;
+
+					case ktx2_fmt_bc7_rgba:
+					case ktx2_fmt_bc7_rgba_srgb:
+						ktx2_uastc_write_bc7(&unpacked, out_data + written + block * 16);
+						break;
 
 #ifdef SK_KTX2_DECODE_UNCOMPRESSED
-				case ktx2_fmt_rgba32:
-				case ktx2_fmt_rgba32_srgb:
-				case ktx2_fmt_r8:
-				case ktx2_fmt_rg8: {
-					uint8_t  texels[64];
-					uint32_t stride = plan->format == ktx2_fmt_r8 ? 1 : (plan->format == ktx2_fmt_rg8 ? 2 : 4);
-					ktx2_uastc_to_rgba(&unpacked, texels);
+					case ktx2_fmt_rgba32:
+					case ktx2_fmt_rgba32_srgb:
+					case ktx2_fmt_r8:
+					case ktx2_fmt_rg8: {
+						uint8_t  texels[64];
+						uint32_t stride = plan->format == ktx2_fmt_r8 ? 1 : (plan->format == ktx2_fmt_rg8 ? 2 : 4);
+						ktx2_uastc_to_rgba(&unpacked, texels);
 
-					uint32_t copy_w = level_w - block_x * 4 < 4 ? level_w - block_x * 4 : 4;
-					uint32_t copy_h = level_h - block_y * 4 < 4 ? level_h - block_y * 4 : 4;
-					for (uint32_t y = 0; y < copy_h; y++) {
-						for (uint32_t x = 0; x < copy_w; x++) {
-							const uint8_t* texel = texels + (y * 4 + x) * 4;
-							uint8_t*       dst   = out_data + written
-								+ ((size_t)(block_y * 4 + y) * level_w + block_x * 4 + x) * stride;
-							if (stride == 4) { memcpy(dst, texel, 4); continue; }
-							// One-channel sources replicate across RGB and two-channel
-							// ones put the second in alpha, so green is never green.
-							dst[0] = texel[0];
-							if (stride == 2) dst[1] = texel[3];
+						uint32_t copy_w = level_w - block_x * 4 < 4 ? level_w - block_x * 4 : 4;
+						uint32_t copy_h = level_h - block_y * 4 < 4 ? level_h - block_y * 4 : 4;
+						for (uint32_t y = 0; y < copy_h; y++) {
+							for (uint32_t x = 0; x < copy_w; x++) {
+								const uint8_t* texel = texels + (y * 4 + x) * 4;
+								uint8_t*       dst   = out_data + written
+									+ ((size_t)(block_y * 4 + y) * level_w + block_x * 4 + x) * stride;
+								if (stride == 4) { memcpy(dst, texel, 4); continue; }
+								// One-channel sources replicate across RGB and two-channel
+								// ones put the second in alpha, so green is never green.
+								dst[0] = texel[0];
+								if (stride == 2) dst[1] = texel[3];
+							}
 						}
+						break;
 					}
-					break;
-				}
 #endif
-				default: return ktx2_result_unsupported;
+					default: return ktx2_result_unsupported;
+					}
 				}
 			}
+			written += ktx2_level_bytes(plan->format, level_w, level_h);
 		}
-		written += ktx2_level_bytes(plan->format, level_w, level_h);
 	}
 	return ktx2_result_success;
 }

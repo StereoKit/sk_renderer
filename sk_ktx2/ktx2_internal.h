@@ -40,6 +40,13 @@ static inline uint32_t ktx2_blocks(uint32_t pixels) {
 	return (pixels + 3) / 4;
 }
 
+// Index of one image in a file's level, then layer, then face order: the order
+// KTX2 stores them within a level, and the order the output is packed in.
+static inline uint32_t ktx2_image_index(const ktx2_reader_t* reader, uint32_t level, uint32_t layer, uint32_t face) {
+	uint32_t layers = reader->layer_count ? reader->layer_count : 1;
+	return (level * layers + layer) * reader->face_count + face;
+}
+
 // Shared so the plan's size and the transcode's write cursor cannot disagree.
 size_t ktx2_level_bytes(ktx2_fmt_ format, uint32_t width, uint32_t height);
 

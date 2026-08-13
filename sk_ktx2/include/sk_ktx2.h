@@ -4,9 +4,11 @@
 
 // sk_ktx2 - a KTX2 / Basis Universal transcoder in C11.
 //
-// Scope is glTF's KHR_texture_basisu: ETC1S and UASTC LDR 4x4, 2D only. Source
-// blocks go straight to the destination block format, never through pixels, so
-// there is no renderer dependency and no GPU.
+// Scope is glTF's KHR_texture_basisu (ETC1S and UASTC LDR 4x4), plus the same
+// encodings in array and cubemap containers, which the extension forbids but
+// KTX2 itself does not. 3D textures stay out. Source blocks go straight to the
+// destination block format, never through pixels, so there is no renderer
+// dependency and no GPU.
 //
 //   static ktx2_context_t ctx = {0};  // ~43 KB, one per process; see below
 //   ktx2_reader_t  r;
@@ -44,10 +46,15 @@ extern "C" {
 // this has headroom; files claiming more are rejected, never truncated.
 #define KTX2_MAX_LEVELS 24
 
-// Bounds every `blocks * blocks * bytes` product downstream, so all of it can be
-// plain size_t arithmetic. At 16384 the worst case - a 4 byte-per-texel decode -
-// is 1 GiB, so the mip chain still fits a 32-bit size_t, which wasm32 has.
+// Bounds every per-image `blocks * blocks * bytes` product downstream, so those
+// stay plain size_t arithmetic. At 16384 the worst case (a 4 byte-per-texel
+// decode) is 1 GiB per image; layers and faces multiply that, so ktx2_plan sums
+// whole-texture totals in 64-bit and rejects what a size_t cannot name.
 #define KTX2_MAX_DIMENSION 16384
+
+// Caps the image count the way KTX2_MAX_LEVELS caps levels: common GPU limits
+// sit at 2048 layers, and layerCount is otherwise a raw u32 from the file.
+#define KTX2_MAX_LAYERS 2048
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -108,8 +115,8 @@ typedef enum ktx2_fmt_ {
 	ktx2_fmt_rgba32,       ktx2_fmt_rgba32_srgb,
 } ktx2_fmt_;
 
-// What ktx2_open found. It parses arrays, cubemaps and the HDR models, and
-// ktx2_plan is what declines them, so these fields report more than we transcode.
+// What ktx2_open found. It parses 3D textures and the HDR models too, and
+// ktx2_plan is what declines those, so these fields report more than we transcode.
 typedef struct ktx2_info_t {
 	int32_t        width;
 	int32_t        height;
@@ -257,9 +264,11 @@ KTX2_API ktx2_result_ ktx2_plan(const ktx2_reader_t* reader, ktx2_context_t* con
 // first texture load and makes the context shareable across threads after.
 KTX2_API void ktx2_context_prepare(ktx2_context_t* ref_context);
 
-// The complete mip chain in one pass, mip 0 first and tightly packed - exactly
-// skr_tex_data_t's layout. Levels are read in the file's native smallest-first
-// order internally. opt_scratch may be NULL to allocate internally.
+// The complete mip chain in one pass, mip 0 first and tightly packed, images
+// within a level in layer-then-face order: exactly skr_tex_data_t's mip-major
+// layout, and also the file's own image order. Levels are read in the file's
+// native smallest-first order internally. opt_scratch may be NULL to allocate
+// internally.
 KTX2_API ktx2_result_ ktx2_transcode(const ktx2_plan_t* plan, void* out_data, size_t out_bytes, void* opt_scratch);
 
 #ifdef __cplusplus
