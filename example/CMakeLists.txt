@@ -30,7 +30,7 @@ else()
 	message(STATUS "Fetching sk_app v2026.7.20...")
 	FetchContent_Declare(sk_app
 		GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-		GIT_TAG        v2026.7.20
+		GIT_TAG        v2026.8.10
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
@@ -126,6 +126,8 @@ set_target_properties(sk_renderer_test PROPERTIES
 	CXX_STANDARD_REQUIRED ON
 )
 
+skr_target_warnings(sk_renderer_test)
+
 if(UNIX AND NOT ANDROID)
 	target_link_libraries(sk_renderer_test PRIVATE m)
 endif()
@@ -203,7 +205,9 @@ target_sources(sk_renderer_test PRIVATE
 	bloom.c
 	text/text.c
 	tools/scene_util.c
-	tools/tex_compress.c
+	tools/compress/tex_compress.c
+	tools/tex_psnr.c
+	tools/compress/astc_io.c
 	imgui_backend/imgui_impl_sk_renderer.cpp
 	${sk_app_SOURCE_DIR}/examples/imgui_example/imgui_impl_sk_app.cpp
 	${cimgui_SOURCE_DIR}/imgui/imgui.cpp
@@ -237,18 +241,15 @@ endif()
 ###############################################################################
 
 # Compile ImGui shader to header file (no debug info, embedded in binary).
-# Web builds carry WGSL only (web-slim); native WebGPU keeps SPIR-V alongside
-# for byte-compat with the Vulkan tooling. WGSL comes only from the SVSL
-# backend, so WebGPU targets pass -svsl (the web host tool may carry glslang,
-# and mixing backends isn't allowed).
-if(EMSCRIPTEN)
+# A container carries one language, so the target follows the backend. WGSL
+# comes only from the SVSL backend, so those builds pass -svsl; the web host
+# tool may still carry glslang, and mixing backends isn't allowed.
+if(SKR_USE_WEBGPU) # includes EMSCRIPTEN, which forces it ON above
 	set(_skr_example_shader_targets "-svsl -t w")
-elseif(SKR_USE_WEBGPU)
-	set(_skr_example_shader_targets "-svsl -t sw")
 else()
 	set(_skr_example_shader_targets "-t s")
 endif()
-# Output goes to the build dir: the flags differ per backend (-t s vs -t sw),
+# Output goes to the build dir: the flags differ per backend (-t s vs -t w),
 # so a source-tree copy would ping-pong between build configurations
 skshaderc_compile_headers(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/imgui_shader "-o3 -e ${_skr_example_shader_targets}"
 	imgui_backend/imgui.hlsl
@@ -298,17 +299,36 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gi_voxel_to_sh.hlsl
 	assets/shaders/postfx_invert.hlsl
 	assets/shaders/postfx_depth_fog.hlsl
+	assets/shaders/postfx_depth_fog_ms.hlsl
 	assets/shaders/postfx_fog_density.svsl
 	assets/shaders/postfx_fog_scatter.svsl
 	assets/shaders/postfx_fog_scatter_taps.svsl
 	assets/shaders/postfx_fog_tile.svsl
+	assets/shaders/postfx_halation.svsl
 	assets/shaders/msaa_resolve.hlsl
 	assets/shaders/msaa_resolve_wide.hlsl
 	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
+	assets/shaders/tex_compare.hlsl
+	# GPU texture compression toolkit — sources live with the tool code in
+	# tools/compress/ (see tools/compress/README.md); compiled .sks output
+	# lands in generated/shaders/ alongside everything else.
+	tools/compress/shaders/bc1_compress.hlsl
+	tools/compress/shaders/bc6h_compress.hlsl
+	tools/compress/shaders/bc7_compress.hlsl
+	tools/compress/shaders/astc4x4_compress.hlsl
+	tools/compress/shaders/astc6x6_compress.hlsl
+	tools/compress/shaders/astc8x8hdr_compress.hlsl
+	tools/compress/shaders/tex_psnr.hlsl
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+###############################################################################
+# ASTC encoder validation tool (desktop only)
+###############################################################################
+
+add_subdirectory(tools/compress/validate)
 
 ###############################################################################
 # "run" command

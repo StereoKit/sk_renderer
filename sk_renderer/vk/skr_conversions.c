@@ -62,6 +62,7 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_bc7_rgba:      return VK_FORMAT_BC7_UNORM_BLOCK;
 		// Mobile compressed formats
 		case skr_tex_fmt_etc1_rgb:           return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+		case skr_tex_fmt_etc1_rgb_srgb:      return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
 		case skr_tex_fmt_etc2_rgba_srgb:     return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;
 		case skr_tex_fmt_etc2_rgba:          return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
 		case skr_tex_fmt_etc2_r11:           return VK_FORMAT_EAC_R11_UNORM_BLOCK;
@@ -74,6 +75,11 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_pvrtc2_rgba:        return VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG;
 		case skr_tex_fmt_astc4x4_rgba_srgb:  return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
 		case skr_tex_fmt_astc4x4_rgba:       return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+		case skr_tex_fmt_astc6x6_rgba_srgb:  return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+		case skr_tex_fmt_astc6x6_rgba:       return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+		// HDR rides on the regular UNORM 8x8 format — the decoder picks
+		// LDR vs HDR per-block from the encoded CEM.
+		case skr_tex_fmt_astc8x8_rgba_hdr:   return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
 		case skr_tex_fmt_atc_rgb:            return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		case skr_tex_fmt_atc_rgba:           return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		// YUV / multi-plane formats
@@ -137,6 +143,7 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 		case VK_FORMAT_BC7_UNORM_BLOCK:            return skr_tex_fmt_bc7_rgba;
 		// Mobile compressed formats
 		case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:    return skr_tex_fmt_etc1_rgb;
+		case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:     return skr_tex_fmt_etc1_rgb_srgb;
 		case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:   return skr_tex_fmt_etc2_rgba_srgb;
 		case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:  return skr_tex_fmt_etc2_rgba;
 		case VK_FORMAT_EAC_R11_UNORM_BLOCK:        return skr_tex_fmt_etc2_r11;
@@ -149,6 +156,11 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 		case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:return skr_tex_fmt_pvrtc2_rgba;
 		case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:        return skr_tex_fmt_astc4x4_rgba_srgb;
 		case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:       return skr_tex_fmt_astc4x4_rgba;
+		case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:        return skr_tex_fmt_astc6x6_rgba_srgb;
+		case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:       return skr_tex_fmt_astc6x6_rgba;
+		// LDR 8x8 has no skr enum of its own; the HDR profile shares the
+		// Vulkan format (HDR is signalled per-block via CEM), so map to it.
+		case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:       return skr_tex_fmt_astc8x8_rgba_hdr;
 		// YUV / multi-plane formats
 		case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:                       return skr_tex_fmt_nv12;
 		case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:     return skr_tex_fmt_p010;
@@ -420,7 +432,10 @@ VkBufferUsageFlags _skr_to_vk_buffer_usage(skr_buffer_type_ type) {
 	if (type & skr_buffer_type_vertex)   flags |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 	if (type & skr_buffer_type_index)    flags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 	if (type & skr_buffer_type_constant) flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-	if (type & skr_buffer_type_storage)  flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+	// No separate indirect or transfer buffer type to key off of, so every
+	// storage buffer carries both bits for skr_compute_execute_indirect and
+	// skr_tex_set_buffer.
+	if (type & skr_buffer_type_storage)  flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	return flags;
 }
 

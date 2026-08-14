@@ -24,6 +24,19 @@ void  _skr_free   (void* ptr);
 // Internal state
 ///////////////////////////////////////////////////////////////////////////////
 
+// Boolean renderpass features, packed into skr_pipeline_renderpass_key_t.flags
+// so a new boolean costs no struct layout churn.
+typedef enum {
+	skr_rp_flag_resolve_subpass    = 1 << 0, // Manual MSAA resolve subpass between geometry and postfx
+	skr_rp_flag_custom_resolve     = 1 << 1, // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
+	skr_rp_flag_postfx_reads_depth = 1 << 2, // Postfx subpasses get depth as an input attachment. Under MSAA,
+	                                         // geometry resolves depth on-tile (VK_KHR_depth_stencil_resolve)
+	skr_rp_flag_postfx_depth_ms    = 1 << 3, // ...unless the postfx shader declared depth as SubpassInputMS,
+	                                         // which reads MSAA depth directly and skips that on-tile resolve
+	skr_rp_flag_tile_shading       = 1 << 4, // VK_QCOM_tile_shading pass: a postfx shader reads an
+	                                         // attachment as a tile attachment (neighborhood reads on-tile)
+} skr_rp_flag_;
+
 typedef struct {
 	VkFormat              color_format;
 	VkFormat              depth_format;
@@ -41,15 +54,9 @@ typedef struct {
 	                                        // content. Single-view (view_mask=0x1) should use 0x1.
 	uint8_t               subpass_index;    // 0 for geometry, 1+ for resolve/postfx subpasses
 	uint8_t               postfx_count;     // 0 = single-subpass (legacy), 1+ = multi-subpass with postfx
-	bool                  has_resolve_subpass;      // Manual MSAA resolve subpass between geometry and postfx
-	bool                  use_custom_resolve_flags; // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
-	bool                  postfx_reads_depth;       // Postfx subpasses get depth as an input attachment; under
-	                                                // MSAA the geometry subpass also resolves depth on-tile
-	                                                // (VK_KHR_depth_stencil_resolve) so postfx reads 1x depth
-	bool                  tile_shading;             // VK_QCOM_tile_shading pass: a postfx shader reads an
-	                                                // attachment as a tile attachment (neighborhood reads on-tile)
-	uint8_t               tile_apron[2];            // VkRenderPassTileShadingCreateInfoQCOM::tileApronSize, from
-	                                                // the postfx shader's //--apron meta, clamped to maxApronSize
+	uint8_t               tile_apron[2];    // VkRenderPassTileShadingCreateInfoQCOM::tileApronSize, from
+	                                        // the postfx shader's //--apron meta, clamped to maxApronSize
+	uint32_t              flags;            // skr_rp_flag_* bits
 	VkFormat              postfx_output_format;     // Format of the final postfx output attachment
 	VkImageLayout         final_color_layout;       // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
 	VkImageLayout         final_resolve_layout;     // 0 or COLOR_ATTACHMENT_OPTIMAL = default; SHADER_READ_ONLY = readable
@@ -219,8 +226,11 @@ typedef struct {
 	bool                     has_custom_resolve;          // VK_QCOM_render_pass_shader_resolve
 	bool                     has_create_renderpass2;      // VK_KHR_create_renderpass2
 	bool                     has_depth_stencil_resolve;   // VK_KHR_depth_stencil_resolve (implies create_renderpass2)
+	bool                     has_present_fence;           // VK_EXT_swapchain_maintenance1, fences observe present completion
+	bool                     has_store_op_none;           // VK_ATTACHMENT_STORE_OP_NONE, from any of the KHR/EXT/QCOM extensions
 	bool                     has_subpass_merge_feedback;  // VK_EXT_subpass_merge_feedback + feature bit
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
+	bool                     has_storage_without_format;  // shaderStorageImage(Write+Read)WithoutFormat, for format Unknown storage access
 	bool                     has_qcom_image_proc;         // VK_QCOM_image_processing + all three feature bits, plus its
 	                                                      // SPIR-V 1.4 prerequisites (VK_KHR_spirv_1_4 + shader_float_controls)
 	                                                      // and VK_KHR_format_feature_flags2
@@ -338,15 +348,11 @@ VkDescriptorSetLayout _skr_shader_make_layout               (VkDevice device, bo
 void                  _skr_shader_resolve_spec_constants    (const sksc_shader_meta_t* meta, const skr_spec_constant_t* specs, uint32_t spec_count, uint32_t out_values[SKR_MAX_SPEC_CONSTANTS]);
 const VkSpecializationInfo* _skr_shader_make_spec_info      (const sksc_shader_meta_t* meta, const uint32_t* spec_values, VkSpecializationMapEntry out_entries[SKR_MAX_SPEC_CONSTANTS], VkSpecializationInfo* out_info);
 
-// Format helpers
-bool                  _skr_format_has_stencil               (VkFormat format);
-bool                  _skr_format_is_depth                  (VkFormat format);
-
 // Timing helpers
 uint64_t              _skr_time_get_ns                      (void);
 
 // Material descriptor caching. Returns -1 on success, or the failing bind index if a resource is missing.
-int32_t               _skr_material_add_writes              (const skr_material_bind_t* binds, uint32_t bind_ct, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct);
+int32_t               _skr_material_add_writes              (const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct);
 const char*           _skr_material_bind_name               (const sksc_shader_meta_t* meta, int32_t bind_idx);
 
 // Bind pool management
@@ -361,6 +367,10 @@ void                  _skr_bind_pool_unlock                 (void);            /
 // Sampler cache management
 void                  _skr_sampler_cache_init               (void);
 void                  _skr_sampler_cache_shutdown           (void);
+void                  _skr_mipgen_materials_init            (void);
+void                  _skr_mipgen_materials_shutdown        (void);
+void                  _skr_mipgen_material_release          (const skr_shader_t* shader);
+void                  _skr_shader_param_write               (const sksc_shader_meta_t* meta, void* param_buffer, uint32_t param_buffer_size, const char* name, sksc_shader_var_ type, uint32_t count, const void* data);
 VkSampler             _skr_sampler_cache_acquire            (skr_tex_sampler_t settings);  // Get or create sampler, increment ref
 void                  _skr_sampler_cache_release            (skr_tex_sampler_t settings);  // Decrement ref, destroy if zero
 
@@ -375,6 +385,7 @@ void                  _skr_render_list_sort                 (skr_render_list_t* 
 
 // Debug
 void                  _skr_set_debug_name                   (VkDevice device, VkObjectType type, uint64_t handle, const char* name);
+void                  _skr_append_str                       (char* ref_str, size_t str_size, const char* text);
 void                  _skr_append_vertex_format             (char* ref_str, size_t str_size, const skr_vert_component_t* components, uint32_t component_count);
 const char*           _skr_semantic_name                    (skr_semantic_ semantic);
 void                  _skr_append_material_config           (char* ref_str, size_t str_size, const _skr_pipeline_material_key_t* mat_key);

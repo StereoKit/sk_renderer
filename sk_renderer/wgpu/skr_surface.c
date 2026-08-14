@@ -6,7 +6,7 @@
 
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_err_ skr_surface_create(void* native_surface, skr_surface_t* out_surface) {
+skr_err_ skr_surface_create(void* native_surface, skr_vec2i_t size, skr_surface_t* out_surface) {
 	if (out_surface == NULL) return skr_err_invalid_parameter;
 	memset(out_surface, 0, sizeof(*out_surface));
 	if (native_surface == NULL) return skr_err_invalid_parameter;
@@ -17,8 +17,9 @@ skr_err_ skr_surface_create(void* native_surface, skr_surface_t* out_surface) {
 
 	WGPUSurfaceCapabilities caps = {0};
 	if (wgpuSurfaceGetCapabilities(out_surface->surface, _skr_wgpu.adapter, &caps) != WGPUStatus_Success || caps.formatCount == 0) {
+		// The caller's reference is only consumed on success, matching Vulkan.
+		// Releasing here left the caller holding a dangling handle.
 		skr_log(skr_log_critical, "Failed to query surface capabilities");
-		wgpuSurfaceRelease(out_surface->surface);
 		memset(out_surface, 0, sizeof(*out_surface));
 		return skr_err_device_error;
 	}
@@ -39,10 +40,8 @@ skr_err_ skr_surface_create(void* native_surface, skr_surface_t* out_surface) {
 	else if (out_surface->format == WGPUTextureFormat_RGBA8Unorm) out_surface->view_format = WGPUTextureFormat_RGBA8UnormSrgb;
 	wgpuSurfaceCapabilitiesFreeMembers(caps);
 
-	// The app sets .size and calls skr_surface_resize for the real window
-	// size; this default just guarantees a valid configuration exists
-	out_surface->size = (skr_vec2i_t){ 1280, 720 };
-	skr_surface_resize(out_surface);
+	// A caller that gave no size still needs a valid configuration
+	skr_surface_resize(out_surface, (size.x > 0 && size.y > 0) ? size : (skr_vec2i_t){ 1280, 720 });
 	return skr_err_success;
 }
 
@@ -61,9 +60,12 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_surface_resize(skr_surface_t* ref_surface) {
+void skr_surface_resize(skr_surface_t* ref_surface, skr_vec2i_t size) {
 	if (ref_surface == NULL || ref_surface->surface == NULL) return;
-	if (ref_surface->size.x <= 0 || ref_surface->size.y <= 0) return;
+	if (size.x <= 0 || size.y <= 0) return;
+
+	// WebGPU never reports its own size, so this is the only source there is
+	ref_surface->size = size;
 
 	WGPUTextureFormat view_format = (WGPUTextureFormat)ref_surface->view_format;
 	WGPUSurfaceConfiguration config = {
@@ -85,9 +87,16 @@ void skr_surface_resize(skr_surface_t* ref_surface) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_tex_t** out_tex) {
+skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, skr_tex_t** out_tex) {
 	if (out_tex) *out_tex = NULL;
 	if (ref_surface == NULL || ref_surface->surface == NULL || !ref_surface->configured) return skr_acquire_error;
+
+	// A zero size is a minimized window, with nothing to acquire
+	if (size.x <= 0 || size.y <= 0) return skr_acquire_not_ready;
+
+	// WebGPU surfaces never report an extent of their own, so the caller's
+	// size is the only resize signal there is.
+	if (size.x != ref_surface->size.x || size.y != ref_surface->size.y) return skr_acquire_needs_resize;
 
 	// Release the previous frame's wrapper if present didn't run
 	if (ref_surface->current.view)    { wgpuTextureViewRelease(ref_surface->current.view);    ref_surface->current.view    = NULL; }

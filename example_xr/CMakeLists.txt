@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.19)
 
 # OpenXR Example for sk_renderer
 # Demonstrates VR rendering using OpenXR with Vulkan backend
@@ -75,7 +75,9 @@ target_sources(sk_renderer_xr_test PRIVATE
 
 	# Scene utilities and tools from example/
 	${EXAMPLE_DIR}/tools/scene_util.c
-	${EXAMPLE_DIR}/tools/tex_compress.c
+	${EXAMPLE_DIR}/tools/compress/tex_compress.c
+	${EXAMPLE_DIR}/tools/tex_psnr.c
+	${EXAMPLE_DIR}/tools/compress/astc_io.c
 	${EXAMPLE_DIR}/text/text.c
 
 	# Scene implementations from example/ (linked, not copied)
@@ -111,6 +113,8 @@ target_link_libraries(sk_renderer_xr_test PRIVATE
 	sk_renderer
 	openxr_loader
 )
+
+skr_target_warnings(sk_renderer_xr_test)
 
 target_include_directories(sk_renderer_xr_test PRIVATE
 	${openxr_loader_SOURCE_DIR}/include

@@ -209,6 +209,7 @@ typedef enum skr_tex_fmt_ {
 
 	// ETC / EAC compressed (mobile)
 	skr_tex_fmt_etc1_rgb,
+	skr_tex_fmt_etc1_rgb_srgb,
 	skr_tex_fmt_etc2_rgba_srgb,
 	skr_tex_fmt_etc2_rgba,
 	skr_tex_fmt_etc2_r11,
@@ -225,6 +226,13 @@ typedef enum skr_tex_fmt_ {
 	// ASTC compressed
 	skr_tex_fmt_astc4x4_rgba_srgb,
 	skr_tex_fmt_astc4x4_rgba,
+	skr_tex_fmt_astc6x6_rgba_srgb,
+	skr_tex_fmt_astc6x6_rgba,
+	// ASTC 8x8 HDR. Sampling produces FP16 RGB. Uses the standard
+	// VK_FORMAT_ASTC_8x8_UNORM_BLOCK on the Vulkan side; the HDR profile
+	// is signalled by the encoded block contents (CEM 11), not the format.
+	// Hardware support required — software decoders typically lack HDR.
+	skr_tex_fmt_astc8x8_rgba_hdr,
 
 	// ATC compressed (Adreno)
 	skr_tex_fmt_atc_rgb,
@@ -367,12 +375,15 @@ typedef enum skr_capability_ {
 	skr_capability_max                    // Must be last - array size
 } skr_capability_;
 
+// Attachment load behavior. Omitting a bit means LOAD, the most expensive
+// option, a full attachment load plus a barrier to make that load valid.
 typedef enum skr_clear_ {
-	skr_clear_none    = 0,
-	skr_clear_color   = 1 << 0,
-	skr_clear_depth   = 1 << 1,
-	skr_clear_stencil = 1 << 2,
-	skr_clear_all     = skr_clear_color | skr_clear_depth | skr_clear_stencil,
+	skr_clear_none          = 0,
+	skr_clear_color         = 1 << 0,
+	skr_clear_depth         = 1 << 1,
+	skr_clear_stencil       = 1 << 2,
+	skr_clear_color_discard = 1 << 3, // Start with undefined color instead of loading. Cheapest for an attachment the pass fully covers. Ignored if skr_clear_color is set, and depth has no equivalent, it always clears.
+	skr_clear_all           = skr_clear_color | skr_clear_depth | skr_clear_stencil,
 } skr_clear_;
 
 typedef enum skr_acquire_ {
@@ -672,6 +683,11 @@ SKR_API void              skr_vk_queue_unlock                  (uint32_t queue_f
 // all its extensions are present and every requested feature bit is supported,
 // queried before enabling. Feature structs merge across requests by sType on
 // VkDeviceCreateInfo.pNext; a `required` request that can't be met fails init.
+//
+// Feature structs are compared as raw VkBool32 dwords, tail padding included,
+// so every byte must be zeroed before setting bits. Partial initialization
+// only zeroes named fields on some compilers (MSVC leaves padding as stack
+// garbage); use a static const struct or memset, not a stack compound literal.
 typedef struct skr_vk_feature_t {
 	const void* vk_struct; // VkPhysicalDevice*Features with sType set and desired bits VK_TRUE. Not VkPhysicalDeviceFeatures2.
 	int32_t     size;
@@ -728,7 +744,6 @@ SKR_API bool              skr_cmd_is_active                (void);
 
 SKR_API void              skr_callback_log                 (void (*callback)(skr_log_ level, const char* text));
 SKR_API void              skr_log                          (skr_log_ level, const char* text, ...);
-SKR_API uint64_t          skr_hash                         (const char *string);
 
 SKR_API skr_err_          skr_buffer_create                (const void *opt_data, uint32_t size_count, uint32_t size_stride, skr_buffer_type_ type, skr_use_ use, skr_buffer_t *out_buffer);
 SKR_API void              skr_buffer_destroy               (      skr_buffer_t* ref_buffer);
@@ -799,6 +814,7 @@ SKR_API int32_t           skr_tex_get_multisample          (const skr_tex_t*    
 SKR_API void              skr_tex_set_sampler              (      skr_tex_t* ref_tex, skr_tex_sampler_t sampler);
 SKR_API skr_tex_sampler_t skr_tex_get_sampler              (const skr_tex_t*     tex);
 SKR_API skr_err_          skr_tex_set_data                 (      skr_tex_t* ref_tex, const skr_tex_data_t* data);
+SKR_API skr_err_          skr_tex_set_buffer               (      skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint32_t base_mip, uint32_t mip_count);
 SKR_API void              skr_tex_generate_mips            (      skr_tex_t* ref_tex, const skr_shader_t* opt_filter_shader);
 SKR_API void              skr_tex_set_name                 (      skr_tex_t* ref_tex, const char* name);
 SKR_API bool              skr_tex_fmt_is_supported         (skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample);
@@ -810,14 +826,12 @@ SKR_API uint32_t          skr_tex_calc_mip_count           (skr_vec3i_t size);
 SKR_API skr_vec3i_t       skr_tex_calc_mip_dimensions      (skr_vec3i_t base_size, uint32_t mip_level);
 SKR_API uint64_t          skr_tex_calc_mip_size            (skr_tex_fmt_ format, skr_vec3i_t base_size, uint32_t mip_level);
 
-// native_surface is a VkSurfaceKHR under SKR_VK, a WGPUSurface under
-// SKR_WEBGPU. Ownership transfers to the renderer either way: the caller's
-// reference is consumed, and skr_surface_destroy releases it.
-SKR_API skr_err_          skr_surface_create               (void* native_surface, skr_surface_t* out_surface);
+
+SKR_API skr_err_          skr_surface_create               (void* native_surface, skr_vec2i_t size, skr_surface_t* out_surface);
 SKR_API bool              skr_surface_is_valid             (const skr_surface_t*     surface);
 SKR_API void              skr_surface_destroy              (      skr_surface_t* ref_surface);
-SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface);
-SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_tex_t** out_tex);
+SKR_API void              skr_surface_resize               (      skr_surface_t* ref_surface, skr_vec2i_t size);
+SKR_API skr_acquire_      skr_surface_next_tex             (      skr_surface_t* ref_surface, skr_vec2i_t size, skr_tex_t** out_tex);
 SKR_API skr_acquire_      skr_surface_present              (      skr_surface_t* ref_surface);
 SKR_API skr_vec2i_t       skr_surface_get_size             (const skr_surface_t*     surface);
 

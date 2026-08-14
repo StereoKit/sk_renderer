@@ -6,6 +6,7 @@
 #include "_sk_renderer.h"
 #include "skr_conversions.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -141,6 +142,52 @@ skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t s
 			vkCmdCopyBuffer(ctx.cmd, staging_buffer, out_buffer->buffer, 1, &(VkBufferCopy){
 				.size = out_buffer->size,
 			});
+
+			// The copy carries no implicit dependency with later reads. Those reads
+			// may land in this same command buffer (_skr_cmd_acquire hands back the
+			// active one, so creation can nest inside an open context), or in a
+			// later submission on this queue — submissions overlap freely. Either
+			// way the barrier below is what orders them.
+			VkAccessFlags        dst_access = 0;
+			VkPipelineStageFlags dst_stage  = 0;
+			if (type & skr_buffer_type_vertex) {
+				dst_access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+			}
+			if (type & skr_buffer_type_index) {
+				dst_access |= VK_ACCESS_INDEX_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+			}
+			if (type & skr_buffer_type_constant) {
+				dst_access |= VK_ACCESS_UNIFORM_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+			}
+			if (type & skr_buffer_type_storage) {
+				// SHADER_WRITE covers the WAW against a compute pass that writes the
+				// buffer on its first dispatch. Storage buffers also double as
+				// indirect args (skr_compute_execute_indirect), so cover that read.
+				dst_access |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+			}
+			if (dst_stage == 0) {
+				// A skr_buffer_type_ with no mapping above. Fail loud in debug, and
+				// stay conservative in release — dropping the barrier here would
+				// surface as intermittent corruption, not a clean failure.
+				assert(false && "skr_buffer_type_ has no barrier mapping, add one above");
+				dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+				dst_stage  = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			}
+			VkBufferMemoryBarrier buffer_barrier = {
+				.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+				.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+				.dstAccessMask       = dst_access,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.buffer              = out_buffer->buffer,
+				.offset              = 0,
+				.size                = out_buffer->size,
+			};
+			vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, NULL, 1, &buffer_barrier, 0, NULL);
 
 			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
 			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).

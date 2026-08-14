@@ -41,14 +41,21 @@ enum resolve_mode_ {
 	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
 	resolve_mode_oled_subpixel,  // OLED subpixel-aware resolve (Texture2DMS, separate pass)
 	resolve_mode_depth_fog,      // Postfx reads depth as input attachment (on-tile resolved under MSAA)
+	resolve_mode_depth_fog_ms,   // Same fog, but depth is SubpassInputMS, so the pass skips the depth
+	                             // resolve entirely. MSAA only, the shader can't run in a 1x pass
 	resolve_mode_fog_scatter,    // Depth fog + light scatter: on-tile density prepass (postfx, depth
 	                             // never stored), then a VK_QCOM_image_processing box-filter blit
 	                             // whose kernel widens with the density packed in alpha
 	resolve_mode_fog_tile,       // Same effect entirely on-tile: VK_QCOM_tile_shading postfx reads
 	                             // color as a tile attachment with a 4px apron (kernel capped there)
+	resolve_mode_halation,       // Film halation: a blit that convolves the scene's clipped highlights
+	                             // with a derived per-wavelength PSF. No extensions.
 	resolve_mode_max,
 };
-const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX", "Depth Fog + Scatter (QCOM)", "Fog Scatter On-Tile (QCOM)" };
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX", "Depth Fog PostFX (MS depth)", "Depth Fog + Scatter (QCOM)", "Fog Scatter On-Tile (QCOM)", "Halation Blit" };
+// The mode combo walks this array to resolve_mode_max, so a missing name is an
+// out of bounds read rather than a blank entry.
+_Static_assert(sizeof(resolve_mode_names) / sizeof(resolve_mode_names[0]) == resolve_mode_max, "resolve_mode_names needs an entry per resolve_mode_");
 
 // Application state
 struct app_t {
@@ -88,6 +95,8 @@ struct app_t {
 	skr_material_t postfx_mat2;  // Second invert for the chained mode — two inverts ≈ identity
 	skr_shader_t   depth_fog_shader;
 	skr_material_t depth_fog_mat;
+	skr_shader_t   depth_fog_ms_shader; // Same shader with SubpassInputMS depth, MSAA passes only
+	skr_material_t depth_fog_ms_mat;
 	// Fog + scatter pair: density prepass (postfx subpass, keeps depth on-tile)
 	// + a scatter blit. The blit prefers the VK_QCOM_image_processing box
 	// filter and falls back to plain 9-tap sampling when the device lacks it.
@@ -99,6 +108,20 @@ struct app_t {
 	// Fog on-tile: same effect as a tile-shading postfx subpass (apron reads).
 	skr_shader_t   fog_tile_shader;
 	skr_material_t fog_tile_mat;
+	// Halation: a blit that convolves the scene with the film-base point
+	// spread function. Reads scene_color, which this mode makes readable.
+	skr_shader_t   halation_shader;
+	skr_material_t halation_mat;
+	// Live tuning values for it. Seeded from the shader's own defaults when the
+	// material is created, so postfx_halation.svsl stays the one place those
+	// numbers live, then driven from the ImGui panel each frame.
+	float          hal_coupling;
+	float          hal_irradiation;
+	float          hal_thickness;
+	float          hal_irr_radius;
+	float          hal_clip_knee;
+	float          hal_clip_range;
+	float          hal_dye[4];
 
 	// Manual MSAA resolve
 	skr_shader_t   resolve_shader;
@@ -193,6 +216,7 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	bool manual_resolve  = (app->resolve_mode == resolve_mode_manual_postfx);
 	bool fog_scatter     = (app->resolve_mode == resolve_mode_fog_scatter);
 	bool fog_tile        = (app->resolve_mode == resolve_mode_fog_tile);
+	bool halation        = (app->resolve_mode == resolve_mode_halation);
 	bool separate_pass   = wide_kernel || oled_subpixel;
 	skr_tex_flags_ msaa_flags = skr_tex_flags_writeable
 		| (manual_resolve ? skr_tex_flags_input_attachment : 0)
@@ -225,6 +249,17 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 				linear_clamp,
 				(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->upscale_target);
 		}
+	} else if (halation) {
+		// Halation blits from this with a wide tap kernel, so the scene has to
+		// land in a sampleable target rather than staying transient. Geometry
+		// writes it at 1x, the MSAA resolve lands in it otherwise — which is
+		// why it takes render_target's format and not offscreen_format: a
+		// resolve attachment has to match the format of its color attachment,
+		// and color_msaa follows the render target here.
+		skr_tex_create(render_target->format,
+			skr_tex_flags_readable | skr_tex_flags_writeable,
+			linear_clamp,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
 	} else if (fog_tile) {
 		// On-tile fog reads this as a sampled tile attachment: SAMPLED usage
 		// rules out the transient flag, but the render pass still never stores
@@ -343,6 +378,13 @@ app_t* app_create(int32_t start_scene) {
 			.depth_test = skr_compare_always,
 		}, &app->depth_fog_mat);
 	}
+	app->depth_fog_ms_shader = su_shader_load("shaders/postfx_depth_fog_ms.hlsl.sks", "postfx_depth_fog_ms");
+	if (skr_shader_is_valid(&app->depth_fog_ms_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->depth_fog_ms_shader,
+			.depth_test = skr_compare_always,
+		}, &app->depth_fog_ms_mat);
+	}
 	// Fog + scatter: the density prepass is an ordinary postfx; the scatter
 	// blit prefers BoxFilterQCOM. skr_shader_create refuses shaders the device
 	// can't run (VK_QCOM_image_processing here), so an invalid result routes
@@ -370,6 +412,26 @@ app_t* app_create(int32_t start_scene) {
 			.shader     = &app->fog_tile_shader,
 			.depth_test = skr_compare_always,
 		}, &app->fog_tile_mat);
+	}
+	// Halation: PSF convolution blit. Plain bilinear taps, so unlike the fog
+	// scatter pair there's no device gate and no fallback shader — the mode is
+	// available everywhere.
+	app->halation_shader = su_shader_load("shaders/postfx_halation.svsl.sks", "postfx_halation");
+	if (skr_shader_is_valid(&app->halation_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->halation_shader,
+			.depth_test = skr_compare_always,
+		}, &app->halation_mat);
+		// Pull the tuning values straight out of the freshly created material,
+		// which carries the shader's declared defaults — no second copy of them
+		// here to drift out of sync.
+		skr_material_get_param(&app->halation_mat, "coupling",       sksc_shader_var_float, 1, &app->hal_coupling);
+		skr_material_get_param(&app->halation_mat, "irradiation",    sksc_shader_var_float, 1, &app->hal_irradiation);
+		skr_material_get_param(&app->halation_mat, "base_thickness", sksc_shader_var_float, 1, &app->hal_thickness);
+		skr_material_get_param(&app->halation_mat, "irr_radius",     sksc_shader_var_float, 1, &app->hal_irr_radius);
+		skr_material_get_param(&app->halation_mat, "clip_knee",      sksc_shader_var_float, 1, &app->hal_clip_knee);
+		skr_material_get_param(&app->halation_mat, "clip_range",     sksc_shader_var_float, 1, &app->hal_clip_range);
+		skr_material_get_param(&app->halation_mat, "dye_absorb",     sksc_shader_var_float, 4,  app->hal_dye);
 	}
 	app->resolve_shader = su_shader_load("shaders/msaa_resolve.hlsl.sks", "msaa_resolve");
 	if (skr_shader_is_valid(&app->resolve_shader)) {
@@ -428,8 +490,6 @@ app_t* app_create(int32_t start_scene) {
 	su_log(su_log_info, "Application created successfully!");
 	su_log(su_log_info, "Available scenes: %d (use arrow keys to switch)", app->scene_count);
 
-	//start_scene = 17;
-	
 	// Start with the requested scene (default to 0 if out of range or -1)
 	app->scene_index = -1;
 	int32_t initial_scene = (start_scene >= 0 && start_scene < app->scene_count) ? start_scene : 0;
@@ -466,6 +526,10 @@ void app_destroy(app_t* app) {
 		skr_material_destroy(&app->depth_fog_mat);
 		skr_shader_destroy(&app->depth_fog_shader);
 	}
+	if (skr_shader_is_valid(&app->depth_fog_ms_shader)) {
+		skr_material_destroy(&app->depth_fog_ms_mat);
+		skr_shader_destroy(&app->depth_fog_ms_shader);
+	}
 	// The fog materials only exist when their shaders passed the device gate
 	if (skr_material_is_valid(&app->fog_density_mat))  skr_material_destroy(&app->fog_density_mat);
 	if (skr_material_is_valid(&app->fog_scatter_mat))  skr_material_destroy(&app->fog_scatter_mat);
@@ -473,6 +537,10 @@ void app_destroy(app_t* app) {
 	if (skr_shader_is_valid(&app->fog_density_shader)) skr_shader_destroy(&app->fog_density_shader);
 	if (skr_shader_is_valid(&app->fog_scatter_shader)) skr_shader_destroy(&app->fog_scatter_shader);
 	if (skr_shader_is_valid(&app->fog_tile_shader))    skr_shader_destroy(&app->fog_tile_shader);
+	if (skr_shader_is_valid(&app->halation_shader)) {
+		skr_material_destroy(&app->halation_mat);
+		skr_shader_destroy(&app->halation_shader);
+	}
 	if (skr_shader_is_valid(&app->postfx_shader)) {
 		skr_material_destroy(&app->postfx_mat);
 		skr_material_destroy(&app->postfx_mat2);
@@ -527,6 +595,10 @@ void app_set_resolve_mode(app_t* app, int32_t mode) {
 	app->resolve_mode = mode;
 }
 
+int32_t app_resolve_mode_count(void) {
+	return resolve_mode_max;
+}
+
 void app_set_msaa(app_t* app, int32_t samples) {
 	if (!app || samples < 1 || samples > skr_get_max_msaa_samples()) return;
 	app->msaa = samples;
@@ -545,7 +617,7 @@ void app_key_press(app_t* app, app_key_ key) {
 	}
 }
 
-void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_target) {
+static void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_target) {
 	if (!app) return;
 
 	// Destroy old render targets
@@ -654,17 +726,23 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// wide_kernel       | color_msaa      | NULL            | NULL (separate pass)
 	// oled_subpixel     | color_msaa      | NULL            | NULL (separate pass)
 	// fog_scatter       | as auto_postfx  | as auto_postfx  | fog_scatter_target (+scatter blit)
+	// halation          | scene_color     | scene_color     | NULL (readable scene + halation blit)
 	//
 	// *render_target = scene_color when enable_offscreen or needs_upscale
 	// final_output   = render_target when !needs_upscale, else upscale_src
 	bool use_chain_postfx   = (app->resolve_mode == resolve_mode_chain_postfx)  && skr_material_is_valid(&app->postfx_mat) && skr_material_is_valid(&app->postfx_mat2);
 	bool use_depth_fog      = (app->resolve_mode == resolve_mode_depth_fog)     && skr_material_is_valid(&app->depth_fog_mat);
+	// SubpassInputMS has no 1x form, so this mode is only offered under MSAA
+	bool use_depth_fog_ms   = (app->resolve_mode == resolve_mode_depth_fog_ms)  && app->msaa > 1 && skr_material_is_valid(&app->depth_fog_ms_mat);
 	// Gate on the support flag, not just material validity — the material is
 	// never created on devices without VK_QCOM_image_processing, and the mode
 	// must fall back to plain rendering there.
 	bool use_fog_scatter    = (app->resolve_mode == resolve_mode_fog_scatter)   && skr_material_is_valid(&app->fog_density_mat) && skr_material_is_valid(&app->fog_scatter_mat);
 	bool use_fog_tile       = (app->resolve_mode == resolve_mode_fog_tile)      && skr_material_is_valid(&app->fog_tile_mat);
-	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog || use_fog_scatter || use_fog_tile;
+	// Halation is not a postfx: it needs neighbours, so it reads the finished
+	// scene as a texture in a blit rather than a pixel-local subpass.
+	bool use_halation       = (app->resolve_mode == resolve_mode_halation)      && skr_material_is_valid(&app->halation_mat);
+	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog || use_depth_fog_ms || use_fog_scatter || use_fog_tile;
 	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
 	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
 	bool use_oled_subpixel  = (app->resolve_mode == resolve_mode_oled_subpixel) && app->msaa > 1 && skr_material_is_valid(&app->oled_resolve_mat);
@@ -674,9 +752,9 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// goes to upscale_target (a separate readable texture) to avoid aliasing in the framebuffer.
 	skr_tex_t* upscale_src = NULL;  // What the upscale blit reads from (NULL = no upscale)
 	if (needs_upscale)
-		// Fog scatter always blits into upscale_target: its postfx output is the
-		// density prepass texture, which the scatter blit must not write back to.
-		upscale_src = ((use_postfx && app->msaa > 1) || use_fog_scatter) ? &app->upscale_target : &app->scene_color;
+		// Fog scatter and halation always blit into upscale_target: their blit
+		// source is scene_color / the prepass, which it must not write back to.
+		upscale_src = ((use_postfx && app->msaa > 1) || use_fog_scatter || use_halation) ? &app->upscale_target : &app->scene_color;
 
 	skr_tex_t* final_output = needs_upscale ? upscale_src : render_target;
 
@@ -703,8 +781,12 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		resolve_target = (app->msaa > 1) ? &app->scene_color : NULL;
 		postfx_output  = use_fog_scatter ? &app->fog_scatter_target : final_output;
 	} else {
-		color_target   = (app->msaa > 1) ? &app->color_msaa : ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target);
-		resolve_target = (app->msaa > 1) ? ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target) : NULL;
+		// Halation renders the scene into scene_color like the offscreen path
+		// does, then blits it to final_output — it samples neighbours, so the
+		// scene has to be a texture by the time it runs.
+		bool to_scene_color = enable_offscreen || needs_upscale || use_halation;
+		color_target   = (app->msaa > 1) ? &app->color_msaa : (to_scene_color ? &app->scene_color : render_target);
+		resolve_target = (app->msaa > 1) ? (to_scene_color ? &app->scene_color : render_target) : NULL;
 	}
 
 	// Scene geometry via deferred pass (handles multi-view transparently)
@@ -735,6 +817,8 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		skr_pass_add_postfx(&pass, &app->fog_density_mat);
 	else if (use_depth_fog)
 		skr_pass_add_postfx(&pass, &app->depth_fog_mat);
+	else if (use_depth_fog_ms)
+		skr_pass_add_postfx(&pass, &app->depth_fog_ms_mat);
 	else if (use_postfx)
 		skr_pass_add_postfx(&pass, &app->postfx_mat);
 	if (use_chain_postfx)
@@ -764,6 +848,21 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		skr_material_set_tex  (&app->fog_scatter_mat, "scene_tex", &app->fog_scatter_target);
 		skr_renderer_blit(&app->fog_scatter_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
 	}
+	// Halation: convolve the scene's clipped highlights with the film-base PSF
+	// and add the halo back over it. 33 bilinear taps, no extensions needed.
+	if (use_halation) {
+		float source_size[2] = { (float)render_w, (float)render_h };
+		skr_material_set_param(&app->halation_mat, "source_size",    sksc_shader_var_float, 2, source_size);
+		skr_material_set_param(&app->halation_mat, "coupling",       sksc_shader_var_float, 1, &app->hal_coupling);
+		skr_material_set_param(&app->halation_mat, "irradiation",    sksc_shader_var_float, 1, &app->hal_irradiation);
+		skr_material_set_param(&app->halation_mat, "base_thickness", sksc_shader_var_float, 1, &app->hal_thickness);
+		skr_material_set_param(&app->halation_mat, "irr_radius",     sksc_shader_var_float, 1, &app->hal_irr_radius);
+		skr_material_set_param(&app->halation_mat, "clip_knee",      sksc_shader_var_float, 1, &app->hal_clip_knee);
+		skr_material_set_param(&app->halation_mat, "clip_range",     sksc_shader_var_float, 1, &app->hal_clip_range);
+		skr_material_set_param(&app->halation_mat, "dye_absorb",     sksc_shader_var_float, 4,  app->hal_dye);
+		skr_material_set_tex  (&app->halation_mat, "src_tex", &app->scene_color);
+		skr_renderer_blit(&app->halation_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+	}
 
 	// Post-processing (operates at render resolution, before upscale)
 	if (enable_offscreen && enable_bloom) {
@@ -780,7 +879,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 
 	// ImGui: always renders to swapchain at native resolution (sharp UI)
 	skr_tex_t* imgui_target = upscale_src ? render_target
-		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel) ? render_target
+		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel || use_halation) ? render_target
 		: (resolve_target ? resolve_target : color_target);
 	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1);
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
@@ -840,6 +939,22 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 		igText("Scatter: 9-tap fallback\n(no VK_QCOM_image_processing)");
 	if (app->resolve_mode == resolve_mode_fog_tile && !skr_material_is_valid(&app->fog_tile_mat))
 		igTextColored((ImVec4){1.0f, 0.45f, 0.35f, 1.0f}, "Needs VK_QCOM_tile_shading\n(renders without postfx here)");
+	if (app->resolve_mode == resolve_mode_halation && skr_material_is_valid(&app->halation_mat)) {
+		igSeparator();
+		igText("Halation");
+		// Both radii are fractions of the source height, so the on-screen size
+		// moves with the render target — show the pixel figures alongside, since
+		// that is what you are actually judging.
+		int32_t rh = APP_SIZE_ROUND((int32_t)(height * app->render_scale));
+		igText("halo reaches %.0f px, glow %.0f px", app->hal_thickness * rh * 4.0f, app->hal_irr_radius * rh);
+		igSliderFloat ("Strength",    &app->hal_coupling,    0.0f, 1.0f,   "%.2f", 0);
+		igSliderFloat ("Glow / Halo", &app->hal_irradiation, 0.0f, 1.0f,   "%.2f", 0);
+		igSliderFloat ("Halo Radius", &app->hal_thickness,   0.0f, 0.03f,  "%.4f", 0);
+		igSliderFloat ("Glow Radius", &app->hal_irr_radius,  0.0f, 0.01f,  "%.4f", 0);
+		igSliderFloat ("Clip Knee",   &app->hal_clip_knee,   0.0f, 1.0f,   "%.2f", 0);
+		igSliderFloat ("Clip Range",  &app->hal_clip_range,  1.0f, 24.0f,  "%.1f", 0);
+		igSliderFloat3("Dye Absorb",  app->hal_dye,          0.0f, 3.0f,   "%.2f", 0);
+	}
 
 	float gpu_ms   = skr_renderer_get_gpu_time_us() / 1000.0f;
 	float cpu_ms   = skr_renderer_get_cpu_time_us() / 1000.0f;

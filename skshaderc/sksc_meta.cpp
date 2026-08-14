@@ -487,7 +487,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			buff->var_count          = count;
 			buff->vars               = (sksc_shader_var_t*)malloc(count * sizeof(sksc_shader_var_t));
 			memset(buff->vars, 0, count * sizeof(sksc_shader_var_t));
-			strncpy(buff->name, buffer_name, sizeof(buff->name));
+			strncpy(buff->name, buffer_name, sizeof(buff->name) - 1);
 
 			for (uint32_t m = 0; m < count; m++) {
 				SpvReflectBlockVariable* member = &binding->block.members[m];
@@ -499,7 +499,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 				}
 				
 				const char* member_name = member->name ? member->name : "";
-				strncpy(buff->vars[m].name, member_name, sizeof(buff->vars[m].name));
+				strncpy(buff->vars[m].name, member_name, sizeof(buff->vars[m].name) - 1);
 				buff->vars[m].offset     = member->offset;
 				buff->vars[m].size       = member->size;
 
@@ -516,7 +516,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 				// Build type name - use SPIRV type_name for structs, construct for primitives
 				const char* type_name = member->type_description->type_name;
 				if (type_name) {
-					strncpy(buff->vars[m].type_name, type_name, sizeof(buff->vars[m].type_name));
+					strncpy(buff->vars[m].type_name, type_name, sizeof(buff->vars[m].type_name) - 1);
 				} else {
 					// Construct type name for primitive types
 					const char* base_type = "unknown";
@@ -542,7 +542,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 					} else if (vec_size > 1) {
 						snprintf(buff->vars[m].type_name, sizeof(buff->vars[m].type_name), "%s%u", base_type, vec_size);
 					} else {
-						strncpy(buff->vars[m].type_name, base_type, sizeof(buff->vars[m].type_name));
+						strncpy(buff->vars[m].type_name, base_type, sizeof(buff->vars[m].type_name) - 1);
 					}
 				}
 
@@ -593,7 +593,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			tex->bind.stage_bits   |= spirv_stage->stage;
 			tex->bind.register_type = skr_register_texture;
 			tex->shape             |= _sksc_image_shape(&binding->image);
-			strncpy(tex->name, name, sizeof(tex->name));
+			strncpy(tex->name, name, sizeof(tex->name) - 1);
 		}
 	}
 
@@ -615,7 +615,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			tex->bind.register_type = skr_register_readwrite_tex;
 			tex->shape             |= _sksc_image_shape(&binding->image);
 			tex->image_format       = (uint8_t)binding->image.image_format;
-			strncpy(tex->name, name, sizeof(tex->name));
+			strncpy(tex->name, name, sizeof(tex->name) - 1);
 		}
 	}
 
@@ -665,7 +665,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			}
 			tex->element_size = element_size;
 
-			strncpy(tex->name, name, sizeof(tex->name));
+			strncpy(tex->name, name, sizeof(tex->name) - 1);
 		}
 	}
 
@@ -686,7 +686,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			res->bind.stage_bits   |= spirv_stage->stage;
 			res->bind.register_type = skr_register_input_attachment;
 			res->shape             |= _sksc_image_shape(&binding->image);
-			strncpy(res->name, name, sizeof(res->name));
+			strncpy(res->name, name, sizeof(res->name) - 1);
 		}
 	}
 
@@ -982,9 +982,9 @@ array_t<sksc_meta_item_t> sksc_meta_find_defaults(const char *hlsl_text) {
 
 			sksc_meta_item_t item = {};
 			sksc_line_col(hlsl_text, comment, &item.row, &item.col);
-			strncpy(item.name,  name,  sizeof(item.name));
-			strncpy(item.tag,   tag,   sizeof(item.tag));
-			strncpy(item.value, value, sizeof(item.value));
+			snprintf(item.name,  sizeof(item.name),  "%s", name);
+			snprintf(item.tag,   sizeof(item.tag),   "%s", tag);
+			snprintf(item.value, sizeof(item.value), "%s", value);
 			items.add(item);
 
 			if (tag[0] == '\0' && value[0] == '\0') {
@@ -1059,7 +1059,7 @@ void sksc_meta_assign_defaults(array_t<sksc_ast_default_t> ast_defaults, array_t
 			if (strcmp(buff->vars[v].name, item->name) != 0) continue;
 
 			found += 1;
-			strncpy(buff->vars[v].extra, item->tag, sizeof(buff->vars[v].extra));
+			strncpy(buff->vars[v].extra, item->tag, sizeof(buff->vars[v].extra) - 1);
 
 			// If no value specified, keep the AST default (if any)
 			if (item->value[0] == '\0') break;
@@ -1100,14 +1100,14 @@ void sksc_meta_assign_defaults(array_t<sksc_ast_default_t> ast_defaults, array_t
 			if (strcmp(ref_meta->resources[r].name, item->name) != 0) continue;
 			found += 1;
 
-			strncpy(ref_meta->resources[r].tags,  item->tag,   sizeof(ref_meta->resources[r].tags ));
-			strncpy(ref_meta->resources[r].value, item->value, sizeof(ref_meta->resources[r].value));
+			strncpy(ref_meta->resources[r].tags,  item->tag,   sizeof(ref_meta->resources[r].tags ) - 1);
+			strncpy(ref_meta->resources[r].value, item->value, sizeof(ref_meta->resources[r].value) - 1);
 			break;
 		}
 
 		if (strcmp(item->name, "name") == 0) {
 			found += 1;
-			strncpy(ref_meta->name, item->value, sizeof(ref_meta->name));
+			strncpy(ref_meta->name, item->value, sizeof(ref_meta->name) - 1);
 		}
 
 		if (strcmp(item->name, "wave_size") == 0) {

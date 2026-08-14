@@ -1,9 +1,8 @@
 # Android build. Needs ANDROID_HOME set, a JDK for APK signing, and the
 # platform matching the example's MIN_SDK for the compile jar
-# (`sdkmanager "platforms;android-29"`). Cross-compiling uses the pre-built
-# host skshaderc from bin/tools/ for shader compilation — run a native build
-# first so it exists and is current (a stale one emits old SKS containers the
-# runtime refuses):
+# (`sdkmanager "platforms;android-29"`). Android can't run its own shader
+# compiler, so the build makes a host skshaderc inside the build folder and
+# compiles shaders with that. The first build of a fresh folder pays for it:
 #
 #   export ANDROID_NDK=$ANDROID_HOME/ndk/25.2.9519653   # or whichever is installed
 #   cmake -B build-android \
@@ -21,14 +20,26 @@
 #
 #   # Filtered logcat for the app
 #   adb logcat -v color --uid `adb shell pm list package -U net.stereokit.renderer_test | cut -d ":" -f3`
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.19)
+
+# Stamp URL downloads with their extraction time, so bumping a dependency's URL
+# rebuilds what depends on it. Guarded because the policy only exists in 3.24+,
+# and cmake_minimum_required above leaves it unset.
+if(POLICY CMP0135)
+	cmake_policy(SET CMP0135 NEW)
+endif()
+
 project(sk_renderer VERSION 0.1.0)
 
 # Add custom cmake modules (includes headers-only FindVulkan for cross-compilation)
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+# Provides skr_target_warnings, the warning level for first-party targets
+include(skr_warnings)
+
 # Build options
 option(SKR_BUILD_SKSHADERC "Build skshaderc shader compiler" ON)
+option(SKR_BUILD_KTX2 "Build the sk_ktx2 KTX2/Basis Universal transcoder" ON)
 option(SKR_BUILD_EXAMPLES "Build sk_renderer example application" ON)
 option(SKR_BUILD_XR_EXAMPLE "Build OpenXR example application (Linux/Windows only)" OFF)
 set(SKR_SK_APP_DIR "" CACHE PATH "Local sk_app checkout for the example (empty = fetch the pinned release)")
@@ -88,9 +99,19 @@ endfunction()
 if(SKR_BUILD_SKSHADERC)
 	# skshaderc handles cross-compilation internally:
 	# - Native builds: builds skshaderc from source and uses it for shaders
-	# - Cross-compiling: builds skshaderc for target, but uses pre-built host
-	#   binary from bin/tools/ for shader compilation
+	# - Cross-compiling: builds a second, host-targeted skshaderc to compile
+	#   shaders with, since the target one can't run here
 	add_subdirectory(skshaderc)
+endif()
+
+###############################################################################
+# sk_ktx2 transcoder
+###############################################################################
+
+# Deliberately independent of sk_renderer: it's pure C11 with no GPU work, so
+# StereoKit can link it directly and its conformance runner works headless.
+if(SKR_BUILD_KTX2)
+	add_subdirectory(sk_ktx2)
 endif()
 
 ###############################################################################
@@ -108,6 +129,8 @@ endif()
 set_target_properties(sk_renderer PROPERTIES
 	C_STANDARD 11
 	C_STANDARD_REQUIRED ON)
+
+skr_target_warnings(sk_renderer)
 
 # If we are building skshaderc, then sk_renderer should make skshaderc build
 # first. This allows consuming projects to use skshaderc's compile functions.
@@ -212,6 +235,7 @@ target_sources(sk_renderer PRIVATE
 	sk_renderer/include/sk_renderer.h
 	sk_renderer/skr_log.c
 	sk_renderer/sksc_file.c
+	sk_renderer/smolv.c
 )
 if(NOT SKR_USE_WEBGPU)
 	target_sources(sk_renderer PRIVATE
@@ -260,13 +284,12 @@ endif()
 # Built-in shaders: compiled to embedded byte-array headers so they ship inside
 # the library binary. Used as fallbacks when blit-based mipgen isn't supported
 # for a given texture format (see skr_texture.c skr_tex_generate_mips).
-# WebGPU builds add WGSL blobs alongside the SPIR-V. WGSL comes only from the
-# SVSL backend, so those builds pass -svsl — the host tool used by web
-# cross-builds may still carry glslang, and mixing backends isn't allowed.
-if(EMSCRIPTEN)
-	set(_skr_builtin_shader_args "-o3 -e -svsl -t w") # web-slim: WGSL only
-elseif(SKR_USE_WEBGPU)
-	set(_skr_builtin_shader_args "-o3 -e -svsl -t sw")
+# A container carries one language, so the target follows the backend. WGSL
+# comes only from the SVSL backend, so those builds pass -svsl; the host tool
+# for web cross-builds may still carry glslang, and mixing backends isn't
+# allowed.
+if(SKR_USE_WEBGPU) # includes EMSCRIPTEN, which forces it ON above
+	set(_skr_builtin_shader_args "-o3 -e -svsl -t w")
 else()
 	set(_skr_builtin_shader_args "-o3 -e -t s")
 endif()

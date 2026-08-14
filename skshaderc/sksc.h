@@ -64,7 +64,9 @@ typedef enum sksc_log_level_ {
 SKSC_API void            sksc_init            (void);
 SKSC_API void            sksc_shutdown        (void);
 SKSC_API bool            sksc_compile         (const char *filename, const char *hlsl_text, sksc_settings_t *settings, sksc_shader_file_t *out_file);
-SKSC_API void            sksc_build_file      (const sksc_shader_file_t *file, void **out_data, uint32_t *out_size);
+// SPIR-V stages are stored SMOL-V encoded (smolv.h) and decoded by the loader.
+// keep_debug_names keeps OpName/OpMemberName, ~8% of a module, for debug builds.
+SKSC_API void            sksc_build_file      (const sksc_shader_file_t *file, bool keep_debug_names, void **out_data, uint32_t *out_size);
 SKSC_API char*           sksc_shader_file_info(const sksc_shader_file_t *file); // Returns malloc'd string, caller must free
 
 SKSC_API void            sksc_log        (sksc_log_level_ level, const char* text, ...);

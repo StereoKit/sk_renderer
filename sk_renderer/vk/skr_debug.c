@@ -39,6 +39,19 @@ const char* _skr_semantic_name(skr_semantic_ semantic) {
 	}
 }
 
+// Bounded strcat for the debug name builders below. Truncates rather than
+// overflowing; debug names are cosmetic and the sources are unbounded.
+void _skr_append_str(char* ref_str, size_t str_size, const char* text) {
+	size_t pos = strlen(ref_str);
+	if (pos + 1 >= str_size) return;
+
+	size_t space = str_size - pos - 1;
+	size_t len   = strlen(text);
+	if (len > space) len = space;
+	memcpy(&ref_str[pos], text, len);
+	ref_str[pos + len] = '\0';
+}
+
 void _skr_append_vertex_format(char* ref_str, size_t str_size, const skr_vert_component_t* components, uint32_t component_count) {
 	if (!ref_str || !components || component_count == 0) return;
 

@@ -113,7 +113,7 @@ static inline uint32_t _utf16_next(const uint16_t** str) {
 
 // Float32 to IEEE 754 float16 conversion
 static inline uint16_t _float_to_half(float f) {
-	uint32_t x = *(uint32_t*)&f;
+	uint32_t x; memcpy(&x, &f, sizeof(x));
 	uint32_t sign = (x >> 16) & 0x8000;
 	int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
 	uint32_t mant = x & 0x7FFFFF;
@@ -225,10 +225,6 @@ static inline void* _array_push(text_array_t* arr) {
 	void* ptr = (char*)arr->data + arr->count * arr->elem_size;
 	arr->count++;
 	return ptr;
-}
-
-static inline void* _array_at(text_array_t* arr, int32_t index) {
-	return (char*)arr->data + index * arr->elem_size;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1388,18 +1384,18 @@ float2 text_add_in_utf8(
 		while (lp < end && *lp && ctx->instance_count < TEXT_MAX_INSTANCES) { \
 			uint32_t cp = _utf8_next(&lp); \
 			if (cp == 0 || cp == '\n') break; \
-			text_glyph_t* glyph = _get_glyph(font, cp); \
-			if (!glyph) continue; \
+			text_glyph_t* lglyph = _get_glyph(font, cp); \
+			if (!lglyph) continue; \
 			if (lprev) { \
-				int32_t kern = stbtt_GetCodepointKernAdvance(&font->stb_font, lprev, cp); \
-				cursor_x += kern * font->scale * scale; \
+				int32_t lkern = stbtt_GetCodepointKernAdvance(&font->stb_font, lprev, cp); \
+				cursor_x += lkern * font->scale * scale; \
 			} \
 			bool in_clip_bounds = !(fit & text_fit_clip) || \
 				(cursor_x >= pivot_offset.x - scale && \
 				 cursor_x <= pivot_offset.x + box_size.x + scale && \
 				 y_pos >= pivot_offset.y - scale && \
 				 y_pos <= pivot_offset.y + box_size.y + scale); \
-			if (glyph->curve_count > 0 && in_clip_bounds) { \
+			if (lglyph->curve_count > 0 && in_clip_bounds) { \
 				float4x4 local = float4x4_trs( \
 					(float3){ cursor_x, y_pos, 0 }, \
 					(float4){ 0, 0, 0, 1 }, \
@@ -1416,7 +1412,7 @@ float2 text_add_in_utf8(
 				inst->up[0]    = final.m[1]; \
 				inst->up[1]    = final.m[5]; \
 				inst->up[2]    = final.m[9]; \
-				inst->glyph_index = glyph->gpu_index; \
+				inst->glyph_index = lglyph->gpu_index; \
 				inst->_pad = 0; \
 				uint32_t r = (uint32_t)(color.x * 255.0f) & 0xFF; \
 				uint32_t g = (uint32_t)(color.y * 255.0f) & 0xFF; \
@@ -1424,7 +1420,7 @@ float2 text_add_in_utf8(
 				uint32_t a = (uint32_t)(color.w * 255.0f) & 0xFF; \
 				inst->color = r | (g << 8) | (b << 16) | (a << 24); \
 			} \
-			cursor_x += glyph->gpu.advance * scale; \
+			cursor_x += lglyph->gpu.advance * scale; \
 			lprev = cp; \
 		} \
 	} while(0)

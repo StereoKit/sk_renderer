@@ -8,6 +8,7 @@
 #include "_sksc.h"
 
 #include "array.h"
+#include "smolv.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -344,10 +345,12 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 		info.append("|--Spec Constants--");
 		for (uint32_t i = 0; i < meta->spec_constant_count; i++) {
 			sksc_shader_spec_constant_t *spec = &meta->spec_constants[i];
+			float   as_float; memcpy(&as_float, &spec->default_value, sizeof(as_float));
+			int32_t as_int;   memcpy(&as_int,   &spec->default_value, sizeof(as_int));
 			switch (spec->type) {
-			case sksc_shader_var_float: info.append("|  [%u] %-15s: float = %.3g", spec->constant_id, spec->name, *(float   *)&spec->default_value); break;
-			case sksc_shader_var_uint:  info.append("|  [%u] %-15s: uint  = %u",   spec->constant_id, spec->name, spec->default_value);              break;
-			default:                    info.append("|  [%u] %-15s: int   = %d",   spec->constant_id, spec->name, *(int32_t *)&spec->default_value); break;
+			case sksc_shader_var_float: info.append("|  [%u] %-15s: float = %.3g", spec->constant_id, spec->name, as_float);            break;
+			case sksc_shader_var_uint:  info.append("|  [%u] %-15s: uint  = %u",   spec->constant_id, spec->name, spec->default_value); break;
+			default:                    info.append("|  [%u] %-15s: int   = %d",   spec->constant_id, spec->name, as_int);              break;
 			}
 		}
 	}
@@ -558,7 +561,7 @@ static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) 
 
 ///////////////////////////////////////////
 
-void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *out_size) {
+void sksc_build_file(const sksc_shader_file_t *file, bool keep_debug_names, void **out_data, uint32_t *out_size) {
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
@@ -663,12 +666,68 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 
 	for (uint32_t i = 0; i < file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &file->stages[i];
+
+		// SMOL-V encode SPIR-V stages, which the loader decodes from the blob's
+		// own magic. Text stages have nothing to gain and are stored as-is.
+		//
+		// Nothing at runtime reads OpName/OpMemberName, since reflection comes
+		// from the meta section, so they only serve RenderDoc and validation.
+		//
+		// Whatever gets stored is decoded and checked first, since a stage that
+		// doesn't round-trip would only surface as a broken shader on device.
+		const uint32_t smolv_flags = keep_debug_names ? smolv_encode_none : smolv_encode_strip_debug_info;
+
+		void    *code       = stage->code;
+		uint32_t code_size  = stage->code_size;
+		uint8_t *smolv_code = nullptr;
+		if (stage->language == skr_shader_lang_spirv && stage->code_size > 0) {
+			size_t bound      = smolv_encode_bound(stage->code_size);
+			size_t smolv_size = 0;
+			bool   ok         = false;
+
+			smolv_code = (uint8_t *)malloc(bound);
+			if (smolv_code != nullptr && smolv_encode(stage->code, stage->code_size, smolv_code, bound, &smolv_size, smolv_flags)) {
+				size_t   decoded_size = smolv_decoded_size(smolv_code, smolv_size);
+				uint8_t *decoded      = decoded_size > 0 ? (uint8_t *)malloc(decoded_size) : nullptr;
+				if (decoded != nullptr && smolv_decode(smolv_code, smolv_size, decoded, decoded_size)) {
+					if (keep_debug_names) {
+						// Nothing was dropped, so the decode has to be the input
+						ok = decoded_size == stage->code_size && memcmp(decoded, stage->code, decoded_size) == 0;
+					} else {
+						// Stripping means the decode isn't the input any more, so
+						// check for a fixed point instead: the stripped module has
+						// no debug info left to drop, so re-encoding it has to
+						// reproduce these exact bytes.
+						size_t   again_bound = smolv_encode_bound(decoded_size);
+						size_t   again_size  = 0;
+						uint8_t *again       = (uint8_t *)malloc(again_bound);
+						ok = again != nullptr
+						  && smolv_encode(decoded, decoded_size, again, again_bound, &again_size, smolv_flags)
+						  && again_size == smolv_size
+						  && memcmp(again, smolv_code, smolv_size) == 0;
+						free(again);
+					}
+				}
+				free(decoded);
+			}
+
+			if (ok) {
+				code      = smolv_code;
+				code_size = (uint32_t)smolv_size;
+			} else {
+				sksc_log(sksc_log_level_warn, "SMOL-V encoding didn't round-trip, storing this stage as plain SPIR-V");
+				free(smolv_code);
+				smolv_code = nullptr;
+			}
+		}
+
 		data.write(stage->language);
 		data.write(stage->stage);
 		uint32_t stage_wave = stage->stage == skr_stage_compute ? file->meta.wave_size : 0;
 		data.write(stage_wave);
-		data.write(stage->code_size);
-		data.write(stage->code, stage->code_size);
+		data.write(code_size);
+		data.write(code, code_size);
+		free(smolv_code);
 	}
 
 	*out_data = data.data.data;

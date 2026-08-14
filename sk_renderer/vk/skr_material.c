@@ -494,15 +494,18 @@ static uint32_t _skr_shader_var_size(sksc_shader_var_ type) {
 	}
 }
 
-void skr_material_set_param(skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
+// Packs a shader parameter into any param buffer with the shader's $Global
+// layout, so per-draw parameter blocks can be built without staging them
+// through a material's own (possibly shared) buffer.
+void _skr_shader_param_write(const sksc_shader_meta_t* meta, void* param_buffer, uint32_t param_buffer_size, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
 
-	int32_t var_index = sksc_shader_meta_get_var_index(&material->key.shader->meta, name);
+	int32_t var_index = sksc_shader_meta_get_var_index(meta, name);
 	if (var_index < 0) {
 		skr_log(skr_log_warning, "Material parameter '%s' not found", name);
 		return;
 	}
 
-	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&material->key.shader->meta, var_index);
+	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(meta, var_index);
 	if (!var) return;
 
 	// When type is uint8, treat count as raw byte count and skip type check
@@ -517,12 +520,16 @@ void skr_material_set_param(skr_material_t* material, const char* name, sksc_sha
 		copy_size = _skr_shader_var_size(type) * count;
 	}
 
-	if (var->offset + copy_size > material->param_buffer_size) {
+	if (var->offset + copy_size > param_buffer_size) {
 		skr_log(skr_log_warning, "Material parameter '%s' write would exceed buffer size", name);
 		return;
 	}
 
-	memcpy((uint8_t*)material->param_buffer + var->offset, data, copy_size);
+	memcpy((uint8_t*)param_buffer + var->offset, data, copy_size);
+}
+
+void skr_material_set_param(skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
+	_skr_shader_param_write(&material->key.shader->meta, material->param_buffer, material->param_buffer_size, name, type, count, data);
 }
 
 void skr_material_get_param(const skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
@@ -578,10 +585,15 @@ const char* _skr_material_bind_name(const sksc_shader_meta_t* meta, int32_t bind
 	return "unknown";
 }
 
-int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct) {
+int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct) {
  	for (uint32_t i = 0; i < bind_ct; i++) {
 		int32_t       slot          = binds[i].bind.slot;
 		skr_register_ register_type = binds[i].bind.register_type;
+
+		// Resources outside the pipeline's stages get no descriptor: a graphics
+		// bind must not write a vs/ps/cs shader's compute-only storage image
+		// (often holding a storage-less default texture), and vice versa.
+		if ((binds[i].bind.stage_bits & stage_mask) == 0) continue;
 
 		bool skip = false;
 		for (int32_t s = 0; s < ignore_ct; s++) {

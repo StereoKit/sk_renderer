@@ -231,6 +231,11 @@ static void _skr_register_internal_requests(void) {
 	_skr_ext_request(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);           // Sync FD export for frame fences (VK_KHR_external_fence is core 1.1)
 	_skr_ext_request(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);         // Postfx depth input attachments (per-reference aspect masks)
 	_skr_ext_request(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME); // Legacy instanced stereo: SV_RenderTargetArrayIndex from the vertex stage
+	// All three alias the same enum value, so any one of them will do. The 1.3
+	// core promotion is no help, since the instance targets Vulkan 1.1.
+	_skr_ext_request(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME);
+	_skr_ext_request(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);
+	_skr_ext_request(VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME);
 #ifndef __ANDROID__
 	_skr_ext_request(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); // Push descriptors have performance overhead per call on Adreno?
 #endif
@@ -252,63 +257,90 @@ static void _skr_register_internal_requests(void) {
 
 	// Multiview is required for stereo/XR rendering. It's core 1.1 but still a
 	// feature flag, so a 1.1 device can report it unsupported.
+	// Feature structs here are static const: the feature compare walks raw
+	// dwords including tail padding, and only static storage guarantees the
+	// padding is zero (stack compound literals leave it as garbage on MSVC).
+	static const VkPhysicalDeviceMultiviewFeatures multiview_features = {
+		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+		.multiview = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name          = "multiview",
 		.required      = true,
-		.features      = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceMultiviewFeatures){
-			.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
-			.multiview = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceMultiviewFeatures) } },
+		.features      = (skr_vk_feature_t[]){ { &multiview_features, sizeof(multiview_features) } },
 		.feature_count = 1,
 	});
 
 	// YCbCr conversion for YUV/NV12 textures and AHB external memory. Core 1.1
 	// struct, but some drivers lack the feature (older Mesa lavapipe).
+	static const VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_features = {
+		.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.samplerYcbcrConversion = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                       = "ycbcr_conversion",
-		.features                   = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSamplerYcbcrConversionFeatures){
-			.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
-			.samplerYcbcrConversion = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSamplerYcbcrConversionFeatures) } },
-		.feature_count              = 1,
+		.name          = "ycbcr_conversion",
+		.features      = (skr_vk_feature_t[]){ { &ycbcr_features, sizeof(ycbcr_features) } },
+		.feature_count = 1,
 	});
 
 	// Subgroup size control lets compute pipelines request a specific subgroup
 	// size at pipeline creation time (the Vulkan analog of HLSL [WaveSize(N)]).
+	static const VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_features = {
+		.sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
+		.subgroupSizeControl = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                    = "subgroup_size_control",
-		.device_extensions       = (const char*[]){ VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME },
-		.device_extension_count  = 1,
-		.features                = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSubgroupSizeControlFeaturesEXT){
-			.sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
-			.subgroupSizeControl = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSubgroupSizeControlFeaturesEXT) } },
-		.feature_count           = 1,
+		.name                   = "subgroup_size_control",
+		.device_extensions      = (const char*[]){ VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &subgroup_size_features, sizeof(subgroup_size_features) } },
+		.feature_count          = 1,
 	});
 
 	// Reports whether drivers actually merge the postfx subpass chain
+	static const VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT subpass_merge_features = {
+		.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
+		.subpassMergeFeedback = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                     = "subpass_merge_feedback",
-		.device_extensions        = (const char*[]){ VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME },
-		.device_extension_count   = 1,
-		.features                 = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT){
-			.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBPASS_MERGE_FEEDBACK_FEATURES_EXT,
-			.subpassMergeFeedback = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSubpassMergeFeedbackFeaturesEXT) } },
-		.feature_count            = 1,
+		.name                   = "subpass_merge_feedback",
+		.device_extensions      = (const char*[]){ VK_EXT_SUBPASS_MERGE_FEEDBACK_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &subpass_merge_features, sizeof(subpass_merge_features) } },
+		.feature_count          = 1,
 	});
 
 	// Synchronization2 is required by video decode and by tile shading's
 	// tile-attachment dependencies; enabled whenever the device offers it.
+	static const VkPhysicalDeviceSynchronization2Features sync2_features = {
+		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+		.synchronization2 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "sync2",
 		.device_extensions      = (const char*[]){ VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME },
 		.device_extension_count = 1,
-		.features               = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceSynchronization2Features){
-			.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-			.synchronization2   = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceSynchronization2Features) } },
+		.features               = (skr_vk_feature_t[]){ { &sync2_features, sizeof(sync2_features) } },
 		.feature_count          = 1,
+	});
+
+	// Present fences make swapchain teardown exact: a present's semaphore
+	// waits and image use are otherwise unobservable, and surface resize must
+	// fall back to a full device idle before destroying the old swapchain.
+	// Promoted to KHR, but drivers keep advertising the EXT spelling.
+	static const VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_maint_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+		.swapchainMaintenance1 = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                     = "swapchain_maintenance1",
+		.instance_extensions      = (const char*[]){ VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+		                                             VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME },
+		.instance_extension_count = 2,
+		.device_extensions        = (const char*[]){ VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME },
+		.device_extension_count   = 1,
+		.features                 = (skr_vk_feature_t[]){ { &swapchain_maint_features, sizeof(swapchain_maint_features) } },
+		.feature_count            = 1,
 	});
 
 	// QCOM image processing: each op family is its own feature and sksc bit, so
@@ -319,34 +351,41 @@ static void _skr_register_internal_requests(void) {
 		VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
 		VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,
 	};
+	static const VkPhysicalDeviceImageProcessingFeaturesQCOM sample_weighted_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.textureSampleWeighted = VK_TRUE,
+	};
+	static const VkPhysicalDeviceImageProcessingFeaturesQCOM box_filter_features = {
+		.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.textureBoxFilter = VK_TRUE,
+	};
+	static const VkPhysicalDeviceImageProcessingFeaturesQCOM block_match_features = {
+		.sType             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
+		.textureBlockMatch = VK_TRUE,
+	};
+	static const VkPhysicalDeviceImageProcessing2FeaturesQCOM block_match2_features = {
+		.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM,
+		.textureBlockMatch2 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                     = "qcom_sample_weighted",
-		.device_extensions        = image_proc_exts,
-		.device_extension_count   = 4,
-		.features                 = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-			.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-			.textureSampleWeighted = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) } },
-		.feature_count            = 1,
+		.name                   = "qcom_sample_weighted",
+		.device_extensions      = image_proc_exts,
+		.device_extension_count = 4,
+		.features               = (skr_vk_feature_t[]){ { &sample_weighted_features, sizeof(sample_weighted_features) } },
+		.feature_count          = 1,
 	});
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "qcom_box_filter",
 		.device_extensions      = image_proc_exts,
 		.device_extension_count = 4,
-		.features               = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-			.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-			.textureBoxFilter   = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) } },
+		.features               = (skr_vk_feature_t[]){ { &box_filter_features, sizeof(box_filter_features) } },
 		.feature_count          = 1,
 	});
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "qcom_block_match",
 		.device_extensions      = image_proc_exts,
 		.device_extension_count = 4,
-		.features               = (skr_vk_feature_t[]){ { &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-			.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-			.textureBlockMatch  = VK_TRUE,
-		}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) } },
+		.features               = (skr_vk_feature_t[]){ { &block_match_features, sizeof(block_match_features) } },
 		.feature_count          = 1,
 	});
 	// The Window/Gather block-match variants layer on VK_QCOM_image_processing2
@@ -360,19 +399,21 @@ static void _skr_register_internal_requests(void) {
 		                                           VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME },
 		.device_extension_count = 5,
 		.features               = (skr_vk_feature_t[]){
-			{ &(VkPhysicalDeviceImageProcessingFeaturesQCOM){
-				.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_FEATURES_QCOM,
-				.textureBlockMatch  = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceImageProcessingFeaturesQCOM) },
-			{ &(VkPhysicalDeviceImageProcessing2FeaturesQCOM){
-				.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_PROCESSING_2_FEATURES_QCOM,
-				.textureBlockMatch2 = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceImageProcessing2FeaturesQCOM) } },
+			{ &block_match_features,  sizeof(block_match_features)  },
+			{ &block_match2_features, sizeof(block_match2_features) } },
 		.feature_count          = 2,
 	});
 
 	// Fragment-stage tile shading: reading color attachments as sampled tile
 	// attachments with an apron. Needs sync2's 64-bit access flags + renderpass2.
+	static const VkPhysicalDeviceTileShadingFeaturesQCOM tile_shading_features = {
+		.sType                         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM,
+		.tileShading                   = VK_TRUE,
+		.tileShadingFragmentStage      = VK_TRUE,
+		.tileShadingColorAttachments   = VK_TRUE,
+		.tileShadingSampledAttachments = VK_TRUE,
+		.tileShadingApron              = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "qcom_tile_shading",
 		.device_extensions      = (const char*[]){ VK_QCOM_TILE_SHADING_EXTENSION_NAME,
@@ -381,61 +422,55 @@ static void _skr_register_internal_requests(void) {
 		                                           VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME },
 		.device_extension_count = 4,
 		.features               = (skr_vk_feature_t[]){
-			{ &(VkPhysicalDeviceTileShadingFeaturesQCOM){
-				.sType                         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_SHADING_FEATURES_QCOM,
-				.tileShading                   = VK_TRUE,
-				.tileShadingFragmentStage      = VK_TRUE,
-				.tileShadingColorAttachments   = VK_TRUE,
-				.tileShadingSampledAttachments = VK_TRUE,
-				.tileShadingApron              = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceTileShadingFeaturesQCOM) },
-			{ &(VkPhysicalDeviceSynchronization2Features){
-				.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-				.synchronization2 = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceSynchronization2Features) } },
+			{ &tile_shading_features, sizeof(tile_shading_features) },
+			{ &sync2_features,        sizeof(sync2_features)        } },
 		.feature_count          = 2,
 	});
 
 	// 16-bit storage access (sksc_feature_bit_storage16). The push-constant bit
 	// is a separate opportunistic request, devices commonly lack just that one.
+	static const VkPhysicalDevice16BitStorageFeatures storage16_features = {
+		.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+		.storageBuffer16BitAccess           = VK_TRUE,
+		.uniformAndStorageBuffer16BitAccess = VK_TRUE,
+	};
+	static const VkPhysicalDevice16BitStorageFeatures storage16_push_features = {
+		.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+		.storagePushConstant16 = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                                   = "storage16",
-		.features                               = (skr_vk_feature_t[]){ { &(VkPhysicalDevice16BitStorageFeatures){
-			.sType                              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-			.storageBuffer16BitAccess           = VK_TRUE,
-			.uniformAndStorageBuffer16BitAccess = VK_TRUE,
-		}, sizeof(VkPhysicalDevice16BitStorageFeatures) } },
-		.feature_count                          = 1,
+		.name          = "storage16",
+		.features      = (skr_vk_feature_t[]){ { &storage16_features, sizeof(storage16_features) } },
+		.feature_count = 1,
 	});
 	skr_vk_request(&(skr_vk_request_t){
-		.name                      = "storage16_push",
-		.features                  = (skr_vk_feature_t[]){ { &(VkPhysicalDevice16BitStorageFeatures){
-			.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
-			.storagePushConstant16 = VK_TRUE,
-		}, sizeof(VkPhysicalDevice16BitStorageFeatures) } },
-		.feature_count             = 1,
+		.name          = "storage16_push",
+		.features      = (skr_vk_feature_t[]){ { &storage16_push_features, sizeof(storage16_push_features) } },
+		.feature_count = 1,
 	});
 
 	// Float atomics (sksc_feature_bit_float_atomics): the coarse bit promises
 	// exchange + add + min/max, and min/max lives in atomic_float2's struct.
+	static const VkPhysicalDeviceShaderAtomicFloatFeaturesEXT float_atomic_features = {
+		.sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+		.shaderBufferFloat32Atomics   = VK_TRUE,
+		.shaderBufferFloat32AtomicAdd = VK_TRUE,
+		.shaderSharedFloat32Atomics   = VK_TRUE,
+		.shaderSharedFloat32AtomicAdd = VK_TRUE,
+	};
+	static const VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT float_atomic2_features = {
+		.sType                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
+		.shaderBufferFloat32AtomicMinMax = VK_TRUE,
+		.shaderSharedFloat32AtomicMinMax = VK_TRUE,
+	};
 	skr_vk_request(&(skr_vk_request_t){
 		.name                   = "float_atomics",
 		.device_extensions      = (const char*[]){ VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
 		                                           VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME },
 		.device_extension_count = 2,
 		.features               = (skr_vk_feature_t[]){
-			{ &(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT){
-				.sType                        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
-				.shaderBufferFloat32Atomics   = VK_TRUE,
-				.shaderBufferFloat32AtomicAdd = VK_TRUE,
-				.shaderSharedFloat32Atomics   = VK_TRUE,
-				.shaderSharedFloat32AtomicAdd = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT) },
-			{ &(VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT){
-				.sType                           = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT,
-				.shaderBufferFloat32AtomicMinMax = VK_TRUE,
-				.shaderSharedFloat32AtomicMinMax = VK_TRUE,
-			}, sizeof(VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT) } },
+			{ &float_atomic_features,  sizeof(float_atomic_features)  },
+			{ &float_atomic2_features, sizeof(float_atomic2_features) } },
 		.feature_count          = 2,
 	});
 }
@@ -466,9 +501,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL _skr_vk_debug_callback(
 
 	skr_log(level, "[Vulkan:%s:%d] %s", severity_str, callback_data->messageIdNumber, callback_data->pMessage);
 
-	if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-		severity_str = severity_str;
-	}
 	return VK_FALSE;
 }
 
@@ -530,6 +562,7 @@ bool skr_init(skr_settings_t settings) {
 
 	_skr_bind_pool_init();
 	_skr_sampler_cache_init();
+	_skr_mipgen_materials_init();
 	_skr_scratch_pool_init();
 	_skr_transient_pool_init();
 
@@ -1068,11 +1101,18 @@ bool skr_init(skr_settings_t settings) {
 			while (feat_queries[q].stype != want->sType) q++;
 			const uint32_t* want_bits = (const uint32_t*)((const uint8_t*)want                 + feat_header);
 			const uint32_t* have_bits = (const uint32_t*)((const uint8_t*)feat_queries[q].data + feat_header);
-			for (int32_t b = 0; b < (feat->size - feat_header) / 4; b++) {
+			const int32_t feat_dwords = (feat->size - feat_header) / 4;
+			for (int32_t b = 0; b < feat_dwords; b++) {
 				if (want_bits[b] == VK_TRUE && have_bits[b] != VK_TRUE) {
 					snprintf(req->missing_feature, sizeof(req->missing_feature), "feature bit %d of sType %u", b, (uint32_t)want->sType);
 					req->missing = req->missing_feature;
 					req->enabled = false;
+					// sizeof rounds a struct's bool payload up to an even dword
+					// count, so for odd counts the last dword is tail padding. A
+					// request failing there is likely uninitialized caller memory.
+					if (b == feat_dwords - 1)
+						skr_log(skr_log_warning, "Request '%s': failing bit %d is the last dword of sType %u, which may be uninitialized struct padding; feature structs must be fully zeroed before setting bits",
+							req->name ? req->name : "(anonymous)", b, (uint32_t)want->sType);
 					break;
 				}
 			}
@@ -1141,10 +1181,14 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_external_fence_fd       = skr_vk_request_enabled(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
 	_skr_vk.has_create_renderpass2      = skr_vk_request_enabled(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
 	_skr_vk.has_depth_stencil_resolve   = skr_vk_request_enabled("depth_stencil_resolve");
+	_skr_vk.has_present_fence           = skr_vk_request_enabled("swapchain_maintenance1");
 	_skr_vk.has_subpass_merge_feedback  = skr_vk_request_enabled("subpass_merge_feedback");
 	_skr_vk.has_subgroup_size_control   = skr_vk_request_enabled("subgroup_size_control");
 	_skr_vk.has_ycbcr_conversion        = skr_vk_request_enabled("ycbcr_conversion");
 	_skr_vk.has_qcom_tile_shading       = skr_vk_request_enabled("qcom_tile_shading");
+	_skr_vk.has_store_op_none           = skr_vk_request_enabled(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME)
+	                                   || skr_vk_request_enabled(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME)
+	                                   || skr_vk_request_enabled(VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME);
 	_skr_vk.has_external_memory_win32   = false;
 	_skr_vk.has_android_hardware_buffer = false;
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
@@ -1170,8 +1214,10 @@ bool skr_init(skr_settings_t settings) {
 	vkGetPhysicalDeviceFeatures(_skr_vk.physical_device, &available_features);
 
 	// Track feature availability
-	_skr_vk.has_depth_clamp          = available_features.depthClamp;
-	_skr_vk.has_fill_mode_non_solid  = available_features.fillModeNonSolid;
+	_skr_vk.has_depth_clamp            = available_features.depthClamp;
+	_skr_vk.has_fill_mode_non_solid    = available_features.fillModeNonSolid;
+	_skr_vk.has_storage_without_format = available_features.shaderStorageImageWriteWithoutFormat
+	                                  && available_features.shaderStorageImageReadWithoutFormat;
 
 	// Enable features we need (only if available)
 	VkPhysicalDeviceFeatures device_features = {
@@ -1186,6 +1232,10 @@ bool skr_init(skr_settings_t settings) {
 		.geometryShader                  = available_features.geometryShader,
 		.shaderStorageImageExtendedFormats = available_features.shaderStorageImageExtendedFormats,
 		.shaderInt16                     = available_features.shaderInt16,
+		// sksc compiles RWTextures with SPIR-V format Unknown (DXC-style), so
+		// storage image access is gated on the WithoutFormat pair.
+		.shaderStorageImageWriteWithoutFormat = available_features.shaderStorageImageWriteWithoutFormat,
+		.shaderStorageImageReadWithoutFormat  = available_features.shaderStorageImageReadWithoutFormat,
 	};
 
 	// Query multiview properties (and subgroup size limits if supported)
@@ -1432,6 +1482,9 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_image_atomics;
 	if (_skr_vk.has_subgroup_size_control)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_wave_size;
+	// The bit is joint read+write; both features are near-universal together.
+	if (_skr_vk.has_storage_without_format)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_formatless;
 	if (enable_sample_weighted)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_qcom_sample_weighted;
 	if (enable_box_filter)
@@ -1451,6 +1504,8 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_geometry;
 	if (device_features.shaderStorageImageExtendedFormats)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_extended_formats;
+	if (_skr_vk.has_storage_without_format) // Read/write to unknown format textures in SPIRV
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_formatless;
 	if (device_features.shaderInt16)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_int16;
 	if (enable_storage16)
@@ -1536,6 +1591,7 @@ void skr_shutdown(void) {
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_2d);
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_cube);
 
+	_skr_mipgen_materials_shutdown(); // Builtin entries died with their shaders above; this drops app-shader ones
 	_skr_scratch_pool_shutdown();   // Free pooled mipgen scratch textures before command shutdown
 	_skr_transient_pool_shutdown(); // Free pooled transient postfx attachments before command shutdown
 

@@ -42,7 +42,7 @@ typedef struct {
 
 // Half-float conversion (IEEE 754 binary16)
 static inline uint16_t f32_to_f16(float f) {
-	uint32_t x = *(uint32_t*)&f;
+	uint32_t x; memcpy(&x, &f, sizeof(x));
 	uint32_t sign = (x >> 16) & 0x8000;
 	int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
 	uint32_t mant = (x >> 13) & 0x3FF;

@@ -25,8 +25,22 @@
 # generator for the path to the skshaderc compiler executable
 # file.
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.19)
+
+# Set again here rather than inherited: skshaderc is also a standalone project,
+# and the cmake_minimum_required above resets policies for this scope either way.
+if(POLICY CMP0135)
+	cmake_policy(SET CMP0135 NEW)
+endif()
+
 project(skshaderc VERSION 1.0 DESCRIPTION "Shader compiler for sk_renderer")
+
+# skr_target_warnings comes from sk_renderer's root when this is a subdirectory,
+# but the cross-compile host tool below configures skshaderc standalone, with no
+# sk_renderer scope to inherit it from.
+if(NOT COMMAND skr_target_warnings)
+	include("${CMAKE_CURRENT_LIST_DIR}/../cmake/skr_warnings.cmake")
+endif()
 
 ###############################################################################
 # Cross-compilation detection
@@ -87,24 +101,113 @@ else()
 	set(SKSHADERC_CROSS_COMPILING FALSE)
 endif()
 
-# Create final shader paths
-# Use CMAKE_SOURCE_DIR so binaries go to the top-level project's bin/,
-# allowing consuming projects to accumulate skshaderc builds.
-set(SKSHADERC_HOST_BIN      "${CMAKE_SOURCE_DIR}/bin/tools/${_HOST_SYS}_${_HOST_ARCH}/skshaderc${_HOST_EXTENSION}")
-set(SKSHADERC_TARGET_FOLDER "${CMAKE_SOURCE_DIR}/bin/tools/${_TARGET_SYS}_${_TARGET_ARCH}")
+###############################################################################
+# Tool locations
+#
+# Tools install to <bin>/tools/<platform>/, and cross-builds look for their
+# host tool in that same layout. Both default into the build folder, so a build
+# tree builds every tool it needs, and never reads or writes another's.
+#
+#   SKSHADERC_BIN_DIR         Where tools install. Point it somewhere shared to
+#                             collect tools from several configs for
+#                             distribution. That folder holds one tool per
+#                             platform, so configs built with different
+#                             backends will overwrite each other there.
+#   SKSHADERC_BUILD_HOST_TOOL Build a host tool for cross-builds. ON by default.
+#                             OFF takes the host tool from SKSHADERC_BIN_DIR.
+#   SKSHADERC_HOST_EXE        An exact prebuilt host tool, wherever it lives.
+#
+# A parent project can set these as normal variables before
+# add_subdirectory(skshaderc), which shadows the cache entries.
+###############################################################################
 
-# Check if host binary exists when cross-compiling (not needed for Wine case)
-if(SKSHADERC_CROSS_COMPILING)
+set(SKSHADERC_BIN_DIR  "${CMAKE_BINARY_DIR}/bin" CACHE PATH     "Folder skshaderc binaries are installed to, as <dir>/tools/<platform>/skshaderc")
+set(SKSHADERC_HOST_EXE ""                        CACHE FILEPATH "Prebuilt host skshaderc to use when cross-compiling (empty = build one, or look in SKSHADERC_BIN_DIR)")
+option(SKSHADERC_BUILD_HOST_TOOL "When cross-compiling, build a host skshaderc from source rather than expecting a prebuilt one" ON)
+
+set(SKSHADERC_HOST_BIN      "${SKSHADERC_BIN_DIR}/tools/${_HOST_SYS}_${_HOST_ARCH}/skshaderc${_HOST_EXTENSION}")
+set(SKSHADERC_TARGET_FOLDER "${SKSHADERC_BIN_DIR}/tools/${_TARGET_SYS}_${_TARGET_ARCH}")
+if(SKSHADERC_HOST_EXE)
+	set(SKSHADERC_HOST_BIN "${SKSHADERC_HOST_EXE}")
+endif()
+
+# Sort out the host tool for cross-builds (the Wine case isn't cross-compiling)
+if(SKSHADERC_CROSS_COMPILING AND SKSHADERC_BUILD_HOST_TOOL AND NOT SKSHADERC_HOST_EXE)
+	# skshaderc is a standalone CMake project, so ExternalProject can configure
+	# it again with the host's toolchain, inheriting nothing from the cross one.
+	include(ExternalProject)
+
+	# Always Release, so a Debug cross build doesn't wait on a debug-speed
+	# shader compiler.
+	set(_HOST_TOOL_ARGS
+		"-DSKSHADERC_BIN_DIR=${SKSHADERC_BIN_DIR}"
+		"-DCMAKE_BUILD_TYPE=Release"
+		# Picks the backends the target build expects: WebGPU gets SVSL with the
+		# WGSL emitter, everything else keeps glslang.
+		"-DSKR_USE_WEBGPU=${SKR_USE_WEBGPU}")
+	# A parent project may have picked backends itself (e.g. SVSL-only, which
+	# skips the expensive glslang build). Mirror any explicit choice; undefined
+	# means the sub-build keeps its own defaults.
+	if(DEFINED SKSHADERC_ENABLE_GLSLANG)
+		list(APPEND _HOST_TOOL_ARGS "-DSKSHADERC_ENABLE_GLSLANG=${SKSHADERC_ENABLE_GLSLANG}")
+	endif()
+	if(DEFINED SKSHADERC_ENABLE_SVSL)
+		list(APPEND _HOST_TOOL_ARGS "-DSKSHADERC_ENABLE_SVSL=${SKSHADERC_ENABLE_SVSL}")
+	endif()
+	if(FETCHCONTENT_SOURCE_DIR_SVSL) # honor an in-progress local SVSL checkout
+		list(APPEND _HOST_TOOL_ARGS "-DFETCHCONTENT_SOURCE_DIR_SVSL=${FETCHCONTENT_SOURCE_DIR_SVSL}")
+	endif()
+	if(CMAKE_MAKE_PROGRAM) # e.g. the Android SDK's ninja, which is a host binary
+		list(APPEND _HOST_TOOL_ARGS "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}")
+	endif()
+	if(MSVC) # don't inherit the cross target's -A, or we'd rebuild the same arch
+		if(_HOST_ARCH STREQUAL "arm64")
+			list(APPEND _HOST_TOOL_ARGS "-AARM64")
+		else()
+			list(APPEND _HOST_TOOL_ARGS "-Ax64")
+		endif()
+	endif()
+
+	# emcmake exports CC/CXX pointing at emcc; scrub them so the host build
+	# finds a real native compiler.
+	set(_HOST_TOOL_ENV)
+	if(EMSCRIPTEN)
+		set(_HOST_TOOL_ENV ${CMAKE_COMMAND} -E env --unset=CC --unset=CXX)
+	endif()
+
+	# A custom BUILD_COMMAND doesn't inherit make's jobserver, so without this
+	# the host tool builds one file at a time.
+	include(ProcessorCount)
+	ProcessorCount(_HOST_TOOL_JOBS)
+	if(_HOST_TOOL_JOBS EQUAL 0)
+		set(_HOST_TOOL_JOBS 1)
+	endif()
+
+	ExternalProject_Add(skshaderc_host
+		SOURCE_DIR        "${CMAKE_CURRENT_SOURCE_DIR}"
+		BINARY_DIR        "${CMAKE_CURRENT_BINARY_DIR}/host-tool"
+		CONFIGURE_COMMAND ${_HOST_TOOL_ENV} ${CMAKE_COMMAND} -G ${CMAKE_GENERATOR} ${_HOST_TOOL_ARGS} <SOURCE_DIR>
+		BUILD_COMMAND     ${_HOST_TOOL_ENV} ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --parallel ${_HOST_TOOL_JOBS}
+		INSTALL_COMMAND   "" # the sub-build's skshaderc_install target does the copy
+		BUILD_ALWAYS      TRUE # so edits to skshaderc's own sources take effect
+		BUILD_BYPRODUCTS  "${SKSHADERC_HOST_BIN}"
+		USES_TERMINAL_CONFIGURE TRUE
+		USES_TERMINAL_BUILD     TRUE)
+
+	message(STATUS "Cross-compiling (${_HOST_SYS}_${_HOST_ARCH} -> ${_TARGET_SYS}_${_TARGET_ARCH}) building host skshaderc into ${SKSHADERC_HOST_BIN}")
+elseif(SKSHADERC_CROSS_COMPILING)
 	if(NOT EXISTS "${SKSHADERC_HOST_BIN}")
 		message(FATAL_ERROR
 			"Cross-compiling (${_HOST_SYS}_${_HOST_ARCH} -> ${_TARGET_SYS}_${_TARGET_ARCH}) requires "
-			"a host compatible skshaderc binary!\n"
+			"a host compatible skshaderc binary, and there is none at ${SKSHADERC_HOST_BIN}!\n"
 			""
-			"To fix, build first for the host platform, ${_HOST_SYS}_${_HOST_ARCH}:\n"
+			"SKSHADERC_BUILD_HOST_TOOL is OFF, so no host tool is being built. Either "
+			"turn it back ON to build one as part of this build, point "
+			"-DSKSHADERC_HOST_EXE=<path> at an existing binary, or build for the host "
+			"platform (${_HOST_SYS}_${_HOST_ARCH}) into the folder this build reads "
+			"from:\n"
 			""
-			"    cmake -B build-${_HOST_SYS} . && cmake --build build-${_HOST_SYS}.\n"
-			""
-			"This will install the binary to ${SKSHADERC_HOST_BIN}.")
+			"    cmake -B build-${_HOST_SYS} -DSKSHADERC_BIN_DIR=${SKSHADERC_BIN_DIR} . && cmake --build build-${_HOST_SYS}")
 	else()
 		message(STATUS "Cross-compiling (${_HOST_SYS}_${_HOST_ARCH} -> ${_TARGET_SYS}_${_TARGET_ARCH}) using host skshaderc from ${SKSHADERC_HOST_BIN}")
 		# Ensure executable permission on Unix hosts
@@ -124,8 +227,8 @@ if(SKSHADERC_CROSS_COMPILING)
 				message(FATAL_ERROR
 					"The host skshaderc at ${SKSHADERC_HOST_BIN} was built without the SVSL "
 					"WGSL emitter (SVSL_ENABLE_WGSL), which web builds require.\n"
-					"Build the native WebGPU config first — it installs a WGSL-capable tool:\n"
-					"    cmake -B build-webgpu -DSKR_USE_WEBGPU=ON && cmake --build build-webgpu")
+					"Turn SKSHADERC_BUILD_HOST_TOOL back ON to build a WGSL-capable host "
+					"tool as part of this build, or point -DSKSHADERC_HOST_EXE=<path> at one.")
 			endif()
 		endif()
 	endif()
@@ -163,8 +266,12 @@ set(VULKAN_VERSION vulkan-sdk-1.4.328.1) # Most of our dependencies here use the
 add_library(skshaderc_lib STATIC)
 
 set_target_properties(skshaderc_lib PROPERTIES
+	C_STANDARD 11
+	C_STANDARD_REQUIRED ON
 	CXX_STANDARD 11
 	CXX_STANDARD_REQUIRED ON)
+
+skr_target_warnings(skshaderc_lib)
 
 # Optional glslang backend: HLSL -> SPIR-V via glslang, optimized with the
 # SPIRV-Tools optimizer and reflected with SPIRV-Reflect. glslang also pulls in
@@ -248,7 +355,7 @@ if(SKSHADERC_ENABLE_SVSL)
 	message(STATUS "Fetching SVSL...")
 	FetchContent_Declare( SVSL
 		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
-		GIT_TAG        v2026.7.21
+		GIT_TAG        v2026.8.11
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
@@ -274,6 +381,7 @@ target_sources(skshaderc_lib PRIVATE
 	miniz.cpp
 	miniz.h
 	../sk_renderer/sksc_file.c
+	../sk_renderer/smolv.c
 )
 target_include_directories(skshaderc_lib PUBLIC
 	${CMAKE_CURRENT_SOURCE_DIR}
@@ -286,6 +394,8 @@ target_include_directories(skshaderc_lib PUBLIC
 
 add_executable(skshaderc main.cpp)
 target_link_libraries(skshaderc PRIVATE skshaderc_lib)
+
+skr_target_warnings(skshaderc)
 
 # Static link MinGW runtime when cross-compiling to Windows
 if(MINGW)
@@ -314,7 +424,13 @@ endif() # NOT SKSHADERC_SKIP_BUILD
 # - Cross-compiling: use the pre-built host binary for shader compilation
 if(SKSHADERC_CROSS_COMPILING)
 	set(SKSHADERC_EXE_PATH "${SKSHADERC_HOST_BIN}" CACHE INTERNAL "Path to skshaderc executable (host binary for cross-compilation)")
-	set(SKSHADERC_DEPENDS  "${SKSHADERC_HOST_BIN}" CACHE INTERNAL "Extra DEPENDS so shaders recompile when skshaderc changes")
+	if(TARGET skshaderc_host)
+		# The target orders shaders after the host build, the file makes them
+		# recompile when it changes.
+		set(SKSHADERC_DEPENDS "${SKSHADERC_HOST_BIN}" skshaderc_host CACHE INTERNAL "Extra DEPENDS so shaders recompile when skshaderc changes")
+	else()
+		set(SKSHADERC_DEPENDS "${SKSHADERC_HOST_BIN}" CACHE INTERNAL "Extra DEPENDS so shaders recompile when skshaderc changes")
+	endif()
 else()
 	set(SKSHADERC_EXE_PATH $<TARGET_FILE:skshaderc> CACHE INTERNAL "Path to skshaderc executable")
 	set(SKSHADERC_DEPENDS  skshaderc                CACHE INTERNAL "Extra DEPENDS so shaders recompile when skshaderc changes")
@@ -328,8 +444,6 @@ endif()
 
 if(NOT SKSHADERC_SKIP_BUILD)
 
-# Copy skshaderc binary to bin/ in the repository root.
-
 # Use a custom target (not POST_BUILD) so it runs every build, even if
 # skshaderc itself is up-to-date. This ensures bin/ is repopulated if deleted.
 add_custom_target(skshaderc_install ALL
@@ -337,7 +451,7 @@ add_custom_target(skshaderc_install ALL
 	# The install script refuses to replace a WGSL-capable tool with one that
 	# lacks the target — web cross-builds depend on the fuller tool staying put
 	COMMAND ${CMAKE_COMMAND} -DSKSHADERC_SRC=$<TARGET_FILE:skshaderc> -DSKSHADERC_DST_DIR=${SKSHADERC_TARGET_FOLDER} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/install_tool.cmake
-	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.distribute.txt" "${CMAKE_SOURCE_DIR}/bin/CMakeLists.txt"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.distribute.txt" "${SKSHADERC_BIN_DIR}/CMakeLists.txt"
 	DEPENDS skshaderc
 	COMMENT "Installing skshaderc to ${SKSHADERC_TARGET_FOLDER}"
 )

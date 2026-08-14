@@ -224,7 +224,6 @@ static void _scene_shadows_render(scene_t* base, int32_t width, int32_t height, 
 
 	// Generate random cubes (using deterministic random seed)
 	for (int32_t i = 0; i < cube_count; i++) {
-		float rand_seed = (float)i / (float)cube_count;
 		float x      = (su_hash_f(i * 3 + 0, 1) - 0.5f) * (SHADOW_SCENE_SIZE - 1.0f);
 		float y      = (su_hash_f(i * 3 + 1, 1) - 0.5f) * (SHADOW_SCENE_SIZE - 1.0f);
 		float size_x = 0.2f + su_hash_f(i * 3 + 2, 1) * 0.4f;

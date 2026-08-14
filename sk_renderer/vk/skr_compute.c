@@ -429,7 +429,7 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 	uint32_t write_ct  = 0;
 	uint32_t buffer_ct = 0;
 	uint32_t image_ct  = 0;
-	int32_t fail_idx = _skr_material_add_writes(ref_compute->binds, ref_compute->bind_count, NULL, 0,
+	int32_t fail_idx = _skr_material_add_writes(ref_compute->binds, ref_compute->bind_count, skr_stage_compute, NULL, 0,
 		writes,       sizeof(writes      )/sizeof(writes      [0]),
 		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
@@ -517,7 +517,7 @@ void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indi
 	uint32_t write_ct = 0;
 	uint32_t buffer_ct = 0;
 	uint32_t image_ct = 0;
-	int32_t fail_idx = _skr_material_add_writes(ref_compute->binds, ref_compute->bind_count, NULL, 0,
+	int32_t fail_idx = _skr_material_add_writes(ref_compute->binds, ref_compute->bind_count, skr_stage_compute, NULL, 0,
 		writes,       sizeof(writes      )/sizeof(writes      [0]),
 		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
 		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),

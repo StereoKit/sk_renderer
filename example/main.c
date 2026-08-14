@@ -39,47 +39,41 @@ static bool _ska_file_read(const char* filename, void** out_data, size_t* out_si
 
 ///////////////////////////////////////////////////////////////////////////////
 // Backend-specific surface glue. Vulkan surfaces come from
-// ska_vk_create_surface; WebGPU surfaces from ska_wgpu_create_surface, and
-// since WebGPU can't query a window's size, the drawable size is pushed into
-// the surface before every configure.
+// ska_vk_create_surface, WebGPU surfaces from ska_wgpu_create_surface. Neither
+// Wayland nor WebGPU can report a surface's size, so the drawable size goes to
+// skr_surface_create directly.
 
 static bool app_surface_create(ska_window_t* window, skr_surface_t* out_surface) {
+	// Read this before creating the surface: on the web, configuring a surface
+	// resizes the canvas backing store, which would overwrite what we read
+	int32_t w = 0, h = 0;
+	ska_window_get_drawable_size(window, &w, &h);
+
 #if defined(SKR_VK)
 	VkSurfaceKHR vk_surface;
 	if (!ska_vk_create_surface(window, skr_get_vk_instance(), &vk_surface)) {
 		su_log(su_log_critical, "Failed to create Vulkan surface: %s", ska_error_get());
 		return false;
 	}
-	skr_surface_create(vk_surface, out_surface);
+	if (skr_surface_create(vk_surface, (skr_vec2i_t){ w, h }, out_surface) != skr_err_success) {
+		vkDestroySurfaceKHR(skr_get_vk_instance(), vk_surface, NULL);
+		return false;
+	}
 #elif defined(SKR_WEBGPU)
 	void* wgpu_surface = NULL;
 	if (!ska_wgpu_create_surface(window, skr_get_wgpu_instance(), &wgpu_surface)) {
 		su_log(su_log_critical, "Failed to create WebGPU surface: %s", ska_error_get());
 		return false;
 	}
-	// Query the drawable size BEFORE creating the surface: on the web,
-	// configuring a surface resizes the canvas backing store, so create's
-	// placeholder configuration would overwrite the size we're about to read
-	int32_t w = 0, h = 0;
-	ska_window_get_drawable_size(window, &w, &h);
-	skr_surface_create(wgpu_surface, out_surface);
-	if (w > 0 && h > 0) {
-		out_surface->size = (skr_vec2i_t){ w, h };
-		skr_surface_resize(out_surface);
-	}
+	skr_surface_create(wgpu_surface, (skr_vec2i_t){ w, h }, out_surface);
 #endif
 	return skr_surface_is_valid(out_surface);
 }
 
 static void app_surface_resize(ska_window_t* window, skr_surface_t* surface) {
-#ifdef SKR_WEBGPU
 	int32_t w = 0, h = 0;
 	ska_window_get_drawable_size(window, &w, &h);
-	if (w > 0 && h > 0) surface->size = (skr_vec2i_t){ w, h };
-#else
-	(void)window;
-#endif
-	skr_surface_resize(surface);
+	skr_surface_resize(surface, (skr_vec2i_t){ w, h });
 }
 
 static void app_device_wait_idle(void) {
@@ -159,7 +153,7 @@ static bool main_frame(void* user_data) {
 	// every mode transition — regression for stale cached framebuffers.
 	if (s->cycle_resolve) {
 		int32_t step = s->frame_count / 4;
-		app_set_resolve_mode(s->app, (step & 1) ? (step / 2) % 7 : 0);
+		app_set_resolve_mode(s->app, (step & 1) ? (step / 2) % app_resolve_mode_count() : 0);
 	}
 
 	// Exit after N frames in test mode, or advance to next scene in testall mode
@@ -229,10 +223,6 @@ static bool main_frame(void* user_data) {
 				}
 				break;
 
-			case ska_event_window_resized:
-				app_surface_resize(s->window, &s->surface);
-				break;
-
 			default:
 				break;
 		}
@@ -255,6 +245,16 @@ static bool main_frame(void* user_data) {
 		return true;
 	}
 
+	// Reconcile the swapchain size here rather than per resized event: an
+	// interactive drag queues configures faster than rebuilds retire them.
+	skr_vec2i_t drawable = {0};
+	ska_window_get_drawable_size(s->window, &drawable.x, &drawable.y);
+	if (drawable.x > 0 && drawable.y > 0) {
+		skr_vec2i_t current = skr_surface_get_size(&s->surface);
+		if (drawable.x != current.x || drawable.y != current.y)
+			skr_surface_resize(&s->surface, drawable);
+	}
+
 	// Calculate delta time
 	double current_time = ska_time_get_elapsed_s();
 	float  delta_time   = (float)(current_time - s->last_time);
@@ -275,7 +275,7 @@ static bool main_frame(void* user_data) {
 
 	// Get next swapchain image (vsync blocking happens here via vkAcquireNextImageKHR)
 	skr_tex_t*   target         = NULL;
-	skr_acquire_ acquire_result = skr_surface_next_tex(&s->surface, &target);
+	skr_acquire_ acquire_result = skr_surface_next_tex(&s->surface, drawable, &target);
 
 	// Frame time measured after surface_next_tex (the vsync sync point when GPU-fast)
 	uint64_t now_ns     = ska_time_get_elapsed_ns();
