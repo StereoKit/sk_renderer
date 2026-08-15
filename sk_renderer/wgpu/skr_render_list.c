@@ -37,13 +37,36 @@ void skr_render_list_clear(skr_render_list_t* ref_list) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Sort key: material queue offset dominates, then pipeline state, then mesh —
-// same spirit as the Vulkan backend's key
-static uint64_t _skr_render_sort_key(const skr_material_t* material, WGPUBuffer first_vertex_buffer) {
-	uint64_t queue = (uint64_t)(uint32_t)(material->queue_offset + 0x8000) & 0xFFFF;
-	uint64_t pipe  = (uint64_t)(uint16_t)material->pipeline_material_idx;
-	uint64_t mesh  = ((uint64_t)(uintptr_t)first_vertex_buffer >> 4) & 0xFFFFFFFF;
-	return (queue << 48) | (pipe << 32) | mesh;
+// Sort key layout (64 bits, ascending sort), field for field with the Vulkan
+// backend's key:
+// Bits 63-54 (10): queue          — (alpha_mode << 8) | (queue_offset + 128), queue_offset ∈ [-128, 127]
+// Bits 53-40 (14): pipeline_idx   — pipeline cache index (up to 16384)
+// Bits 39-22 (18): material_id    — low bits of bind_start; unique per material instance
+// Bits 21-10 (12): mesh_id        — hash of first vertex buffer pointer (up to 4096)
+// Bits 9-0   (10): sub_hash       — hash(first_index, index_count, vertex_offset) sub-mesh disambiguator
+//
+// The lower fields order differently to Vulkan since handles are per backend,
+// which is fine. The queue field is driven by render options, so it must match.
+static uint64_t _skr_render_sort_key(const skr_material_t* material, WGPUBuffer first_vertex_buffer, int32_t first_index, int32_t index_count, int32_t vertex_offset) {
+	// Derive alpha mode: 0 = opaque, 1 = alpha-to-coverage, 2 = transparent
+	uint32_t alpha_mode = 0;
+	if (material->key.alpha_to_coverage) {
+		alpha_mode = 1;
+	} else if (material->key.blend_state.dst_color_factor != skr_blend_zero) {
+		alpha_mode = 2;
+	}
+	// Bit-pack alpha_mode and queue_offset into 10 bits: 2 bits alpha_mode (high) + 8 bits biased offset.
+	// queue_offset is biased by +128 so negative values stay positive in a uint8.
+	uint64_t queue       = ((uint64_t)alpha_mode << 8) | (uint64_t)((material->queue_offset + 128) & 0xFF);
+	uint64_t pipeline_id = (uint64_t)(material->pipeline_material_idx)      & 0x3FFF;
+	uint64_t material_id = (uint64_t)(material->bind_start)                 & 0x3FFFF;
+	uint64_t mesh_id     = (uint64_t)((uintptr_t)first_vertex_buffer >> 4)  & 0xFFF;
+
+	// Hash draw params into 10 bits to disambiguate different draw ranges of the same mesh.
+	uint32_t sub      = (uint32_t)first_index ^ ((uint32_t)index_count * 2654435761u) ^ ((uint32_t)vertex_offset * 2246822519u);
+	uint64_t sub_hash = (uint64_t)((sub ^ (sub >> 10)) & 0x3FF);
+
+	return (queue << 54) | (pipeline_id << 40) | (material_id << 22) | (mesh_id << 10) | sub_hash;
 }
 
 void skr_render_list_add(skr_render_list_t* ref_list, skr_mesh_t* mesh, skr_material_t* material, const void* opt_instance_data, uint32_t single_instance_data_size, uint32_t instance_count) {
@@ -99,7 +122,7 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 
 	uint32_t aligned_inst_offset = (ref_list->instance_data_used + _SKR_OFFSET_ALIGN - 1) & ~(_SKR_OFFSET_ALIGN - 1);
 	int32_t  resolved_index_count = index_count > 0 ? index_count : (int32_t)mesh->ind_count;
-	item->sort_key           = _skr_render_sort_key(material, item->vertex_buffers[0]);
+	item->sort_key           = _skr_render_sort_key(material, item->vertex_buffers[0], first_index, resolved_index_count, vertex_offset);
 	item->instance_offset    = aligned_inst_offset;
 	item->instance_data_size = (uint16_t)single_instance_data_size;
 	item->instance_count     = instance_count > 0 ? instance_count : 1;

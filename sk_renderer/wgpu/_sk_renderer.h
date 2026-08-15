@@ -208,5 +208,8 @@ WGPUBuffer _skr_bump_uniform_write(const void* data, uint32_t size, uint64_t* ou
 // Draw-order sort (skr_render_list.c)
 void _skr_render_list_sort(skr_render_list_t* ref_list);
 
+uint64_t _skr_time_now_ns (void);
+void     _skr_cpu_wait_add(uint64_t start_ns);
+
 // Lazily-created single-layer render view for layered targets (skr_texture.c)
 WGPUTextureView _skr_tex_layer_view(skr_tex_t* tex, uint32_t layer);

@@ -142,8 +142,10 @@ static bool               _timer_init_tried;
 static uint64_t           _gpu_time_us;
 static uint64_t           _cpu_time_us;
 static uint64_t           _cpu_frame_start_ns;
+static uint64_t           _cpu_wait_ns;   // Blocking waits inside the frame, subtracted from CPU time
+static bool               _cpu_in_frame;
 
-static uint64_t _skr_time_now_ns(void) {
+uint64_t _skr_time_now_ns(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -257,13 +259,27 @@ void skr_renderer_frame_begin(void) {
 	_skr_transient_tick();
 	_skr_timer_harvest();
 	_cpu_frame_start_ns = _skr_time_now_ns();
+	_cpu_wait_ns        = 0;
+	_cpu_in_frame       = true;
+}
+
+// Waits outside a frame are ignored, matching the Vulkan backend's in_frame guard.
+void _skr_cpu_wait_add(uint64_t start_ns) {
+	if (!_cpu_in_frame) return;
+	_cpu_wait_ns += _skr_time_now_ns() - start_ns;
 }
 
 void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 	(void)opt_surfaces; (void)count;
 	_skr_cmd_submit();
 	_skr_timer_flush();
-	_cpu_time_us = (_skr_time_now_ns() - _cpu_frame_start_ns) / 1000;
+
+	// Busy time, not wall time: blocking waits are the caller's frame budget
+	uint64_t total_ns = _skr_time_now_ns() - _cpu_frame_start_ns;
+	uint64_t wait_ns  = _cpu_wait_ns > total_ns ? 0 : _cpu_wait_ns;
+	_cpu_time_us  = (total_ns - wait_ns) / 1000;
+	_cpu_in_frame = false;
+
 	wgpuInstanceProcessEvents(_skr_wgpu.instance);
 }
 
@@ -1115,6 +1131,8 @@ void _skr_renderer_sys_shutdown(void) {
 	_gpu_time_us        = 0;
 	_cpu_time_us        = 0;
 	_cpu_frame_start_ns = 0;
+	_cpu_wait_ns        = 0;
+	_cpu_in_frame       = false;
 
 	for (uint32_t i = 0; i < _SKR_TRANSIENT_MAX; i++) {
 		if (_transients[i].tex.texture) skr_tex_destroy(&_transients[i].tex);

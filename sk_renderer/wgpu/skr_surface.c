@@ -102,8 +102,14 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, 
 	if (ref_surface->current.view)    { wgpuTextureViewRelease(ref_surface->current.view);    ref_surface->current.view    = NULL; }
 	if (ref_surface->current.texture) { wgpuTextureRelease(ref_surface->current.texture);     ref_surface->current.texture = NULL; }
 
+	// Where vsync lands: Dawn blocks here until a swapchain image retires
+	uint64_t wait_start = _skr_time_now_ns();
+
 	WGPUSurfaceTexture surface_tex = {0};
 	wgpuSurfaceGetCurrentTexture(ref_surface->surface, &surface_tex);
+
+	_skr_cpu_wait_add(wait_start);
+
 	switch (surface_tex.status) {
 		case WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal:
 		case WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal:
@@ -153,7 +159,10 @@ skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 	// returns to the event loop; wgpuSurfacePresent traps on the web
 	WGPUStatus status = WGPUStatus_Success;
 #else
-	WGPUStatus status = wgpuSurfacePresent(ref_surface->surface);
+	// Present can block for the same reason acquire can, so it's excluded too
+	uint64_t   present_start = _skr_time_now_ns();
+	WGPUStatus status        = wgpuSurfacePresent(ref_surface->surface);
+	_skr_cpu_wait_add(present_start);
 #endif
 
 	if (ref_surface->current.view)    { wgpuTextureViewRelease(ref_surface->current.view);    ref_surface->current.view    = NULL; }
