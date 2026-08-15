@@ -319,8 +319,13 @@ if(SKR_BUILD_EXAMPLES)
 		endif()
 
 		add_subdirectory(example)
-		if(NOT SKR_USE_WEBGPU)
-			add_subdirectory(example_xr) # OpenXR is Vulkan-only
+		# example_xr covers two of the three configurations:
+		#   Vulkan     -> the Khronos loader, whatever runtime is active
+		#   Emscripten -> WebGPU via WebOpenXR, an OpenXR runtime on WebXR
+		# Native WebGPU (Dawn) is the gap: it is the WebGPU backend without a
+		# browser, and no OpenXR runtime offers a WebGPU graphics binding there.
+		if(NOT SKR_USE_WEBGPU OR EMSCRIPTEN)
+			add_subdirectory(example_xr)
 		endif()
 	endif()
 endif() # SKR_BUILD_EXAMPLES

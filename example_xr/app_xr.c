@@ -171,14 +171,28 @@ void app_xr_render_stereo(skr_tex_t* color_target, skr_tex_t* resolve_target, sk
 	sys.view_count  = view_count;
 	sys.screen_size = (float4){(float)width, (float)height, 1.0f / width, 1.0f / height};
 
+	// The head pose starts at the reference space origin, which puts the viewer
+	// inside scenes built around it, so offset by the flat app's camera
+	// position. Position only: a look-at would fight head tracking.
+	scene_camera_t scene_cam;
+	const scene_vtable_t* vtable = s_scene_types[s_scene_index];
+	float3 origin = (vtable->get_camera && vtable->get_camera(s_scene_current, &scene_cam))
+		? scene_cam.position
+		: (float3){0.0f, 3.0f, 8.0f};
+
 	for (uint32_t v = 0; v < view_count && v < SU_MAX_VIEWS; v++) {
 		const XrView* view = &views[v];
 
-		float4x4 view_mat = xr_view_matrix(view->pose);
+		XrPosef pose = view->pose;
+		pose.position.x += origin.x;
+		pose.position.y += origin.y;
+		pose.position.z += origin.z;
+
+		float4x4 view_mat = xr_view_matrix(pose);
 		float4x4 proj_mat = xr_projection(view->fov, 0.05f, 100.0f);
 
-		float4 q       = (float4){view->pose.orientation.x, view->pose.orientation.y, view->pose.orientation.z, view->pose.orientation.w};
-		float3 cam_pos = (float3){view->pose.position.x, view->pose.position.y, view->pose.position.z};
+		float4 q       = (float4){pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w};
+		float3 cam_pos = (float3){pose.position.x, pose.position.y, pose.position.z};
 		float3 cam_dir = float4_quat_rotate(q, (float3){0, 0, -1});
 
 		sys.view[v]           = view_mat;

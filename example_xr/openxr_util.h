@@ -3,17 +3,33 @@
 // sk_renderer uses Volk for Vulkan - must include first before any Vulkan headers
 #include <sk_renderer.h>
 
-// Tell OpenXR we're using Vulkan
-#define XR_USE_GRAPHICS_API_VULKAN
+// One app, two graphics bindings, following sk_renderer's own backend split:
+//
+//   native  Vulkan  + the system OpenXR loader (Monado, SteamVR, ...)
+//   web     WebGPU  + WebOpenXR, which implements OpenXR on top of WebXR
+//
+// sk_renderer is backend-agnostic already, so app_xr.c and every scene in
+// example/ compile unchanged for both. Only the OpenXR plumbing in main.c
+// differs, and that difference is entirely about which graphics binding struct
+// xrCreateSession is handed.
+#ifdef __EMSCRIPTEN__
+	// openxr_webxr.h defines XR_USE_GRAPHICS_API_OPENGL_ES and pulls in
+	// webgpu.h; the WebGPU binding is a WebOpenXR extension, not a Khronos one.
+	#include <openxr/openxr.h>
+	#include <openxr_webxr/openxr_webxr.h>
+#else
+	// Tell OpenXR we're using Vulkan
+	#define XR_USE_GRAPHICS_API_VULKAN
 
-// Android platform support
-#ifdef __ANDROID__
-#include <jni.h>
-#define XR_USE_PLATFORM_ANDROID
+	// Android platform support
+	#ifdef __ANDROID__
+	#include <jni.h>
+	#define XR_USE_PLATFORM_ANDROID
+	#endif
+
+	#include <openxr/openxr.h>
+	#include <openxr/openxr_platform.h>
 #endif
-
-#include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,8 +44,12 @@ typedef struct xr_swapchain_t {
 	int32_t      height;
 	int32_t      array_size;      // Number of array layers (2 for stereo)
 	int32_t      sample_count;    // MSAA sample count
-	skr_tex_t*   color_textures;  // Array of wrapped VkImages (each is an array texture for stereo)
+	skr_tex_t*   color_textures;  // Wrapped swapchain images (each an array texture for stereo)
 	uint32_t     image_count;
+	// Web only: with XR_SKW_transient_swapchain_images the compositor hands out
+	// a different texture every frame, so color_textures[0] is re-pointed at it
+	// each frame rather than being a stable set enumerated once at startup.
+	bool         transient;
 } xr_swapchain_t;
 
 typedef struct xr_input_state_t {
@@ -76,12 +96,14 @@ extern XrViewConfigurationType xr_config_view;
 // Function pointers for OpenXR extensions
 ///////////////////////////////////////////
 
+#ifndef __EMSCRIPTEN__
 extern PFN_xrCreateVulkanInstanceKHR           ext_xrCreateVulkanInstanceKHR;
 extern PFN_xrCreateVulkanDeviceKHR             ext_xrCreateVulkanDeviceKHR;
 extern PFN_xrGetVulkanGraphicsDevice2KHR       ext_xrGetVulkanGraphicsDevice2KHR;
 extern PFN_xrGetVulkanGraphicsRequirements2KHR ext_xrGetVulkanGraphicsRequirements2KHR;
 extern PFN_xrCreateDebugUtilsMessengerEXT      ext_xrCreateDebugUtilsMessengerEXT;
 extern PFN_xrDestroyDebugUtilsMessengerEXT     ext_xrDestroyDebugUtilsMessengerEXT;
+#endif
 
 ///////////////////////////////////////////
 // OpenXR Functions

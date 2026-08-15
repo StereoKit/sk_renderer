@@ -1,5 +1,12 @@
 // OpenXR + sk_renderer Example
-// A minimal VR application demonstrating sk_renderer with OpenXR/Vulkan
+// A minimal VR application demonstrating sk_renderer with OpenXR.
+//
+// Two graphics bindings, matching sk_renderer's own backend split:
+//   native  Vulkan (XR_KHR_vulkan_enable2) + the system OpenXR loader
+//   web     WebGPU (XR_SKW_webgpu_enable)  + WebOpenXR, on top of WebXR
+//
+// Everything above the binding - scenes, app_xr.c, the whole render path - is
+// shared. See openxr_util.h.
 
 #include "openxr_util.h"
 #include "app_xr.h"
@@ -9,6 +16,13 @@
 #include <stdbool.h>
 
 #include <sk_app.h>
+
+#ifdef __EMSCRIPTEN__
+	// wgpuCreateInstance and emscripten_webgpu_get_device both come from
+	// emdawnwebgpu's <webgpu/webgpu.h>, which openxr_util.h already pulls in
+	// via openxr_webxr.h - there is no separate emscripten/html5_webgpu.h here.
+	#include <emscripten.h>
+#endif
 
 ///////////////////////////////////////////
 // OpenXR Error Checking
@@ -53,13 +67,28 @@ XrViewConfigurationView* xr_config_views  = NULL;
 xr_swapchain_t           xr_swapchain     = {0};  // Single stereo swapchain
 uint32_t                 xr_view_count    = 0;
 
+#ifdef __EMSCRIPTEN__
+// Kept so the per-frame transient wrap can name the format the swapchain was
+// created with - the compositor's texture is new each frame, its format is not.
+static skr_tex_fmt_      xr_swapchain_tex_format = skr_tex_fmt_rgba32;
+#endif
+
 skr_tex_t                xr_depth_texture = {0};  // Single array depth texture
+
+// MSAA is native only: WebGPU forbids a multisampled texture with more than one
+// array layer, and a stereo projection layer is two by definition. The web path
+// renders straight into the compositor's texture.
+#ifdef __EMSCRIPTEN__
+static const int32_t     xr_msaa_samples  = 1;
+#else
 skr_tex_t                xr_color_msaa    = {0};  // MSAA array color texture (render target)
 static const int32_t     xr_msaa_samples  = 4;    // MSAA sample count
+#endif
 
 XrFormFactor             xr_config_form   = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
 XrViewConfigurationType  xr_config_view   = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
+#ifndef __EMSCRIPTEN__
 // Function pointers for OpenXR extensions (vulkan_enable2)
 PFN_xrCreateVulkanInstanceKHR          ext_xrCreateVulkanInstanceKHR          = NULL;
 PFN_xrCreateVulkanDeviceKHR            ext_xrCreateVulkanDeviceKHR            = NULL;
@@ -67,6 +96,7 @@ PFN_xrGetVulkanGraphicsDevice2KHR      ext_xrGetVulkanGraphicsDevice2KHR      = 
 PFN_xrGetVulkanGraphicsRequirements2KHR ext_xrGetVulkanGraphicsRequirements2KHR = NULL;
 PFN_xrCreateDebugUtilsMessengerEXT     ext_xrCreateDebugUtilsMessengerEXT     = NULL;
 PFN_xrDestroyDebugUtilsMessengerEXT    ext_xrDestroyDebugUtilsMessengerEXT    = NULL;
+#endif
 
 ///////////////////////////////////////////
 // Forward declarations
@@ -74,11 +104,19 @@ PFN_xrDestroyDebugUtilsMessengerEXT    ext_xrDestroyDebugUtilsMessengerEXT    = 
 
 static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProjectionView* views, uint32_t view_count, XrCompositionLayerProjection* layer);
 static void xr_swapchain_destroy(xr_swapchain_t* swapchain);
+#ifdef __EMSCRIPTEN__
+static bool openxr_create_swapchain(void);
+#endif
 
 ///////////////////////////////////////////
 // Debug callback
+//
+// XR_EXT_debug_utils is a loader/runtime facility; WebOpenXR doesn't implement
+// it (the browser console and sk_app's log carry the same information), so the
+// whole messenger is native-only.
 ///////////////////////////////////////////
 
+#ifndef __EMSCRIPTEN__
 static XrBool32 XRAPI_CALL xr_debug_callback(XrDebugUtilsMessageSeverityFlagsEXT severity, XrDebugUtilsMessageTypeFlagsEXT types, const XrDebugUtilsMessengerCallbackDataEXT* data, void* user_data) {
 	(void)user_data;
 	const char* type_str = "";
@@ -165,6 +203,7 @@ static void* xr_device_create_callback(skr_device_create_info_t* info, void* use
 	}
 	return device;
 }
+#endif // !__EMSCRIPTEN__
 
 ///////////////////////////////////////////
 // OpenXR Initialization
@@ -213,35 +252,57 @@ bool openxr_init(const char* app_name) {
 
 	// Build list of extensions to use
 	const char* ask_extensions[] = {
+#ifdef __EMSCRIPTEN__
+		XR_SKW_WEBGPU_ENABLE_EXTENSION_NAME,
+		// Optional. With it the compositor lends us its own texture each frame
+		// and we render straight into it; without it the runtime allocates a
+		// swapchain and copies. See the transient handling in the frame loop.
+		XR_SKW_TRANSIENT_SWAPCHAIN_IMAGES_EXTENSION_NAME,
+#else
 		XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 		XR_EXT_DEBUG_UTILS_EXTENSION_NAME,
-#ifdef __ANDROID__
+	#ifdef __ANDROID__
 		XR_KHR_LOADER_INIT_ANDROID_EXTENSION_NAME,
 		XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
+	#endif
 #endif
 	};
 	const char* use_extensions[16];
 	uint32_t    use_count = 0;
 
 	ska_log(ska_log_info, "OpenXR extensions available:");
-	bool has_vulkan = false;
+	bool has_gfx = false;
 	for (uint32_t i = 0; i < ext_count; i++) {
 		ska_log(ska_log_info, "- %s", xr_exts[i].extensionName);
 
 		for (uint32_t ask = 0; ask < sizeof(ask_extensions)/sizeof(ask_extensions[0]); ask++) {
 			if (strcmp(ask_extensions[ask], xr_exts[i].extensionName) == 0) {
 				use_extensions[use_count++] = ask_extensions[ask];
-				if (strcmp(ask_extensions[ask], XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
-					has_vulkan = true;
-				}
+#ifdef __EMSCRIPTEN__
+				if (strcmp(ask_extensions[ask], XR_SKW_WEBGPU_ENABLE_EXTENSION_NAME) == 0)
+					has_gfx = true;
+				if (strcmp(ask_extensions[ask], XR_SKW_TRANSIENT_SWAPCHAIN_IMAGES_EXTENSION_NAME) == 0)
+					xr_swapchain.transient = true;
+#else
+				if (strcmp(ask_extensions[ask], XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0)
+					has_gfx = true;
+#endif
 				break;
 			}
 		}
 	}
 	free(xr_exts);
 
-	if (!has_vulkan) {
+	if (!has_gfx) {
+#ifdef __EMSCRIPTEN__
+		// Almost always means the browser has no XRGPUBinding: Quest Browser 149
+		// lacks it entirely, and desktop Chrome needs
+		// --enable-features=WebXRWebGPUBinding.
+		ska_log(ska_log_error, "OpenXR runtime does not support %s - does this browser have XRGPUBinding?",
+			XR_SKW_WEBGPU_ENABLE_EXTENSION_NAME);
+#else
 		ska_log(ska_log_error, "OpenXR runtime does not support Vulkan");
+#endif
 		return false;
 	}
 
@@ -268,6 +329,7 @@ bool openxr_init(const char* app_name) {
 		return false;
 	}
 
+#ifndef __EMSCRIPTEN__
 	// Load extension function pointers (vulkan_enable2)
 	xrGetInstanceProcAddr(xr_instance, "xrCreateVulkanInstanceKHR",           (PFN_xrVoidFunction*)&ext_xrCreateVulkanInstanceKHR);
 	xrGetInstanceProcAddr(xr_instance, "xrCreateVulkanDeviceKHR",             (PFN_xrVoidFunction*)&ext_xrCreateVulkanDeviceKHR);
@@ -291,6 +353,7 @@ bool openxr_init(const char* app_name) {
 		debug_info.userData     = NULL;
 		ext_xrCreateDebugUtilsMessengerEXT(xr_instance, &debug_info, &xr_debug);
 	}
+#endif // !__EMSCRIPTEN__
 
 	// Get system (HMD)
 	result = xrGetSystem(xr_instance, &(XrSystemGetInfo){
@@ -321,7 +384,45 @@ bool openxr_init(const char* app_name) {
 	                         (xr_blend == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE)    ? "ADDITIVE" : "OPAQUE";
 	ska_log(ska_log_info, "Using blend mode: %s", blend_name);
 
-	// Get graphics requirements (must call before creating session)
+	// Get graphics requirements. Mandatory before xrCreateSession on both paths -
+	// Monado enforces it, and so does WebOpenXR.
+#ifdef __EMSCRIPTEN__
+	// Not in the dispatch table as a named symbol; it's an extension entry point.
+	PFN_xrVoidFunction gfx_req_fn = NULL;
+	if (XR_FAILED(xrGetInstanceProcAddr(xr_instance, "xrGetWebGPUGraphicsRequirementsSKW", &gfx_req_fn)) || gfx_req_fn == NULL) {
+		ska_log(ska_log_error, "xrGetWebGPUGraphicsRequirementsSKW missing");
+		return false;
+	}
+	XrGraphicsRequirementsWebGPUSKW gfx_requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_WEBGPU_SKW };
+	((PFN_xrGetWebGPUGraphicsRequirementsSKW)gfx_req_fn)(xr_instance, xr_system_id, &gfx_requirements);
+	ska_log(ska_log_info, "OpenXR WebGPU requirements: xrCompatible adapter required = %d",
+		(int)gfx_requirements.xrCompatibleAdapterRequired);
+
+	// The adapter must be requested {xrCompatible:true} before wasm starts, so
+	// web/pre.js parks the device on Module.preinitializedWebGPUDevice. Instance
+	// and device are mandatory together: without the device skr_init takes the
+	// native path and dies with "wgpuCreateInstance failed".
+	if (!EM_ASM_INT({ return Module['preinitializedWebGPUDevice'] ? 1 : 0; })) {
+		ska_log(ska_log_error, "No pre-initialized WebGPU device - does this browser have WebGPU?");
+		return false;
+	}
+	if (!skr_init((skr_settings_t){
+		.app_name          = app_name,
+		.app_version       = 1,
+		.enable_validation = true,
+		.wgpu_instance     = wgpuCreateInstance(NULL),
+		.wgpu_device       = emscripten_webgpu_get_device(),
+	})) {
+		ska_log(ska_log_error, "Failed to initialize sk_renderer");
+		return false;
+	}
+
+	XrGraphicsBindingWebGPUSKW binding = {
+		.type     = XR_TYPE_GRAPHICS_BINDING_WEBGPU_SKW,
+		.instance = skr_get_wgpu_instance(),
+		.adapter  = skr_get_wgpu_adapter (),
+		.device   = skr_get_wgpu_device  () };
+#else
 	XrGraphicsRequirementsVulkan2KHR gfx_requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR };
 	ext_xrGetVulkanGraphicsRequirements2KHR(xr_instance, xr_system_id, &gfx_requirements);
 	ska_log(ska_log_info, "OpenXR Vulkan requirements: API %u.%u.%u - %u.%u.%u",
@@ -354,6 +455,7 @@ bool openxr_init(const char* app_name) {
 		.device           = skr_get_vk_device               (),
 		.queueFamilyIndex = skr_get_vk_graphics_queue_family(),
 		.queueIndex       = 0 };
+#endif
 
 	result = xrCreateSession(xr_instance, &(XrSessionCreateInfo){
 		.type     = XR_TYPE_SESSION_CREATE_INFO,
@@ -390,27 +492,68 @@ bool openxr_init(const char* app_name) {
 			xr_config_views[i].recommendedSwapchainSampleCount);
 	}
 
-	// Find preferred format (SRGB)
+#ifdef __EMSCRIPTEN__
+	// Web: deferred to the first frame. The projection layer does not exist
+	// until an immersive session does, and the view size reported now is a
+	// guess. Native runtimes answer both at xrCreateSession.
+	return true;
+}
+
+// Split out of openxr_init so the web can call it later. Native calls it inline
+// and nothing about its behaviour changed.
+static bool openxr_create_swapchain(void) {
+	// Re-read the view configuration: on the web the size at xrCreateSession is
+	// provisional and only becomes exact once the session is running.
+	xrEnumerateViewConfigurationViews(xr_instance, xr_system_id, xr_config_view,
+		xr_view_count, &xr_view_count, xr_config_views);
+	ska_log(ska_log_info, "OpenXR views (final): %ux%u",
+		xr_config_views[0].recommendedImageRectWidth,
+		xr_config_views[0].recommendedImageRectHeight);
+#endif
+
+	// The runtime lists only formats it supports, in its own preference order,
+	// so take the first one we recognise rather than second-guessing it. Values
+	// are backend-native: VkFormat natively, WGPUTextureFormat on the web.
+	static const struct { int64_t api_format; skr_tex_fmt_ tex_format; } known_formats[] = {
+#ifdef __EMSCRIPTEN__
+		{ 18, skr_tex_fmt_rgba32      },   // WGPUTextureFormat_RGBA8Unorm
+		{ 19, skr_tex_fmt_rgba32_srgb },   // WGPUTextureFormat_RGBA8UnormSrgb
+		{ 23, skr_tex_fmt_bgra32      },   // WGPUTextureFormat_BGRA8Unorm
+		{ 24, skr_tex_fmt_bgra32_srgb },   // WGPUTextureFormat_BGRA8UnormSrgb
+#else
+		{ VK_FORMAT_R8G8B8A8_SRGB,  skr_tex_fmt_rgba32_srgb },
+		{ VK_FORMAT_R8G8B8A8_UNORM, skr_tex_fmt_rgba32      },
+		{ VK_FORMAT_B8G8R8A8_SRGB,  skr_tex_fmt_bgra32_srgb },
+		{ VK_FORMAT_B8G8R8A8_UNORM, skr_tex_fmt_bgra32      },
+#endif
+	};
+
 	uint32_t format_count = 0;
 	xrEnumerateSwapchainFormats(xr_session, 0, &format_count, NULL);
 	int64_t* formats = malloc(format_count * sizeof(int64_t));
 	xrEnumerateSwapchainFormats(xr_session, format_count, &format_count, formats);
 
-	int64_t swapchain_format = VK_FORMAT_R8G8B8A8_SRGB;  // Preferred
-	bool    found_format     = false;
-	for (uint32_t i = 0; i < format_count; i++) {
-		if (formats[i] == VK_FORMAT_R8G8B8A8_SRGB || formats[i] == VK_FORMAT_B8G8R8A8_SRGB) {
+	int64_t      swapchain_format = 0;
+	skr_tex_fmt_ tex_format       = skr_tex_fmt_none;
+	for (uint32_t i = 0; i < format_count && tex_format == skr_tex_fmt_none; i++) {
+		for (uint32_t k = 0; k < sizeof(known_formats)/sizeof(known_formats[0]); k++) {
+			if (formats[i] != known_formats[k].api_format) continue;
 			swapchain_format = formats[i];
-			found_format     = true;
+			tex_format       = known_formats[k].tex_format;
 			break;
 		}
 	}
-	if (!found_format && format_count > 0) {
-		swapchain_format = formats[0];  // Fallback to first available
-	}
 	free(formats);
 
+	if (tex_format == skr_tex_fmt_none) {
+		ska_log(ska_log_error, "None of the runtime's %u swapchain formats are ones we can render into", format_count);
+		return false;
+	}
 	ska_log(ska_log_info, "Using swapchain format: %lld", (long long)swapchain_format);
+
+#ifdef __EMSCRIPTEN__
+	xr_swapchain_tex_format = tex_format;
+#endif
 
 	// Create a single stereo swapchain (without MSAA - we'll render to separate MSAA texture and resolve)
 	// Use recommended settings from first view (both eyes should match for stereo)
@@ -441,6 +584,45 @@ bool openxr_init(const char* app_name) {
 		return false;
 	}
 
+	// Store swapchain info
+	xr_swapchain.handle       = handle;
+	xr_swapchain.width        = swapchain_info.width;
+	xr_swapchain.height       = swapchain_info.height;
+	xr_swapchain.array_size   = xr_view_count;
+	xr_swapchain.sample_count = 1;  // Swapchain has no MSAA - we resolve to it
+
+#ifdef __EMSCRIPTEN__
+	if (xr_swapchain.transient) {
+		// The compositor lends out a different texture every frame, so there is
+		// nothing stable to enumerate here. One slot, re-pointed each frame in
+		// openxr_render_layer - the extension's contract is that the app
+		// re-reads and caches nothing.
+		xr_swapchain.image_count    = 1;
+		xr_swapchain.color_textures = calloc(1, sizeof(skr_tex_t));
+	} else {
+		uint32_t image_count = 0;
+		xrEnumerateSwapchainImages(handle, 0, &image_count, NULL);
+
+		XrSwapchainImageWebGPUSKW* images = calloc(image_count, sizeof(XrSwapchainImageWebGPUSKW));
+		for (uint32_t j = 0; j < image_count; j++)
+			images[j].type = XR_TYPE_SWAPCHAIN_IMAGE_WEBGPU_SKW;
+		xrEnumerateSwapchainImages(handle, image_count, &image_count, (XrSwapchainImageBaseHeader*)images);
+
+		xr_swapchain.image_count    = image_count;
+		xr_swapchain.color_textures = calloc(image_count, sizeof(skr_tex_t));
+		for (uint32_t j = 0; j < image_count; j++) {
+			skr_tex_create_external_wgpu((skr_tex_external_wgpu_info_t){
+				.texture      = images[j].texture,
+				.format       = tex_format,
+				.sampler      = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
+				.size         = { (int32_t)swapchain_info.width, (int32_t)swapchain_info.height, (int32_t)xr_view_count },
+				.multisample  = 1,
+				.owns_texture = false,
+			}, &xr_swapchain.color_textures[j]);
+		}
+		free(images);
+	}
+#else
 	// Enumerate swapchain images
 	uint32_t image_count = 0;
 	xrEnumerateSwapchainImages(handle, 0, &image_count, NULL);
@@ -451,20 +633,10 @@ bool openxr_init(const char* app_name) {
 	}
 	xrEnumerateSwapchainImages(handle, image_count, &image_count, (XrSwapchainImageBaseHeader*)images);
 
-	// Store swapchain info
-	xr_swapchain.handle       = handle;
-	xr_swapchain.width        = swapchain_info.width;
-	xr_swapchain.height       = swapchain_info.height;
-	xr_swapchain.array_size   = xr_view_count;
-	xr_swapchain.sample_count = 1;  // Swapchain has no MSAA - we resolve to it
 	xr_swapchain.image_count  = image_count;
 	xr_swapchain.color_textures = calloc(image_count, sizeof(skr_tex_t));
 
 	// Wrap each VkImage in sk_renderer texture (as array texture, no MSAA)
-	skr_tex_fmt_ tex_format = (swapchain_format == VK_FORMAT_B8G8R8A8_SRGB)
-		? skr_tex_fmt_bgra32_srgb
-		: skr_tex_fmt_rgba32_srgb;
-
 	for (uint32_t j = 0; j < image_count; j++) {
 		skr_tex_create_external_vk((skr_tex_external_info_t){
 			.image          = images[j].image,
@@ -491,8 +663,10 @@ bool openxr_init(const char* app_name) {
 		xr_msaa_samples, 1, NULL,
 		&xr_color_msaa );
 	skr_tex_set_name(&xr_color_msaa, "XR Color MSAA (Array)");
+#endif
 
-	// Create MSAA depth array texture
+	// Depth. Multisampled on the Vulkan path to match the MSAA colour target;
+	// single-sampled on the web, where there is no MSAA target to match.
 	skr_tex_create(
 		skr_tex_fmt_depth16,
 		skr_tex_flags_writeable | skr_tex_flags_array,
@@ -500,7 +674,7 @@ bool openxr_init(const char* app_name) {
 		(skr_vec3i_t){ (int32_t)swapchain_info.width, (int32_t)swapchain_info.height, (int32_t)xr_view_count },
 		xr_msaa_samples, 1, NULL,
 		&xr_depth_texture );
-	skr_tex_set_name(&xr_depth_texture, "XR Depth MSAA (Array)");
+	skr_tex_set_name(&xr_depth_texture, "XR Depth");
 
 	return true;
 }
@@ -580,7 +754,9 @@ void openxr_make_actions(void) {
 void openxr_shutdown(void) {
 	xrDestroySwapchain  (xr_swapchain.handle);
 	xr_swapchain_destroy(&xr_swapchain);
+#ifndef __EMSCRIPTEN__
 	skr_tex_destroy     (&xr_color_msaa);
+#endif
 	skr_tex_destroy     (&xr_depth_texture);
 	free                ( xr_config_views);
 	free                ( xr_views);
@@ -594,9 +770,11 @@ void openxr_shutdown(void) {
 
 	if (xr_app_space != XR_NULL_HANDLE) xrDestroySpace(xr_app_space);
 	if (xr_session   != XR_NULL_HANDLE) xrDestroySession(xr_session);
+#ifndef __EMSCRIPTEN__
 	if (xr_debug     != XR_NULL_HANDLE && ext_xrDestroyDebugUtilsMessengerEXT) {
 		ext_xrDestroyDebugUtilsMessengerEXT(xr_debug);
 	}
+#endif
 	if (xr_instance  != XR_NULL_HANDLE) xrDestroyInstance(xr_instance);
 }
 
@@ -708,6 +886,15 @@ void openxr_poll_predicted(XrTime predicted_time) {
 ///////////////////////////////////////////
 
 void openxr_render_frame(void) {
+#ifdef __EMSCRIPTEN__
+	// Built on the first frame rather than at init - see openxr_create_swapchain
+	// for why the web can't answer either question any earlier.
+	if (xr_swapchain.handle == XR_NULL_HANDLE && !openxr_create_swapchain()) {
+		ska_log(ska_log_error, "[OpenXR] swapchain creation failed");
+		return;
+	}
+#endif
+
 	XrFrameState frame_state = { XR_TYPE_FRAME_STATE };
 	XrResult wait_result = xrWaitFrame(xr_session, &(XrFrameWaitInfo){ .type = XR_TYPE_FRAME_WAIT_INFO }, &frame_state);
 	if (XR_FAILED(wait_result)) {
@@ -776,11 +963,52 @@ static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProject
 		views[i].subImage.imageArrayIndex  = i;  // Each view uses a different array layer
 	}
 
+#ifdef __EMSCRIPTEN__
+	// No MSAA here (see xr_msaa_samples), so we render straight into the
+	// swapchain texture and there is nothing to resolve into.
+	if (xr_swapchain.transient) {
+		// Re-read every frame: under XR_SKW_transient_swapchain_images the
+		// compositor hands out a *different* texture each frame, and caching the
+		// previous one renders into a texture that no longer exists.
+		XrSwapchainImageWebGPUSKW image = { XR_TYPE_SWAPCHAIN_IMAGE_WEBGPU_SKW };
+		uint32_t got = 0;
+		XR_CHECK(xrEnumerateSwapchainImages(xr_swapchain.handle, 1, &got, (XrSwapchainImageBaseHeader*)&image));
+		if (got == 0 || image.texture == NULL) {
+			ska_log(ska_log_error, "[OpenXR] no transient swapchain texture this frame");
+			skr_renderer_frame_end(NULL, 0);
+			XR_CHECK(xrReleaseSwapchainImage(xr_swapchain.handle, &(XrSwapchainImageReleaseInfo){ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO }));
+			return false;
+		}
+
+		skr_tex_t* swap = &xr_swapchain.color_textures[0];
+		skr_err_   err  = skr_tex_is_valid(swap)
+			? skr_tex_update_external_wgpu(swap, image.texture)
+			: skr_tex_create_external_wgpu((skr_tex_external_wgpu_info_t){
+				.texture      = image.texture,
+				.format       = xr_swapchain_tex_format,
+				.sampler      = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
+				.size         = { xr_swapchain.width, xr_swapchain.height, xr_swapchain.array_size },
+				.multisample  = 1,
+				.owns_texture = false,
+			}, swap);
+		if (err != skr_err_success) {
+			ska_log(ska_log_error, "[OpenXR] failed to wrap the transient swapchain texture");
+			skr_renderer_frame_end(NULL, 0);
+			XR_CHECK(xrReleaseSwapchainImage(xr_swapchain.handle, &(XrSwapchainImageReleaseInfo){ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO }));
+			return false;
+		}
+		img_idx = 0;
+	}
+
+	app_xr_render_stereo(&xr_swapchain.color_textures[img_idx], NULL, &xr_depth_texture,
+		xr_views, view_count, xr_swapchain.width, xr_swapchain.height);
+#else
 	// Single-pass stereo rendering - render to MSAA, resolve to swapchain
 	skr_tex_t* color_target   = &xr_color_msaa;  // MSAA render target
 	skr_tex_t* resolve_target = &xr_swapchain.color_textures[img_idx];  // Swapchain for resolve
 	skr_tex_t* depth_target   = &xr_depth_texture;  // MSAA depth
 	app_xr_render_stereo(color_target, resolve_target, depth_target, xr_views, view_count, xr_swapchain.width, xr_swapchain.height);
+#endif
 
 	// End sk_renderer frame - must happen BEFORE releasing swapchain images
 	skr_renderer_frame_end(NULL, 0);
@@ -797,6 +1025,50 @@ static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProject
 ///////////////////////////////////////////
 // Main
 ///////////////////////////////////////////
+
+// Both targets run this exact function; only who calls it differs. It must
+// return void, because emscripten_set_main_loop takes a void(*)(void) and wasm
+// traps on an indirect call whose signature doesn't match - so the "should we
+// keep going" answer leaves through s_running rather than a return value.
+static bool s_running = true;
+
+static void frame(void) {
+	bool quit = false;
+	openxr_poll_events(&quit);
+
+	if (quit) {
+		// Teardown lives here rather than after the loop: on the web
+		// emscripten_set_main_loop's simulate_infinite_loop unwinds the stack,
+		// so main() never gets to run its own.
+		s_running = false;
+#ifndef __EMSCRIPTEN__
+		vkDeviceWaitIdle(skr_get_vk_device());
+#endif
+		app_xr_shutdown();
+		openxr_shutdown();
+		skr_shutdown();
+		ska_log(ska_log_info, "Cleanly shut down.");
+#ifdef __EMSCRIPTEN__
+		emscripten_cancel_main_loop();
+#endif
+		return;
+	}
+	if (!xr_running) return;
+
+	openxr_poll_actions();
+	app_xr_update();
+	openxr_render_frame();
+
+#ifndef __EMSCRIPTEN__
+	// Sleep if not visible. Native only - on the web this function returns to
+	// the browser every tick, so the page idles politely by construction, and
+	// blocking here would just freeze the tab.
+	if (xr_session_state != XR_SESSION_STATE_VISIBLE &&
+	    xr_session_state != XR_SESSION_STATE_FOCUSED) {
+		ska_time_sleep(250);
+	}
+#endif
+}
 
 int main(int argc, char* argv[]) {
 	(void)argc;
@@ -821,30 +1093,15 @@ int main(int argc, char* argv[]) {
 	openxr_make_actions();
 	app_xr_init();
 
-	bool quit = false;
-	while (!quit) {
-		openxr_poll_events(&quit);
-
-		if (xr_running) {
-			openxr_poll_actions();
-			app_xr_update();
-			openxr_render_frame();
-
-			// Sleep if not visible
-			if (xr_session_state != XR_SESSION_STATE_VISIBLE &&
-			    xr_session_state != XR_SESSION_STATE_FOCUSED) {
-				ska_time_sleep(250);
-			}
-		}
-	}
-
-	// Cleanup
-	vkDeviceWaitIdle(skr_get_vk_device());
-	app_xr_shutdown();
-	openxr_shutdown();
-	skr_shutdown();
-
-	ska_log(ska_log_info, "Cleanly shut down.");
+#ifdef __EMSCRIPTEN__
+	// window.requestAnimationFrame stops firing once a session goes immersive, so
+	// an app-owned loop would stop dead in VR. WebOpenXR redirects emscripten's
+	// loop onto the session rAF, which needs this call and fps 0; any other value
+	// selects setTimeout scheduling, which cannot be redirected.
+	emscripten_set_main_loop(frame, 0, 1);   // does not return
+#else
+	while (s_running) frame();
+#endif
 	return 0;
 }
 
