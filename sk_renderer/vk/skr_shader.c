@@ -162,16 +162,18 @@ static const char* _skr_feature_bit_name(int32_t bit) {
 	}
 }
 
-// Returns true if the device can run this shader. Gates only on requirements we
-// can confirm missing: known feature bits the device didn't enable, and a pinned
-// subgroup size out of range. The `unknown` bit is masked out — "unrecognized"
+// Returns true if the device can run this shader. Gates only on known feature
+// bits the device didn't enable. The `unknown` bit is masked out: "unrecognized"
 // isn't "unsupported" (the app may have enabled the extension via skr_vk_ext_*,
 // or the compiler is simply older than this runtime), so it falls through to
-// pipeline creation. A false result means the shader comes back invalid.
+// pipeline creation. `wave_size` is masked too because a pin is a hint, not a
+// requirement: pipeline creation falls back to the implementation default when
+// the device can't honor it. A false result means the shader comes back invalid.
 static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta) {
 	bool     supported = true;
 	uint64_t missing   = sksc_shader_meta_missing_features(meta, _skr_vk.enabled_features)
-	                     & ~((uint64_t)1 << sksc_feature_bit_unknown);
+	                     & ~((uint64_t)1 << sksc_feature_bit_unknown)
+	                     & ~((uint64_t)1 << sksc_feature_bit_wave_size);
 	if (missing != 0) {
 		supported = false;
 		for (int32_t bit = 0; bit < 64; bit++) {
@@ -179,20 +181,6 @@ static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta) {
 				skr_log(skr_log_warning, "Shader '%s' requires unsupported feature: %s", meta->name, _skr_feature_bit_name(bit));
 		}
 	}
-
-	// A pinned subgroup size is a numeric constraint the feature mask can't
-	// express: subgroup size control must be present and the size must sit
-	// within the device's reported range.
-	if (meta->wave_size != 0) {
-		if (!_skr_vk.has_subgroup_size_control) {
-			skr_log(skr_log_warning, "Shader '%s' pins subgroup size %u but the device lacks subgroup size control", meta->name, meta->wave_size);
-			supported = false;
-		} else if (meta->wave_size < _skr_vk.min_subgroup_size || meta->wave_size > _skr_vk.max_subgroup_size) {
-			skr_log(skr_log_warning, "Shader '%s' pins subgroup size %u outside the device range [%u, %u]", meta->name, meta->wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
-			supported = false;
-		}
-	}
-
 	return supported;
 }
 

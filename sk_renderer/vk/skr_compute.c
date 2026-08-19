@@ -27,11 +27,11 @@ static skr_err_ _skr_compute_build_pipeline(const skr_compute_t* compute, skr_co
 	void* stage_pNext = NULL;
 	if (shader->meta.wave_size != 0) {
 		if (!_skr_vk.has_subgroup_size_control) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.wave_size);
+			skr_log(skr_log_warning, "Shader '%s' requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.name, shader->meta.wave_size);
 		} else if (shader->meta.wave_size < _skr_vk.min_subgroup_size || shader->meta.wave_size > _skr_vk.max_subgroup_size) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
+			skr_log(skr_log_warning, "Shader '%s' requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.name, shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
 		} else if ((_skr_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.wave_size);
+			skr_log(skr_log_warning, "Shader '%s' requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.name, shader->meta.wave_size);
 		} else {
 			required_subgroup_size.requiredSubgroupSize = shader->meta.wave_size;
 			stage_pNext = &required_subgroup_size;

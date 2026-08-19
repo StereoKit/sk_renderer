@@ -31,7 +31,10 @@ static WGPUComputePipeline _skr_compute_pipeline_create(const skr_shader_t* shad
 skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info, skr_compute_t* out_compute) {
 	if (out_compute == NULL) return skr_err_invalid_parameter;
 	memset(out_compute, 0, sizeof(*out_compute));
-	if (shader == NULL || shader->compute_stage.shader == NULL) return skr_err_invalid_parameter;
+	if (shader == NULL || shader->compute_stage.shader == NULL) {
+		skr_log(skr_log_critical, "Invalid shader or no compute stage");
+		return skr_err_invalid_parameter;
+	}
 
 	const sksc_shader_meta_t* meta = &shader->meta;
 	out_compute->shader = shader;

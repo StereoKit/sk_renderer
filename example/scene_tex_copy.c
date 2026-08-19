@@ -25,6 +25,7 @@
 #define ICON_SIZE 256
 #define ICON_MSAA 4
 #define SPHERE_COUNT 5
+#define FILL_COUNT 1024  // uints written by buffer_fill.hlsl and read back
 
 typedef struct {
 	scene_t        base;
@@ -53,6 +54,16 @@ typedef struct {
 	bool                 readback_pending;
 	bool                 readback_saved;
 	skr_tex_readback_t   readback;
+
+	// Buffer readback: compute fills a storage buffer, we read it back and
+	// verify the pattern byte-for-byte on both backends
+	skr_shader_t          fill_shader;
+	skr_compute_t         fill_compute;
+	skr_buffer_t          fill_buffer;
+	skr_buffer_readback_t buffer_readback;
+	bool                  buffer_readback_pending;
+	bool                  buffer_readback_done;
+	bool                  buffer_readback_ok;
 
 	float time;
 } scene_tex_copy_t;
@@ -133,6 +144,14 @@ static scene_t* _scene_tex_copy_create(void) {
 	scene->quad_mesh = su_mesh_create_quad(1.5f, 1.5f, (skr_vec3_t){0, 0, 1}, false, (skr_vec4_t){1, 1, 1, 1});
 	skr_mesh_set_name(&scene->quad_mesh, "icon_quad");
 
+	// Compute-filled storage buffer for the buffer readback check
+	scene->fill_shader = su_shader_load("shaders/buffer_fill.hlsl.sks", "buffer_fill");
+	skr_buffer_create(NULL, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write, &scene->fill_buffer);
+	skr_buffer_set_name(&scene->fill_buffer, "fill_buffer");
+	skr_compute_create(&scene->fill_shader, (skr_compute_info_t){0}, &scene->fill_compute);
+	skr_compute_set_buffer(&scene->fill_compute, "output", &scene->fill_buffer);
+	skr_compute_set_param (&scene->fill_compute, "count", sksc_shader_var_uint, 1, &(uint32_t){FILL_COUNT});
+
 	su_log(su_log_info, "scene_tex_copy: Created with %d spheres", SPHERE_COUNT);
 
 	return &scene->base;
@@ -142,10 +161,13 @@ static void _scene_tex_copy_destroy(scene_t* s) {
 	scene_tex_copy_t* scene = (scene_tex_copy_t*)s;
 
 	// Clean up pending readback
-	if (scene->readback_pending) {
-		skr_future_wait(&scene->readback.future);
+	if (scene->readback_pending)
 		skr_tex_readback_destroy(&scene->readback);
-	}
+	if (scene->buffer_readback_pending)
+		skr_buffer_readback_destroy(&scene->buffer_readback);
+	skr_compute_destroy(&scene->fill_compute);
+	skr_buffer_destroy (&scene->fill_buffer);
+	skr_shader_destroy (&scene->fill_shader);
 
 	// Destroy icon textures and materials
 	if (scene->icons_created) {
@@ -194,6 +216,21 @@ static void _scene_tex_copy_update(scene_t* s, float delta_time) {
 		// Clean up
 		skr_tex_readback_destroy(&scene->readback);
 		scene->readback_pending = false;
+	}
+
+	// Check if the buffer readback is complete, and verify the compute pattern
+	if (scene->buffer_readback_pending && skr_future_check(&scene->buffer_readback.future)) {
+		const uint32_t* values = (const uint32_t*)scene->buffer_readback.data;
+		bool ok = scene->buffer_readback.size == FILL_COUNT * sizeof(uint32_t);
+		for (uint32_t i = 0; ok && i < FILL_COUNT; i++)
+			ok = values[i] == i * 2654435761u + 42u;
+		su_log(ok ? su_log_info : su_log_warning, "scene_tex_copy: buffer readback %s",
+			ok ? "matches the compute pattern" : "DOES NOT match the compute pattern");
+
+		skr_buffer_readback_destroy(&scene->buffer_readback);
+		scene->buffer_readback_pending = false;
+		scene->buffer_readback_done    = true;
+		scene->buffer_readback_ok      = ok;
 	}
 }
 
@@ -245,6 +282,18 @@ static void _render_sphere_to_icon(scene_tex_copy_t* scene, int32_t sphere_idx, 
 static void _scene_tex_copy_render(scene_t* s, int32_t width, int32_t height,
                                     skr_render_list_t* ref_render_list, su_system_buffer_t* ref_system_buffer) {
 	scene_tex_copy_t* scene = (scene_tex_copy_t*)s;
+
+	// Dispatch the fill and read its result back (once only)
+	if (!scene->buffer_readback_done && !scene->buffer_readback_pending) {
+		skr_compute_execute(&scene->fill_compute, (FILL_COUNT + 63) / 64, 1, 1); // 64 = [numthreads] in buffer_fill.hlsl
+		skr_err_ err = skr_buffer_readback(&scene->fill_buffer, &scene->buffer_readback);
+		if (err == skr_err_success) {
+			scene->buffer_readback_pending = true;
+		} else {
+			su_log(su_log_warning, "scene_tex_copy: skr_buffer_readback failed: %d", err);
+			scene->buffer_readback_done = true;
+		}
+	}
 
 	// First pass: Create icon textures for each sphere (once only)
 	if (!scene->icons_created) {
@@ -339,6 +388,13 @@ static void _scene_tex_copy_render_ui(scene_t* s) {
 		igTextColored((ImVec4){1.0f, 1.0f, 0.4f, 1.0f}, "Readback pending...");
 	} else if (scene->readback_saved) {
 		igTextColored((ImVec4){0.4f, 1.0f, 0.4f, 1.0f}, "Saved: icon_readback.ppm");
+	}
+
+	if (scene->buffer_readback_pending) {
+		igTextColored((ImVec4){1.0f, 1.0f, 0.4f, 1.0f}, "Buffer readback pending...");
+	} else if (scene->buffer_readback_done) {
+		if (scene->buffer_readback_ok) igTextColored((ImVec4){0.4f, 1.0f, 0.4f, 1.0f}, "Buffer readback: pattern verified");
+		else                           igTextColored((ImVec4){1.0f, 0.4f, 0.4f, 1.0f}, "Buffer readback: FAILED");
 	}
 
 	igSeparator();

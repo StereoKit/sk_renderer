@@ -730,9 +730,10 @@ SKR_API bool              skr_thread_is_initialized        (void);
 SKR_API bool              skr_is_capable                   (skr_capability_ capability);
 
 // Futures track GPU work completion. skr_future_check is a non-blocking poll
-// and is always safe. skr_future_wait blocks until completion — on the WebGPU
-// backend under WASM, blocking is impossible in a browser, so skr_future_wait
-// is a hard error there; structure web code around skr_future_check instead.
+// and is always safe. skr_future_wait blocks until completion; a browser can
+// never block, so on the WebGPU backend under WASM it is a hard error.
+// Portable code (readbacks included) polls skr_future_check from the frame
+// loop and never waits.
 SKR_API skr_future_t      skr_future_get                   (void);
 SKR_API bool              skr_future_check                 (const skr_future_t* future);
 SKR_API void              skr_future_wait                  (const skr_future_t* future);
@@ -752,6 +753,8 @@ SKR_API void              skr_buffer_set                   (      skr_buffer_t* 
 SKR_API void              skr_buffer_get                   (const skr_buffer_t*     buffer, void *ref_buffer, uint32_t buffer_size);
 SKR_API uint32_t          skr_buffer_get_size              (const skr_buffer_t*     buffer);
 SKR_API void              skr_buffer_set_name              (      skr_buffer_t* ref_buffer, const char* name);
+SKR_API skr_err_          skr_buffer_readback              (const skr_buffer_t*     buffer, skr_buffer_readback_t* out_readback);
+SKR_API void              skr_buffer_readback_destroy      (      skr_buffer_readback_t* ref_readback);
 
 SKR_API skr_err_          skr_vert_type_create             (const skr_vert_component_t* items, int32_t item_count, skr_vert_type_t* out_type);
 SKR_API bool              skr_vert_type_is_valid           (const skr_vert_type_t*     type);
@@ -785,16 +788,11 @@ typedef struct skr_tex_external_wgpu_info_t {
 } skr_tex_external_wgpu_info_t;
 
 SKR_API skr_err_          skr_tex_create_external_wgpu     (skr_tex_external_wgpu_info_t info, skr_tex_t* out_tex);
-// Swaps in a new WGPUTexture, keeping the sampler and settings. Views are
-// rebuilt lazily. Intended for compositors that hand out a fresh texture every
-// frame (see XR_SKW_transient_swapchain_images), so it must stay cheap.
 SKR_API skr_err_          skr_tex_update_external_wgpu     (skr_tex_t* ref_tex, void* texture);
 #endif
 
 
 #ifdef SKR_VK
-// The remaining external imports are Vulkan-only — their info structs embed
-// Vulkan handles and OS-specific memory (see skr_capability_external_*).
 SKR_API skr_err_          skr_tex_create_external_vk       (skr_tex_external_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_gl       (skr_tex_external_gl_info_t info, skr_tex_t* out_tex);
 SKR_API skr_err_          skr_tex_create_external_ahb      (skr_tex_external_ahb_info_t info, skr_tex_t* out_tex);

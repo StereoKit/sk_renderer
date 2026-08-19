@@ -24,6 +24,7 @@
 	#define _skr_atomic(T)      T
 	#define _skr_load_acquire(p)      (*(p))
 	#define _skr_store_release(p, v)  (*(p) = (v))
+	#define _skr_fetch_add(p, v)      ((*(p) += (v)) - (v))
 #else
 	#include <threads.h>
 	#include <stdatomic.h>
@@ -35,6 +36,7 @@
 	#define _skr_atomic(T)      _Atomic(T)
 	#define _skr_load_acquire(p)      atomic_load_explicit((p), memory_order_acquire)
 	#define _skr_store_release(p, v)  atomic_store_explicit((p), (v), memory_order_release)
+	#define _skr_fetch_add(p, v)      atomic_fetch_add_explicit((p), (v), memory_order_acq_rel)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -134,6 +136,33 @@ skr_future_t _skr_cmd_submit(void);
 
 // Wrap any WGPUFuture (mapAsync etc.) in a pollable skr_future_t slot
 skr_future_t _skr_future_from_wgpu(WGPUFuture future);
+
+// Shared readback lifetime state (skr_command.c). Texture and buffer readbacks
+// stage into a mappable buffer, then a pollable map fills `dest`, heap memory
+// the caller reads once the future completes. Embed as the FIRST member so the
+// map callback's userdata doubles as the containing context.
+typedef struct _skr_readback_base_t {
+	WGPUBuffer staging;
+	void*      dest;
+	uint32_t   dest_size;
+	uint64_t   map_bytes;  // staging size; copies and maps need 4-byte multiples
+	// The map callback and destroy each bump this exactly once, in either
+	// order; the second arriver frees. This is what lets destroy return
+	// without waiting while the map is still in flight.
+	_skr_atomic(int32_t) settled;
+	// Completion marker for the wrapped future: on the web the map future
+	// can't be observed via WaitAny (see _SKR_CB_MODE_ASYNC), so the callback
+	// marks the slot directly
+	_skr_cmd_slot_t* done_slot;
+	uint64_t         done_generation;
+} _skr_readback_base_t;
+
+// Start the pollable map on `staging` and wire its future. The callback must
+// end with _skr_readback_finish, which releases staging, marks the future's
+// slot, and frees the readback when destroy already let go of it.
+skr_future_t _skr_readback_map    (_skr_readback_base_t* ref_base, WGPUBufferMapCallback callback);
+void         _skr_readback_finish (_skr_readback_base_t* ref_base);
+void         _skr_readback_destroy(_skr_readback_base_t* opt_base);
 
 // Samplers from sk_renderer sampler settings (skr_texture.c). The plain
 // version strips comparison state; _ex keeps it.

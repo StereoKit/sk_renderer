@@ -492,10 +492,16 @@ skr_shader_t su_shader_load(const char* filename, const char* opt_name) {
 	skr_shader_t shader = {0};
 
 	if (su_file_read(filename, &shader_data, &shader_size)) {
-		skr_shader_create(shader_data, (uint32_t)shader_size, &shader);
+		skr_err_ err = skr_shader_create(shader_data, (uint32_t)shader_size, &shader);
 		free(shader_data);
 
-		if (opt_name && skr_shader_is_valid(&shader)) {
+		// Unsupported is a platform gap the shader compiler already warned
+		// about at build time, not a broken asset
+		if (err == skr_err_unsupported) {
+			su_log(su_log_warning, "Shader '%s' isn't supported on this device", filename);
+		} else if (!skr_shader_is_valid(&shader)) {
+			su_log(su_log_critical, "Failed to create shader from '%s'", filename);
+		} else if (opt_name) {
 			skr_shader_set_name(&shader, opt_name);
 		}
 	}

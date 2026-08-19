@@ -325,6 +325,123 @@ uint32_t skr_buffer_get_size(const skr_buffer_t* buffer) {
 	return buffer ? buffer->size : 0;
 }
 
+// Internal state for readback: the host-visible staging snapshot
+typedef struct _skr_buffer_readback_internal_t {
+	VkBuffer       staging_buffer;
+	VkDeviceMemory staging_memory;
+} _skr_buffer_readback_internal_t;
+
+skr_err_ skr_buffer_readback(const skr_buffer_t* buffer, skr_buffer_readback_t* out_readback) {
+	if (!buffer || !out_readback) return skr_err_invalid_parameter;
+	memset(out_readback, 0, sizeof(*out_readback));
+
+	// Storage is the only type both backends can copy out of; see the header
+	if (!(buffer->type & skr_buffer_type_storage)) {
+		skr_log(skr_log_critical, "skr_buffer_readback needs a storage-type buffer");
+		return skr_err_unsupported;
+	}
+
+	VkBuffer staging_buffer;
+	VkResult vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
+		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size        = buffer->size,
+		.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	}, NULL, &staging_buffer);
+	SKR_VK_CHECK_RET(vr, "vkCreateBuffer", skr_err_device_error);
+
+	VkMemoryRequirements mem_requirements;
+	vkGetBufferMemoryRequirements(_skr_vk.device, staging_buffer, &mem_requirements);
+
+	VkDeviceMemory staging_memory;
+	vr = vkAllocateMemory(_skr_vk.device, &(VkMemoryAllocateInfo){
+		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize  = mem_requirements.size,
+		.memoryTypeIndex = _skr_find_memory_type(_skr_vk.physical_device, mem_requirements.memoryTypeBits,
+		                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+	}, NULL, &staging_memory);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkAllocateMemory");
+		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		return skr_err_out_of_memory;
+	}
+	vr = vkBindBufferMemory(_skr_vk.device, staging_buffer, staging_memory, 0);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkBindBufferMemory");
+		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
+		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		return skr_err_device_error;
+	}
+
+	void* mapped;
+	vr = vkMapMemory(_skr_vk.device, staging_memory, 0, buffer->size, 0, &mapped);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkMapMemory");
+		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
+		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		return skr_err_device_error;
+	}
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+
+	VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+	// Order the copy after shader writes and the initial-data upload
+	vkCmdPipelineBarrier(ctx.cmd, shader_stages | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &(VkBufferMemoryBarrier){
+		.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.buffer              = buffer->buffer,
+		.offset              = 0,
+		.size                = buffer->size,
+	}, 0, NULL);
+
+	vkCmdCopyBuffer(ctx.cmd, buffer->buffer, staging_buffer, 1, &(VkBufferCopy){ .size = buffer->size });
+
+	// And later shader writes after the copy (WAR with the next dispatch)
+	vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages, 0, 0, NULL, 1, &(VkBufferMemoryBarrier){
+		.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+		.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.buffer              = buffer->buffer,
+		.offset              = 0,
+		.size                = buffer->size,
+	}, 0, NULL);
+
+	// Future before release, matching skr_tex_readback: release submits this
+	// command buffer when the readback isn't nested inside a larger batch
+	skr_future_t future = skr_future_get();
+	_skr_cmd_release(ctx.cmd);
+
+	_skr_buffer_readback_internal_t* internal = (_skr_buffer_readback_internal_t*)_skr_malloc(sizeof(_skr_buffer_readback_internal_t));
+	internal->staging_buffer = staging_buffer;
+	internal->staging_memory = staging_memory;
+
+	out_readback->data      = mapped;
+	out_readback->size      = buffer->size;
+	out_readback->future    = future;
+	out_readback->_internal = internal;
+	return skr_err_success;
+}
+
+void skr_buffer_readback_destroy(skr_buffer_readback_t* ref_readback) {
+	if (!ref_readback || !ref_readback->_internal) return;
+	_skr_buffer_readback_internal_t* internal = (_skr_buffer_readback_internal_t*)ref_readback->_internal;
+
+	// No wait: the copy may sit in a command buffer this thread has yet to
+	// submit, and blocking on that here deadlocks. Deferred destruction
+	// releases the staging once the GPU is done with it (LIFO: memory first).
+	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
+	_skr_cmd_destroy_memory(NULL, internal->staging_memory);
+	_skr_cmd_destroy_buffer(NULL, internal->staging_buffer);
+	_skr_free(internal);
+
+	*ref_readback = (skr_buffer_readback_t){0};
+}
+
 void skr_buffer_set_name(skr_buffer_t* ref_buffer, const char* name) {
 	if (!ref_buffer || ref_buffer->buffer == VK_NULL_HANDLE) return;
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_BUFFER, (uint64_t)ref_buffer->buffer, name);

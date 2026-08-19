@@ -20,9 +20,25 @@ typedef struct skr_future_t {
 typedef struct skr_tex_readback_t {
 	void*        data;      // CPU-accessible data pointer (valid after future completes)
 	uint32_t     size;      // Data size in bytes
-	skr_future_t future;    // Poll with skr_future_check() — never block on web
+	skr_future_t future;    // Poll with skr_future_check(); see future notes in sk_renderer.h
 	void*        _internal; // Internal state (staging buffer/map) - do not access directly
 } skr_tex_readback_t;
+
+// Async GPU->CPU snapshot of a storage-type buffer (the only type both
+// backends can copy out of). `data` is memory the readback owns, unaffected
+// by later writes to the buffer. The future covers work recorded on the
+// calling thread so far: dispatch first, then read back, never inside an open
+// pass. A skr_buffer_set between the dispatch and the readback snapshots the
+// newly set contents instead of the dispatch results. Creation may submit the
+// thread's pending commands (WebGPU always does; mapAsync must follow submit).
+// Create, poll, and destroy on one thread; destroying mid-flight is safe and
+// never blocks.
+typedef struct skr_buffer_readback_t {
+	void*        data;      // CPU-accessible data pointer (valid after future completes)
+	uint32_t     size;      // Data size in bytes
+	skr_future_t future;    // Poll with skr_future_check(); see future notes in sk_renderer.h
+	void*        _internal; // Internal state (staging buffer/map) - do not access directly
+} skr_buffer_readback_t;
 
 // No update ring here: wgpuQueueWriteBuffer stages data internally and lands
 // in queue order, so in-flight frames keep the contents they were submitted

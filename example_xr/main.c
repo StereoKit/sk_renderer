@@ -1029,8 +1029,11 @@ static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProject
 // Both targets run this exact function; only who calls it differs. It must
 // return void, because emscripten_set_main_loop takes a void(*)(void) and wasm
 // traps on an indirect call whose signature doesn't match - so the "should we
-// keep going" answer leaves through s_running rather than a return value.
+// keep going" answer leaves through s_running natively, and through
+// emscripten_cancel_main_loop on the web, rather than a return value.
+#ifndef __EMSCRIPTEN__
 static bool s_running = true;
+#endif
 
 static void frame(void) {
 	bool quit = false;
@@ -1040,8 +1043,8 @@ static void frame(void) {
 		// Teardown lives here rather than after the loop: on the web
 		// emscripten_set_main_loop's simulate_infinite_loop unwinds the stack,
 		// so main() never gets to run its own.
-		s_running = false;
 #ifndef __EMSCRIPTEN__
+		s_running = false;
 		vkDeviceWaitIdle(skr_get_vk_device());
 #endif
 		app_xr_shutdown();

@@ -195,6 +195,48 @@ bool skr_cmd_is_active(void) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Readback lifetime protocol, shared by skr_tex_readback and
+// skr_buffer_readback. See _skr_readback_base_t in _sk_renderer.h.
+
+skr_future_t _skr_readback_map(_skr_readback_base_t* ref_base, WGPUBufferMapCallback callback) {
+	WGPUFuture map_future = wgpuBufferMapAsync(ref_base->staging, WGPUMapMode_Read, 0, (size_t)ref_base->map_bytes, (WGPUBufferMapCallbackInfo){
+		.mode      = _SKR_CB_MODE_ASYNC,
+		.callback  = callback,
+		.userdata1 = ref_base });
+
+	skr_future_t future = _skr_future_from_wgpu(map_future);
+	ref_base->done_slot       = (_skr_cmd_slot_t*)future.slot;
+	ref_base->done_generation = future.generation;
+	// The callback can land before the slot is wired: AllowSpontaneous on the
+	// web, another thread pumping ProcessEvents on native. It bumps `settled`,
+	// so complete the slot for it here. Destroy can't have run yet, the caller
+	// doesn't hold the readback until we return.
+	if (_skr_load_acquire(&ref_base->settled) != 0) ((_skr_cmd_slot_t*)future.slot)->completed = true;
+	return future;
+}
+
+void _skr_readback_finish(_skr_readback_base_t* ref_base) {
+	wgpuBufferRelease(ref_base->staging);
+	ref_base->staging = NULL;
+	if (ref_base->done_slot && ref_base->done_slot->generation == ref_base->done_generation)
+		ref_base->done_slot->completed = true;
+	if (_skr_fetch_add(&ref_base->settled, 1) == 1) { // destroy already ran; we free
+		_skr_free(ref_base->dest);
+		_skr_free(ref_base);
+	}
+}
+
+void _skr_readback_destroy(_skr_readback_base_t* opt_base) {
+	if (opt_base == NULL) return;
+	// Never blocks: when the map is still in flight, the callback arrives
+	// second and frees from _skr_readback_finish
+	if (_skr_fetch_add(&opt_base->settled, 1) == 1) {
+		_skr_free(opt_base->dest);
+		_skr_free(opt_base);
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 // Drops this thread's encoder and resets the slot-ring lock so
 // skr_shutdown -> skr_init cycles start clean. Worker threads should have

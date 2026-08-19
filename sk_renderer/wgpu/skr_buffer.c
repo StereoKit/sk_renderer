@@ -135,6 +135,61 @@ void skr_buffer_get(const skr_buffer_t* buffer, void* ref_buffer, uint32_t buffe
 
 ///////////////////////////////////////////////////////////////////////////////
 
+static void _skr_on_buffer_readback_map(WGPUMapAsyncStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
+	(void)message; (void)userdata2;
+	_skr_readback_base_t* ctx = (_skr_readback_base_t*)userdata1;
+	// settled != 0 means destroy already gave up on the data; skip the copy
+	if (status == WGPUMapAsyncStatus_Success && _skr_load_acquire(&ctx->settled) == 0) {
+		const void* mapped = wgpuBufferGetConstMappedRange(ctx->staging, 0, (size_t)ctx->map_bytes);
+		if (mapped) memcpy(ctx->dest, mapped, ctx->dest_size);
+		wgpuBufferUnmap(ctx->staging);
+	} else if (status != WGPUMapAsyncStatus_Success) {
+		skr_log(skr_log_warning, "Buffer readback map failed (%d)", (int)status);
+	}
+	_skr_readback_finish(ctx);
+}
+
+skr_err_ skr_buffer_readback(const skr_buffer_t* buffer, skr_buffer_readback_t* out_readback) {
+	if (buffer == NULL || buffer->buffer == NULL || out_readback == NULL) return skr_err_invalid_parameter;
+	memset(out_readback, 0, sizeof(*out_readback));
+
+	// Storage is the only type both backends can copy out of; see the header
+	if (!(buffer->type & skr_buffer_type_storage)) {
+		skr_log(skr_log_critical, "skr_buffer_readback needs a storage-type buffer");
+		return skr_err_unsupported;
+	}
+
+	_skr_readback_base_t* ctx = (_skr_readback_base_t*)_skr_calloc(1, sizeof(_skr_readback_base_t));
+	ctx->dest_size = buffer->size;
+	ctx->map_bytes = (buffer->size + 3) & ~3u; // in-bounds: skr_buffer_create pads the allocation to 4
+	ctx->dest      = _skr_malloc(ctx->dest_size);
+
+	WGPUBufferDescriptor staging_desc = {
+		.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+		.size  = ctx->map_bytes,
+	};
+	ctx->staging = wgpuDeviceCreateBuffer(_skr_wgpu.device, &staging_desc);
+	if (ctx->staging == NULL) { _skr_free(ctx->dest); _skr_free(ctx); return skr_err_device_error; }
+
+	wgpuCommandEncoderCopyBufferToBuffer(_skr_cmd_get(), buffer->buffer, 0, ctx->staging, 0, ctx->map_bytes);
+
+	// mapAsync has to follow the submit, which flushes this thread's whole encoder
+	_skr_cmd_submit();
+	out_readback->future    = _skr_readback_map(ctx, _skr_on_buffer_readback_map);
+	out_readback->data      = ctx->dest;
+	out_readback->size      = ctx->dest_size;
+	out_readback->_internal = ctx;
+	return skr_err_success;
+}
+
+void skr_buffer_readback_destroy(skr_buffer_readback_t* ref_readback) {
+	if (ref_readback == NULL) return;
+	_skr_readback_destroy((_skr_readback_base_t*)ref_readback->_internal);
+	memset(ref_readback, 0, sizeof(*ref_readback));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 uint32_t skr_buffer_get_size(const skr_buffer_t* buffer) {
 	return buffer ? buffer->size : 0;
 }

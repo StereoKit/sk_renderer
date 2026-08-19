@@ -469,6 +469,52 @@ static void case_cubemap_mips(void) {
 	printf("  %-34s six faces match the 2D reference\n", name);
 }
 
+// ktx2_transcode_level writes each level exactly where the whole-chain pass
+// would have, so the sliced results concatenated must be byte-identical.
+static void case_transcode_by_level(void) {
+	bw_t endpoints, selectors, tables;
+	craft_endpoints(&endpoints);
+	craft_selectors(&selectors);
+	craft_tables(&tables, CRAFT_ENDPOINTS, CRAFT_SELECTORS + 8 + 1, 8);
+
+	bw_t slices[2];
+	craft_slice(&slices[0], 2, 2); // 8x8 mip 0
+	craft_slice(&slices[1], 1, 1); // 4x4 mip 1
+
+	craft_t cube;
+	craft_build_mips(&cube, 8, 8, 0, 6, 2, &endpoints, &selectors, &tables, slices);
+
+	const char* name = "per-level vs whole-chain";
+	ktx2_reader_t reader;
+	ktx2_plan_t   plan;
+	uint8_t whole [6 * 32 + 6 * 8];
+	uint8_t sliced[6 * 32 + 6 * 8];
+	if (ktx2_open(cube.data, cube.bytes, &reader)                  != ktx2_result_success ||
+	    ktx2_plan(&reader, &k_host_context, ktx2_caps_etc2, &plan) != ktx2_result_success ||
+	    plan.data_bytes != sizeof(whole)                                                  ||
+	    ktx2_transcode(&plan, whole, sizeof(whole), NULL)          != ktx2_result_success) {
+		printf("  FAIL  %s did not transcode whole\n", name); g_failures++; return;
+	}
+	if (ktx2_transcode_level_bytes(&plan, 0) != 6 * 32 ||
+	    ktx2_transcode_level_bytes(&plan, 1) != 6 * 8  ||
+	    ktx2_transcode_level_bytes(&plan, 2) != 0) {
+		printf("  FAIL  %s: level bytes are wrong\n", name); g_failures++; return;
+	}
+	if (ktx2_transcode_level(&plan, 0, sliced,          6 * 32, NULL) != ktx2_result_success ||
+	    ktx2_transcode_level(&plan, 1, sliced + 6 * 32, 6 * 8,  NULL) != ktx2_result_success) {
+		printf("  FAIL  %s did not transcode by level\n", name); g_failures++; return;
+	}
+	if (memcmp(whole, sliced, sizeof(whole)) != 0) {
+		printf("  FAIL  %s: outputs differ\n", name); g_failures++; return;
+	}
+	if (ktx2_transcode_level(&plan,  0, sliced, 6 * 32 - 1,    NULL) != ktx2_result_buffer_too_small ||
+	    ktx2_transcode_level(&plan,  2, sliced, sizeof(sliced), NULL) != ktx2_result_unsupported     ||
+	    ktx2_transcode_level(&plan, -1, sliced, sizeof(sliced), NULL) != ktx2_result_unsupported) {
+		printf("  FAIL  %s: bad arguments not refused\n", name); g_failures++; return;
+	}
+	printf("  %-34s levels match the whole chain\n", name);
+}
+
 int main(void) {
 	printf("Crafted ETC1S bitstreams:\n");
 	case_pred_repeat_overflow();
@@ -479,6 +525,7 @@ int main(void) {
 	case_truncated_slice();
 	case_dimension_amplification();
 	case_cubemap_mips();
+	case_transcode_by_level();
 
 	if (g_failures == 0) printf("craft: all cases returned cleanly\n");
 	else                 printf("%d failure(s)\n", g_failures);

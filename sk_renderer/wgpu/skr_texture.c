@@ -4,6 +4,8 @@
 
 #include "_sk_renderer.h"
 
+#include <stddef.h>
+
 ///////////////////////////////////////////////////////////////////////////////
 // Format block info — backend-independent data, mirrors the Vulkan table
 
@@ -392,9 +394,16 @@ skr_err_ skr_tex_copy(const skr_tex_t* src, skr_tex_t* dst, uint32_t src_mip, ui
 	if (layer_count == 0) layer_count = 1;
 
 	skr_vec3i_t mip_size = skr_tex_calc_mip_dimensions(src->size, src_mip);
+	uint32_t    block_w, block_h;
+	skr_tex_fmt_block_info(src->format, &block_w, &block_h, NULL);
+
 	WGPUTexelCopyTextureInfo from = { .texture = src->texture, .mipLevel = src_mip, .origin = { 0, 0, src_layer } };
 	WGPUTexelCopyTextureInfo to   = { .texture = dst->texture, .mipLevel = dst_mip, .origin = { 0, 0, dst_layer } };
-	WGPUExtent3D extent = { (uint32_t)mip_size.x, (uint32_t)mip_size.y, layer_count };
+	// Copy extents must be block aligned; rounding past the logical mip edge is valid
+	WGPUExtent3D extent = {
+		((uint32_t)mip_size.x + block_w - 1) / block_w * block_w,
+		((uint32_t)mip_size.y + block_h - 1) / block_h * block_h,
+		layer_count };
 	wgpuCommandEncoderCopyTextureToTexture(_skr_cmd_get(), &from, &to, &extent);
 	return skr_err_success;
 }
@@ -523,37 +532,29 @@ skr_err_ skr_tex_set_buffer(skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint
 // stable from creation and valid once the future completes.
 
 typedef struct _skr_readback_ctx_t {
-	WGPUBuffer staging;
-	void*      dest;
-	uint32_t   dest_size;
-	uint32_t   row_bytes;     // tight row size
-	uint32_t   padded_row;    // 256-aligned staging row pitch
-	uint32_t   rows;
-	// Completion marker for the wrapped future — on the web the map future
-	// can't be observed via WaitAny (see _SKR_CB_MODE_ASYNC), so the callback
-	// marks the slot directly
-	_skr_cmd_slot_t* done_slot;
-	uint64_t         done_generation;
+	_skr_readback_base_t base;          // must be first; see _skr_readback_base_t
+	uint32_t             row_bytes;     // tight row size
+	uint32_t             padded_row;    // 256-aligned staging row pitch
+	uint32_t             rows;
 } _skr_readback_ctx_t;
+_Static_assert(offsetof(_skr_readback_ctx_t, base) == 0, "_skr_readback_destroy casts _internal straight to the base");
 
 static void _skr_on_readback_map(WGPUMapAsyncStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
 	(void)message; (void)userdata2;
 	_skr_readback_ctx_t* ctx = (_skr_readback_ctx_t*)userdata1;
-	if (status == WGPUMapAsyncStatus_Success) {
-		const uint8_t* mapped = (const uint8_t*)wgpuBufferGetConstMappedRange(ctx->staging, 0, (size_t)ctx->padded_row * ctx->rows);
+	// settled != 0 means destroy already gave up on the data; skip the copy
+	if (status == WGPUMapAsyncStatus_Success && _skr_load_acquire(&ctx->base.settled) == 0) {
+		const uint8_t* mapped = (const uint8_t*)wgpuBufferGetConstMappedRange(ctx->base.staging, 0, (size_t)ctx->base.map_bytes);
 		if (mapped) {
-			uint8_t* dst = (uint8_t*)ctx->dest;
+			uint8_t* dst = (uint8_t*)ctx->base.dest;
 			for (uint32_t r = 0; r < ctx->rows; r++)
 				memcpy(dst + (size_t)r * ctx->row_bytes, mapped + (size_t)r * ctx->padded_row, ctx->row_bytes);
 		}
-		wgpuBufferUnmap(ctx->staging);
-	} else {
+		wgpuBufferUnmap(ctx->base.staging);
+	} else if (status != WGPUMapAsyncStatus_Success) {
 		skr_log(skr_log_warning, "Texture readback map failed (%d)", (int)status);
 	}
-	wgpuBufferRelease(ctx->staging);
-	ctx->staging = NULL;
-	if (ctx->done_slot && ctx->done_slot->generation == ctx->done_generation)
-		ctx->done_slot->completed = true;
+	_skr_readback_finish(&ctx->base);
 }
 
 skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t array_layer, skr_tex_readback_t* out_readback) {
@@ -569,49 +570,37 @@ skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t arr
 	uint32_t padded    = (row_bytes + 255) & ~255u; // buffer copies need 256-aligned rows
 
 	_skr_readback_ctx_t* ctx = (_skr_readback_ctx_t*)_skr_calloc(1, sizeof(_skr_readback_ctx_t));
-	ctx->row_bytes  = row_bytes;
-	ctx->padded_row = padded;
-	ctx->rows       = blocks_y;
-	ctx->dest_size  = row_bytes * blocks_y;
-	ctx->dest       = _skr_malloc(ctx->dest_size);
+	ctx->row_bytes      = row_bytes;
+	ctx->padded_row     = padded;
+	ctx->rows           = blocks_y;
+	ctx->base.dest_size = row_bytes * blocks_y;
+	ctx->base.map_bytes = (uint64_t)padded * blocks_y;
+	ctx->base.dest      = _skr_malloc(ctx->base.dest_size);
 
 	WGPUBufferDescriptor staging_desc = {
 		.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
-		.size  = (uint64_t)padded * blocks_y,
+		.size  = ctx->base.map_bytes,
 	};
-	ctx->staging = wgpuDeviceCreateBuffer(_skr_wgpu.device, &staging_desc);
-	if (ctx->staging == NULL) { _skr_free(ctx->dest); _skr_free(ctx); return skr_err_device_error; }
+	ctx->base.staging = wgpuDeviceCreateBuffer(_skr_wgpu.device, &staging_desc);
+	if (ctx->base.staging == NULL) { _skr_free(ctx->base.dest); _skr_free(ctx); return skr_err_device_error; }
 
 	WGPUTexelCopyTextureInfo from = { .texture = tex->texture, .mipLevel = mip_level, .origin = { 0, 0, array_layer } };
-	WGPUTexelCopyBufferInfo  to   = { .layout = { .offset = 0, .bytesPerRow = padded, .rowsPerImage = blocks_y }, .buffer = ctx->staging };
+	WGPUTexelCopyBufferInfo  to   = { .layout = { .offset = 0, .bytesPerRow = padded, .rowsPerImage = blocks_y }, .buffer = ctx->base.staging };
 	WGPUExtent3D extent = { (uint32_t)mip_size.x, (uint32_t)mip_size.y, 1 };
 	wgpuCommandEncoderCopyTextureToBuffer(_skr_cmd_get(), &from, &to, &extent);
 
 	// Submit, then chain the map; its future is what the caller polls
 	_skr_cmd_submit();
-	WGPUFuture map_future = wgpuBufferMapAsync(ctx->staging, WGPUMapMode_Read, 0, (size_t)padded * blocks_y, (WGPUBufferMapCallbackInfo){
-		.mode      = _SKR_CB_MODE_ASYNC,
-		.callback  = _skr_on_readback_map,
-		.userdata1 = ctx });
-
-	out_readback->future    = _skr_future_from_wgpu(map_future);
-	ctx->done_slot          = (_skr_cmd_slot_t*)out_readback->future.slot;
-	ctx->done_generation    = out_readback->future.generation;
-	out_readback->data      = ctx->dest;
-	out_readback->size      = ctx->dest_size;
+	out_readback->future    = _skr_readback_map(&ctx->base, _skr_on_readback_map);
+	out_readback->data      = ctx->base.dest;
+	out_readback->size      = ctx->base.dest_size;
 	out_readback->_internal = ctx;
 	return skr_err_success;
 }
 
 void skr_tex_readback_destroy(skr_tex_readback_t* ref_readback) {
 	if (ref_readback == NULL) return;
-	_skr_readback_ctx_t* ctx = (_skr_readback_ctx_t*)ref_readback->_internal;
-	if (ctx) {
-		if (ctx->staging != NULL) // map still pending; let it finish (native)
-			skr_future_wait(&ref_readback->future);
-		_skr_free(ctx->dest);
-		_skr_free(ctx);
-	}
+	_skr_readback_destroy((_skr_readback_base_t*)ref_readback->_internal);
 	memset(ref_readback, 0, sizeof(*ref_readback));
 }
 

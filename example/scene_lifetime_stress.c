@@ -23,6 +23,8 @@
 #define STRESS_CUBE_COUNT       25
 #define SORT_STRESS_MAT_COUNT   16
 #define SORT_STRESS_MESH_COUNT  4
+#define READBACK_SLOTS          4
+#define READBACK_UINTS          256
 
 typedef struct {
 	skr_material_t material;
@@ -84,6 +86,16 @@ typedef struct {
 	skr_mesh_t     sort_stress_meshes[SORT_STRESS_MESH_COUNT];
 	int32_t        sort_stress_draw_count;
 	bool           sort_stress_enabled;
+
+	// Test 9: Buffer readback churn (snapshots against live destroys)
+	skr_buffer_t          readback_buffers[READBACK_SLOTS];
+	skr_buffer_readback_t readbacks       [READBACK_SLOTS];
+	uint32_t              readback_seeds  [READBACK_SLOTS];
+	bool                  readback_live   [READBACK_SLOTS];
+	uint32_t              readback_started;
+	uint32_t              readback_verified;
+	uint32_t              readback_abandoned;
+	uint32_t              readback_failures;
 
 	// Statistics
 	uint32_t frame_count;
@@ -270,6 +282,14 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 	skr_material_destroy(&scene->replaceable_material);
 	skr_tex_destroy(&scene->replaceable_texture);
 
+	// Destroy in-flight readbacks, then their buffers
+	for (int32_t i = 0; i < READBACK_SLOTS; i++) {
+		if (scene->readback_live[i]) {
+			skr_buffer_readback_destroy(&scene->readbacks[i]);
+			skr_buffer_destroy(&scene->readback_buffers[i]);
+		}
+	}
+
 	// Destroy sort stress resources
 	for (int32_t i = 0; i < SORT_STRESS_MAT_COUNT; i++)
 		skr_material_destroy(&scene->sort_stress_materials[i]);
@@ -285,6 +305,9 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 
 	su_log(su_log_info, "Lifetime stress test: %u creates, %u destroys, %u draws over %u frames",
 		scene->total_creates, scene->total_destroys, scene->total_draws, scene->frame_count);
+	su_log(scene->readback_failures > 0 ? su_log_warning : su_log_info,
+		"Lifetime stress readbacks: %u started, %u verified, %u abandoned, %u failures",
+		scene->readback_started, scene->readback_verified, scene->readback_abandoned, scene->readback_failures);
 
 	free(scene);
 }
@@ -321,6 +344,59 @@ static void _scene_lifetime_stress_update(scene_t* base, float dt) {
 		}
 	}
 	pthread_mutex_unlock(&scene->thread_mutex);
+
+	// Test 9: Buffer readback churn
+	{
+		uint32_t slot = scene->frame_count % READBACK_SLOTS;
+
+		// Retire the slot's previous round: verify when complete, abandon
+		// mid-flight otherwise - both must clean up without touching freed memory
+		if (scene->readback_live[slot]) {
+			if (skr_future_check(&scene->readbacks[slot].future)) {
+				const uint32_t* values = (const uint32_t*)scene->readbacks[slot].data;
+				bool ok = scene->readbacks[slot].size == READBACK_UINTS * sizeof(uint32_t);
+				for (uint32_t i = 0; ok && i < READBACK_UINTS; i++)
+					ok = values[i] == scene->readback_seeds[slot] + i;
+				if (ok) scene->readback_verified++;
+				else    scene->readback_failures++;
+			} else {
+				scene->readback_abandoned++;
+			}
+			skr_buffer_readback_destroy(&scene->readbacks[slot]);
+			skr_buffer_destroy(&scene->readback_buffers[slot]);
+			scene->readback_live[slot] = false;
+			scene->total_destroys++;
+		}
+
+		// Refill: upload a seeded pattern and snapshot it in the same frame
+		uint32_t seed = scene->frame_count * 2654435761u;
+		uint32_t data[READBACK_UINTS];
+		for (uint32_t i = 0; i < READBACK_UINTS; i++) data[i] = seed + i;
+		if (skr_buffer_create(data, READBACK_UINTS, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_read, &scene->readback_buffers[slot]) == skr_err_success) {
+			if (skr_buffer_readback(&scene->readback_buffers[slot], &scene->readbacks[slot]) == skr_err_success) {
+				scene->readback_seeds[slot] = seed;
+				scene->readback_live [slot] = true;
+				scene->readback_started++;
+				scene->total_creates++;
+			} else {
+				skr_buffer_destroy(&scene->readback_buffers[slot]);
+			}
+		}
+
+		// Same-frame create+readback+destroy: the abandon-while-pending path,
+		// with the source buffer destroyed right behind it
+		if (scene->frame_count % 7 == 0) {
+			skr_buffer_t          burst_buffer;
+			skr_buffer_readback_t burst;
+			if (skr_buffer_create(data, READBACK_UINTS, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_read, &burst_buffer) == skr_err_success) {
+				if (skr_buffer_readback(&burst_buffer, &burst) == skr_err_success) {
+					skr_buffer_readback_destroy(&burst);
+					scene->readback_abandoned++;
+				}
+				skr_buffer_destroy(&burst_buffer);
+			}
+		}
+	}
 }
 
 static void _scene_lifetime_stress_render(scene_t* base, int32_t width, int32_t height, skr_render_list_t* ref_render_list, su_system_buffer_t* ref_system_buffer) {
@@ -623,6 +699,13 @@ static void _scene_lifetime_stress_render_ui(scene_t* base) {
 	if (igSliderInt("Draw items", &sort_count, 0, 5000, "%d", 0)) {
 		scene->sort_stress_draw_count = sort_count;
 	}
+
+	igSeparator();
+	igText("Test 9 - Buffer readback churn:");
+	igText("  Started: %u  Verified: %u  Abandoned: %u",
+		scene->readback_started, scene->readback_verified, scene->readback_abandoned);
+	if (scene->readback_failures > 0)
+		igTextColored((ImVec4){1.0f, 0.4f, 0.4f, 1.0f}, "  FAILURES: %u", scene->readback_failures);
 
 	igSeparator();
 	igText("Totals:");

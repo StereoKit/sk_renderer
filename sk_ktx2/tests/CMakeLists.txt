@@ -1,7 +1,9 @@
 # The library ships no decompressor - Zstd supercompressed UASTC needs one from
 # the host. The tests supply the system libzstd; without it those paths skip.
+# Cross builds skip the probe: pkg-config finds the build machine's libzstd,
+# whose headers and libs the target sysroot doesn't carry.
 find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
+if(PkgConfig_FOUND AND NOT CMAKE_CROSSCOMPILING)
 	pkg_check_modules(ZSTD QUIET libzstd)
 endif()
 if(ZSTD_FOUND)

@@ -114,7 +114,7 @@ static ktx2_result_ _write_blocks(const ktx2_etc1s_t* etc1s, const ktx2_gray_fit
 	return ktx2_result_success;
 }
 
-static ktx2_result_ _transcode_etc1s(const ktx2_plan_t* plan, uint8_t* out_data, ktx2_arena_t* ref_arena) {
+static ktx2_result_ _transcode_etc1s(const ktx2_plan_t* plan, uint8_t* out_data, ktx2_arena_t* ref_arena, uint32_t level_first, uint32_t level_count) {
 	const ktx2_reader_t* reader     = plan->reader;
 	bool                 two_slices = reader->sample_count == 2;
 
@@ -148,7 +148,7 @@ static ktx2_result_ _transcode_etc1s(const ktx2_plan_t* plan, uint8_t* out_data,
 
 	uint32_t layers  = reader->layer_count ? reader->layer_count : 1;
 	size_t   written = 0;
-	for (uint32_t level = 0; level < reader->level_stored; level++) {
+	for (uint32_t level = level_first; level < level_first + level_count; level++) {
 		uint32_t level_w  = ktx2_mip_size(reader->width, level);
 		uint32_t level_h  = ktx2_mip_size(height,        level);
 		uint32_t level_bx = ktx2_blocks(level_w);
@@ -190,7 +190,7 @@ static ktx2_result_ _transcode_etc1s(const ktx2_plan_t* plan, uint8_t* out_data,
 
 // UASTC needs no codebooks: every block stands alone, so this is a flat walk.
 // Blocks are always 16 bytes and 4x4, hence no block-size arithmetic.
-static ktx2_result_ _transcode_uastc(const ktx2_plan_t* plan, uint8_t* out_data, ktx2_arena_t* ref_arena) {
+static ktx2_result_ _transcode_uastc(const ktx2_plan_t* plan, uint8_t* out_data, ktx2_arena_t* ref_arena, uint32_t level_first, uint32_t level_count) {
 	const ktx2_reader_t* reader = plan->reader;
 	if (reader->supercompression != 0 && reader->supercompression != 2)
 		return ktx2_result_unsupported;
@@ -210,7 +210,7 @@ static ktx2_result_ _transcode_uastc(const ktx2_plan_t* plan, uint8_t* out_data,
 	}
 
 	size_t written = 0;
-	for (uint32_t level = 0; level < reader->level_stored; level++) {
+	for (uint32_t level = level_first; level < level_first + level_count; level++) {
 		uint32_t level_w     = ktx2_mip_size(reader->width, level);
 		uint32_t level_h     = ktx2_mip_size(height,        level);
 		uint32_t level_bx    = ktx2_blocks(level_w);
@@ -296,9 +296,12 @@ static ktx2_result_ _transcode_uastc(const ktx2_plan_t* plan, uint8_t* out_data,
 
 ///////////////////////////////////////////////////////////////////////////////
 
-ktx2_result_ ktx2_transcode(const ktx2_plan_t* plan, void* out_data, size_t out_bytes, void* opt_scratch) {
-	if (plan->reader == NULL)         return ktx2_result_corrupt;
-	if (out_bytes < plan->data_bytes) return ktx2_result_buffer_too_small;
+static ktx2_result_ _transcode_range(const ktx2_plan_t* plan, void* out_data, uint32_t level_first, uint32_t level_count, void* opt_scratch) {
+	// The helpers index reader->levels directly; bound against what the file
+	// stores so a plan whose mip_count ever diverges can't walk past them
+	uint32_t stored = plan->reader->level_stored;
+	if (level_first >= stored)                return ktx2_result_unsupported;
+	if (level_count > stored - level_first)   level_count = stored - level_first;
 
 	void* scratch = opt_scratch;
 	if (scratch == NULL && plan->scratch_bytes > 0) {
@@ -309,12 +312,38 @@ ktx2_result_ ktx2_transcode(const ktx2_plan_t* plan, void* out_data, size_t out_
 	ktx2_arena_t arena  = { (uint8_t*)scratch, plan->scratch_bytes, 0, false };
 	ktx2_result_ result = ktx2_result_unsupported;
 	if (plan->reader->source == ktx2_source_etc1s)
-		result = _transcode_etc1s(plan, (uint8_t*)out_data, &arena);
+		result = _transcode_etc1s(plan, (uint8_t*)out_data, &arena, level_first, level_count);
 #ifdef SK_KTX2_UASTC
 	else if (plan->reader->source == ktx2_source_uastc_ldr_4x4)
-		result = _transcode_uastc(plan, (uint8_t*)out_data, &arena);
+		result = _transcode_uastc(plan, (uint8_t*)out_data, &arena, level_first, level_count);
 #endif
 
 	if (scratch != opt_scratch) free(scratch);
 	return result;
+}
+
+size_t ktx2_transcode_level_bytes(const ktx2_plan_t* plan, int32_t level) {
+	if (plan->reader == NULL || level < 0 || level >= plan->mip_count) return 0;
+
+	const ktx2_reader_t* reader = plan->reader;
+	uint32_t images = (reader->layer_count ? reader->layer_count : 1) * reader->face_count;
+	uint32_t height = reader->height ? reader->height : 1;
+	return (size_t)images * ktx2_level_bytes(plan->format,
+		ktx2_mip_size(reader->width, level), ktx2_mip_size(height, level));
+}
+
+ktx2_result_ ktx2_transcode(const ktx2_plan_t* plan, void* out_data, size_t out_bytes, void* opt_scratch) {
+	if (plan->reader == NULL)         return ktx2_result_corrupt;
+	if (out_bytes < plan->data_bytes) return ktx2_result_buffer_too_small;
+
+	return _transcode_range(plan, out_data, 0, (uint32_t)plan->mip_count, opt_scratch);
+}
+
+ktx2_result_ ktx2_transcode_level(const ktx2_plan_t* plan, int32_t level, void* out_data, size_t out_bytes, void* opt_scratch) {
+	if (plan->reader == NULL)                  return ktx2_result_corrupt;
+	// The file is fine here, the argument isn't; unsupported, not corrupt
+	if (level < 0 || level >= plan->mip_count) return ktx2_result_unsupported;
+	if (out_bytes < ktx2_transcode_level_bytes(plan, level)) return ktx2_result_buffer_too_small;
+
+	return _transcode_range(plan, out_data, (uint32_t)level, 1, opt_scratch);
 }

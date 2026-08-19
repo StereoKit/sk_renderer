@@ -260,6 +260,7 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/bloom_composite.hlsl
 	assets/shaders/bloom_downsample.hlsl
 	assets/shaders/bloom_upsample.hlsl
+	assets/shaders/buffer_fill.hlsl
 	assets/shaders/compute_test.hlsl
 	assets/shaders/cubemap_mipgen.hlsl
 	assets/shaders/cubemap_reflection.hlsl

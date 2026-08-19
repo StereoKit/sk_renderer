@@ -271,6 +271,17 @@ KTX2_API void ktx2_context_prepare(ktx2_context_t* ref_context);
 // internally.
 KTX2_API ktx2_result_ ktx2_transcode(const ktx2_plan_t* plan, void* out_data, size_t out_bytes, void* opt_scratch);
 
+// One level of the same walk, written to its own base: every image of `level`
+// in layer-then-face order, tightly packed. For callers pacing transcode work
+// across frames. ETC1S re-reads its codebooks per call. A level outside the
+// plan's mip_count returns ktx2_result_unsupported.
+KTX2_API ktx2_result_ ktx2_transcode_level(const ktx2_plan_t* plan, int32_t level, void* out_data, size_t out_bytes, void* opt_scratch);
+
+// Output bytes ktx2_transcode_level writes for `level`, 0 when out of range.
+// Summing the preceding levels gives a level's offset in the whole-chain
+// output, so a caller can assemble data_bytes one level at a time.
+KTX2_API size_t ktx2_transcode_level_bytes(const ktx2_plan_t* plan, int32_t level);
+
 #ifdef __cplusplus
 }
 #endif

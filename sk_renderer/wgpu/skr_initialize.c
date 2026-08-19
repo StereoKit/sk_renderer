@@ -207,11 +207,13 @@ bool skr_init(skr_settings_t settings) {
 void skr_shutdown(void) {
 	if (!_skr_wgpu.initialized) return;
 
-	// Finish any in-flight work so destruction is orderly (native only; on
-	// web the page teardown handles this)
+	// Drain before destruction; on web page teardown does it, since we can't block
+#ifndef __EMSCRIPTEN__
 	skr_future_t pending = _skr_cmd_submit();
-	if (skr_future_check(&pending) == false)
-		skr_future_wait(&pending);
+	skr_future_wait(&pending);
+#else
+	_skr_cmd_submit();
+#endif
 
 	// Subsystems before the device: internal materials unregister from the
 	// pipeline registry, so the registry tears down after them

@@ -3938,16 +3938,13 @@ void skr_tex_readback_destroy(skr_tex_readback_t* ref_readback) {
 
 	_skr_tex_readback_internal_t* internal = (_skr_tex_readback_internal_t*)ref_readback->_internal;
 
-	// Wait for GPU to complete before destroying (in case user forgot)
-	skr_future_wait(&ref_readback->future);
-
-	// Unmap and free staging resources
-	vkUnmapMemory  (_skr_vk.device, internal->staging_memory);
-	vkFreeMemory   (_skr_vk.device, internal->staging_memory, NULL);
-	vkDestroyBuffer(_skr_vk.device, internal->staging_buffer, NULL);
-
+	// No wait: the copy may sit in a command buffer this thread has yet to
+	// submit, and blocking on that here deadlocks. Deferred destruction
+	// releases the staging once the GPU is done with it (LIFO: memory first).
+	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
+	_skr_cmd_destroy_memory(NULL, internal->staging_memory);
+	_skr_cmd_destroy_buffer(NULL, internal->staging_buffer);
 	_skr_free(internal);
 
-	// Zero out the readback struct
 	*ref_readback = (skr_tex_readback_t){0};
 }
