@@ -23,6 +23,169 @@ void sksc_log_shader_info(const sksc_shader_file_t *file);
 
 ///////////////////////////////////////////
 
+static const char *_last_sep(const char *path) {
+	const char *sep  = strrchr(path, '/');
+	const char *back = strrchr(path, '\\');
+	if (back && (!sep || back > sep)) sep = back;
+	return sep;
+}
+
+///////////////////////////////////////////
+
+static bool _is_file(const char *path) {
+	struct stat info;
+	// POSIX fopen("rb") succeeds on a directory, so ask for a regular file
+	return stat(path, &info) == 0 && S_ISREG(info.st_mode);
+}
+
+///////////////////////////////////////////
+
+// The dependency walk dedupes by path string, so separators have to agree
+static void _normalize_seps(char *ref_path) {
+	for (char *at = ref_path; *at != '\0'; at++)
+		if (*at == '\\') *at = '/';
+}
+
+///////////////////////////////////////////
+
+static bool _is_absolute(const char *path) {
+	return path[0] == '/' || path[0] == '\\' || (path[0] != '\0' && path[1] == ':');
+}
+
+///////////////////////////////////////////
+
+bool sksc_include_resolve(const char *path, const char *requester, const sksc_settings_t *settings, char *out_full, size_t full_size) {
+	if (_is_absolute(path)) {
+		snprintf(out_full, full_size, "%s", path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+		out_full[0] = '\0';
+		return false;
+	}
+
+	const char *slash = requester ? _last_sep(requester) : nullptr;
+	if (slash) {
+		snprintf(out_full, full_size, "%.*s/%s", (int32_t)(slash - requester), requester, path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+	} else if (requester) {
+		// A bare filename's folder is the cwd
+		snprintf(out_full, full_size, "%s", path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+	}
+
+	for (int32_t i = 0; i < settings->include_folder_ct; i++) {
+		snprintf(out_full, full_size, "%s/%s", settings->include_folders[i], path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+	}
+
+	out_full[0] = '\0';
+	return false;
+}
+
+///////////////////////////////////////////
+
+char *sksc_file_read(const char *path, int32_t *opt_out_len) {
+	FILE *fp = fopen(path, "rb");
+	if (!fp) return nullptr;
+	fseek(fp, 0, SEEK_END);
+	long size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	// ftell returns -1 for an unseekable stream, so reject a bad size before it
+	// wraps to a huge malloc/fread.
+	if (size < 0) { fclose(fp); return nullptr; }
+	char *data = (char*)malloc((size_t)size + 1);
+	if (!data) { fclose(fp); return nullptr; }
+	size_t got = fread(data, 1, (size_t)size, fp);
+	fclose(fp);
+	data[got] = '\0';
+	if (opt_out_len) *opt_out_len = (int32_t)got;
+	return data;
+}
+
+///////////////////////////////////////////
+
+static bool _parse_include(const char *line, char *out_path, size_t path_size) {
+	const char *at = line;
+	while (*at == ' ' || *at == '\t') at++;
+	if (*at != '#') return false;
+	at++;
+	while (*at == ' ' || *at == '\t') at++;
+	if (strncmp(at, "include", 7) != 0) return false;
+	at += 7;
+	if (*at != ' ' && *at != '\t' && *at != '"' && *at != '<') return false;
+	while (*at == ' ' || *at == '\t') at++;
+
+	char close = *at == '"' ? '"' : (*at == '<' ? '>' : '\0');
+	if (close == '\0') return false;
+	at++;
+
+	size_t len = 0;
+	while (at[len] != close && at[len] != '\0' && at[len] != '\n' && at[len] != '\r') len++;
+	if (at[len] != close || len == 0 || len >= path_size) return false;
+
+	memcpy(out_path, at, len);
+	out_path[len] = '\0';
+	return true;
+}
+
+///////////////////////////////////////////
+
+static bool _include_walk(const char *filename, const sksc_settings_t *settings, void (*on_dep)(void *user, const char *path), void *user, array_t<char*> *ref_visited, int32_t depth) {
+	if (depth > 32) return false; // cycles are caught by ref_visited, this is a backstop
+
+	char *text = sksc_file_read(filename, nullptr);
+	if (!text) return false;
+
+	bool        complete = true;
+	const char *line     = text;
+	while (*line != '\0') {
+		char inc[SKSC_PATH_MAX];
+		if (_parse_include(line, inc, sizeof(inc))) {
+			char full[SKSC_PATH_MAX];
+			if (!sksc_include_resolve(inc, filename, settings, full, sizeof(full))) {
+				complete = false;
+			} else {
+				bool seen = false;
+				for (size_t i = 0; i < ref_visited->count && !seen; i++)
+					seen = strcmp(ref_visited->data[i], full) == 0;
+
+				if (!seen) {
+					size_t len  = strlen(full) + 1;
+					char  *keep = (char*)malloc(len);
+					memcpy(keep, full, len);
+					ref_visited->add(keep);
+
+					on_dep(user, full);
+					if (!_include_walk(full, settings, on_dep, user, ref_visited, depth + 1))
+						complete = false;
+				}
+			}
+		}
+
+		const char *next = strchr(line, '\n');
+		if (!next) break;
+		line = next + 1;
+	}
+	free(text);
+	return complete;
+}
+
+///////////////////////////////////////////
+
+bool sksc_include_walk(const char *filename, const sksc_settings_t *settings, void (*on_dep)(void *user, const char *path), void *user) {
+	array_t<char*> visited = {};
+	bool           complete = _include_walk(filename, settings, on_dep, user, &visited, 0);
+
+	visited.each([](char *&p) { free(p); });
+	visited.free();
+	return complete;
+}
+
+///////////////////////////////////////////
+
 void sksc_init() {
 #ifdef SKSC_HAS_GLSLANG
 	sksc_glslang_init();

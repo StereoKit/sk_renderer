@@ -38,36 +38,6 @@ struct svsl_include_ctx_t {
 
 ///////////////////////////////////////////
 
-static const char *_last_sep(const char *path) {
-	const char *sep  = strrchr(path, '/');
-	const char *back = strrchr(path, '\\');
-	if (back && (!sep || back > sep)) sep = back;
-	return sep;
-}
-
-///////////////////////////////////////////
-
-static char *_read_file(const char *path, int32_t *out_len) {
-	FILE *fp = fopen(path, "rb");
-	if (!fp) return nullptr;
-	fseek(fp, 0, SEEK_END);
-	long size = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
-	// ftell returns -1 for an unseekable stream, and on POSIX fopen("rb")
-	// succeeds on a directory (Windows fails it above), so reject a bad size
-	// before it wraps to a huge malloc/fread.
-	if (size < 0) { fclose(fp); return nullptr; }
-	char *data = (char*)malloc((size_t)size + 1);
-	if (!data) { fclose(fp); return nullptr; }
-	size_t got = fread(data, 1, (size_t)size, fp);
-	fclose(fp);
-	data[got] = '\0';
-	if (out_len) *out_len = (int32_t)got;
-	return data;
-}
-
-///////////////////////////////////////////
-
 static void *_track(svsl_include_ctx_t *ctx, void *p) {
 	if (p) ctx->allocs.add(p);
 	return p;
@@ -84,26 +54,18 @@ static char *_dup_str(const char *s) {
 
 ///////////////////////////////////////////
 
-// Resolve an #include the way skshaderc does: the requesting file's own folder
-// first, then each -i include folder in order.
 static svsl_include_src_t _svsl_include(void *user, const char *path, const char *requester) {
 	svsl_include_ctx_t *ctx = (svsl_include_ctx_t*)user;
-	char                full[2048];
+	char                full[SKSC_PATH_MAX];
 
-	const char *slash = requester ? _last_sep(requester) : nullptr;
-	if (slash) {
-		snprintf(full, sizeof(full), "%.*s/%s", (int32_t)(slash - requester), requester, path);
-		int32_t len;
-		char   *content = _read_file(full, &len);
-		if (content) return svsl_include_src_t{ (const char*)_track(ctx, content), len, (const char*)_track(ctx, _dup_str(full)) };
-	}
-	for (int32_t i = 0; i < ctx->settings->include_folder_ct; i++) {
-		snprintf(full, sizeof(full), "%s/%s", ctx->settings->include_folders[i], path);
-		int32_t len;
-		char   *content = _read_file(full, &len);
-		if (content) return svsl_include_src_t{ (const char*)_track(ctx, content), len, (const char*)_track(ctx, _dup_str(full)) };
-	}
-	return svsl_include_src_t{};
+	if (!sksc_include_resolve(path, requester, ctx->settings, full, sizeof(full)))
+		return svsl_include_src_t{};
+
+	int32_t len;
+	char   *content = sksc_file_read(full, &len);
+	if (!content) return svsl_include_src_t{};
+
+	return svsl_include_src_t{ (const char*)_track(ctx, content), len, (const char*)_track(ctx, _dup_str(full)) };
 }
 
 ///////////////////////////////////////////

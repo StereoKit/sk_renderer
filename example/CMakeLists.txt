@@ -321,6 +321,13 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	tools/compress/shaders/astc6x6_compress.hlsl
 	tools/compress/shaders/astc8x8hdr_compress.hlsl
 	tools/compress/shaders/tex_psnr.hlsl
+
+	INCLUDES
+	assets/shaders/common.hlsli
+	assets/shaders/gpu_sort_common.hlsli
+	assets/shaders/pbr.hlsli
+	tools/compress/shaders/astc_common.hlsli
+	tools/compress/shaders/bc_common.hlsli
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

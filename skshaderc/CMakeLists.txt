@@ -20,6 +20,10 @@
 #
 # skshaderc_compile_assets(PROJECT_SHADERS_HLSL "-t xge")
 #
+# Both take an optional trailing INCLUDES list of .hlsli files.
+# cmake can't see through an #include, so anything a shader pulls
+# in has to be named there for an edit to it to trigger a rebuild.
+#
 # If you wish to design your own shader compiling function,
 # this file also exports SKSHADERC_EXE_PATH, which is a
 # generator for the path to the skshaderc compiler executable
@@ -459,23 +463,37 @@ message(STATUS "skshaderc will be copied to: ${SKSHADERC_TARGET_FOLDER}")
 
 endif() # NOT SKSHADERC_SKIP_BUILD
 
+# cmake can't see through an #include, so INCLUDES is listed by hand and applies
+# to every shader in the call. skshaderc re-checks each shader's real include
+# tree, so the ones that don't use an edited header still skip.
+function(SKSHADERC_INCLUDE_DEPS OUT_LIST)
+	set(RESULT)
+	foreach(INC IN LISTS ARGN)
+		list(APPEND RESULT ${CMAKE_CURRENT_SOURCE_DIR}/${INC})
+	endforeach()
+	set(${OUT_LIST} ${RESULT} PARENT_SCOPE)
+endfunction()
+
 # functions for compiling shaders easily
 function(SKSHADERC_COMPILE_ASSETS TARGET OUT_PATH COMMAND_STRING OUT_LIST)
+	cmake_parse_arguments(PARSE_ARGV 4 SKSC "" "" "INCLUDES")
 	set(SKSHADERC_COMPILE_COMMANDS "-e $<$<CONFIG:Debug>:-d> -o ${OUT_PATH} ${COMMAND_STRING}")
 	message(STATUS "sk_renderer compiling shader assets with args 'skshaderc ${SKSHADERC_COMPILE_COMMANDS} [shaders]'")
 	separate_arguments(SKSHADERC_COMPILE_COMMANDS)
 
+	skshaderc_include_deps(INCLUDE_DEPS ${SKSC_INCLUDES})
+
 	set(SHADER_LIST)
 	set(COMPILED_SHADERS)
 
-	foreach(SHADER IN LISTS ARGN)
+	foreach(SHADER IN LISTS SKSC_UNPARSED_ARGUMENTS)
 		get_filename_component(SHADER_NAME ${SHADER} NAME)
 		set(COMPILED_SHADER "${OUT_PATH}/${SHADER_NAME}.sks")
 
 		add_custom_command(
 			OUTPUT ${COMPILED_SHADER}
 			COMMAND ${WINE} ${SKSHADERC_EXE_PATH} ${SKSHADERC_COMPILE_COMMANDS} ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
-			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} ${SKSHADERC_DEPENDS}
+			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} ${INCLUDE_DEPS} ${SKSHADERC_DEPENDS}
 			VERBATIM
 		)
 		list(APPEND SHADER_LIST ${SHADER})
@@ -489,17 +507,20 @@ function(SKSHADERC_COMPILE_ASSETS TARGET OUT_PATH COMMAND_STRING OUT_LIST)
 endfunction()
 
 function(SKSHADERC_COMPILE_HEADERS ADD_TARGET OUTPUT_FOLDER COMMAND_STRING)
+	cmake_parse_arguments(PARSE_ARGV 3 SKSC "" "" "INCLUDES")
 	set(SKSHADERC_COMPILE_COMMANDS "-h $<$<CONFIG:Debug>:-d> -o ${OUTPUT_FOLDER} ${COMMAND_STRING}")
 	message(STATUS "sk_renderer compiling shader headers with args 'skshaderc ${SKSHADERC_COMPILE_COMMANDS} [shaders]'")
 	separate_arguments(SKSHADERC_COMPILE_COMMANDS)
 
+	skshaderc_include_deps(INCLUDE_DEPS ${SKSC_INCLUDES})
+
 	set(SHADER_LIST)
-	foreach(SHADER IN LISTS ARGN)
+	foreach(SHADER IN LISTS SKSC_UNPARSED_ARGUMENTS)
 		get_filename_component(SHADER_NAME ${SHADER} NAME)
 		add_custom_command(
 			OUTPUT ${OUTPUT_FOLDER}/${SHADER_NAME}.h
 			COMMAND ${WINE} ${SKSHADERC_EXE_PATH} ${SKSHADERC_COMPILE_COMMANDS} ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
-			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} ${SKSHADERC_DEPENDS}
+			DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} ${INCLUDE_DEPS} ${SKSHADERC_DEPENDS}
 			VERBATIM
 		)
 		list(APPEND SHADER_LIST ${OUTPUT_FOLDER}/${SHADER_NAME}.h)

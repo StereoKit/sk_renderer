@@ -26,6 +26,9 @@
 #include <dirent.h>
 #include <libgen.h>
 #include <ctype.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #define SKSC_IMPL
@@ -51,6 +54,11 @@ typedef struct compiler_settings_t {
 	sksc_settings_t shaderc;
 } compiler_settings_t;
 
+typedef struct include_age_t {
+	uint64_t output_time; // oldest enabled output
+	bool     stale;       // a dependency is at least as new as that
+} include_age_t;
+
 ///////////////////////////////////////////
 
 uint64_t exe_file_time = 0;
@@ -58,7 +66,7 @@ const int32_t path_size = 2048;
 
 ///////////////////////////////////////////
 
-bool                read_file     (const char *filename, char **out_text, size_t *out_size);
+char               *read_file     (const char *filename); // malloc'd, NUL terminated
 bool                write_file    (const char *filename, void *file_data, size_t file_size);
 bool                write_file_txt(const char *filename, void *file_data, size_t file_size);
 bool                write_header  (const char *filename, void *file_data, size_t file_size, bool zipped, const sksc_shader_file_t *shader_file);
@@ -69,6 +77,7 @@ void                iterate_dir   (const char *directory_path, void *callback_da
 compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit); 
 void                show_usage    ();
 uint64_t            file_time     (const char *file);
+void                exe_path      (const char *argv0, char *out_path, size_t path_size);
 void                file_name     (const char *file, char *out_name, size_t name_size);
 void                file_name_ext (const char *file, char *out_name, size_t name_size);
 void                file_dir      (const char *file, char *out_path, size_t path_size);
@@ -80,6 +89,7 @@ bool                recurse_mkdir (const char *dirname);
 
 ///////////////////////////////////////////
 
+int32_t file_count     = 0; // handed to compile_file, up-to-date ones included
 int32_t compiled_count = 0;
 int32_t failed_count   = 0;
 
@@ -93,7 +103,9 @@ int main(int argc, const char **argv) {
 	compiler_settings_t settings = check_settings(argc, argv, &exit);
 	if (exit) return 0;
 
-	exe_file_time = file_time(argv[0]);
+	char exe[path_size];
+	exe_path(argv[0], exe, sizeof(exe));
+	exe_file_time = file_time(exe);
 
 	sksc_init();
 
@@ -109,12 +121,12 @@ int main(int argc, const char **argv) {
 		const char *path = argv[i];
 		if (file_exists(path)) {
 			compile_file(path, &settings);
-			compiled_count++;
+			file_count++;
 		} else if (path_is_file(path) && path_is_wild(path)) {
 			iterate_dir(path, &settings, [](void *callback_data, const char *src_filename, bool file) {
 				if (!file) return;
 				compile_file(src_filename, (compiler_settings_t*)callback_data);
-				compiled_count++;
+				file_count++;
 			});
 		}
 	}
@@ -128,11 +140,13 @@ int main(int argc, const char **argv) {
 
 		if (file_exists(argv[i])) {
 			compile_file(argv[i], &settings);
-			compiled_count++;
+			file_count++;
 		}
 	}
 #endif
-	if (settings.shaderc.silent_info == false || compiled_count == 0) {
+	// file_count, not compiled_count: an all-up-to-date run compiles nothing and
+	// has nothing to say, but a run that matched no files at all does.
+	if (settings.shaderc.silent_info == false || file_count == 0) {
 		printf("Compiled %d %s", compiled_count, compiled_count == 1 ? "shader" : "shaders");
 		if (failed_count > 0) {
 			printf(", %d failed", failed_count);
@@ -184,9 +198,6 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		}
 	}
 
-	// Get the inlcude folder
-	file_dir(argv[argc-1], result.shaderc.folder, sizeof(result.shaderc.folder));
-
 	bool set_targets = false;
 	for (int32_t i=1; i<argc-1; i++) {
 		if      (strcmp(argv[i], ""   ) == 0) {}
@@ -216,7 +227,7 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		else if (strcmp(argv[i], "-i" ) == 0 && i<argc-1) {
 			size_t len = strlen(argv[i + 1]) + 1;
 			result.shaderc.include_folder_ct += 1;
-			result.shaderc.include_folders    = (char**)realloc(result.shaderc.include_folders, sizeof(result.shaderc.include_folder_ct * sizeof(char *)));
+			result.shaderc.include_folders    = (char**)realloc(result.shaderc.include_folders, result.shaderc.include_folder_ct * sizeof(char *));
 			result.shaderc.include_folders[result.shaderc.include_folder_ct-1] = (char*)malloc(len);
 			strncpy(result.shaderc.include_folders[result.shaderc.include_folder_ct-1], argv[i+1], len); 
 			i++; }
@@ -281,8 +292,9 @@ Options:
 			shaders.
 	-sw		No info or warnings are printed when compiling shaders.
 	-si		No info is printed when compiling shaders.
-	-f		Force the shader to recompile, even if the timestamp on the
-			matching .sks file is newer.
+	-f		Force the shader to recompile. Without it, a shader is skipped
+			when every output is newer than the source, every file it
+			#includes, and skshaderc itself.
 	-svsl		Compile the shader with the SVSL backend instead of the glslang
 			pipeline. Files ending in .svsl use SVSL automatically. Only
 			available when skshaderc was built with SKSHADERC_ENABLE_SVSL.
@@ -305,7 +317,8 @@ Options:
 			names from vertex and pixel shader stages. Default is 'vs'.
 
 	-i folder	Adds a folder to the include path when searching for #include
-			files.
+			files. An #include is looked for next to the file that requested
+			it, then in each -i folder in the order given.
 	-o path	Sets the output folder for compiled shaders. Default will
 			leave them in the same folder as the original file. Can also be a
 			specific filename.
@@ -353,7 +366,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		snprintf(new_filename_cs,  sizeof(new_filename_cs ), "%s", settings->out_folder);
 	}
 
-	// Skip this file if it hasn't changed 
+	// Skip this file if it hasn't changed
 	uint64_t src_file_time          = file_time(src_filename);
 	uint64_t compiled_file_time_sks = make_sks                     ? file_time(new_filename_sks) : UINT64_MAX;
 	uint64_t compiled_file_time_h   = settings->output_header      ? file_time(new_filename_h)   : UINT64_MAX;
@@ -366,21 +379,36 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		oldest_time = compiled_file_time_cs;
 	if (oldest_time > compiled_file_time_raw)
 		oldest_time = compiled_file_time_raw;
+	// Walking includes costs file reads, so it only runs once the cheap checks
+	// have found no reason to compile
 	if (settings->only_if_changed && src_file_time < oldest_time && exe_file_time < oldest_time) {
-		if (!settings->shaderc.silent_info) {
-			printf("File '%s' is already up-to-date, skipping...\n", src_filename);
+		include_age_t deps = { oldest_time, false };
+		// An unresolved #include is a change too: the header moved or was
+		// deleted, and the compile needs to run to report it.
+		if (!sksc_include_walk(src_filename, &settings->shaderc, [](void *user, const char *path) {
+			include_age_t *age  = (include_age_t*)user;
+			uint64_t       time = file_time(path);
+			if (time >= age->output_time)
+				age->stale = true;
+		}, &deps))
+			deps.stale = true;
+
+		if (!deps.stale) {
+			if (!settings->shaderc.silent_info) {
+				printf("File '%s' is already up-to-date, skipping...\n", src_filename);
+			}
+			return;
 		}
-		return;
 	}
 
-	char  *file_text;
-	size_t file_size;
-	if (read_file(src_filename, &file_text, &file_size) == false) {
+	char *file_text = read_file(src_filename);
+	if (file_text == nullptr) {
 		printf("Couldn't read file '%s'!\n", src_filename);
 		return;
 	}
 	
 	sksc_shader_file_t file;
+	compiled_count++;
 	sksc_log(sksc_log_level_info, "Compiling %s..", src_filename);
 	if (sksc_compile(src_filename, file_text, &settings->shaderc, &file)) {
 
@@ -515,26 +543,21 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, const char
 
 ///////////////////////////////////////////
 
-bool read_file(const char *filename, char **out_text, size_t *out_size) {
-	*out_text = nullptr;
-	*out_size = 0;
-
+char *read_file(const char *filename) {
 	FILE *fp = fopen(filename, "rb");
-	if (fp == nullptr) {
-		return false;
-	}
-
-	fseek(fp, 0L, SEEK_END);
-	*out_size = ftell(fp);
-	rewind(fp);
-
-	*out_text = (char*)malloc(*out_size+1);
-	if (*out_text == nullptr) { *out_size = 0; fclose(fp); return false; }
-	if (fread(*out_text, 1, *out_size, fp) == 0) return false;
+	if (!fp) return nullptr;
+	fseek(fp, 0, SEEK_END);
+	long size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	// ftell returns -1 for an unseekable stream, so reject a bad size before it
+	// wraps to a huge malloc/fread.
+	if (size < 0) { fclose(fp); return nullptr; }
+	char *data = (char*)malloc((size_t)size + 1);
+	if (!data) { fclose(fp); return nullptr; }
+	size_t got = fread(data, 1, (size_t)size, fp);
 	fclose(fp);
-
-	(*out_text)[*out_size] = 0;
-	return true;
+	data[got] = '\0';
+	return data;
 }
 
 ///////////////////////////////////////////
@@ -895,14 +918,17 @@ class Material%s : Material
 
 uint64_t file_time(const char *file) {
 #if defined(_WIN32)
-	HANDLE   handle = CreateFileA(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-	FILETIME write_time;
-
-	if (!GetFileTime(handle, nullptr, nullptr, &write_time))
+	HANDLE handle = CreateFileA(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (handle == INVALID_HANDLE_VALUE)
 		return 0;
+
+	FILETIME write_time;
+	bool     ok = GetFileTime(handle, nullptr, nullptr, &write_time) != 0;
 	CloseHandle(handle);
+	if (!ok) return 0;
+
 	return (static_cast<uint64_t>(write_time.dwHighDateTime) << 32) | write_time.dwLowDateTime;
-#elif defined(__linux__) || __APPLE__
+#elif defined(__linux__) || defined(__APPLE__)
 	struct stat result;
 	if(stat(file, &result)==0)
 		return result.st_mtime;
@@ -910,6 +936,29 @@ uint64_t file_time(const char *file) {
 #else
 	#error "Platform unsupported"
 #endif
+}
+
+///////////////////////////////////////////
+
+// argv[0] doesn't resolve when we're launched off PATH, and file_time's 0 then
+// silently disables the compiler half of the up-to-date check.
+void exe_path(const char *argv0, char *out_path, size_t path_size) {
+#if defined(_WIN32)
+	DWORD len = GetModuleFileNameA(NULL, out_path, (DWORD)path_size);
+	if (len > 0 && len < path_size)
+		return;
+#elif defined(__linux__)
+	ssize_t len = readlink("/proc/self/exe", out_path, path_size - 1);
+	if (len > 0) {
+		out_path[len] = '\0'; // readlink doesn't terminate
+		return;
+	}
+#elif defined(__APPLE__)
+	uint32_t size = (uint32_t)path_size;
+	if (_NSGetExecutablePath(out_path, &size) == 0) // may contain symlinks or '..', stat follows both
+		return;
+#endif
+	snprintf(out_path, path_size, "%s", argv0);
 }
 
 ///////////////////////////////////////////

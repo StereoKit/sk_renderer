@@ -1,9 +1,30 @@
 #pragma once
 
+#ifndef _CRT_INTERNAL_NONSTDC_NAMES
+#define _CRT_INTERNAL_NONSTDC_NAMES 1 // must beat MSVC's sys/stat.h to the unprefixed S_IF* names
+#endif
+#include <sys/stat.h>
 #include <sksc_file.h>
 
 #include "sksc.h"
 #include "array.h"
+
+// MSVC's sys/stat.h has no S_ISREG/S_ISDIR, and falls back to the underscored
+// constants when something included it before the define above landed.
+#if !defined(S_ISREG)
+  #if   defined(S_IFMT)  && defined(S_IFREG)
+    #define S_ISREG(m) (((m) &  S_IFMT) ==  S_IFREG)
+  #elif defined(_S_IFMT) && defined(_S_IFREG)
+    #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+  #endif
+#endif
+#if !defined(S_ISDIR)
+  #if   defined(S_IFMT)  && defined(S_IFDIR)
+    #define S_ISDIR(m) (((m) &  S_IFMT) ==  S_IFDIR)
+  #elif defined(_S_IFMT) && defined(_S_IFDIR)
+    #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+  #endif
+#endif
 
 enum compile_result_ {
 	compile_result_success = 1,
@@ -23,6 +44,13 @@ struct sksc_ast_default_t {
 	double  values[16];
 	int32_t value_count;
 };
+
+// Shared, so a long path can't resolve for one caller and truncate for another
+#define SKSC_PATH_MAX 2048
+
+// Searches the requester's own folder, then each -i folder in order
+bool                        sksc_include_resolve       (const char *path, const char *requester, const sksc_settings_t *settings, char *out_full, size_t full_size);
+char                       *sksc_file_read             (const char *path, int32_t *opt_out_len); // malloc'd, NUL terminated
 
 void                        sksc_glslang_init          ();
 void                        sksc_glslang_shutdown      ();

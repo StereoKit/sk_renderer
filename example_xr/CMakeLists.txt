@@ -265,6 +265,11 @@ skshaderc_compile_assets(sk_renderer_xr_test ${CMAKE_CURRENT_BINARY_DIR}/generat
 	../example/assets/shaders/gi_voxelize.hlsl
 	../example/assets/shaders/gi_fast_voxelize.hlsl
 	../example/assets/shaders/gi_voxel_to_sh.hlsl
+
+	INCLUDES
+	../example/assets/shaders/common.hlsli
+	../example/assets/shaders/gpu_sort_common.hlsli
+	../example/assets/shaders/pbr.hlsli
 )
 target_skapp_assets(sk_renderer_xr_test ${CMAKE_CURRENT_BINARY_DIR}/generated)
 

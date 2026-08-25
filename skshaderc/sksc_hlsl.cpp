@@ -3,7 +3,6 @@
 #define ENABLE_HLSL
 
 #include <glslang/Public/ShaderLang.h>
-#include "StandAlone/DirStackFileIncluder.h"
 #include "SPIRV/GlslangToSpv.h"
 
 #include <spirv-tools/optimizer.hpp>
@@ -25,13 +24,32 @@ void sksc_glslang_shutdown() {
 // HLSL to SPIR-V                        //
 ///////////////////////////////////////////
 
-class SkscIncluder : public DirStackFileIncluder {
+// glslang hands us an empty includer name for the top level string, hence source_file
+class SkscIncluder : public glslang::TShader::Includer {
 public:
-	virtual IncludeResult* includeSystem(const char* header_name, const char* includer_name, size_t inclusion_depth) override {
-		recordLocalPath(includer_name, inclusion_depth);
-		IncludeResult* result = readLocalPath(header_name);
-		if (result) return result;
-		return readSystemPath(header_name);
+	const char            *source_file;
+	const sksc_settings_t *settings;
+
+	IncludeResult* include(const char* header_name, const char* includer_name) {
+		const char *requester = includer_name && includer_name[0] != '\0' ? includer_name : source_file;
+		char        full[SKSC_PATH_MAX];
+		if (!sksc_include_resolve(header_name, requester, settings, full, sizeof(full)))
+			return nullptr;
+
+		int32_t len;
+		char   *text = sksc_file_read(full, &len);
+		if (!text) return nullptr;
+
+		return new IncludeResult(full, text, len, text);
+	}
+
+	virtual IncludeResult* includeLocal (const char* header_name, const char* includer_name, size_t) override { return include(header_name, includer_name); }
+	virtual IncludeResult* includeSystem(const char* header_name, const char* includer_name, size_t) override { return include(header_name, includer_name); }
+
+	virtual void releaseInclude(IncludeResult* result) override {
+		if (!result) return;
+		free(result->userData);
+		delete result;
 	}
 };
 
@@ -155,11 +173,9 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	shader.setStrings         (shader_strings, 1);
 
 	// Setup includer
-	SkscIncluder includer;
-	includer.pushExternalDirectory(settings->folder);
-	for (int32_t i = 0; i < settings->include_folder_ct; i++) {
-		includer.pushExternalDirectory(settings->include_folders[i]);
-	}
+	SkscIncluder includer = {};
+	includer.source_file  = filename;
+	includer.settings     = settings;
 
 	std::string preprocessed_glsl;
 	if (!shader.preprocess(
