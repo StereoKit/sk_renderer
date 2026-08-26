@@ -31,10 +31,12 @@ typedef enum {
 	skr_rp_flag_custom_resolve     = 1 << 1, // VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM on resolve subpass
 	skr_rp_flag_postfx_reads_depth = 1 << 2, // Postfx subpasses get depth as an input attachment. Under MSAA,
 	                                         // geometry resolves depth on-tile (VK_KHR_depth_stencil_resolve)
-	skr_rp_flag_postfx_depth_ms    = 1 << 3, // ...unless the postfx shader declared depth as SubpassInputMS,
+	skr_rp_flag_postfx_depth_ms    = 1 << 3, // ...unless a depth-reading shader declared it as SubpassInputMS,
 	                                         // which reads MSAA depth directly and skips that on-tile resolve
 	skr_rp_flag_tile_shading       = 1 << 4, // VK_QCOM_tile_shading pass: a postfx shader reads an
 	                                         // attachment as a tile attachment (neighborhood reads on-tile)
+	skr_rp_flag_resolve_reads_depth= 1 << 5, // Tracked apart from the postfx flag so a depth-free resolve
+	                                         // releases depth from tile memory after the geometry subpass
 } skr_rp_flag_;
 
 typedef struct {

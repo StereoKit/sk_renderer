@@ -110,6 +110,7 @@ typedef struct skr_tex_t {
 	uint32_t               mip_levels;       // Number of mip levels
 	uint32_t               layer_count;      // Number of array layers (1 for regular, N for arrays, 6 for cubemaps)
 	VkImageAspectFlags     aspect_mask;      // Depth bit for depth textures, color bit for color textures
+	VkImageUsageFlags      usage;            // Adopted images carry only the bits their flags promise
 
 	// Automatic layout transition tracking. current_layout is the actual GPU
 	// layout right now — used as oldLayout for the next barrier and to skip
@@ -214,7 +215,8 @@ typedef struct skr_shader_stage_t {
 } skr_shader_stage_t;
 
 typedef struct skr_shader_t {
-	sksc_shader_meta_t   meta;
+	sksc_shader_meta_t  meta;
+	sksc_pass_inputs_t  pass_inputs; // "color"/"depth" convention, resolved at creation
 	skr_shader_stage_t  vertex_stage;
 	skr_shader_stage_t  pixel_stage;
 	skr_shader_stage_t  compute_stage;

@@ -54,6 +54,7 @@ static skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, sk
                                        skr_shader_stage_t p_shader, skr_shader_stage_t c_shader) {
 	skr_shader_t shader  = {0};
 	if (meta) shader.meta = *meta;
+	shader.pass_inputs   = sksc_shader_meta_pass_inputs(&shader.meta);
 	shader.vertex_stage  = v_shader;
 	shader.pixel_stage   = p_shader;
 	shader.compute_stage = c_shader;
@@ -367,6 +368,9 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 		if (bind.stage_bits & skr_stage_vertex ) stages |= VK_SHADER_STAGE_VERTEX_BIT;
 		if (bind.stage_bits & skr_stage_pixel  ) stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
 		if (bind.stage_bits & skr_stage_compute) stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+		// Vulkan allows only fragment (or nothing) on an input attachment
+		// binding, whatever stages reflection found it in
+		if (desc_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) stages &= VK_SHADER_STAGE_FRAGMENT_BIT;
 
 		bindings[binding_count++] = (VkDescriptorSetLayoutBinding){
 			.binding            = bind.slot,
@@ -404,6 +408,9 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 		if (bind.stage_bits & skr_stage_vertex ) stages |= VK_SHADER_STAGE_VERTEX_BIT;
 		if (bind.stage_bits & skr_stage_pixel  ) stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
 		if (bind.stage_bits & skr_stage_compute) stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+		// Vulkan allows only fragment (or nothing) on an input attachment
+		// binding, whatever stages reflection found it in
+		if (desc_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) stages &= VK_SHADER_STAGE_FRAGMENT_BIT;
 
 		const VkSampler* found_sampler = _skr_find_immutable_sampler(bind.slot, immutable_samplers, immutable_sampler_slots, immutable_sampler_count);
 		bindings[binding_count++] = (VkDescriptorSetLayoutBinding){

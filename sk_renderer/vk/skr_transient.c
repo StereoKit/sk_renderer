@@ -100,6 +100,7 @@ static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat form
 	e->tex.mip_levels          = 1;
 	e->tex.layer_count         = (uint32_t)layers;
 	e->tex.aspect_mask         = aspect;
+	e->tex.usage               = usage;
 	e->tex.current_layout      = VK_IMAGE_LAYOUT_UNDEFINED;
 	e->tex.is_transient_discard = true;
 

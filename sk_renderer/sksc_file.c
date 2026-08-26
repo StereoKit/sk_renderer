@@ -351,6 +351,27 @@ skr_bind_t sksc_shader_meta_get_bind(const sksc_shader_meta_t *meta, const char 
 
 ///////////////////////////////////////////////////////////////////////////////
 
+sksc_pass_inputs_t sksc_shader_meta_pass_inputs(const sksc_shader_meta_t *meta) {
+	sksc_pass_inputs_t result = {0};
+	for (uint32_t i = 0; i < meta->resource_count; i++) {
+		const sksc_shader_resource_t* res = &meta->resources[i];
+		bool is_color = strcmp(res->name, "color") == 0;
+		bool is_depth = strcmp(res->name, "depth") == 0;
+		if (res->bind.register_type == skr_register_input_attachment) {
+			if      (is_color)              result.input_color = true;
+			else if (is_depth && !result.input_depth) {
+				result.input_depth    = true;
+				result.input_depth_ms = (res->shape & SKSC_SHAPE_MS) != 0;
+			}
+		} else if (res->bind.register_type == skr_register_tile_sampled && is_color) {
+			result.tile_color = true;
+		}
+	}
+	return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 uint64_t sksc_shader_meta_missing_features(const sksc_shader_meta_t *meta, uint64_t enabled_features) {
 	if (meta == NULL) return 0;
 	// Every requirement bit the shader declared that the capability mask doesn't

@@ -370,6 +370,16 @@ typedef struct {
 	uint64_t                    features_reserved;
 } sksc_shader_meta_t;
 
+// Pass-input name conventions resolved once at shader load: an input
+// attachment named "color" is the scene, "depth" the depth buffer. Binding is
+// still by name, so presence is all a pass needs to know.
+typedef struct {
+	bool input_color;    // input attachment named "color"
+	bool input_depth;    // input attachment named "depth"
+	bool tile_color;     // tile attachment (skr_register_tile_sampled) named "color"
+	bool input_depth_ms; // depth declared multisampled (SubpassInputMS)
+} sksc_pass_inputs_t;
+
 typedef struct {
 	skr_shader_lang_ language;
 	skr_stage_       stage;
@@ -394,6 +404,7 @@ SKSC_API sksc_result_             sksc_shader_file_load_memory    (const void *f
 SKSC_API void                     sksc_shader_file_destroy        (sksc_shader_file_t *ref_file);
 
 SKSC_API skr_bind_t               sksc_shader_meta_get_bind       (const sksc_shader_meta_t*     meta, const char *name);
+SKSC_API sksc_pass_inputs_t       sksc_shader_meta_pass_inputs    (const sksc_shader_meta_t*     meta);
 SKSC_API uint64_t                 sksc_shader_meta_missing_features(const sksc_shader_meta_t*     meta, uint64_t enabled_features);
 SKSC_API int32_t                  sksc_shader_meta_get_var_count  (const sksc_shader_meta_t*     meta);
 SKSC_API int32_t                  sksc_shader_meta_get_var_index  (const sksc_shader_meta_t*     meta, const char *name);

@@ -1006,18 +1006,16 @@ void skr_pass_submit(skr_pass_t* pass) {
 	if (!final_output) final_output = use_msaa ? resolve : color;
 	if (!final_output || !color) { skr_log(skr_log_critical, "skr_pass_submit: no postfx output target"); return; }
 
-	// Depth becomes a postfx input when a postfx shader declares an input
-	// attachment named "depth" — same name convention the Vulkan backend uses.
-	// Under MSAA, depth resolves to an r32f transient after the geometry pass
-	// (WebGPU render passes can't resolve depth attachments themselves).
+	// Depth becomes a lowered-stage input when the resolve material or a
+	// postfx shader declares an input attachment named "depth", the same
+	// name convention the Vulkan backend uses. Under MSAA, depth resolves to an
+	// r32f transient after the geometry pass (WebGPU render passes can't
+	// resolve depth attachments themselves).
 	skr_tex_t* postfx_depth      = NULL;
 	skr_tex_t* depth_resolve_out = NULL; // transient; returns to the pool at the frame boundary
-	for (uint32_t p = 0; p < postfx_count && postfx_depth == NULL; p++) {
-		const sksc_shader_meta_t* meta = &postfx[p]->key.shader->meta;
-		for (uint32_t r = 0; r < meta->resource_count; r++) {
-			if (meta->resources[r].bind.register_type == skr_register_input_attachment &&
-			    strcmp(meta->resources[r].name, "depth") == 0) { postfx_depth = depth; break; }
-		}
+	for (int32_t p = has_resolve_mat ? -1 : 0; p < (int32_t)postfx_count && postfx_depth == NULL; p++) {
+		skr_material_t* mat = p < 0 ? pass->resolve_material : postfx[p];
+		if (mat->key.shader->pass_inputs.input_depth) postfx_depth = depth;
 	}
 
 	const void* system_data      = pass->draw_count > 0 ? pass->draws[0].system_data      : NULL;
@@ -1061,11 +1059,13 @@ void skr_pass_submit(skr_pass_t* pass) {
 		}
 	}
 
-	// Manual resolve stage reads the multisampled color directly
+	// Manual resolve stage reads the multisampled color directly. Its input is
+	// multisampled, so there's no copy-through fallback like the postfx chain's.
 	if (has_resolve_mat) {
 		skr_tex_t* target = postfx_count > 0 ? _skr_transient_acquire(chain_fmt, color->size.x, color->size.y, layers) : final_output;
 		if (!target) return;
-		_skr_lowered_stage(target, pass->resolve_material, cur, NULL, fx_bounds_opt, system_data, system_data_size);
+		if (!_skr_lowered_stage(target, pass->resolve_material, cur, postfx_depth, fx_bounds_opt, system_data, system_data_size))
+			skr_log(skr_log_warning, "Resolve stage couldn't draw, leaving its output undefined");
 		cur = target;
 	}
 

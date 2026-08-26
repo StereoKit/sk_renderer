@@ -703,13 +703,14 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	bool use_msaa      = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
 	bool has_color     = key->color_format != VK_FORMAT_UNDEFINED;
 	bool has_depth     = key->depth_format != VK_FORMAT_UNDEFINED;
-	bool reads_depth   = (key->flags & skr_rp_flag_postfx_reads_depth) && has_depth;
+	bool reads_depth   = (key->flags & skr_rp_flag_postfx_reads_depth)  && has_depth;
+	bool resolve_reads = (key->flags & skr_rp_flag_resolve_reads_depth) && has_depth;
 	// MS-declared postfx depth reads the MSAA attachment directly, so no
 	// resolve attachment and no 1x transient - the depth input reference below
 	// falls through to depth_idx exactly as it does in a single-sample pass.
-	bool resolve_depth = reads_depth && key->samples > VK_SAMPLE_COUNT_1_BIT && !(key->flags & skr_rp_flag_postfx_depth_ms);
+	bool resolve_depth = (reads_depth || resolve_reads) && key->samples > VK_SAMPLE_COUNT_1_BIT && !(key->flags & skr_rp_flag_postfx_depth_ms);
 
-	if (reads_depth && !_skr_vk.has_create_renderpass2) {
+	if ((reads_depth || resolve_reads) && !_skr_vk.has_create_renderpass2) {
 		skr_log(skr_log_critical, "PostFX depth read requires VK_KHR_create_renderpass2");
 		return VK_NULL_HANDLE;
 	}
@@ -931,8 +932,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	};
 
 	// Subpass 1 (optional): Manual MSAA resolve
-	// Reads MSAA color as multisampled input attachment, writes 1x resolved output.
-	// No depth — frees tile memory after geometry subpass.
+	// Reads MSAA color as multisampled input attachment, writes 1x resolved
+	// output. Depth stays out of its input refs unless the resolve material
+	// itself reads it, freeing tile memory after the geometry subpass.
 	uint32_t next_sp = 1;
 	if (key->flags & skr_rp_flag_resolve_subpass) {
 		input_refs[1][0] = (VkAttachmentReference2){
@@ -941,6 +943,14 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		};
+		if (resolve_reads) {
+			input_refs[1][1] = (VkAttachmentReference2){
+				.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+				.attachment = (uint32_t)(resolve_depth ? depth_resolve_idx : depth_idx),
+				.layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+			};
+		}
 		color_refs[1] = (VkAttachmentReference2){
 			.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 			.attachment = (uint32_t)resolve_idx,
@@ -954,7 +964,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 				: 0),
 			.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
 			.viewMask                = key->view_mask,
-			.inputAttachmentCount    = 1,
+			.inputAttachmentCount    = resolve_reads ? 2u : 1u,
 			.pInputAttachments       = &input_refs[1][0],
 			.colorAttachmentCount    = 1,
 			.pColorAttachments       = &color_refs[1],
@@ -1113,15 +1123,17 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 	}
 
-	// Geometry → each postfx subpass: depth writes (and the on-tile depth
-	// resolve, which Vulkan places in late fragment tests / color output)
-	// must land before postfx reads depth as an input attachment.
-	if (reads_depth) {
-		for (uint32_t p = 0; p < key->postfx_count; p++) {
+	// Geometry → each depth-reading subpass: depth writes (and the on-tile
+	// depth resolve, which Vulkan places in late fragment tests / color
+	// output) must land before depth is read as an input attachment.
+	if (reads_depth || resolve_reads) {
+		for (uint32_t sp = 1; sp < subpass_count; sp++) {
+			bool is_resolve_sp = (key->flags & skr_rp_flag_resolve_subpass) && sp == 1;
+			if (is_resolve_sp ? !resolve_reads : !reads_depth) continue;
 			dependencies[dep_count++] = (VkSubpassDependency2){
 				.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 				.srcSubpass      = 0,
-				.dstSubpass      = next_sp + p,
+				.dstSubpass      = sp,
 				.srcStageMask    = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				.dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 				.srcAccessMask   = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1148,9 +1160,10 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			.srcSubpass    = reads_depth ? subpass_count - 1 : 0,  // Without depth read, depth is only used in geometry subpass
+			// A subpass that never touched depth can't source its write
+			.srcSubpass    = reads_depth ? subpass_count - 1 : (resolve_reads ? 1 : 0),
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
-			.srcStageMask  = reads_depth ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.srcStageMask  = (reads_depth || resolve_reads) ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
@@ -1225,10 +1238,11 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	char name[512]; // shader name is up to 256, plus the config suffixes
-	snprintf(name, sizeof(name), "rpass_%s%s%s%u_",
-		(key->flags & skr_rp_flag_resolve_subpass)    ? "resolve_" : "",
-		(key->flags & skr_rp_flag_custom_resolve)     ? "cr_"      : "",
-		(key->flags & skr_rp_flag_postfx_reads_depth) ? "din_"     : "",
+	snprintf(name, sizeof(name), "rpass_%s%s%s%s%u_",
+		(key->flags & skr_rp_flag_resolve_subpass)     ? "resolve_" : "",
+		(key->flags & skr_rp_flag_custom_resolve)      ? "cr_"      : "",
+		(key->flags & skr_rp_flag_resolve_reads_depth) ? "rdin_"    : "",
+		(key->flags & skr_rp_flag_postfx_reads_depth)  ? "din_"     : "",
 		key->postfx_count);
 	_skr_append_renderpass_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);

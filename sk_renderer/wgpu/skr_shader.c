@@ -96,6 +96,7 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 	// Move meta ownership to the shader; zero file.meta so destroy skips it
 	out_shader->meta          = file.meta;
 	file.meta                 = (sksc_shader_meta_t){0};
+	out_shader->pass_inputs   = sksc_shader_meta_pass_inputs(&out_shader->meta);
 	out_shader->vertex_stage  = v_stage;
 	out_shader->pixel_stage   = p_stage;
 	out_shader->compute_stage = c_stage;

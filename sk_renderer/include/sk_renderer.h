@@ -650,8 +650,10 @@ typedef struct skr_pass_t {
 	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
 	uint32_t        draw_count;
 
-	// Populated by skr_pass_add_resolve()
-	skr_material_t* resolve_material;  // Manual MSAA resolve shader (reads SubpassInputMS)
+	// Populated by skr_pass_add_resolve(). Requires an MSAA color target.
+	// Input attachment 0 is the MSAA color ("color", SubpassInputMS); 1 is
+	// optional depth ("depth"), following the same convention as postfx.
+	skr_material_t* resolve_material;
 
 	// Populated by skr_pass_add_postfx()
 	skr_material_t* postfx[SKR_PASS_MAX_POSTFX];

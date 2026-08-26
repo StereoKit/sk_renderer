@@ -700,6 +700,7 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 		skr_log(skr_log_critical, "_skr_tex_create_yuv: vkCreateImage failed: 0x%X", (uint32_t)vr);
 		return skr_err_device_error;
 	}
+	out_tex->usage = image_info.usage;
 
 	// Single allocation for all planes (non-disjoint)
 	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
@@ -1025,8 +1026,10 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 	}
 
-	// For input attachments (SubpassInput in shaders)
-	if (out_tex->flags & skr_tex_flags_input_attachment) {
+	// For input attachments (SubpassInput in shaders). In-tile MSAA
+	// attachments get it too: a manual-resolve subpass reads the raw
+	// samples that way, and the usage is transient-compatible.
+	if (out_tex->flags & (skr_tex_flags_input_attachment | skr_tex_flags_in_tile_msaa)) {
 		usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 	}
 
@@ -1068,6 +1071,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		skr_log(skr_log_critical, "vkCreateImage failed");
 		return skr_err_device_error;
 	}
+	out_tex->usage = usage;
 
 	// Allocate memory using helper
 	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_transient_candidate, &out_tex->memory) == VK_NULL_HANDLE) {
@@ -1197,6 +1201,7 @@ skr_err_ _skr_tex_create_scratch(const skr_tex_t* template_src, skr_tex_t* out_t
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
+	out_tex->usage = usage;
 
 	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
 		skr_log(skr_log_critical, "Failed to allocate scratch texture memory");
@@ -2795,6 +2800,9 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = layer_count;
 	out_tex->aspect_mask = aspect_mask;
+	// Adopted image: the true usage is unknown, carry only what the caller's
+	// flags promise (input attachment is the one bit pass submission gates on)
+	out_tex->usage       = (info.flags & skr_tex_flags_input_attachment) ? VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT : 0;
 	out_tex->is_external = !info.owns_image;  // If we don't own it, it's external
 
 	// Layout tracking
@@ -3087,6 +3095,7 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 	out_tex->mip_levels  = mip_levels;
 	out_tex->layer_count = layer_count;
 	out_tex->aspect_mask = aspect_mask;
+	out_tex->usage       = image_info.usage;
 	out_tex->is_external = false;  // We own the imported memory
 
 	// Layout tracking
@@ -3294,6 +3303,7 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = 1;
 	out_tex->aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
+	out_tex->usage       = image_info.usage;
 	out_tex->is_external = false; // We own the imported memory
 
 	// Layout tracking
@@ -3546,6 +3556,7 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = layer_count;
 	out_tex->aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
+	out_tex->usage       = image_info.usage;
 	out_tex->is_external = false;  // We own the imported memory
 
 	// AHB tracking
