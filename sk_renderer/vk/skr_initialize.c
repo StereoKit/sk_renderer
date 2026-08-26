@@ -534,6 +534,173 @@ static bool _skr_ext_available(const char* name, const VkExtensionProperties* av
 	return false;
 }
 
+// Append to an enable list, skipping names it already holds
+static void _skr_ext_list_add(const char** list, uint32_t* ref_count, const char* name) {
+	for (uint32_t i = 0; i < *ref_count; i++)
+		if (strcmp(list[i], name) == 0) return;
+	list[(*ref_count)++] = name;
+}
+
+// Video decode needs all of these plus a decode queue family, which a request
+// can't express, so it's special-cased during init and in the summary table.
+static const char* _skr_video_device_exts[] = {
+	VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+	VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
+	VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
+	VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME,
+};
+#define _SKR_VIDEO_DEVICE_EXT_COUNT (sizeof(_skr_video_device_exts) / sizeof(_skr_video_device_exts[0]))
+
+///////////////////////////////////////////////////////////////////////////////
+// Init summary table
+///////////////////////////////////////////////////////////////////////////////
+
+typedef enum {
+	_skr_use_activated, // Enabled on the instance or device
+	_skr_use_present,   // Device offers it, but the request that wanted it failed elsewhere
+	_skr_use_missing,   // Device doesn't offer it
+	_skr_use_blocked,   // Feature request off; detail names the first unsatisfied piece
+} _skr_use_;
+
+static const char* _skr_use_str[] = { "ACTIVATED", "  present", "  missing", "  blocked" };
+
+typedef struct {
+	const char* name;
+	const char* detail; // Right column, may be NULL
+	_skr_use_   use;
+} _skr_row_t;
+
+static void _skr_row_add_ext(_skr_row_t* rows, int32_t section_start, int32_t* ref_count,
+                             const char* name, const VkExtensionProperties* avail, uint32_t avail_count) {
+	for (int32_t i = section_start; i < *ref_count; i++)
+		if (strcmp(rows[i].name, name) == 0) return;
+	rows[(*ref_count)++] = (_skr_row_t){ name, NULL,
+		_skr_ext_available(name, avail, avail_count) ? _skr_use_present : _skr_use_missing };
+}
+
+// A request named after the one extension it wants is already an extension row
+static bool _skr_req_is_bare_ext(const _skr_req_t* req) {
+	return req->name != NULL && req->feat_count == 0 && req->inst_ext_count == 0 &&
+	       req->dev_ext_count == 1 && req->name == _skr_reg.exts[req->dev_ext_start];
+}
+
+// Why video decode didn't come up. Derived at log time so it can't drift from
+// the checks in skr_init.
+static const char* _skr_video_missing(const VkExtensionProperties* avail, uint32_t avail_count) {
+	if (_skr_vk.video_decode_queue_family == UINT32_MAX) return "no video decode queue family";
+	if (!skr_vk_request_enabled("sync2"))                return "sync2";
+	for (uint32_t v = 0; v < _SKR_VIDEO_DEVICE_EXT_COUNT; v++)
+		if (!_skr_ext_available(_skr_video_device_exts[v], avail, avail_count)) return _skr_video_device_exts[v];
+	return "?";
+}
+
+// Everything sk_renderer asked this device for, in one table. Vulkan has far
+// too many extensions to list, so the request registry bounds what's reported.
+static void _skr_log_summary(void) {
+	uint32_t avail_inst_count = 0;
+	vkEnumerateInstanceExtensionProperties(NULL, &avail_inst_count, NULL);
+	VkExtensionProperties* avail_inst = _skr_malloc((avail_inst_count + 1) * sizeof(VkExtensionProperties));
+	vkEnumerateInstanceExtensionProperties(NULL, &avail_inst_count, avail_inst);
+
+	uint32_t avail_dev_count = 0;
+	vkEnumerateDeviceExtensionProperties(_skr_vk.physical_device, NULL, &avail_dev_count, NULL);
+	VkExtensionProperties* avail_dev = _skr_malloc((avail_dev_count + 1) * sizeof(VkExtensionProperties));
+	vkEnumerateDeviceExtensionProperties(_skr_vk.physical_device, NULL, &avail_dev_count, avail_dev);
+
+	int32_t     row_cap   = (int32_t)_skr_vk.enabled_instance_ext_count + (int32_t)_skr_vk.enabled_device_ext_count
+	                      + _skr_reg.ext_count + _skr_reg.req_count + 1;
+	_skr_row_t* rows      = _skr_malloc(row_cap * sizeof(_skr_row_t));
+	int32_t     row_count = 0;
+
+	// Enabled names first; registry entries not among them are present or missing
+	for (uint32_t i = 0; i < _skr_vk.enabled_instance_ext_count; i++)
+		rows[row_count++] = (_skr_row_t){ _skr_vk.enabled_instance_exts[i], NULL, _skr_use_activated };
+	for (int32_t r = 0; r < _skr_reg.req_count; r++)
+		for (int32_t i = 0; i < _skr_reg.reqs[r].inst_ext_count; i++)
+			_skr_row_add_ext(rows, 0, &row_count, _skr_reg.exts[_skr_reg.reqs[r].inst_ext_start + i], avail_inst, avail_inst_count);
+	int32_t inst_end = row_count;
+
+	for (uint32_t i = 0; i < _skr_vk.enabled_device_ext_count; i++)
+		rows[row_count++] = (_skr_row_t){ _skr_vk.enabled_device_exts[i], NULL, _skr_use_activated };
+	for (int32_t r = 0; r < _skr_reg.req_count; r++)
+		for (int32_t i = 0; i < _skr_reg.reqs[r].dev_ext_count; i++)
+			_skr_row_add_ext(rows, inst_end, &row_count, _skr_reg.exts[_skr_reg.reqs[r].dev_ext_start + i], avail_dev, avail_dev_count);
+	int32_t dev_end = row_count;
+
+	char multiview_detail[32], apron_detail[32];
+	snprintf(multiview_detail, sizeof(multiview_detail), "max %u views", _skr_vk.max_multiview_view_count);
+	snprintf(apron_detail,     sizeof(apron_detail),     "max apron %u", _skr_vk.max_tile_apron);
+
+	for (int32_t r = 0; r < _skr_reg.req_count; r++) {
+		const _skr_req_t* req = &_skr_reg.reqs[r];
+		if (_skr_req_is_bare_ext(req)) continue;
+		const char* name   = req->name ? req->name : "(anonymous)";
+		const char* detail = NULL;
+		if      (!req->enabled)                          detail = req->missing ? req->missing : "?";
+		else if (strcmp(name, "multiview")         == 0) detail = multiview_detail;
+		else if (strcmp(name, "qcom_tile_shading") == 0) detail = apron_detail;
+		rows[row_count++] = (_skr_row_t){ name, detail, req->enabled ? _skr_use_activated : _skr_use_blocked };
+	}
+	rows[row_count++] = _skr_vk.has_video_decode
+		? (_skr_row_t){ "video_decode", NULL,                                           _skr_use_activated }
+		: (_skr_row_t){ "video_decode", _skr_video_missing(avail_dev, avail_dev_count), _skr_use_blocked   };
+
+	// Detail column sits past the longest name that has one
+	int32_t name_width = 0;
+	for (int32_t i = 0; i < row_count; i++) {
+		int32_t len = (int32_t)strlen(rows[i].name);
+		if (rows[i].detail != NULL && len > name_width) name_width = len;
+	}
+	int32_t content_width = 0;
+	for (int32_t i = 0; i < row_count; i++) {
+		int32_t len = rows[i].detail != NULL
+			? name_width + 2 + (int32_t)strlen(rows[i].detail)
+			: (int32_t)strlen(rows[i].name);
+		if (len > content_width) content_width = len;
+	}
+	if (content_width < 19) content_width = 19; // "Instance extensions"
+
+	// "| ACTIVATED | " is 14 wide, with the usage cell spanning columns 1-11
+	char rule[256], line[256];
+	int32_t width = 14 + content_width;
+	if (width > (int32_t)sizeof(rule) - 1) width = (int32_t)sizeof(rule) - 1;
+	memset(rule, '_', width);
+	rule[width] = '\0';
+	skr_log(skr_log_info, "%s", rule);
+	memset(rule, '-', width);
+	rule[0] = '|'; rule[12] = '|'; rule[width] = '\0';
+
+	const int32_t section_end [] = { inst_end, dev_end, row_count };
+	const char*   section_name[] = { "Instance extensions", "Device extensions", "Features" };
+	int32_t       section_start  = 0;
+	bool          any_printed    = false;
+	for (int32_t s = 0; s < 3; s++) {
+		if (section_end[s] > section_start) {
+			if (any_printed) skr_log(skr_log_info, "%s", rule);
+			skr_log(skr_log_info, "|           | %s", section_name[s]);
+			skr_log(skr_log_info, "%s", rule);
+			any_printed = true;
+			// Registration order within a usage, so bundled extensions stay adjacent
+			for (_skr_use_ use = _skr_use_activated; use <= _skr_use_blocked; use++) {
+				for (int32_t i = section_start; i < section_end[s]; i++) {
+					if (rows[i].use != use) continue;
+					if (rows[i].detail != NULL) snprintf(line, sizeof(line), "%-*s  %s", name_width, rows[i].name, rows[i].detail);
+					else                        snprintf(line, sizeof(line), "%s", rows[i].name);
+					skr_log(skr_log_info, "| %s | %s", _skr_use_str[use], line);
+				}
+			}
+		}
+		section_start = section_end[s];
+	}
+	memset(rule, '_', width);
+	rule[0] = '|'; rule[12] = '|'; rule[width] = '\0';
+	skr_log(skr_log_info, "%s", rule);
+
+	_skr_free(rows);
+	_skr_free(avail_dev);
+	_skr_free(avail_inst);
+}
+
 bool skr_init(skr_settings_t settings) {
 	if (_skr_vk.initialized) {
 		skr_log(skr_log_warning, "sk_renderer already initialized");
@@ -609,17 +776,10 @@ bool skr_init(skr_settings_t settings) {
 	// Device extensions all come from requests, both sk_renderer's own and any
 	// the application registered before skr_init.
 
-	// Video decode extensions (all required together for video support).
-	// VK_KHR_synchronization2 is also required, but lives in the optional list
-	// above since tile shading needs it too — the video check below requires it
-	// separately.
-	const char* video_device_exts[] = {
-		VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
-		VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
-		VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
-		VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME,
-	};
-	const uint32_t video_device_ext_count = sizeof(video_device_exts) / sizeof(video_device_exts[0]);
+	// Video also needs VK_KHR_synchronization2, checked separately below since
+	// it arrives as a request rather than a video extension
+	const char**   video_device_exts     = _skr_video_device_exts;
+	const uint32_t video_device_ext_count = _SKR_VIDEO_DEVICE_EXT_COUNT;
 
 	///////////////////////////////////////////////////////////////////////////
 	// Instance creation
@@ -650,7 +810,7 @@ bool skr_init(skr_settings_t settings) {
 	// Add application-required extensions first
 	for (uint32_t i = 0; i < settings.required_extension_count; i++) {
 		if (_skr_ext_available(settings.required_extensions[i], available_inst_exts, available_inst_ext_count)) {
-			instance_exts[instance_ext_count++] = settings.required_extensions[i];
+			_skr_ext_list_add(instance_exts, &instance_ext_count, settings.required_extensions[i]);
 		} else {
 			skr_log(skr_log_critical, "Required instance extension '%s' not available", settings.required_extensions[i]);
 			_skr_free(instance_exts);
@@ -667,7 +827,7 @@ bool skr_init(skr_settings_t settings) {
 			continue;
 		}
 		if (_skr_ext_available(optional_instance_exts[i], available_inst_exts, available_inst_ext_count)) {
-			instance_exts[instance_ext_count++] = optional_instance_exts[i];
+			_skr_ext_list_add(instance_exts, &instance_ext_count, optional_instance_exts[i]);
 			if (strcmp(optional_instance_exts[i], VK_KHR_SURFACE_EXTENSION_NAME) == 0) has_surface = true;
 		}
 	}
@@ -695,13 +855,8 @@ bool skr_init(skr_settings_t settings) {
 			}
 			continue;
 		}
-		for (int32_t i = 0; i < req->inst_ext_count; i++) {
-			const char* name    = _skr_reg.exts[req->inst_ext_start + i];
-			bool        present = false;
-			for (uint32_t e = 0; e < instance_ext_count; e++)
-				if (strcmp(instance_exts[e], name) == 0) { present = true; break; }
-			if (!present) instance_exts[instance_ext_count++] = name;
-		}
+		for (int32_t i = 0; i < req->inst_ext_count; i++)
+			_skr_ext_list_add(instance_exts, &instance_ext_count, _skr_reg.exts[req->inst_ext_start + i]);
 	}
 
 	// Keep a copy of the final list for skr_vk_ext_enabled
@@ -899,8 +1054,10 @@ bool skr_init(skr_settings_t settings) {
 	VkPhysicalDeviceProperties device_props;
 	vkGetPhysicalDeviceProperties(_skr_vk.physical_device, &device_props);
 
-	// Print selected device if we didn't find discrete GPU
-	skr_log(skr_log_info, "Using GPU: %s", device_props.deviceName);
+	skr_log(skr_log_info, "Using GPU: %s (Vulkan %u.%u.%u)", device_props.deviceName,
+		VK_API_VERSION_MAJOR(device_props.apiVersion),
+		VK_API_VERSION_MINOR(device_props.apiVersion),
+		VK_API_VERSION_PATCH(device_props.apiVersion));
 
 	// Store device limits
 	_skr_vk.timestamp_period      = device_props.limits.timestampPeriod;
@@ -1133,13 +1290,8 @@ bool skr_init(skr_settings_t settings) {
 	for (int32_t r = 0; r < _skr_reg.req_count; r++) {
 		_skr_req_t* req = &_skr_reg.reqs[r];
 		if (!req->enabled) continue;
-		for (int32_t i = 0; i < req->dev_ext_count; i++) {
-			const char* name    = _skr_reg.exts[req->dev_ext_start + i];
-			bool        present = false;
-			for (uint32_t e = 0; e < device_ext_count; e++)
-				if (strcmp(device_exts[e], name) == 0) { present = true; break; }
-			if (!present) device_exts[device_ext_count++] = name;
-		}
+		for (int32_t i = 0; i < req->dev_ext_count; i++)
+			_skr_ext_list_add(device_exts, &device_ext_count, _skr_reg.exts[req->dev_ext_start + i]);
 	}
 
 	// Video decode is all-or-nothing and also gated on a decode queue family,
@@ -1153,14 +1305,10 @@ bool skr_init(skr_settings_t settings) {
 				video_found++;
 		}
 		if (video_found == video_device_ext_count) {
-			for (uint32_t v = 0; v < video_device_ext_count; v++) {
-				bool present = false; // An app request may already list one (e.g. timeline semaphore)
-				for (uint32_t e = 0; e < device_ext_count; e++)
-					if (strcmp(device_exts[e], video_device_exts[v]) == 0) { present = true; break; }
-				if (!present) device_exts[device_ext_count++] = video_device_exts[v];
-			}
+			// An app request may already list one (e.g. timeline semaphore)
+			for (uint32_t v = 0; v < video_device_ext_count; v++)
+				_skr_ext_list_add(device_exts, &device_ext_count, video_device_exts[v]);
 			_skr_vk.has_video_decode = true;
-			skr_log(skr_log_info, "Vulkan video decode extensions enabled");
 		}
 	}
 
@@ -1554,17 +1702,7 @@ bool skr_init(skr_settings_t settings) {
 	if (skr_shader_create(sks_skr_mipgen_2d_hlsl,   sizeof(sks_skr_mipgen_2d_hlsl),   &_skr_vk.builtin_mipgen_2d  ) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_2d,   "skr_builtin_mipgen_2d");
 	if (skr_shader_create(sks_skr_mipgen_cube_hlsl, sizeof(sks_skr_mipgen_cube_hlsl), &_skr_vk.builtin_mipgen_cube) == skr_err_success) skr_shader_set_name(&_skr_vk.builtin_mipgen_cube, "skr_builtin_mipgen_cube");
 
-	// Log request outcomes, including which piece a disabled request missed,
-	// so a device log answers "why" by itself
-	for (int32_t r = 0; r < _skr_reg.req_count; r++) {
-		const _skr_req_t* req  = &_skr_reg.reqs[r];
-		const char*       name = req->name ? req->name : "(anonymous)";
-		if (req->enabled) skr_log(skr_log_info, "[%s] true", name);
-		else              skr_log(skr_log_info, "[%s] false (missing %s)", name, req->missing ? req->missing : "?");
-	}
-	if (_skr_vk.has_qcom_tile_shading)
-		skr_log(skr_log_info, "[%s] max apron %u",  VK_QCOM_TILE_SHADING_EXTENSION_NAME, _skr_vk.max_tile_apron);
-	skr_log(skr_log_info, "[%s] max %u views", VK_KHR_MULTIVIEW_EXTENSION_NAME,     _skr_vk.max_multiview_view_count);
+	_skr_log_summary();
 
 	_skr_vk.initialized = true;
 	return true;
