@@ -28,6 +28,7 @@ typedef struct {
 	skr_material_t material;
 	float          time;
 	float          delta_time;
+	bool           snap_to_pixel; // exactly one pixel, at the cost of quantized motion
 
 	// Arc-ball camera state
 	float  cam_yaw;
@@ -60,6 +61,20 @@ static float _star_randf(void) {
 
 static void _star_rand_seed(uint32_t seed) {
 	_star_rand_state = seed;
+}
+
+// STAR_SNAP is a spec constant, so flipping it rebuilds the pipeline. Every
+// other pipeline field has to be repeated here or set_pipeline drops it.
+static void _stars_set_pipeline(scene_stars_t* scene) {
+	skr_spec_constant_t spec = { .name = "STAR_SNAP", .value = scene->snap_to_pixel ? 1.0 : 0.0 };
+	skr_material_set_pipeline(&scene->material, (skr_material_info_t){
+		.shader              = &scene->shader,
+		.cull                = skr_cull_none,
+		.depth_test          = skr_compare_less,
+		.write_mask          = skr_write_default,
+		.spec_constants      = &spec,
+		.spec_constant_count = 1,
+	});
 }
 
 static scene_t* _scene_stars_create(void) {
@@ -109,12 +124,8 @@ static scene_t* _scene_stars_create(void) {
 	scene->shader = su_shader_load("shaders/stars.hlsl.sks", "stars_shader");
 
 	// Create opaque material - stars are too small to overlap
-	skr_material_create((skr_material_info_t){
-		.shader       = &scene->shader,
-		.cull         = skr_cull_none,
-		.depth_test   = skr_compare_less,
-		.write_mask   = skr_write_default,
-	}, &scene->material);
+	skr_material_create((skr_material_info_t){ .shader = &scene->shader }, &scene->material);
+	_stars_set_pipeline(scene);
 	skr_material_set_buffer(&scene->material, "stars", &scene->star_buffer);
 
 	return (scene_t*)scene;
@@ -221,6 +232,11 @@ static void _scene_stars_render_ui(scene_t* base) {
 
 	igText("Stars: %d", STAR_COUNT);
 	igText("Distance: %.1f", scene->cam_distance);
+
+	if (igCheckbox("Snap to pixel grid", &scene->snap_to_pixel))
+		_stars_set_pipeline(scene);
+	if (igIsItemHovered(0))
+		igSetTooltip("Pins each star to a pixel center so it lights that pixel's MSAA samples and no others. Exact, but quantizes motion.");
 
 	if (igButton("Reset Camera", (ImVec2){0, 0})) {
 		scene->cam_yaw          = 0.0f;
