@@ -556,7 +556,7 @@ static const char* _skr_video_device_exts[] = {
 ///////////////////////////////////////////////////////////////////////////////
 
 // Geometry of StereoKit's OpenXR extension table, which this mirrors: rows are
-// "| ACTIVATED | " then content, 35 columns unless a row needs more
+// "| ACTIVATED | " then content, and the rules are 35 columns regardless of it
 #define _SKR_TABLE_PREFIX 14
 #define _SKR_TABLE_WIDTH  35
 
@@ -660,27 +660,13 @@ static void _skr_log_summary(void) {
 		int32_t len = (int32_t)strlen(rows[i].name);
 		if (rows[i].detail != NULL && len > name_width) name_width = len;
 	}
-	int32_t content_width = _SKR_TABLE_WIDTH - _SKR_TABLE_PREFIX;
-	for (int32_t s = 0; s < section_count; s++) {
-		int32_t len = (int32_t)strlen(section_name[s]);
-		if (len > content_width) content_width = len;
-	}
-	for (int32_t i = 0; i < row_count; i++) {
-		int32_t len = rows[i].detail != NULL
-			? name_width + 2 + (int32_t)strlen(rows[i].detail)
-			: (int32_t)strlen(rows[i].name);
-		if (len > content_width) content_width = len;
-	}
-
-	char rule[256], line[256];
-	int32_t width = _SKR_TABLE_PREFIX + content_width;
-	if (width > (int32_t)sizeof(rule) - 1) width = (int32_t)sizeof(rule) - 1;
-	memset(rule, '_', width);
-	rule[width] = '\0';
+	char rule[_SKR_TABLE_WIDTH + 1], line[256];
+	memset(rule, '_', _SKR_TABLE_WIDTH);
+	rule[_SKR_TABLE_WIDTH] = '\0';
 	skr_log(skr_log_info, "Vulkan extensions & features:");
 	skr_log(skr_log_info, "%s", rule);
-	memset(rule, '-', width);
-	rule[0] = '|'; rule[_SKR_TABLE_PREFIX - 2] = '|'; rule[width] = '\0';
+	memset(rule, '-', _SKR_TABLE_WIDTH);
+	rule[0] = '|'; rule[_SKR_TABLE_PREFIX - 2] = '|'; rule[_SKR_TABLE_WIDTH] = '\0';
 
 	int32_t section_start = 0;
 	bool    any_printed   = false;
@@ -703,8 +689,8 @@ static void _skr_log_summary(void) {
 		}
 		section_start = section_end[s];
 	}
-	memset(rule, '_', width);
-	rule[0] = '|'; rule[12] = '|'; rule[width] = '\0';
+	memset(rule, '_', _SKR_TABLE_WIDTH);
+	rule[0] = '|'; rule[_SKR_TABLE_PREFIX - 2] = '|'; rule[_SKR_TABLE_WIDTH] = '\0';
 	skr_log(skr_log_info, "%s", rule);
 
 	_skr_free(rows);
