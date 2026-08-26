@@ -555,6 +555,11 @@ static const char* _skr_video_device_exts[] = {
 // Init summary table
 ///////////////////////////////////////////////////////////////////////////////
 
+// Geometry of StereoKit's OpenXR extension table, which this mirrors: rows are
+// "| ACTIVATED | " then content, 35 columns unless a row needs more
+#define _SKR_TABLE_PREFIX 14
+#define _SKR_TABLE_WIDTH  35
+
 typedef enum {
 	_skr_use_activated, // Enabled on the instance or device
 	_skr_use_present,   // Device offers it, but the request that wanted it failed elsewhere
@@ -645,39 +650,45 @@ static void _skr_log_summary(void) {
 		? (_skr_row_t){ "video_decode", NULL,                                           _skr_use_activated }
 		: (_skr_row_t){ "video_decode", _skr_video_missing(avail_dev, avail_dev_count), _skr_use_blocked   };
 
+	const int32_t section_end [] = { inst_end, dev_end, row_count };
+	const char*   section_name[] = { "Instance extensions", "Device extensions", "Features" };
+	const int32_t section_count  = (int32_t)(sizeof(section_end) / sizeof(section_end[0]));
+
 	// Detail column sits past the longest name that has one
 	int32_t name_width = 0;
 	for (int32_t i = 0; i < row_count; i++) {
 		int32_t len = (int32_t)strlen(rows[i].name);
 		if (rows[i].detail != NULL && len > name_width) name_width = len;
 	}
-	int32_t content_width = 0;
+	int32_t content_width = _SKR_TABLE_WIDTH - _SKR_TABLE_PREFIX;
+	for (int32_t s = 0; s < section_count; s++) {
+		int32_t len = (int32_t)strlen(section_name[s]);
+		if (len > content_width) content_width = len;
+	}
 	for (int32_t i = 0; i < row_count; i++) {
 		int32_t len = rows[i].detail != NULL
 			? name_width + 2 + (int32_t)strlen(rows[i].detail)
 			: (int32_t)strlen(rows[i].name);
 		if (len > content_width) content_width = len;
 	}
-	if (content_width < 19) content_width = 19; // "Instance extensions"
 
-	// "| ACTIVATED | " is 14 wide, with the usage cell spanning columns 1-11
 	char rule[256], line[256];
-	int32_t width = 14 + content_width;
+	int32_t width = _SKR_TABLE_PREFIX + content_width;
 	if (width > (int32_t)sizeof(rule) - 1) width = (int32_t)sizeof(rule) - 1;
 	memset(rule, '_', width);
 	rule[width] = '\0';
+	skr_log(skr_log_info, "Vulkan extensions & features:");
 	skr_log(skr_log_info, "%s", rule);
 	memset(rule, '-', width);
-	rule[0] = '|'; rule[12] = '|'; rule[width] = '\0';
+	rule[0] = '|'; rule[_SKR_TABLE_PREFIX - 2] = '|'; rule[width] = '\0';
 
-	const int32_t section_end [] = { inst_end, dev_end, row_count };
-	const char*   section_name[] = { "Instance extensions", "Device extensions", "Features" };
-	int32_t       section_start  = 0;
-	bool          any_printed    = false;
-	for (int32_t s = 0; s < 3; s++) {
+	int32_t section_start = 0;
+	bool    any_printed   = false;
+	for (int32_t s = 0; s < section_count; s++) {
 		if (section_end[s] > section_start) {
 			if (any_printed) skr_log(skr_log_info, "%s", rule);
-			skr_log(skr_log_info, "|           | %s", section_name[s]);
+			// The usage column is labeled once, on the first section
+			skr_log(skr_log_info, "|%s| %s", any_printed ? "           " : "     Usage ", section_name[s]);
 			skr_log(skr_log_info, "%s", rule);
 			any_printed = true;
 			// Registration order within a usage, so bundled extensions stay adjacent
