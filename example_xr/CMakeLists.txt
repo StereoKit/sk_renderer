@@ -146,6 +146,13 @@ target_link_libraries(sk_renderer_xr_test PRIVATE
 	${SKR_XR_IMPL}
 )
 
+set_target_properties(sk_renderer_xr_test PROPERTIES
+	C_STANDARD 11
+	C_STANDARD_REQUIRED ON
+	CXX_STANDARD 17
+	CXX_STANDARD_REQUIRED ON
+)
+
 skr_target_warnings(sk_renderer_xr_test)
 
 target_include_directories(sk_renderer_xr_test PRIVATE
