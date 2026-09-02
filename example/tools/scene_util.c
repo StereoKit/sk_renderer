@@ -3,6 +3,10 @@
 // Copyright (c) 2025 Nick Klingensmith
 // Copyright (c) 2025 Qualcomm Technologies, Inc.
 
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include "scene_util.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -528,7 +532,7 @@ void* su_image_load(const char* filename, int32_t* opt_out_width, int32_t* opt_o
 }
 
 void* su_image_load_from_memory(const void* data, size_t size, int32_t* opt_out_width, int32_t* opt_out_height, skr_tex_fmt_* opt_out_format, int32_t force_channels) {
-	int   width, height, channels;
+	int   width = 0, height = 0, channels = 0;
 	void* pixels = NULL;
 
 	hdr_header_t hdr_header = hdr_parse_header(data, (int32_t)size);

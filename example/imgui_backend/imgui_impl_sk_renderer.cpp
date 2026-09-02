@@ -60,7 +60,7 @@ extern "C" bool ImGui_ImplSkRenderer_CreateFontsTexture() {
 	skr_tex_t      replacement = {};
 	skr_tex_data_t font_data   = {.data = pixels, .mip_count = 1, .layer_count = 1};
 	if (skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, font_sampler,
-					   (skr_vec3i_t){width, height, 1}, 1, 1, &font_data, &replacement) != skr_err_success) {
+					   {width, height, 1}, 1, 1, &font_data, &replacement) != skr_err_success) {
 		return false;
 	}
 	skr_tex_set_name(&replacement, "ImGui Font Atlas");
@@ -118,7 +118,7 @@ extern "C" bool ImGui_ImplSkRenderer_Init() {
 	}
 
 	// Create material with alpha blending
-	skr_material_create((skr_material_info_t){
+	skr_material_create({
 		.shader       = &bd->shader,
 		.cull         = skr_cull_none,
 		.write_mask   = skr_write_default,
@@ -292,7 +292,7 @@ extern "C" void ImGui_ImplSkRenderer_RenderDrawData(int width, int height) {
 	// We're now INSIDE a render pass, just drawing.
 
 	// Set viewport
-	skr_renderer_set_viewport((skr_rect_t){0, 0, (float)width, (float)height});
+	skr_renderer_set_viewport({0, 0, (float)width, (float)height});
 
 	// Will project scissor/clipping rectangles into framebuffer space
 	ImVec2 clip_off = draw_data->DisplayPos;          // (0,0) unless using multi-viewports

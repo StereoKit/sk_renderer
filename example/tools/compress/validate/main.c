@@ -11,6 +11,10 @@
 // original with astcenc at the specified quality (e.g. "medium") to provide
 // a "what a slow encoder gets" quality target.
 
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -23,6 +27,7 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+	#include <direct.h>
 	#define PATH_SEP '\\'
 	#define MKTMPDIR(s) _mkdir(s)
 #else
