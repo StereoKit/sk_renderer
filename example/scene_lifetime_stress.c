@@ -9,7 +9,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
+#include <threads.h>
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include <cimgui.h>
@@ -58,9 +58,9 @@ typedef struct {
 	uint32_t             ephemeral_next;
 
 	// Test 3: Thread-created resources
-	pthread_t          thread;
+	thrd_t             thread;
 	thread_resource_t  thread_resources[MAX_THREAD_MATERIALS];
-	pthread_mutex_t    thread_mutex;
+	mtx_t              thread_mutex;
 	volatile bool      thread_running;
 	volatile bool      thread_should_stop;
 	uint32_t           thread_create_count;
@@ -106,14 +106,14 @@ typedef struct {
 } scene_lifetime_stress_t;
 
 // Thread function that creates resources
-static void* _thread_create_resources(void* arg) {
+static int _thread_create_resources(void* arg) {
 	scene_lifetime_stress_t* scene = (scene_lifetime_stress_t*)arg;
 
 	// Register this thread with sk_renderer command system
 	skr_thread_init();
 
 	while (!scene->thread_should_stop) {
-		pthread_mutex_lock(&scene->thread_mutex);
+		mtx_lock(&scene->thread_mutex);
 
 		// Find an unused slot
 		int32_t slot = -1;
@@ -124,7 +124,7 @@ static void* _thread_create_resources(void* arg) {
 			}
 		}
 
-		pthread_mutex_unlock(&scene->thread_mutex);
+		mtx_unlock(&scene->thread_mutex);
 
 		if (slot >= 0) {
 			// Create resources outside the lock
@@ -147,21 +147,21 @@ static void* _thread_create_resources(void* arg) {
 			skr_material_set_tex(&res->material, "tex", &res->texture);
 
 			// Mark as ready
-			pthread_mutex_lock(&scene->thread_mutex);
+			mtx_lock(&scene->thread_mutex);
 			res->ready = true;
 			scene->thread_create_count++;
-			pthread_mutex_unlock(&scene->thread_mutex);
+			mtx_unlock(&scene->thread_mutex);
 		}
 
 		// Sleep a bit to avoid spinning
 		struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 }; // 10ms
-		nanosleep(&ts, NULL);
+		thrd_sleep(&ts, NULL);
 	}
 
 	// Unregister this thread from sk_renderer command system
 	skr_thread_shutdown();
 
-	return NULL;
+	return 0;
 }
 
 static scene_t* _scene_lifetime_stress_create(void) {
@@ -215,10 +215,10 @@ static scene_t* _scene_lifetime_stress_create(void) {
 	}
 
 	// Initialize thread resources
-	pthread_mutex_init(&scene->thread_mutex, NULL);
+	mtx_init(&scene->thread_mutex, mtx_plain);
 	scene->thread_running = true;
 	scene->thread_should_stop = false;
-	pthread_create(&scene->thread, NULL, _thread_create_resources, scene);
+	thrd_create(&scene->thread, _thread_create_resources, scene);
 
 	// Test 8: Sort stress - create diverse materials and meshes
 	scene->sort_stress_draw_count = 2000;
@@ -254,8 +254,8 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 
 	// Stop thread
 	scene->thread_should_stop = true;
-	pthread_join(scene->thread, NULL);
-	pthread_mutex_destroy(&scene->thread_mutex);
+	thrd_join(scene->thread, NULL);
+	mtx_destroy(&scene->thread_mutex);
 
 	// Destroy thread resources
 	for (int32_t i = 0; i < MAX_THREAD_MATERIALS; i++) {
@@ -332,7 +332,7 @@ static void _scene_lifetime_stress_update(scene_t* base, float dt) {
 	}
 
 	// Test 3: Check for used thread resources and destroy them
-	pthread_mutex_lock(&scene->thread_mutex);
+	mtx_lock(&scene->thread_mutex);
 	for (int32_t i = 0; i < MAX_THREAD_MATERIALS; i++) {
 		thread_resource_t* res = &scene->thread_resources[i];
 		if (res->used && !res->ready) {
@@ -343,7 +343,7 @@ static void _scene_lifetime_stress_update(scene_t* base, float dt) {
 			scene->total_destroys++;
 		}
 	}
-	pthread_mutex_unlock(&scene->thread_mutex);
+	mtx_unlock(&scene->thread_mutex);
 
 	// Test 9: Buffer readback churn
 	{
@@ -504,7 +504,7 @@ static void _scene_lifetime_stress_render(scene_t* base, int32_t width, int32_t 
 	}
 
 	// === TEST 3: Use thread-created resources ===
-	pthread_mutex_lock(&scene->thread_mutex);
+	mtx_lock(&scene->thread_mutex);
 	for (int32_t i = 0; i < MAX_THREAD_MATERIALS && draw_idx < STRESS_CUBE_COUNT; i++) {
 		thread_resource_t* res = &scene->thread_resources[i];
 		if (res->ready) {
@@ -526,7 +526,7 @@ static void _scene_lifetime_stress_render(scene_t* base, int32_t width, int32_t 
 			}
 		}
 	}
-	pthread_mutex_unlock(&scene->thread_mutex);
+	mtx_unlock(&scene->thread_mutex);
 
 	// === TEST 4: Rapid create/destroy cycles ===
 	for (uint32_t cycle = 0; cycle < scene->rapid_cycles_per_frame; cycle++) {
@@ -671,14 +671,14 @@ static void _scene_lifetime_stress_render_ui(scene_t* base) {
 	}
 	igText("  Active ephemeral: %d", active_ephemeral);
 
-	pthread_mutex_lock(&scene->thread_mutex);
+	mtx_lock(&scene->thread_mutex);
 	igText("Test 3 - Thread-created: %u", scene->thread_create_count);
 	int32_t ready_count = 0;
 	for (int32_t i = 0; i < MAX_THREAD_MATERIALS; i++) {
 		if (scene->thread_resources[i].ready) ready_count++;
 	}
 	igText("  Ready to use: %d", ready_count);
-	pthread_mutex_unlock(&scene->thread_mutex);
+	mtx_unlock(&scene->thread_mutex);
 
 	igText("Test 4 - Rapid cycles: %u", scene->rapid_cycle_count);
 
