@@ -240,10 +240,10 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			set_targets = true;
 			const char *targets = argv[i + 1];
 			size_t      len     = strlen(targets);
-			for (size_t i = 0; i < len; i++) {
-				if      (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
-				else if (targets[i] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
-				else { printf("Unrecognized shader language target '%c'\n", targets[i]); *exit = true; }
+			for (size_t t = 0; t < len; t++) {
+				if      (targets[t] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				else if (targets[t] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
+				else { printf("Unrecognized shader language target '%c'\n", targets[t]); *exit = true; }
 			}
 			i++;
 		}
