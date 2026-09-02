@@ -122,7 +122,7 @@ add_skapp(sk_renderer_test
 set_target_properties(sk_renderer_test PROPERTIES
 	C_STANDARD 11
 	C_STANDARD_REQUIRED ON
-	CXX_STANDARD 17
+	CXX_STANDARD 20
 	CXX_STANDARD_REQUIRED ON
 )
 
