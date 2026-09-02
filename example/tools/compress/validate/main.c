@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+	#include <direct.h>
 	#define PATH_SEP '\\'
 	#define MKTMPDIR(s) _mkdir(s)
 #else
