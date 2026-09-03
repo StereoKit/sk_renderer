@@ -238,6 +238,7 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 }
 
 void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_buffer_t* buffer) {
+	if (!ref_compute || !ref_compute->shader) return;
 	const sksc_shader_meta_t *meta = &ref_compute->shader->meta;
 
 	int32_t  idx  = -1;
@@ -271,6 +272,7 @@ void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_bu
 }
 
 void skr_compute_set_tex(skr_compute_t* ref_compute, const char* name, skr_tex_t* texture) {
+	if (!ref_compute || !ref_compute->shader) return;
 	const sksc_shader_meta_t *meta = &ref_compute->shader->meta;
 
 	int32_t  idx  = -1;
