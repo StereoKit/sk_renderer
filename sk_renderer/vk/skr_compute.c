@@ -238,7 +238,7 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 }
 
 void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_buffer_t* buffer) {
-	if (!ref_compute || !ref_compute->shader) return;
+	if (!ref_compute || !ref_compute->shader || !name) return;
 	const sksc_shader_meta_t *meta = &ref_compute->shader->meta;
 
 	int32_t  idx  = -1;
@@ -272,7 +272,7 @@ void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_bu
 }
 
 void skr_compute_set_tex(skr_compute_t* ref_compute, const char* name, skr_tex_t* texture) {
-	if (!ref_compute || !ref_compute->shader) return;
+	if (!ref_compute || !ref_compute->shader || !name) return;
 	const sksc_shader_meta_t *meta = &ref_compute->shader->meta;
 
 	int32_t  idx  = -1;
@@ -312,6 +312,10 @@ void skr_compute_set_params(skr_compute_t* ref_compute, const void* data, uint32
 		skr_log(skr_log_warning, "compute_set_params: compute has no $Global buffer");
 		return;
 	}
+	if (!data) {
+		skr_log(skr_log_warning, "compute_set_params: data is NULL");
+		return;
+	}
 	if (size != ref_compute->param_buffer_size) {
 		skr_log(skr_log_warning, "compute_set_params: incorrect size! Expected %u, got %u", ref_compute->param_buffer_size, size);
 		return;
@@ -321,7 +325,7 @@ void skr_compute_set_params(skr_compute_t* ref_compute, const void* data, uint32
 }
 
 void skr_compute_set_param(skr_compute_t* ref_compute, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
-	if (!ref_compute || !ref_compute->shader || !ref_compute->param_buffer) return;
+	if (!ref_compute || !ref_compute->shader || !ref_compute->param_buffer || !name || !data) return;
 
 	int32_t var_index = sksc_shader_meta_get_var_index(&ref_compute->shader->meta, name);
 	if (var_index < 0) {
@@ -354,7 +358,7 @@ void skr_compute_set_param(skr_compute_t* ref_compute, const char* name, sksc_sh
 }
 
 void skr_compute_get_param(const skr_compute_t* compute, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
-	if (!compute || !compute->shader || !compute->param_buffer) return;
+	if (!compute || !compute->shader || !compute->param_buffer || !name || !out_data) return;
 
 	int32_t var_index = sksc_shader_meta_get_var_index(&compute->shader->meta, name);
 	if (var_index < 0) {
@@ -465,7 +469,7 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 }
 
 void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indirect_args) {
-	if (!skr_compute_is_valid(ref_compute) || !indirect_args) return;
+	if (!skr_compute_is_valid(ref_compute) || !indirect_args || !indirect_args->buffer) return;
 
 	const sksc_shader_meta_t* meta = &ref_compute->shader->meta;
 
