@@ -305,6 +305,32 @@ skshaderc_compile_headers(sk_renderer ${CMAKE_BINARY_DIR}/sk_renderer_generated/
 )
 
 ###############################################################################
+# Dear ImGui backend
+###############################################################################
+
+# Interface-only: the backend compiles against whichever Dear ImGui the consumer
+# supplies, so its source is carried as an INTERFACE source and built into the
+# consuming target. Link it to get the backend and its shader:
+#   target_link_libraries(my_app PRIVATE sk_renderer_imgui)
+#
+# The shader header is generated rather than checked in, for the same reason the
+# built-in ones are. It hangs off sk_renderer so that linking orders it ahead of
+# the consumer's objects.
+skshaderc_compile_headers(sk_renderer ${CMAKE_BINARY_DIR}/sk_renderer_generated/imgui_shader "${_skr_builtin_shader_args}"
+	example/imgui_backend/imgui.hlsl
+)
+
+add_library(sk_renderer_imgui INTERFACE)
+target_sources(sk_renderer_imgui INTERFACE
+	${CMAKE_CURRENT_SOURCE_DIR}/example/imgui_backend/imgui_impl_sk_renderer.cpp
+)
+target_include_directories(sk_renderer_imgui INTERFACE
+	${CMAKE_CURRENT_SOURCE_DIR}/example/imgui_backend
+	${CMAKE_BINARY_DIR}/sk_renderer_generated/imgui_shader
+)
+target_link_libraries(sk_renderer_imgui INTERFACE sk_renderer)
+
+###############################################################################
 # Example application
 ###############################################################################
 

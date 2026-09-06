@@ -1361,7 +1361,7 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_gi_t* scene = (scene_gi_t*)base;
 	float delta_time  = scene->delta_time;
 
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 
 #ifdef __ANDROID__
 	// Arc rotation camera (touch)
@@ -1573,13 +1573,11 @@ static void _scene_gi_render_ui(scene_t* base) {
 				if (igButton("Pause", (ImVec2){0, 0})) scene->gi_stepping = true;
 			}
 
-			ImVec2 avail;
-			igGetContentRegionAvail(&avail);
+			ImVec2 avail    = igGetContentRegionAvail();
 			float  img_size = avail.x > 0 ? avail.x : 128;
-			igImage((ImTextureID)(uintptr_t)&scene->gi_capture_color,
+			igImage((ImTextureRef){._TexID = (ImTextureID)(uintptr_t)&scene->gi_capture_color},
 				(ImVec2){img_size, img_size},
-				(ImVec2){0, 0}, (ImVec2){1, 1},
-				(ImVec4){1, 1, 1, 1}, (ImVec4){0.5f, 0.5f, 0.5f, 0.5f});
+				(ImVec2){0, 0}, (ImVec2){1, 1});
 		}
 	}
 

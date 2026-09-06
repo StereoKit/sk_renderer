@@ -993,9 +993,8 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	const float gpu_graph_max   = 3.0f;
 
 	// Get available width for full-width plots
-	ImVec2 content_region;
-	igGetContentRegionAvail(&content_region);
-	float plot_width = content_region.x;
+	ImVec2 content_region = igGetContentRegionAvail();
+	float  plot_width     = content_region.x;
 
 	char frame_overlay[32], cpu_overlay[32], gpu_overlay[32];
 	snprintf(frame_overlay, sizeof(frame_overlay), "Frame: %.1f ms", app->frame_ema);

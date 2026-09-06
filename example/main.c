@@ -459,7 +459,7 @@ int main(int argc, char* argv[]) {
 
 	// Initialize ImGui
 	igCreateContext(NULL);
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 	io->ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;  // Enable Keyboard Controls
 
 	// Build font atlas at larger size for crisp rendering

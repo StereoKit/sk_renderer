@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.19)
 # are backend-agnostic sk_renderer code and compile unchanged for both.
 
 # Ensure our cmake/ folder is in path to override FindMetalTools (skip Metal on macOS)
-list(PREPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+list(PREPEND CMAKE_MODULE_PATH "${sk_renderer_SOURCE_DIR}/cmake")
 
 include(FetchContent)
 
@@ -99,7 +99,7 @@ add_skapp(sk_renderer_xr_test
 	MIN_SDK 29
 	MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/AndroidManifest.xml)
 
-set(EXAMPLE_DIR ${CMAKE_SOURCE_DIR}/example)
+set(EXAMPLE_DIR ${sk_renderer_SOURCE_DIR}/example)
 
 target_sources(sk_renderer_xr_test PRIVATE
 	main.c
@@ -196,7 +196,7 @@ endif()
 if(MINGW)
 	target_link_options       (sk_renderer_xr_test PRIVATE -static-libgcc -static-libstdc++ -static)
 	target_link_libraries     (sk_renderer_xr_test PRIVATE pthread)
-	target_include_directories(sk_renderer_xr_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	target_include_directories(sk_renderer_xr_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 	# MSVC enables SSE4.1 intrinsics on x64 unconditionally; mingw-w64 GCC needs
 	# -msse4.1 explicitly so BC1/ETC SIMD paths can compile.
 	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -207,7 +207,7 @@ endif()
 # macOS needs pthread fallback for C11 threads (no static linking)
 if(APPLE)
 	target_link_libraries     (sk_renderer_xr_test PRIVATE pthread)
-	target_include_directories(sk_renderer_xr_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	target_include_directories(sk_renderer_xr_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 endif()
 
 ###################################

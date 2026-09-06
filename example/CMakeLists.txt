@@ -14,11 +14,11 @@ if(ANDROID)
 	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 # SKR_SK_APP_DIR points at a local sk_app checkout for development (e.g.
-# -DSKR_SK_APP_DIR=../sk_app, resolved against the top-level source dir);
+# -DSKR_SK_APP_DIR=../sk_app, resolved against the sk_renderer root);
 # empty — the default — fetches the pinned release. v2026.7.20+ carries the
 # WebGPU surface + web platform support the WebGPU backend needs.
 if(SKR_SK_APP_DIR)
-	get_filename_component(_skr_sk_app_dir "${SKR_SK_APP_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+	get_filename_component(_skr_sk_app_dir "${SKR_SK_APP_DIR}" ABSOLUTE BASE_DIR "${sk_renderer_SOURCE_DIR}")
 	if(NOT EXISTS "${_skr_sk_app_dir}/CMakeLists.txt")
 		message(FATAL_ERROR "SKR_SK_APP_DIR (${_skr_sk_app_dir}) doesn't look like an sk_app checkout")
 	endif()
@@ -61,7 +61,7 @@ FetchContent_MakeAvailable(cgltf)
 message(STATUS "Fetching cimgui...")
 FetchContent_Declare(cimgui
 	GIT_REPOSITORY https://github.com/cimgui/cimgui.git
-	GIT_TAG        1.91.6
+	GIT_TAG        1.92.9
 	GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(cimgui)
@@ -156,7 +156,7 @@ endif()
 if(MINGW)
 	target_link_options       (sk_renderer_test PRIVATE -static-libgcc -static-libstdc++ -static)
 	target_link_libraries     (sk_renderer_test PRIVATE pthread)
-	target_include_directories(sk_renderer_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	target_include_directories(sk_renderer_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 	# MSVC enables SSE4.1 intrinsics on x64 unconditionally; mingw-w64 GCC needs
 	# -msse4.1 explicitly so BC1/ETC SIMD paths can compile.
 	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -167,10 +167,10 @@ endif()
 # macOS needs pthread fallback for C11 threads (no static linking)
 if(APPLE)
 	target_link_libraries     (sk_renderer_test PRIVATE pthread)
-	target_include_directories(sk_renderer_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	target_include_directories(sk_renderer_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 endif()
 
-target_link_libraries(sk_renderer_test PRIVATE sk_renderer)
+target_link_libraries(sk_renderer_test PRIVATE sk_renderer sk_renderer_imgui)
 skr_copy_moltenvk(sk_renderer_test)
 target_include_directories(sk_renderer_test PRIVATE
 	${stb_SOURCE_DIR}
@@ -208,7 +208,6 @@ target_sources(sk_renderer_test PRIVATE
 	tools/compress/tex_compress.c
 	tools/tex_psnr.c
 	tools/compress/astc_io.c
-	imgui_backend/imgui_impl_sk_renderer.cpp
 	${sk_app_SOURCE_DIR}/examples/imgui_example/imgui_impl_sk_app.cpp
 	${cimgui_SOURCE_DIR}/imgui/imgui.cpp
 	${cimgui_SOURCE_DIR}/imgui/imgui_draw.cpp
@@ -240,20 +239,15 @@ endif()
 # Shader compilation
 ###############################################################################
 
-# Compile ImGui shader to header file (no debug info, embedded in binary).
 # A container carries one language, so the target follows the backend. WGSL
 # comes only from the SVSL backend, so those builds pass -svsl; the web host
 # tool may still carry glslang, and mixing backends isn't allowed.
+# (The ImGui shader comes from the sk_renderer_imgui target.)
 if(SKR_USE_WEBGPU) # includes EMSCRIPTEN, which forces it ON above
 	set(_skr_example_shader_targets "-svsl -t w")
 else()
 	set(_skr_example_shader_targets "-t s")
 endif()
-# Output goes to the build dir: the flags differ per backend (-t s vs -t w),
-# so a source-tree copy would ping-pong between build configurations
-skshaderc_compile_headers(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/imgui_shader "-o3 -e ${_skr_example_shader_targets}"
-	imgui_backend/imgui.hlsl
-)
 
 # Compile other shaders to .sks files
 skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders "${_skr_example_shader_targets}" _

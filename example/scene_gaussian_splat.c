@@ -770,7 +770,7 @@ static bool _scene_gaussian_splat_get_camera(scene_t* base, scene_camera_t* out_
 	const float max_distance       = 100.0f;
 	const float move_speed         = 5.0f;
 
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 
 	float cos_pitch = cosf(scene->cam_pitch);
 	float sin_pitch = sinf(scene->cam_pitch);

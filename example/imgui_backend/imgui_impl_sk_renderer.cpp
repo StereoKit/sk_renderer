@@ -15,7 +15,6 @@
 struct ImGui_ImplSkRenderer_Data {
 	skr_shader_t       shader;
 	skr_material_t     material;
-	skr_tex_t          font_texture;
 	skr_mesh_t         mesh;
 	skr_vert_type_t    vertex_type;
 
@@ -39,46 +38,60 @@ static bool ImGui_ImplSkRenderer_CreateVertexFormat(skr_vert_type_t* out_vertex_
 	return skr_vert_type_create(components, 3, out_vertex_type) == skr_err_success;
 }
 
-// Initialize backend
-// Rebuilds the atlas texture from whatever fonts ImGui currently holds. Needed
-// after a DPI change, where fonts are re-rasterized at the new scale.
-extern "C" bool ImGui_ImplSkRenderer_CreateFontsTexture() {
-	ImGuiIO&                    io = ImGui::GetIO();
-	ImGui_ImplSkRenderer_Data*  bd = (ImGui_ImplSkRenderer_Data*)io.BackendRendererUserData;
-	if (!bd) return false;
+// ImGui owns texture lifetime since 1.92, and queues the work here. Each
+// skr_tex_t is heap allocated so its address can serve as the ImTextureID.
+static void ImGui_ImplSkRenderer_DestroyTexture(ImTextureData* tex) {
+	skr_tex_t* skr_tex = (skr_tex_t*)tex->BackendUserData;
+	if (!skr_tex) return;
 
-	unsigned char* pixels;
-	int            width, height;
-	io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+	// Frames in flight may still reference it
+	skr_future_t pending = skr_future_get();
+	skr_future_wait(&pending);
 
-	skr_tex_sampler_t font_sampler = {
-		.sample         = skr_tex_sample_linear,
-		.address        = skr_tex_address_clamp,
-		.sample_compare = skr_compare_never,
-	};
+	skr_tex_destroy(skr_tex);
+	free(skr_tex);
 
-	skr_tex_t      replacement = {};
-	skr_tex_data_t font_data   = {.data = pixels, .mip_count = 1, .layer_count = 1};
-	if (skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_readable, font_sampler,
-					   (skr_vec3i_t){width, height, 1}, 1, 1, &font_data, &replacement) != skr_err_success) {
-		return false;
+	tex->BackendUserData = nullptr;
+	tex->SetTexID(ImTextureID_Invalid);
+	tex->SetStatus(ImTextureStatus_Destroyed);
+}
+
+static void ImGui_ImplSkRenderer_UpdateTexture(ImTextureData* tex) {
+	// The shader samples RGBA; an Alpha8 atlas would need its own variant
+	IM_ASSERT(tex->Format == ImTextureFormat_RGBA32);
+
+	if (tex->Status == ImTextureStatus_WantCreate) {
+		skr_tex_sampler_t sampler = {
+			.sample         = skr_tex_sample_linear,
+			.address        = skr_tex_address_clamp,
+			.sample_compare = skr_compare_never,
+		};
+
+		skr_tex_t* skr_tex = (skr_tex_t*)calloc(1, sizeof(skr_tex_t));
+		if (!skr_tex) return;
+
+		skr_tex_data_t data = {.data = tex->GetPixels(), .mip_count = 1, .layer_count = 1};
+		if (skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_dynamic, sampler,
+						   (skr_vec3i_t){tex->Width, tex->Height, 1}, 1, 1, &data, skr_tex) != skr_err_success) {
+			free(skr_tex);
+			return;
+		}
+		skr_tex_set_name(skr_tex, "ImGui Atlas");
+
+		tex->BackendUserData = skr_tex;
+		tex->SetTexID((ImTextureID)skr_tex);
+		tex->SetStatus(ImTextureStatus_OK);
 	}
-	skr_tex_set_name(&replacement, "ImGui Font Atlas");
-
-	// The old texture may still be referenced by frames in flight
-	if (io.Fonts->TexID != 0) {
-		skr_future_t pending = skr_future_get();
-		skr_future_wait(&pending);
-		skr_tex_destroy(&bd->font_texture);
+	else if (tex->Status == ImTextureStatus_WantUpdates) {
+		// skr uploads whole mips, so tex->Updates' sub-rects don't buy anything here
+		skr_tex_t*     skr_tex = (skr_tex_t*)tex->BackendUserData;
+		skr_tex_data_t data    = {.data = tex->GetPixels(), .mip_count = 1, .layer_count = 1};
+		if (skr_tex_set_data(skr_tex, &data) == skr_err_success)
+			tex->SetStatus(ImTextureStatus_OK);
 	}
-	bd->font_texture = replacement;
-	io.Fonts->SetTexID((ImTextureID)&bd->font_texture);
-
-	// The material only exists once Init has finished its first pass
-	if (skr_material_is_valid(&bd->material)) {
-		skr_material_set_tex(&bd->material, "texture0", &bd->font_texture);
+	else if (tex->Status == ImTextureStatus_WantDestroy && tex->UnusedFrames > 0) {
+		ImGui_ImplSkRenderer_DestroyTexture(tex);
 	}
-	return true;
 }
 
 extern "C" bool ImGui_ImplSkRenderer_Init() {
@@ -91,6 +104,7 @@ extern "C" bool ImGui_ImplSkRenderer_Init() {
 
 	io.BackendRendererUserData = (void*)bd;
 	io.BackendRendererName = "imgui_impl_sk_renderer";
+	io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 
 	// Create vertex format
 	if (!ImGui_ImplSkRenderer_CreateVertexFormat(&bd->vertex_type)) {
@@ -108,15 +122,6 @@ extern "C" bool ImGui_ImplSkRenderer_Init() {
 	}
 	skr_shader_set_name(&bd->shader, "ImGui");
 
-	// Create font atlas texture
-	if (!ImGui_ImplSkRenderer_CreateFontsTexture()) {
-		skr_shader_destroy(&bd->shader);
-		skr_vert_type_destroy(&bd->vertex_type);
-		free(bd);
-		io.BackendRendererUserData = nullptr;
-		return false;
-	}
-
 	// Create material with alpha blending
 	skr_material_create((skr_material_info_t){
 		.shader       = &bd->shader,
@@ -126,9 +131,6 @@ extern "C" bool ImGui_ImplSkRenderer_Init() {
 		.blend_state  = skr_blend_alpha,
 		.queue_offset = 100,  // Render last
 	}, &bd->material);
-
-	// Bind font texture to material
-	skr_material_set_tex(&bd->material, "texture0", &bd->font_texture);
 
 	// Mesh will be created dynamically on first frame
 	bd->mesh_vertex_capacity = 0;
@@ -144,20 +146,24 @@ extern "C" void ImGui_ImplSkRenderer_Shutdown() {
 
 	ImGuiIO& io = ImGui::GetIO();
 
+	// Textures shared with another context are that context's to release
+	ImVector<ImTextureData*>& textures = ImGui::GetPlatformIO().Textures;
+	for (int i = 0; i < textures.Size; i++) {
+		if (textures[i]->RefCount == 1)
+			ImGui_ImplSkRenderer_DestroyTexture(textures[i]);
+	}
+
 	// Destroy resources
 	if (bd->mesh_vertex_capacity > 0) {
 		skr_mesh_destroy(&bd->mesh);
 	}
 	skr_material_destroy(&bd->material);
-	skr_tex_destroy(&bd->font_texture);
 	skr_shader_destroy(&bd->shader);
 	skr_vert_type_destroy(&bd->vertex_type);
 
-	// Clear font texture ID
-	io.Fonts->SetTexID(0);
-
 	// Free backend data
 	io.BackendRendererUserData = nullptr;
+	io.BackendFlags &= ~ImGuiBackendFlags_RendererHasTextures;
 	free(bd);
 }
 
@@ -229,6 +235,16 @@ extern "C" void ImGui_ImplSkRenderer_PrepareDrawData(void) {
 
 	ImGui_ImplSkRenderer_Data* bd = ImGui_ImplSkRenderer_GetBackendData();
 	IM_ASSERT(bd != nullptr && "Backend not initialized!");
+
+	// Texture uploads copy through a staging buffer, so they belong out here
+	// alongside the mesh upload rather than inside the pass
+	if (draw_data->Textures != nullptr) {
+		for (int i = 0; i < draw_data->Textures->Size; i++) {
+			ImTextureData* tex = (*draw_data->Textures)[i];
+			if (tex->Status != ImTextureStatus_OK)
+				ImGui_ImplSkRenderer_UpdateTexture(tex);
+		}
+	}
 
 	if (draw_data->TotalVtxCount == 0 || draw_data->TotalIdxCount == 0)
 		return;

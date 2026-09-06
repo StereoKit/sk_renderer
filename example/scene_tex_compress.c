@@ -437,7 +437,7 @@ static void _scene_texcomp_render(scene_t* base, int32_t width, int32_t height,
 static bool _scene_texcomp_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_texcomp_t* scene = (scene_texcomp_t*)base;
 
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 	if (!io->WantCaptureMouse) {
 		if (io->MouseWheel != 0.0f) {
 			scene->cam_distance -= io->MouseWheel * 0.5f;

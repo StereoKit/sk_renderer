@@ -413,7 +413,7 @@ static bool _scene_text_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	const float min_distance       = 1.0f;
 	const float max_distance       = 50.0f;
 
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 
 	if (!io->WantCaptureMouse) {
 		if (io->MouseDown[0]) {
