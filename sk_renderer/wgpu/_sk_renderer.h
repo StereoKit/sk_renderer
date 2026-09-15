@@ -239,6 +239,8 @@ void _skr_render_list_sort(skr_render_list_t* ref_list);
 
 uint64_t _skr_time_now_ns (void);
 void     _skr_cpu_wait_add(uint64_t start_ns);
+void     _skr_frame_note_present(const skr_surface_t* surface, uint64_t id);  // Joins a present to the frame that just ended, when it was that frame's surface
+void     _skr_frame_forget_surface(const skr_surface_t* surface);
 
 // Lazily-created single-layer render view for layered targets (skr_texture.c)
 WGPUTextureView _skr_tex_layer_view(skr_tex_t* tex, uint32_t layer);

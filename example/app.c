@@ -139,21 +139,29 @@ struct app_t {
 
 	// Performance tracking
 	float   frame_time_ms;
+	float   refresh_hz;
 	float   gpu_time_total_ms;
 	float   gpu_time_min_ms;
 	float   gpu_time_max_ms;
 	int32_t gpu_time_samples;
 
-	// Frame time history for graphs (circular buffer)
-	#define FRAME_HISTORY_SIZE 512
-	float   frame_time_history[512];
-	float   gpu_time_history[512];
-	float   cpu_time_history[512];
-	int32_t history_index;
 	float   frame_ema;
 	float   gpu_ema;
 	float   cpu_ema;
+
+	// Presentation timeline for the overlay, both rings indexed by present id
+	#define PRESENT_HISTORY 512
+	skr_present_info_t presents[PRESENT_HISTORY];
+	skr_frame_timing_t frames  [PRESENT_HISTORY];  // by the present each frame fed
+	uint64_t           newest_present_id;          // newest drained present, 0 = none yet
+	bool               timeline_frozen;            // overlay keeps drawing from frozen_head
+	uint64_t           frozen_head;
+	pacer_run_ahead_   run_ahead;
+	bool               fullscreen;
+	skr_present_mode_  present_mode;               // what the surface is doing
 };
+
+static const char* run_ahead_names[pacer_run_ahead_max] = { "Swapchain depth", "Two frames", "One frame" };
 
 static const char* _tex_fmt_name(skr_tex_fmt_ fmt) {
 	switch (fmt) {
@@ -482,7 +490,8 @@ app_t* app_create(int32_t start_scene) {
 	app->scene_types[16] = &scene_yuv_test_vtable;
 	app->scene_types[17] = &scene_gi_vtable;
 	app->scene_types[18] = &scene_pbr_vtable;
-	app->scene_count = 19;
+	app->scene_types[19] = &scene_frame_pacing_vtable;
+	app->scene_count = 20;
 #ifdef SKR_HAS_VIDEO
 	app->scene_types[app->scene_count++] = &scene_video_vtable;
 #endif
@@ -634,11 +643,31 @@ static void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* ren
 
 void app_update(app_t* app, float delta_time) {
 	if (!app || !app->scene_current) return;
+	app->scene_current->refresh_hz = app->refresh_hz;
 	scene_update(app->scene_types[app->scene_index], app->scene_current, delta_time);
 }
 
 void app_set_frame_time(app_t* app, float frame_time_ms) {
 	if (app) app->frame_time_ms = frame_time_ms;
+}
+
+void app_set_refresh_rate(app_t* app, float refresh_hz) {
+	if (app) app->refresh_hz = refresh_hz;
+}
+
+void              app_set_run_ahead   (app_t* app, pacer_run_ahead_ run_ahead) { app->run_ahead = run_ahead; }
+pacer_run_ahead_  app_run_ahead       (app_t* app)                             { return app->run_ahead; }
+void              app_set_fullscreen  (app_t* app, bool fullscreen)            { app->fullscreen = fullscreen; }
+bool              app_fullscreen      (app_t* app)                             { return app->fullscreen; }
+void              app_set_present_mode(app_t* app, skr_present_mode_ active)   { app->present_mode = active; }
+
+void app_add_timing(app_t* app, const skr_frame_timing_t* opt_frame, const skr_present_info_t* presents, int32_t count) {
+	if (opt_frame && opt_frame->present_id != 0)
+		app->frames[opt_frame->present_id % PRESENT_HISTORY] = *opt_frame;
+	for (int32_t i = 0; i < count; i++) {
+		app->presents[presents[i].id % PRESENT_HISTORY] = presents[i];
+		if (presents[i].id > app->newest_present_id) app->newest_present_id = presents[i].id;
+	}
 }
 
 void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t height) {
@@ -888,6 +917,127 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	skr_renderer_end_pass();
 }
 
+static ImU32 _rgba(float r, float g, float b, float a) {
+	return igGetColorU32_Vec4((ImVec4){r, g, b, a});
+}
+
+static void _rect(ImDrawList* dl, float x0, float y0, float x1, float y1, ImU32 col) {
+	ImDrawList_AddRectFilled(dl, (ImVec2){x0, y0}, (ImVec2){x1, y1}, col, 0.0f, 0);
+}
+
+// How many refreshes an image stayed on screen, 0 when either side is unknown
+static float _present_refreshes(const app_t* app, uint64_t id, float refresh_ms) {
+	if (id < 2) return 0.0f;
+	const skr_present_info_t* pi   = &app->presents[ id      % PRESENT_HISTORY];
+	const skr_present_info_t* prev = &app->presents[(id - 1) % PRESENT_HISTORY];
+	if (pi->id != id || prev->id != id - 1 || pi->display_ns == 0 || prev->display_ns == 0 || pi->display_ns <= prev->display_ns) return 0.0f;
+	return (float)(pi->display_ns - prev->display_ns) / (refresh_ms * 1000000.0f);
+}
+
+// The bottom half of the graph is 0 to 1 refresh, where frames normally live;
+// the top half is 1 to 4.5, where the misses and the queue depth are
+static float _axis(float refreshes) {
+	return refreshes <= 1.0f ? refreshes * 0.5f : 0.5f + (refreshes - 1.0f) / 3.5f * 0.5f;
+}
+
+// Newest at the right. The top row is one square per present, colored by how
+// many refreshes the image stayed on screen: what a capture card would see.
+// Below it CPU, GPU and present-to-display latency run as lines over a grid
+// in refresh periods.
+static void _draw_timeline(app_t* app, float width) {
+	const float   pitch   = 3.0f;  // pixels per present
+	const float   gap     = 8.0f;
+	const float   graph_h = 100.0f;
+	int32_t cols = (int32_t)(width / pitch);
+	if (cols > PRESENT_HISTORY) cols = PRESENT_HISTORY;
+	ImDrawList* dl = igGetWindowDrawList();
+	ImVec2      p  = igGetCursorScreenPos();
+	igDummy((ImVec2){width, pitch + gap + graph_h});
+	uint64_t head = app->timeline_frozen ? app->frozen_head : app->newest_present_id;
+	if (cols < 1 || head == 0) return;
+
+	float refresh_ms = 1000.0f / (app->refresh_hz > 0.0f ? app->refresh_hz : 60.0f);
+	float gx1        = p.x + cols * pitch;
+	float gy0        = p.y + pitch + gap;
+	float gy1        = gy0 + graph_h;
+	_rect(dl, p.x, gy0, gx1, gy1, _rgba(0.08f, 0.08f, 0.10f, 1.0f));
+	static const float grid[] = { 0.25f, 0.5f, 0.75f, 1.0f, 2.0f, 3.0f, 4.0f };
+	for (int32_t g = 0; g < (int32_t)(sizeof(grid) / sizeof(grid[0])); g++) {
+		float y = gy1 - graph_h * _axis(grid[g]);
+		ImDrawList_AddLine(dl, (ImVec2){p.x, y}, (ImVec2){gx1, y}, _rgba(1.0f, 1.0f, 1.0f, grid[g] == 1.0f ? 0.4f : 0.15f), 1.0f);
+		if (grid[g] < 1.0f) continue;
+		char label[4];
+		snprintf(label, sizeof(label), "%d", (int32_t)grid[g]);
+		ImDrawList_AddText_Vec2(dl, (ImVec2){gx1 - 10.0f, y - 15.0f}, _rgba(1.0f, 1.0f, 1.0f, 0.5f), label, NULL);
+	}
+
+	const ImU32 blue   = _rgba(0.30f, 0.55f, 1.0f, 1.0f);
+	const ImU32 orange = _rgba(1.0f,  0.60f, 0.15f, 1.0f);
+	ImVec2 prev_cpu = {0}, prev_gpu = {0}, prev_lat = {0};
+	bool   has_prev_frame = false, has_prev_lat = false;
+	for (int32_t i = 0; i < cols; i++) {
+		uint64_t back = (uint64_t)(cols - 1 - i);
+		if (back >= head) continue;
+		uint64_t id = head - back;
+		float    x0 = p.x + i * pitch;
+		float    cx = x0 + pitch * 0.5f;
+
+		const skr_present_info_t* pi        = &app->presents[id % PRESENT_HISTORY];
+		float                     refreshes = _present_refreshes(app, id, refresh_ms);
+		ImU32                     col       = _rgba(0.35f, 0.35f, 0.35f, 1.0f);
+		if (refreshes > 0.0f) {
+			int32_t n = (int32_t)(refreshes + 0.5f);
+			float   a = pi->source >= skr_timing_source_vblank ? 1.0f : 0.5f;
+			col = n <= 1 ? _rgba(0.25f, 0.85f, 0.35f, a) : n == 2 ? _rgba(1.0f, 0.75f, 0.2f, a) : _rgba(1.0f, 0.25f, 0.2f, a);
+		}
+		_rect(dl, x0, p.y, x0 + pitch, p.y + pitch, col);
+
+		const skr_frame_timing_t* ft = &app->frames[id % PRESENT_HISTORY];
+		if (ft->present_id == id) {
+			uint64_t total  = ft->cpu_end_ns > ft->cpu_begin_ns ? ft->cpu_end_ns - ft->cpu_begin_ns : 0;
+			uint64_t wait   = ft->cpu_wait_ns < total ? ft->cpu_wait_ns : total;
+			ImVec2   cpu    = { cx, gy1 - graph_h * _axis((float)(total - wait)  / 1000000.0f / refresh_ms) };
+			ImVec2   gpu    = { cx, gy1 - graph_h * _axis((float)ft->gpu_time_ns / 1000000.0f / refresh_ms) };
+			if (cpu.y < gy0) cpu.y = gy0;
+			if (gpu.y < gy0) gpu.y = gy0;
+			if (has_prev_frame) {
+				ImDrawList_AddLine(dl, prev_cpu, cpu, blue,   1.5f);
+				ImDrawList_AddLine(dl, prev_gpu, gpu, orange, 1.5f);
+			}
+			prev_cpu = cpu; prev_gpu = gpu; has_prev_frame = true;
+		} else has_prev_frame = false;
+
+		if (pi->id == id && pi->display_ns > pi->cpu_present_ns) {
+			ImVec2 lat = { cx, gy1 - graph_h * _axis((float)(pi->display_ns - pi->cpu_present_ns) / 1000000.0f / refresh_ms) };
+			if (lat.y < gy0) lat.y = gy0;
+			if (has_prev_lat) ImDrawList_AddLine(dl, prev_lat, lat, _rgba(1.0f, 1.0f, 1.0f, pi->source >= skr_timing_source_vblank ? 0.9f : 0.4f), 1.5f);
+			prev_lat = lat; has_prev_lat = true;
+		} else has_prev_lat = false;
+	}
+
+	// Stats over everything still in the ring, not just the squares
+	int32_t counted = 0, doubled = 0;
+	float   worst   = 0.0f;
+	for (uint64_t back = 0; back < PRESENT_HISTORY && back < head; back++) {
+		float refreshes = _present_refreshes(app, head - back, refresh_ms);
+		if (refreshes <= 0.0f) continue;
+		counted++;
+		if (refreshes >= 1.5f)  doubled++;
+		if (refreshes > worst)  worst = refreshes;
+	}
+
+	const skr_present_info_t* newest = &app->presents[head % PRESENT_HISTORY];
+	float lat_ms = newest->display_ns > newest->cpu_present_ns ? (float)(newest->display_ns - newest->cpu_present_ns) / 1000000.0f : 0.0f;
+	const char* source = pacer_source_names[newest->source];
+	igTextColored((ImVec4){0.30f, 0.55f, 1.0f, 1.0f}, "CPU %.2f ms", app->cpu_ema);
+	igSameLine(0.0f, 12.0f);
+	igTextColored((ImVec4){1.0f, 0.60f, 0.15f, 1.0f}, "GPU %.2f ms", app->gpu_ema);
+	igText("Lag %05.2f ms (%.1f refr)", lat_ms, lat_ms / refresh_ms);
+	igSameLine(0.0f, 12.0f);
+	if (igCheckbox("Freeze", &app->timeline_frozen) && app->timeline_frozen) app->frozen_head = app->newest_present_id;
+	igText("Last %d: %d doubled, worst %.1f, %s", counted, doubled, worst, source);
+}
+
 void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32_t height) {
 	if (!app) return;
 
@@ -919,6 +1069,8 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 
 	// Show render info and controls
 	igText("Window: %d x %d", width, height);
+	igSameLine(0.0f, 12.0f);
+	igCheckbox("Fullscreen", &app->fullscreen);
 	{
 		float rs = app->render_scale   * 100.0f;
 		float vs = app->viewport_scale * 100.0f;
@@ -935,6 +1087,14 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	igText("MSAA: %dx", app->msaa);
 	if (app->msaa > 1)
 		igCombo_Str_arr("Resolve Mode", &app->resolve_mode, resolve_mode_names, resolve_mode_max, 0);
+
+	// Presentation. Present mode is only reachable from the command line;
+	// vsync'd FIFO is the only mode worth pacing.
+	{
+		int32_t run_ahead = (int32_t)app->run_ahead;
+		if (igCombo_Str_arr("Run ahead", &run_ahead, run_ahead_names, pacer_run_ahead_max, 0)) app->run_ahead = (pacer_run_ahead_)run_ahead;
+		igText("%s, refresh %.2f Hz", pacer_present_mode_names[app->present_mode], app->refresh_hz);
+	}
 	if (app->resolve_mode == resolve_mode_fog_scatter && !app->fog_scatter_qcom)
 		igText("Scatter: 9-tap fallback\n(no VK_QCOM_image_processing)");
 	if (app->resolve_mode == resolve_mode_fog_tile && !skr_material_is_valid(&app->fog_tile_mat))
@@ -968,48 +1128,16 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 		if (gpu_ms > app->gpu_time_max_ms) app->gpu_time_max_ms = gpu_ms;
 	}
 
-	// Store history in circular buffer
-	app->frame_time_history[app->history_index] = frame_ms;
-	app->gpu_time_history  [app->history_index] = gpu_ms > 0.0f ? gpu_ms : app->gpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE];
-	app->cpu_time_history  [app->history_index] = cpu_ms > 0.0f ? cpu_ms : app->cpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE];
-	app->history_index = (app->history_index + 1) % FRAME_HISTORY_SIZE;
-
-	// Exponential moving average for readable display (smoothing factor ~0.1)
+	// Exponential moving average for readable display
 	const float ema_a = 0.02f;
 	app->frame_ema = app->frame_ema > 0.0f ? app->frame_ema + ema_a * (frame_ms - app->frame_ema) : frame_ms;
-	app->gpu_ema   = app->gpu_ema   > 0.0f ? app->gpu_ema   + ema_a * (app->gpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE] - app->gpu_ema) : gpu_ms;
-	app->cpu_ema   = app->cpu_ema   > 0.0f ? app->cpu_ema   + ema_a * (app->cpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE] - app->cpu_ema) : cpu_ms;
+	if (gpu_ms > 0.0f) app->gpu_ema = app->gpu_ema > 0.0f ? app->gpu_ema + ema_a * (gpu_ms - app->gpu_ema) : gpu_ms;
+	if (cpu_ms > 0.0f) app->cpu_ema = app->cpu_ema > 0.0f ? app->cpu_ema + ema_a * (cpu_ms - app->cpu_ema) : cpu_ms;
 
-	igText("Frame Time: %.3f ms (%.1f FPS)", app->frame_ema, 1000.0f / app->frame_ema);
-	igText("CPU Time: %.3f ms", app->cpu_ema);
-	igText("GPU Time: %.3f ms", app->gpu_ema);
+	igText("Frame Time: %05.2f ms (%5.1f FPS)", app->frame_ema, 1000.0f / app->frame_ema);
 
-	// Graph display ranges
-	const float frame_graph_min = 6.0f;
-	const float frame_graph_max = 10.0f;
-	const float cpu_graph_min   = 0.0f;
-	const float cpu_graph_max   = 3.0f;
-	const float gpu_graph_min   = 0.0f;
-	const float gpu_graph_max   = 3.0f;
-
-	// Get available width for full-width plots
 	ImVec2 content_region = igGetContentRegionAvail();
-	float  plot_width     = content_region.x;
-
-	char frame_overlay[32], cpu_overlay[32], gpu_overlay[32];
-	snprintf(frame_overlay, sizeof(frame_overlay), "Frame: %.1f ms", app->frame_ema);
-	snprintf(cpu_overlay,   sizeof(cpu_overlay),   "CPU: %.1f ms",   app->cpu_ema);
-	snprintf(gpu_overlay,   sizeof(gpu_overlay),   "GPU: %.1f ms",   app->gpu_ema);
-
-	// Plot frame time - using values_offset for circular buffer
-	igPlotLines_FloatPtr("##frame_graph", app->frame_time_history, FRAME_HISTORY_SIZE,
-		app->history_index, frame_overlay, frame_graph_min, frame_graph_max, (ImVec2){plot_width, 60}, sizeof(float));
-
-	igPlotLines_FloatPtr("##cpu_graph", app->cpu_time_history, FRAME_HISTORY_SIZE,
-		app->history_index, cpu_overlay, cpu_graph_min, cpu_graph_max, (ImVec2){plot_width, 60}, sizeof(float));
-
-	igPlotLines_FloatPtr("##gpu_graph", app->gpu_time_history, FRAME_HISTORY_SIZE,
-		app->history_index, gpu_overlay, gpu_graph_min, gpu_graph_max, (ImVec2){plot_width, 60}, sizeof(float));
+	_draw_timeline(app, content_region.x);
 
 	igEnd();
 }

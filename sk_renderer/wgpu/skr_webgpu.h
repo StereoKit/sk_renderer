@@ -5,6 +5,7 @@
 #pragma once
 
 #include <webgpu/webgpu.h>
+#include "../skr_present.h"
 
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 
@@ -111,6 +112,13 @@ typedef struct skr_surface_t {
 	// comes from an explicit viewFormats entry + sRGB frame views.
 	uint32_t       view_format;
 	bool           configured;
+
+	skr_present_ring_t ring;
+	uint32_t           present_mode_mask;   // 1 << skr_present_mode_ the surface offers
+	skr_present_mode_  present_mode;        // What the surface is configured with (never default)
+	skr_present_mode_  present_mode_request; // From skr_surface_info_t, resolved against the mask at every rebuild
+	skr_future_t       frame_future   [SKR_MAX_FRAMES_IN_FLIGHT]; // Submission of the frame each slot fed
+	uint64_t           slot_present_id[SKR_MAX_FRAMES_IN_FLIGHT]; // The present each slot fed, for skr_surface_wait_present
 } skr_surface_t;
 
 typedef struct skr_shader_stage_t {

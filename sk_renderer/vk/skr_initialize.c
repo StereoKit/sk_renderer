@@ -343,6 +343,65 @@ static void _skr_register_internal_requests(void) {
 		.feature_count            = 1,
 	});
 
+	// Presentation timing: which vblank each present landed on, and the
+	// panel's refresh period
+	static const VkPhysicalDevicePresentTimingFeaturesEXT present_timing_features = {
+		.sType         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+		.presentTiming = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                     = "present_timing",
+		.instance_extensions      = (const char*[]){ VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME },
+		.instance_extension_count = 1,
+		.device_extensions        = (const char*[]){ VK_EXT_PRESENT_TIMING_EXTENSION_NAME },
+		.device_extension_count   = 1,
+		.features                 = (skr_vk_feature_t[]){ { &present_timing_features, sizeof(present_timing_features) } },
+		.feature_count            = 1,
+	});
+
+	// Present ids name each present so timing reports and skr_surface_wait_present
+	// can refer to one. The KHR 2 pair is preferred, the originals are the fallback.
+	static const VkPhysicalDevicePresentId2FeaturesKHR present_id2_features = {
+		.sType      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+		.presentId2 = VK_TRUE,
+	};
+	static const VkPhysicalDevicePresentWait2FeaturesKHR present_wait2_features = {
+		.sType        = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR,
+		.presentWait2 = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                     = "present_wait2",
+		.instance_extensions      = (const char*[]){ VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME },
+		.instance_extension_count = 1,
+		.device_extensions        = (const char*[]){ VK_KHR_PRESENT_ID_2_EXTENSION_NAME, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME },
+		.device_extension_count   = 2,
+		.features                 = (skr_vk_feature_t[]){ { &present_id2_features,   sizeof(present_id2_features) },
+		                                                  { &present_wait2_features, sizeof(present_wait2_features) } },
+		.feature_count            = 2,
+	});
+	static const VkPhysicalDevicePresentIdFeaturesKHR present_id_features = {
+		.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+		.presentId = VK_TRUE,
+	};
+	static const VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features = {
+		.sType       = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+		.presentWait = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                   = "present_wait",
+		.device_extensions      = (const char*[]){ VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_KHR_PRESENT_WAIT_EXTENSION_NAME },
+		.device_extension_count = 2,
+		.features               = (skr_vk_feature_t[]){ { &present_id_features,   sizeof(present_id_features) },
+		                                                { &present_wait_features, sizeof(present_wait_features) } },
+		.feature_count          = 2,
+	});
+
+	// GPU timestamps on the CPU clock, so frame timing and present timing can
+	// share an axis. Android's older display timing extension rides along.
+	_skr_ext_request(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+	_skr_ext_request(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+	_skr_ext_request(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+
 	// QCOM image processing: each op family is its own feature and sksc bit, so
 	// each is its own request. The shaders are SPIR-V 1.4, hence the ext chain.
 	const char* image_proc_exts[] = {
@@ -1327,6 +1386,36 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_create_renderpass2      = skr_vk_request_enabled(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
 	_skr_vk.has_depth_stencil_resolve   = skr_vk_request_enabled("depth_stencil_resolve");
 	_skr_vk.has_present_fence           = skr_vk_request_enabled("swapchain_maintenance1");
+	_skr_vk.has_present_timing          = skr_vk_request_enabled("present_timing");
+	_skr_vk.has_present_wait2           = skr_vk_request_enabled("present_wait2");
+	_skr_vk.has_present_wait            = skr_vk_request_enabled("present_wait");
+	_skr_vk.has_display_timing_google   = skr_vk_request_enabled(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+#ifdef _WIN32
+	_skr_vk.host_time_domain            = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+	_skr_vk.host_time_domain            = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+	// Calibration is only useful if the device can pair its own clock with the
+	// one skr_time_now_ns reads
+	_skr_vk.has_calibrated_timestamps = false;
+	if (skr_vk_request_enabled(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) || skr_vk_request_enabled(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+		PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_domains = vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+			? vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+			: vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+		uint32_t        domain_count = 0;
+		VkTimeDomainKHR domains[8];
+		if (get_domains) get_domains(_skr_vk.physical_device, &domain_count, NULL);
+		if (domain_count > 8) domain_count = 8;
+		if (get_domains && domain_count > 0) get_domains(_skr_vk.physical_device, &domain_count, domains);
+		bool has_device = false, has_host = false;
+		for (uint32_t i = 0; i < domain_count; i++) {
+			has_device |= domains[i] == VK_TIME_DOMAIN_DEVICE_KHR;
+			has_host   |= domains[i] == _skr_vk.host_time_domain;
+		}
+		_skr_vk.has_calibrated_timestamps = has_device && has_host;
+	}
+	if (_skr_vk.has_calibrated_timestamps)
+		_skr_vk.get_calibrated_timestamps = vkGetCalibratedTimestampsKHR ? vkGetCalibratedTimestampsKHR : vkGetCalibratedTimestampsEXT;
 	_skr_vk.has_subpass_merge_feedback  = skr_vk_request_enabled("subpass_merge_feedback");
 	_skr_vk.has_subgroup_size_control   = skr_vk_request_enabled("subgroup_size_control");
 	_skr_vk.has_ycbcr_conversion        = skr_vk_request_enabled("ycbcr_conversion");
@@ -1548,10 +1637,6 @@ bool skr_init(skr_settings_t settings) {
 	}, NULL, &_skr_vk.timestamp_pool);
 	SKR_VK_CHECK_RET(vr, "vkCreateQueryPool", false);
 	_skr_cmd_destroy_query_pool(&_skr_vk.destroy_list, _skr_vk.timestamp_pool);
-
-	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
-		_skr_vk.timestamps_valid[i] = false;
-	}
 
 	vr = vkCreatePipelineCache(_skr_vk.device, &(VkPipelineCacheCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,

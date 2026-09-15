@@ -146,7 +146,7 @@ if(NOT SKR_USE_WEBGPU)
 	message(STATUS "Fetching Vulkan-Headers...")
 	FetchContent_Declare(
 		vulkan_headers
-		URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.328.1.zip
+		URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.zip
 	)
 	FetchContent_MakeAvailable(vulkan_headers)
 	# Set paths for volk and our custom FindVulkan.cmake
@@ -156,7 +156,7 @@ if(NOT SKR_USE_WEBGPU)
 	message(STATUS "Fetching volk...")
 	FetchContent_Declare( volk
 		GIT_REPOSITORY https://github.com/zeux/volk.git
-		GIT_TAG        1.4.304
+		GIT_TAG        1.4.350
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
@@ -234,6 +234,7 @@ target_include_directories(sk_renderer PUBLIC sk_renderer/include)
 target_sources(sk_renderer PRIVATE
 	sk_renderer/include/sk_renderer.h
 	sk_renderer/skr_log.c
+	sk_renderer/skr_present.c
 	sk_renderer/sksc_file.c
 	sk_renderer/smolv.c
 )

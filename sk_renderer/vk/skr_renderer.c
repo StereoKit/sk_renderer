@@ -38,20 +38,65 @@
 // Helpers
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifdef _WIN32
+static uint64_t _skr_qpc_to_ns(uint64_t ticks) {
+	static LARGE_INTEGER freq = {0};
+	if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+	uint64_t f = (uint64_t)freq.QuadPart;
+	// ticks * 1e9 overflows 64 bits half an hour after boot at the usual 10 MHz
+	return (ticks / f) * 1000000000ULL + (ticks % f) * 1000000000ULL / f;
+}
+#endif
+
 uint64_t _skr_time_get_ns(void) {
 #ifdef _WIN32
-	static LARGE_INTEGER freq = {0};
-	if (freq.QuadPart == 0) {
-		QueryPerformanceFrequency(&freq);
-	}
 	LARGE_INTEGER counter;
 	QueryPerformanceCounter(&counter);
-	return (uint64_t)(counter.QuadPart * 1000000000ULL / freq.QuadPart);
+	return _skr_qpc_to_ns((uint64_t)counter.QuadPart);
 #else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 #endif
+}
+
+uint64_t skr_time_now_ns(void) {
+	return _skr_time_get_ns();
+}
+
+// A raw stamp from _skr_vk.host_time_domain, on the _skr_time_get_ns scale
+uint64_t _skr_time_from_host_domain(uint64_t stamp) {
+#ifdef _WIN32
+	return _skr_qpc_to_ns(stamp);
+#else
+	return stamp;
+#endif
+}
+
+// One device/host clock pair per frame; GPU timestamps are placed on the CPU
+// timeline relative to it
+static void _skr_calibrate_clocks(void) {
+	PFN_vkGetCalibratedTimestampsKHR get = _skr_vk.get_calibrated_timestamps;
+	if (get == NULL) return;
+	VkCalibratedTimestampInfoKHR infos[2] = {
+		{ .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, .timeDomain = VK_TIME_DOMAIN_DEVICE_KHR },
+		{ .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, .timeDomain = _skr_vk.host_time_domain },
+	};
+	uint64_t stamps[2], deviation;
+	uint64_t before = _skr_time_get_ns();
+	if (get(_skr_vk.device, 2, infos, stamps, &deviation) != VK_SUCCESS) return;
+	uint64_t after   = _skr_time_get_ns();
+	uint64_t host_ns = _skr_time_from_host_domain(stamps[1]);
+	// A host stamp outside the call's window came from another clock: Wine's
+	// QPC domain reads CLOCK_MONOTONIC_RAW while its QPC reads CLOCK_BOOTTIME
+	if (host_ns < before || host_ns > after) host_ns = before + (after - before) / 2;
+	_skr_vk.calib_device_ticks = stamps[0];
+	_skr_vk.calib_host_ns      = host_ns;
+}
+
+static uint64_t _skr_gpu_ticks_to_host_ns(uint64_t ticks) {
+	double delta_ns = (double)((int64_t)ticks - (int64_t)_skr_vk.calib_device_ticks) * (double)_skr_vk.timestamp_period;
+	return (uint64_t)((int64_t)_skr_vk.calib_host_ns + (int64_t)delta_ns);
 }
 
 // FNV-1a over attachment view handles. A cached framebuffer must be dropped
@@ -248,7 +293,10 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 	);
 
 	// Record CPU end time (after submission, before present/vsync)
-	_skr_vk.cpu_frame_end_ns[_skr_vk.flight_idx] = _skr_time_get_ns();
+	_skr_vk.cpu_frame_end_ns [_skr_vk.flight_idx] = _skr_time_get_ns();
+	_skr_vk.frame_present_id[_skr_vk.flight_idx] = 0;  // Filled by the present that follows, if one does
+	_skr_vk.frame_surface   [_skr_vk.flight_idx] = count > 0 ? opt_surfaces[0] : NULL;
+	_skr_calibrate_clocks();
 
 	// Record future in all surfaces for their current frame_idx
 	for (uint32_t i = 0; i < count; i++) {
@@ -265,10 +313,32 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 			sizeof(uint64_t) * SKR_QUERIES_PER_FRAME, _skr_vk.frame_timestamps[prev_flight],
 			sizeof(uint64_t), VK_QUERY_RESULT_64_BIT
 		);
-		_skr_vk.timestamps_valid[prev_flight] = (result == VK_SUCCESS);
+		// This slot's CPU stamps, GPU stamps and present id belong to one
+		// frame only until the next frame_begin reuses it, so join them now
+		skr_frame_timing_t timing = {
+			.cpu_begin_ns = _skr_vk.cpu_frame_start_ns[prev_flight],
+			.cpu_end_ns   = _skr_vk.cpu_frame_end_ns  [prev_flight],
+			.cpu_wait_ns  = _skr_vk.cpu_frame_wait_ns [prev_flight],
+			.present_id   = _skr_vk.frame_present_id  [prev_flight],
+		};
+		uint64_t gpu_end_host_ns = 0;
+		if (result == VK_SUCCESS) {
+			uint64_t start = _skr_vk.frame_timestamps[prev_flight][0];
+			uint64_t end   = _skr_vk.frame_timestamps[prev_flight][1];
+			timing.gpu_time_ns = (uint64_t)((double)(end - start) * (double)_skr_vk.timestamp_period);
+			if (_skr_vk.has_calibrated_timestamps && _skr_vk.calib_host_ns != 0)
+				gpu_end_host_ns = _skr_gpu_ticks_to_host_ns(end);
+		}
+		_skr_vk.last_frame_timing       = timing;
+		_skr_vk.last_frame_timing_valid = true;
 
-		// CPU timestamps are always valid once we have enough frames
-		_skr_vk.cpu_timestamps_valid[prev_flight] = true;
+		// The present that frame fed learns when its rendering finished, so
+		// the record is complete on every tier, not only with present timing
+		skr_surface_t* fed = _skr_vk.frame_surface[prev_flight];
+		if (fed && gpu_end_host_ns != 0) {
+			skr_present_info_t* slot = _skr_present_slot(&fed->ring, timing.present_id);
+			if (slot && slot->gpu_done_ns == 0) slot->gpu_done_ns = gpu_end_host_ns;
+		}
 	}
 
 	_skr_scratch_pool_tick();    // Evict scratch mipgen textures idle for N frames
@@ -1074,45 +1144,29 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 }
 
 uint64_t skr_renderer_get_gpu_time_us(void) {
-	// Return timing from most recently completed frame
-	uint32_t read_flight = (_skr_vk.flight_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
-
-	if (!_skr_vk.timestamps_valid[read_flight]) {
-		return 0;
-	}
-
-	uint64_t start = _skr_vk.frame_timestamps[read_flight][0];
-	uint64_t end   = _skr_vk.frame_timestamps[read_flight][1];
-
-	// Convert ticks to microseconds: (ticks * ns_per_tick) / 1,000
-	float time_ns = (float)(end - start) * _skr_vk.timestamp_period;
-	return (uint64_t)(time_ns / 1000.0f);
+	return _skr_vk.last_frame_timing.gpu_time_ns / 1000;
 }
 
+// Busy time, not wall time: blocking waits are the caller's frame budget
 uint64_t skr_renderer_get_cpu_time_us(void) {
-	// Return CPU timing from most recently completed frame
-	uint32_t read_flight = (_skr_vk.flight_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
-
-	if (!_skr_vk.cpu_timestamps_valid[read_flight]) {
-		return 0;
-	}
-
-	uint64_t start = _skr_vk.cpu_frame_start_ns[read_flight];
-	uint64_t end   = _skr_vk.cpu_frame_end_ns[read_flight];
-	uint64_t wait  = _skr_vk.cpu_frame_wait_ns[read_flight];
-
-	// Guard against invalid data (end should be > start)
-	if (end <= start) {
-		return 0;
-	}
-
-	uint64_t total = end - start;
-
-	// Guard against wait time exceeding total (shouldn't happen)
-	if (wait > total) wait = 0;
-
-	// Convert nanoseconds to microseconds, subtracting wait time
+	const skr_frame_timing_t* t = &_skr_vk.last_frame_timing;
+	if (t->cpu_end_ns <= t->cpu_begin_ns) return 0;
+	uint64_t total = t->cpu_end_ns - t->cpu_begin_ns;
+	uint64_t wait  = t->cpu_wait_ns > total ? 0 : t->cpu_wait_ns;
 	return (total - wait) / 1000;
+}
+
+void _skr_frame_note_present(const skr_surface_t* surface, uint64_t id) {
+	if (_skr_vk.in_frame) return;
+	uint32_t ended = (_skr_vk.flight_idx + SKR_MAX_FRAMES_IN_FLIGHT - 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+	if (_skr_vk.frame_surface[ended] != surface || _skr_vk.frame_present_id[ended] != 0) return;
+	_skr_vk.frame_present_id[ended] = id;
+}
+
+bool skr_renderer_get_frame_timing(skr_frame_timing_t* out_timing) {
+	if (!_skr_vk.last_frame_timing_valid) return false;
+	*out_timing = _skr_vk.last_frame_timing;
+	return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

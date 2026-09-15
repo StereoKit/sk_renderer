@@ -61,6 +61,7 @@ XrSystemId               xr_system_id     = XR_NULL_SYSTEM_ID;
 xr_input_state_t         xr_input         = {0};
 XrEnvironmentBlendMode   xr_blend         = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 XrDebugUtilsMessengerEXT xr_debug         = XR_NULL_HANDLE;
+static bool              xr_lost          = false;  // the runtime is gone, every frame fails from here on
 
 XrView*                  xr_views         = NULL;
 XrViewConfigurationView* xr_config_views  = NULL;
@@ -102,7 +103,7 @@ PFN_xrDestroyDebugUtilsMessengerEXT    ext_xrDestroyDebugUtilsMessengerEXT    = 
 // Forward declarations
 ///////////////////////////////////////////
 
-static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProjectionView* views, uint32_t view_count, XrCompositionLayerProjection* layer);
+static bool openxr_render_layer(XrTime predicted_time, float delta_time, float refresh_hz, XrCompositionLayerProjectionView* views, uint32_t view_count, XrCompositionLayerProjection* layer);
 static void xr_swapchain_destroy(xr_swapchain_t* swapchain);
 #ifdef __EMSCRIPTEN__
 static bool openxr_create_swapchain(void);
@@ -885,6 +886,16 @@ void openxr_poll_predicted(XrTime predicted_time) {
 // Frame Rendering
 ///////////////////////////////////////////
 
+// Anything short of a dead runtime gets a frame's pause, so a persistent
+// error can't spin the loop at full speed
+static void xr_frame_failed(const char* call, XrResult result) {
+	ska_log(ska_log_error, "[OpenXR] %s failed: %s (%d)", call, xr_result_to_string(result), result);
+	xr_lost = result == XR_ERROR_INSTANCE_LOST || result == XR_ERROR_SESSION_LOST || result == XR_ERROR_RUNTIME_FAILURE;
+#ifndef __EMSCRIPTEN__
+	if (!xr_lost) ska_time_sleep(16);
+#endif
+}
+
 void openxr_render_frame(void) {
 #ifdef __EMSCRIPTEN__
 	// Built on the first frame rather than at init - see openxr_create_swapchain
@@ -898,13 +909,13 @@ void openxr_render_frame(void) {
 	XrFrameState frame_state = { XR_TYPE_FRAME_STATE };
 	XrResult wait_result = xrWaitFrame(xr_session, &(XrFrameWaitInfo){ .type = XR_TYPE_FRAME_WAIT_INFO }, &frame_state);
 	if (XR_FAILED(wait_result)) {
-		ska_log(ska_log_error, "[OpenXR] xrWaitFrame failed: %s (%d)", xr_result_to_string(wait_result), wait_result);
+		xr_frame_failed("xrWaitFrame", wait_result);
 		return;
 	}
 
 	XrResult begin_result = xrBeginFrame(xr_session, &(XrFrameBeginInfo){ .type = XR_TYPE_FRAME_BEGIN_INFO });
 	if (XR_FAILED(begin_result)) {
-		ska_log(ska_log_error, "[OpenXR] xrBeginFrame failed: %s (%d)", xr_result_to_string(begin_result), begin_result);
+		xr_frame_failed("xrBeginFrame", begin_result);
 		return;
 	}
 
@@ -919,7 +930,18 @@ void openxr_render_frame(void) {
 	                     (xr_session_state == XR_SESSION_STATE_VISIBLE ||
 	                      xr_session_state == XR_SESSION_STATE_FOCUSED);
 
-	if (should_render && openxr_render_layer(frame_state.predictedDisplayTime, views, xr_view_count, &layer_proj)) {
+	// The runtime says which vblank this frame is for, so the simulation
+	// advances by the gap between predicted display times: exactly one period
+	// when frames are on time, a whole multiple when one was skipped. A pause
+	// restarts the clock.
+	static XrTime last_predicted = 0;
+	XrTime period = frame_state.predictedDisplayPeriod;
+	XrTime gap    = last_predicted ? frame_state.predictedDisplayTime - last_predicted : period;
+	float delta_time = (float)(gap / 1e9);
+	float refresh_hz = period > 0 ? (float)(1e9 / (double)period) : 0.0f;
+	last_predicted   = should_render ? frame_state.predictedDisplayTime : 0;
+
+	if (should_render && openxr_render_layer(frame_state.predictedDisplayTime, delta_time, refresh_hz, views, xr_view_count, &layer_proj)) {
 		layer = (XrCompositionLayerBaseHeader*)&layer_proj;
 	}
 
@@ -933,7 +955,7 @@ void openxr_render_frame(void) {
 	free(views);
 }
 
-static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProjectionView* views, uint32_t view_count, XrCompositionLayerProjection* layer) {
+static bool openxr_render_layer(XrTime predicted_time, float delta_time, float refresh_hz, XrCompositionLayerProjectionView* views, uint32_t view_count, XrCompositionLayerProjection* layer) {
 	// Locate views
 	XrViewState  view_state    = { XR_TYPE_VIEW_STATE };
 	uint32_t     located_count = 0;
@@ -1001,13 +1023,13 @@ static bool openxr_render_layer(XrTime predicted_time, XrCompositionLayerProject
 	}
 
 	app_xr_render_stereo(&xr_swapchain.color_textures[img_idx], NULL, &xr_depth_texture,
-		xr_views, view_count, xr_swapchain.width, xr_swapchain.height);
+		xr_views, view_count, xr_swapchain.width, xr_swapchain.height, delta_time, refresh_hz);
 #else
 	// Single-pass stereo rendering - render to MSAA, resolve to swapchain
 	skr_tex_t* color_target   = &xr_color_msaa;  // MSAA render target
 	skr_tex_t* resolve_target = &xr_swapchain.color_textures[img_idx];  // Swapchain for resolve
 	skr_tex_t* depth_target   = &xr_depth_texture;  // MSAA depth
-	app_xr_render_stereo(color_target, resolve_target, depth_target, xr_views, view_count, xr_swapchain.width, xr_swapchain.height);
+	app_xr_render_stereo(color_target, resolve_target, depth_target, xr_views, view_count, xr_swapchain.width, xr_swapchain.height, delta_time, refresh_hz);
 #endif
 
 	// End sk_renderer frame - must happen BEFORE releasing swapchain images
@@ -1039,7 +1061,7 @@ static void frame(void) {
 	bool quit = false;
 	openxr_poll_events(&quit);
 
-	if (quit) {
+	if (quit || xr_lost) {
 		// Teardown lives here rather than after the loop: on the web
 		// emscripten_set_main_loop's simulate_infinite_loop unwinds the stack,
 		// so main() never gets to run its own.

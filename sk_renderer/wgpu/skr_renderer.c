@@ -131,6 +131,7 @@ typedef struct _skr_timer_frame_t {
 	volatile bool     pending;      // submitted, waiting on the map callback
 	volatile bool     map_done;
 	WGPUMapAsyncStatus map_status;
+	skr_frame_timing_t timing;      // the frame these stamps belong to, published when they land
 } _skr_timer_frame_t;
 
 static WGPUQuerySet       _timer_set;
@@ -144,6 +145,10 @@ static uint64_t           _cpu_time_us;
 static uint64_t           _cpu_frame_start_ns;
 static uint64_t           _cpu_wait_ns;   // Blocking waits inside the frame, subtracted from CPU time
 static bool               _cpu_in_frame;
+static skr_frame_timing_t _last_frame;    // Most recently completed frame, for skr_renderer_get_frame_timing
+static bool               _last_frame_valid;
+static const skr_surface_t* _last_frame_surface;  // Whose present joins the frame that just ended; cleared on surface destroy
+static _skr_timer_frame_t*  _frame_timer;         // That frame's timer entry, NULL when it had none and was published at once
 
 uint64_t _skr_time_now_ns(void) {
 	struct timespec ts;
@@ -190,12 +195,12 @@ static void _skr_on_timer_map(WGPUMapAsyncStatus status, WGPUStringView message,
 	frame->map_done   = true;
 }
 
-// Harvest finished readbacks (frame_begin) — sums each pass's duration.
-// If several ring entries completed, the last one visited wins; for a stats
-// readout that's fine, so no need to order them by frame age.
+// Harvest finished readbacks (frame_begin), sum each pass's duration, and
+// publish the frame they belong to. Oldest first, so when several land at
+// once the newest is the one left published.
 static void _skr_timer_harvest(void) {
-	for (uint32_t i = 0; i < _SKR_TIMER_RING; i++) {
-		_skr_timer_frame_t* frame = &_timer_ring[i];
+	for (uint32_t k = 0; k < _SKR_TIMER_RING; k++) {
+		_skr_timer_frame_t* frame = &_timer_ring[(_timer_ring_idx + k) % _SKR_TIMER_RING];
 		if (!frame->pending || !frame->map_done) continue;
 		if (frame->map_status == WGPUMapAsyncStatus_Success) {
 			const uint64_t* stamps = (const uint64_t*)wgpuBufferGetConstMappedRange(frame->readback, 0, frame->pair_count * 2 * sizeof(uint64_t));
@@ -203,23 +208,27 @@ static void _skr_timer_harvest(void) {
 				uint64_t total_ns = 0;
 				for (uint32_t p = 0; p < frame->pair_count; p++)
 					if (stamps[p * 2 + 1] > stamps[p * 2]) total_ns += stamps[p * 2 + 1] - stamps[p * 2];
-				_gpu_time_us = total_ns / 1000;
+				frame->timing.gpu_time_ns = total_ns;
+				_gpu_time_us              = total_ns / 1000;
 			}
 			wgpuBufferUnmap(frame->readback);
 		}
+		_last_frame       = frame->timing;
+		_last_frame_valid = true;
 		frame->pending  = false;
 		frame->map_done = false;
 	}
 }
 
-// Kick off this frame's resolve + readback (frame_end)
-static void _skr_timer_flush(void) {
+// Kick off this frame's resolve + readback (frame_end). NULL when the frame
+// had no timed passes or the ring is full
+static _skr_timer_frame_t* _skr_timer_flush(void) {
 	uint32_t pairs = _timer_pair_next;
 	_timer_pair_next = 0;
-	if (pairs == 0 || _timer_set == NULL) return;
+	if (pairs == 0 || _timer_set == NULL) return NULL;
 
 	_skr_timer_frame_t* frame = &_timer_ring[_timer_ring_idx];
-	if (frame->pending) return; // ring full: skip this frame's numbers
+	if (frame->pending) return NULL; // ring full: skip this frame's numbers
 	_timer_ring_idx = (_timer_ring_idx + 1) % _SKR_TIMER_RING;
 
 	uint64_t size = (uint64_t)pairs * 2 * sizeof(uint64_t);
@@ -245,6 +254,7 @@ static void _skr_timer_flush(void) {
 		.callback  = _skr_on_timer_map,
 		.userdata1 = frame,
 	});
+	return frame;
 }
 
 void skr_renderer_frame_begin(void) {
@@ -270,9 +280,21 @@ void _skr_cpu_wait_add(uint64_t start_ns) {
 }
 
 void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
-	(void)opt_surfaces; (void)count;
-	_skr_cmd_submit();
-	_skr_timer_flush();
+	skr_future_t future = _skr_cmd_submit();
+	for (uint32_t i = 0; i < count; i++)
+		opt_surfaces[i]->frame_future[opt_surfaces[i]->frame_idx % SKR_MAX_FRAMES_IN_FLIGHT] = future;
+
+	// present_id is filled by the present that follows, if one does. A frame
+	// with timed passes is published when its stamps land, the rest now.
+	skr_frame_timing_t timing = {
+		.cpu_begin_ns = _cpu_frame_start_ns,
+		.cpu_end_ns   = _skr_time_now_ns(),
+		.cpu_wait_ns  = _cpu_wait_ns,
+	};
+	_frame_timer        = _skr_timer_flush();
+	_last_frame_surface = count > 0 ? opt_surfaces[0] : NULL;
+	if (_frame_timer) _frame_timer->timing = timing;
+	else            { _last_frame = timing; _last_frame_valid = true; }
 
 	// Busy time, not wall time: blocking waits are the caller's frame budget
 	uint64_t total_ns = _skr_time_now_ns() - _cpu_frame_start_ns;
@@ -285,6 +307,23 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 
 uint64_t skr_renderer_get_gpu_time_us(void) { return _gpu_time_us; }
 uint64_t skr_renderer_get_cpu_time_us(void) { return _cpu_time_us; }
+uint64_t skr_time_now_ns             (void) { return _skr_time_now_ns(); }
+
+void _skr_frame_note_present(const skr_surface_t* surface, uint64_t id) {
+	if (_cpu_in_frame || _last_frame_surface != surface) return;
+	skr_frame_timing_t* timing = _frame_timer ? &_frame_timer->timing : &_last_frame;
+	if (timing->present_id == 0) timing->present_id = id;
+}
+
+void _skr_frame_forget_surface(const skr_surface_t* surface) {
+	if (_last_frame_surface == surface) _last_frame_surface = NULL;
+}
+
+bool skr_renderer_get_frame_timing(skr_frame_timing_t* out_timing) {
+	if (!_last_frame_valid) return false;
+	*out_timing = _last_frame;
+	return true;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 

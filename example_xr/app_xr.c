@@ -156,13 +156,12 @@ void app_xr_update_predicted(void) {
 	// Nothing needed - scenes don't use hand tracking directly
 }
 
-void app_xr_render_stereo(skr_tex_t* color_target, skr_tex_t* resolve_target, skr_tex_t* depth_target, const XrView* views, uint32_t view_count, int32_t width, int32_t height) {
+void app_xr_render_stereo(skr_tex_t* color_target, skr_tex_t* resolve_target, skr_tex_t* depth_target, const XrView* views, uint32_t view_count, int32_t width, int32_t height, float delta_time, float refresh_hz) {
 	if (!s_scene_current) return;
 
-	float delta_time = 1.0f / 72.0f;
 	s_time += delta_time;
 
-	// Update scene
+	s_scene_current->refresh_hz = refresh_hz;
 	scene_update(s_scene_types[s_scene_index], s_scene_current, delta_time);
 
 	// Build system buffer with all views

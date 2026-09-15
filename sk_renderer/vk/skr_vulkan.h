@@ -6,6 +6,7 @@
 #pragma once
 
 #include <volk.h>
+#include "../skr_present.h"
 
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 #define SKR_MAX_SURFACES 2  // Maximum surfaces for VR stereo rendering
@@ -207,6 +208,23 @@ typedef struct skr_surface_t {
 	VkSemaphore    semaphore_acquire[SKR_MAX_FRAMES_IN_FLIGHT];
 	VkSemaphore*   semaphore_submit;
 	skr_vec2i_t    size;
+
+	skr_present_ring_t ring;
+	uint64_t           slot_present_id[SKR_MAX_FRAMES_IN_FLIGHT]; // The present each frame slot fed, for the wait fallback
+	uint64_t*          image_present_id;    // Per image, the id it was last presented with; 0 = never
+	uint64_t           swapchain_first_id;  // First present id issued on the current swapchain
+	uint32_t           present_mode_mask;   // 1 << skr_present_mode_ the surface offers
+	skr_present_mode_  present_mode;        // What the swapchain was created with (never default)
+	skr_present_mode_  present_mode_request; // From skr_surface_info_t, resolved against the mask at every rebuild
+	bool               present_id2;         // Swapchain created with the present_id2/present_wait2 bits
+	// VK_EXT_present_timing, all zero when the swapchain doesn't have it
+	bool               timing;
+	uint32_t           timing_stages;       // VkPresentStageFlagsEXT this surface can query
+	uint64_t           timing_domain_id;
+	uint32_t           timing_domain;       // VkTimeDomainKHR behind timing_domain_id
+	int64_t            timing_stage_offset_ns[4]; // host ns = stamp + offset, per present stage bit; stage-local domains give every stage its own clock
+	uint64_t           timing_seq_id;       // Next id for in-order results when no present ids are chained
+	uint32_t           timing_frames;       // Frames since the refresh duration was last read
 } skr_surface_t;
 
 typedef struct skr_shader_stage_t {

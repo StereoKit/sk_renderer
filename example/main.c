@@ -5,6 +5,7 @@
 
 #include "app.h"
 #include "tools/scene_util.h"
+#include "tools/pacer.h"
 #include "imgui_backend/imgui_impl_sk_renderer.h"
 #include "imgui_impl_sk_app.h"
 
@@ -43,7 +44,7 @@ static bool _ska_file_read(const char* filename, void** out_data, size_t* out_si
 // Wayland nor WebGPU can report a surface's size, so the drawable size goes to
 // skr_surface_create directly.
 
-static bool app_surface_create(ska_window_t* window, skr_surface_t* out_surface) {
+static bool app_surface_create(ska_window_t* window, skr_present_mode_ present_mode, skr_surface_t* out_surface) {
 	// Read this before creating the surface: on the web, configuring a surface
 	// resizes the canvas backing store, which would overwrite what we read
 	int32_t w = 0, h = 0;
@@ -55,7 +56,7 @@ static bool app_surface_create(ska_window_t* window, skr_surface_t* out_surface)
 		su_log(su_log_critical, "Failed to create Vulkan surface: %s", ska_error_get());
 		return false;
 	}
-	if (skr_surface_create(vk_surface, (skr_vec2i_t){ w, h }, out_surface) != skr_err_success) {
+	if (skr_surface_create((skr_surface_info_t){ .native_surface = vk_surface, .size = { w, h }, .present_mode = present_mode }, out_surface) != skr_err_success) {
 		vkDestroySurfaceKHR(skr_get_vk_instance(), vk_surface, NULL);
 		return false;
 	}
@@ -65,7 +66,7 @@ static bool app_surface_create(ska_window_t* window, skr_surface_t* out_surface)
 		su_log(su_log_critical, "Failed to create WebGPU surface: %s", ska_error_get());
 		return false;
 	}
-	skr_surface_create(wgpu_surface, (skr_vec2i_t){ w, h }, out_surface);
+	skr_surface_create((skr_surface_info_t){ .native_surface = wgpu_surface, .size = { w, h }, .present_mode = present_mode }, out_surface);
 #endif
 	return skr_surface_is_valid(out_surface);
 }
@@ -99,6 +100,10 @@ typedef struct main_loop_t {
 	int           test_frames;
 	bool          test_all;
 	bool          cycle_resolve;
+	bool          fullscreen;       // what the window currently is
+	bool          run_ahead_forced; // -runahead was given, so fullscreen toggles leave it alone
+	skr_present_mode_ present_mode; // from -present, for surface creation and recreation
+	pacer_t       pacer;
 } main_loop_t;
 
 static main_loop_t _loop;
@@ -216,7 +221,7 @@ static bool main_frame(void* user_data) {
 				// created during startup.
 				if (skr_surface_is_valid(&s->surface)) break;
 				su_log(su_log_info, "Window shown — recreating surface");
-				if (!app_surface_create(s->window, &s->surface)) {
+				if (!app_surface_create(s->window, s->present_mode, &s->surface)) {
 					su_log(su_log_critical, "Failed to recreate sk_renderer surface");
 					s->running = false;
 					break;
@@ -265,9 +270,25 @@ static bool main_frame(void* user_data) {
 	ImGui_ImplSkApp_NewFrame();
 	igNewFrame();
 
+	// Fullscreen toggle from the panel. Direct scanout makes two frames of run
+	// ahead safe, so the default follows unless the command line chose.
+	if (app_fullscreen(s->app) != s->fullscreen) {
+		s->fullscreen = app_fullscreen(s->app);
+		ska_window_set_fullscreen(s->window, s->fullscreen);
+		if (!s->run_ahead_forced)
+			app_set_run_ahead(s->app, s->fullscreen ? pacer_run_ahead_two : pacer_run_ahead_full);
+	}
+
+	// Pacing: the display driven step replaces the wall clock one, and the
+	// run ahead wait happens here, before the frame's work starts
+	s->pacer.run_ahead = app_run_ahead(s->app);
+	delta_time = pacer_frame_begin(&s->pacer, &s->surface, delta_time, s->window);
+	app_set_refresh_rate (s->app, (float)(1e9 / (double)s->pacer.refresh_ns));
+	app_set_present_mode (s->app, skr_surface_get_present_mode(&s->surface));
+
 	skr_renderer_frame_begin();
 
-	app_update      (s->app, delta_time);
+	app_update(s->app, delta_time);
 	app_render_imgui(s->app, NULL, s->surface.size.x, s->surface.size.y);
 
 	// Finalize ImGui rendering to get draw data
@@ -294,6 +315,12 @@ static bool main_frame(void* user_data) {
 
 		// Present
 		surface_result = skr_surface_present(&s->surface);
+
+		skr_frame_timing_t frame;
+		bool               has_frame = skr_renderer_get_frame_timing(&frame);
+		skr_present_info_t presents[16];
+		int32_t present_count = pacer_frame_end(&s->pacer, &s->surface, has_frame ? &frame : NULL, presents, 16);
+		app_add_timing(s->app, has_frame ? &frame : NULL, presents, present_count);
 	} else {
 		skr_renderer_frame_end(NULL, 0);
 	}
@@ -320,6 +347,12 @@ int main(int argc, char* argv[]) {
 	int  msaa          = -1;  // -1 = use default, 1 = off, 2/4/8 = sample count
 	bool test_all      = false;
 	bool cycle_resolve = false;  // Step through every resolve mode transition (stale-cache regression)
+	int  run_ahead     = -1;     // pacer_run_ahead_ index
+	int  present_mode  = -1;     // skr_present_mode_ index
+	int  buffering     = 0;      // skr_buffering_, 0 = library default
+	bool log_presents  = false;  // Print every drained presentation record
+	bool fullscreen    = false;  // Lets a compositor scan the window out directly
+	static const char* run_ahead_args[] = { "full", "2", "1" };
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-test") == 0) {
 			test_frames = 10;  // Default test mode: 10 frames
@@ -336,6 +369,18 @@ int main(int argc, char* argv[]) {
 			msaa = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "-cycleresolve") == 0) {
 			cycle_resolve = true;
+		} else if (strcmp(argv[i], "-runahead") == 0 && i + 1 < argc) {
+			i++;
+			for (int p = 0; p < pacer_run_ahead_max; p++) if (strcmp(argv[i], run_ahead_args[p]) == 0) run_ahead = p;
+		} else if (strcmp(argv[i], "-present") == 0 && i + 1 < argc) {
+			i++;
+			for (int p = 0; p < skr_present_mode_max; p++) if (strcmp(argv[i], pacer_present_mode_names[p]) == 0) present_mode = p;
+		} else if (strcmp(argv[i], "-buffering") == 0 && i + 1 < argc) {
+			buffering = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-logpresents") == 0) {
+			log_presents = true;
+		} else if (strcmp(argv[i], "-fullscreen") == 0) {
+			fullscreen = true;
 		}
 	}
 
@@ -385,7 +430,7 @@ int main(int argc, char* argv[]) {
 	window = ska_window_create("sk_renderer_test",
 		win_x, win_y,
 		win_w, win_h,
-		ska_window_resizable);
+		ska_window_resizable | (fullscreen ? ska_window_fullscreen : 0));
 #endif
 	su_log(su_log_info, "Window created");
 	if (!window) {
@@ -408,6 +453,7 @@ int main(int argc, char* argv[]) {
 		.enable_validation        = enable_validation,
 		.required_extensions      = extensions,
 		.required_extension_count = extension_count,
+		.buffering                = (skr_buffering_)buffering,
 	};
 
 #if defined(SKR_WEBGPU) && defined(__EMSCRIPTEN__)
@@ -437,7 +483,8 @@ int main(int argc, char* argv[]) {
 	}
 
 	// Create the rendering surface for the active backend
-	if (!app_surface_create(window, &_loop.surface)) {
+	_loop.present_mode = present_mode >= 0 ? (skr_present_mode_)present_mode : skr_present_mode_default;
+	if (!app_surface_create(window, _loop.present_mode, &_loop.surface)) {
 		su_log(su_log_critical, "Failed to create surface!");
 		skr_shutdown();
 		ska_window_destroy(window);
@@ -471,7 +518,7 @@ int main(int argc, char* argv[]) {
 	#if defined(ANDROID)
 	ImGuiStyle* style = igGetStyle();
 	ImGuiStyle_ScaleAllSizes(style, 2.0f);
-	io->FontGlobalScale = 2.0f;
+	style->FontScaleMain = 2.0f;
 	#endif
 
 	// Initialize ImGui sk_app backend
@@ -497,6 +544,18 @@ int main(int argc, char* argv[]) {
 		app_set_resolve_mode(app, resolve_mode);
 	if (app && msaa >= 1)
 		app_set_msaa(app, msaa);
+	// Direct scanout makes two frames of run ahead safe; through a compositor
+	// the default stays at the swapchain's depth
+#ifdef __ANDROID__
+	fullscreen = true;
+#endif
+	_loop.run_ahead_forced = run_ahead >= 0;
+	if (app && run_ahead < 0 && fullscreen)
+		run_ahead = pacer_run_ahead_two;
+	if (app && run_ahead >= 0)
+		app_set_run_ahead(app, (pacer_run_ahead_)run_ahead);
+	if (app)
+		app_set_fullscreen(app, fullscreen);
 	if (!app) {
 		su_log(su_log_critical, "Failed to create application!");
 		ImGui_ImplSkRenderer_Shutdown();
@@ -523,6 +582,8 @@ int main(int argc, char* argv[]) {
 	_loop.test_frames   = test_frames;
 	_loop.test_all      = test_all;
 	_loop.cycle_resolve = cycle_resolve;
+	_loop.pacer.log  = log_presents;
+	_loop.fullscreen = fullscreen;
 
 	ska_run(main_frame, &_loop);
 

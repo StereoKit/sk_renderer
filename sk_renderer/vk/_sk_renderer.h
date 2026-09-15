@@ -7,6 +7,7 @@
 
 #include "sk_renderer.h"
 #include "skr_vulkan.h"
+#include "../_skr_shared.h"
 
 #include <volk.h>
 #include <threads.h>
@@ -229,6 +230,17 @@ typedef struct {
 	bool                     has_create_renderpass2;      // VK_KHR_create_renderpass2
 	bool                     has_depth_stencil_resolve;   // VK_KHR_depth_stencil_resolve (implies create_renderpass2)
 	bool                     has_present_fence;           // VK_EXT_swapchain_maintenance1, fences observe present completion
+	bool                     has_present_timing;          // VK_EXT_present_timing, presentTiming feature
+	bool                     has_present_wait2;           // VK_KHR_present_id2 + VK_KHR_present_wait2
+	bool                     has_present_wait;            // VK_KHR_present_id + VK_KHR_present_wait
+	bool                     has_display_timing_google;   // VK_GOOGLE_display_timing (Android)
+	bool                     has_calibrated_timestamps;   // VK_KHR/EXT_calibrated_timestamps with a device + host domain pair
+	PFN_vkGetCalibratedTimestampsKHR get_calibrated_timestamps; // Whichever spelling the driver enabled, NULL without has_calibrated_timestamps
+	VkTimeDomainKHR          host_time_domain;            // The domain skr_time_now_ns reads
+	uint64_t                 calib_device_ticks;          // Last calibration pair, device ticks and host ns
+	uint64_t                 calib_host_ns;
+	uint64_t                 frame_present_id[SKR_MAX_FRAMES_IN_FLIGHT]; // The present each frame fed, 0 if none
+	skr_surface_t*           frame_surface   [SKR_MAX_FRAMES_IN_FLIGHT]; // and the surface it went to; cleared on surface destroy
 	bool                     has_store_op_none;           // VK_ATTACHMENT_STORE_OP_NONE, from any of the KHR/EXT/QCOM extensions
 	bool                     has_subpass_merge_feedback;  // VK_EXT_subpass_merge_feedback + feature bit
 	bool                     has_subgroup_size_control;   // VK_EXT_subgroup_size_control + subgroupSizeControl feature
@@ -284,13 +296,13 @@ typedef struct {
 	uint32_t                 min_ssbo_offset_align;  // minStorageBufferOffsetAlignment
 	int32_t                  max_msaa_samples;       // Maximum supported MSAA sample count
 	uint64_t                 frame_timestamps[SKR_MAX_FRAMES_IN_FLIGHT][2];  // [frame][start/end]
-	bool                     timestamps_valid[SKR_MAX_FRAMES_IN_FLIGHT];
 
 	// CPU timing (wall-clock time for frame work, excluding vsync)
 	uint64_t                 cpu_frame_start_ns  [SKR_MAX_FRAMES_IN_FLIGHT];
 	uint64_t                 cpu_frame_end_ns    [SKR_MAX_FRAMES_IN_FLIGHT];
 	uint64_t                 cpu_frame_wait_ns   [SKR_MAX_FRAMES_IN_FLIGHT];  // Accumulated wait time to subtract
-	bool                     cpu_timestamps_valid[SKR_MAX_FRAMES_IN_FLIGHT];
+	skr_frame_timing_t       last_frame_timing;      // Snapshot taken when a frame's timestamps are read back
+	bool                     last_frame_timing_valid;
 
 	// Current render pass (for pipeline lookup)
 	int32_t                  current_renderpass_idx;
@@ -352,6 +364,8 @@ const VkSpecializationInfo* _skr_shader_make_spec_info      (const sksc_shader_m
 
 // Timing helpers
 uint64_t              _skr_time_get_ns                      (void);
+uint64_t              _skr_time_from_host_domain            (uint64_t stamp);  // A raw host_time_domain stamp onto the _skr_time_get_ns scale
+void                  _skr_frame_note_present               (const skr_surface_t* surface, uint64_t id);  // Joins a present to the frame that just ended, when it was that frame's surface
 
 // Material descriptor caching. Returns -1 on success, or the failing bind index if a resource is missing.
 int32_t               _skr_material_add_writes              (const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct);

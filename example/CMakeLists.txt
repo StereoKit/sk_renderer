@@ -7,38 +7,21 @@ include(FetchContent)
 # Dependencies
 ###############################################################################
 
-# sk_app for windowing and platform abstraction
-set(SKA_BUILD_EXAMPLES OFF CACHE BOOL "Disable sk_app examples" FORCE)
-# Ensure sk_app is built with PIC for Android shared library
-if(ANDROID)
-	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-endif()
-# SKR_SK_APP_DIR points at a local sk_app checkout for development (e.g.
-# -DSKR_SK_APP_DIR=../sk_app, resolved against the sk_renderer root);
-# empty — the default — fetches the pinned release. v2026.7.20+ carries the
-# WebGPU surface + web platform support the WebGPU backend needs.
+# sk_app for windowing and platform abstraction. SKR_SK_APP_DIR swaps in a
+# local checkout for the pinned release.
+set(SKA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 if(SKR_SK_APP_DIR)
-	get_filename_component(_skr_sk_app_dir "${SKR_SK_APP_DIR}" ABSOLUTE BASE_DIR "${sk_renderer_SOURCE_DIR}")
-	if(NOT EXISTS "${_skr_sk_app_dir}/CMakeLists.txt")
-		message(FATAL_ERROR "SKR_SK_APP_DIR (${_skr_sk_app_dir}) doesn't look like an sk_app checkout")
-	endif()
-	message(STATUS "Using sk_app from ${_skr_sk_app_dir}")
-	FetchContent_Declare(sk_app
-		SOURCE_DIR "${_skr_sk_app_dir}"
-	)
-else()
-	message(STATUS "Fetching sk_app v2026.7.20...")
-	FetchContent_Declare(sk_app
-		GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-		GIT_TAG        v2026.8.10
-		GIT_SHALLOW    TRUE
-		GIT_PROGRESS   TRUE
-	)
+	message(STATUS "Using sk_app from ${SKR_SK_APP_DIR}")
+	set(FETCHCONTENT_SOURCE_DIR_SK_APP "${SKR_SK_APP_DIR}")
 endif()
+message(STATUS "Fetching sk_app...")
+FetchContent_Declare(sk_app
+	GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
+	GIT_TAG        v2026.9.10
+	GIT_SHALLOW    TRUE
+	GIT_PROGRESS   TRUE
+)
 FetchContent_MakeAvailable(sk_app)
-if(ANDROID)
-	set_target_properties(sk_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
-endif()
 
 # stb for image loading
 message(STATUS "Fetching stb...")
@@ -202,9 +185,11 @@ target_sources(sk_renderer_test PRIVATE
 	scene_yuv_test.c
 	scene_gi.c
 	scene_pbr.c
+	scene_frame_pacing.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c
+	tools/pacer.c
 	tools/compress/tex_compress.c
 	tools/tex_psnr.c
 	tools/compress/astc_io.c
@@ -295,6 +280,7 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/postfx_invert.hlsl
 	assets/shaders/postfx_depth_fog.hlsl
 	assets/shaders/postfx_depth_fog_ms.hlsl
+	assets/shaders/frame_pacing.hlsl
 	assets/shaders/postfx_fog_density.svsl
 	assets/shaders/postfx_fog_scatter.svsl
 	assets/shaders/postfx_fog_scatter_taps.svsl

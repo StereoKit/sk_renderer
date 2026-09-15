@@ -26,6 +26,234 @@ static VkSurfaceFormatKHR _skr_find_surface_format(const VkSurfaceFormatKHR* for
 	return formats[0];
 }
 
+static VkPresentModeKHR _skr_present_mode_to_vk(skr_present_mode_ mode) {
+	switch (mode) {
+	case skr_present_mode_fifo_relaxed: return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+	case skr_present_mode_mailbox:      return VK_PRESENT_MODE_MAILBOX_KHR;
+	case skr_present_mode_immediate:    return VK_PRESENT_MODE_IMMEDIATE_KHR;
+	default:                            return VK_PRESENT_MODE_FIFO_KHR;
+	}
+}
+
+static skr_present_mode_ _skr_present_mode_from_vk(VkPresentModeKHR mode) {
+	switch (mode) {
+	case VK_PRESENT_MODE_FIFO_KHR:         return skr_present_mode_fifo;
+	case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return skr_present_mode_fifo_relaxed;
+	case VK_PRESENT_MODE_MAILBOX_KHR:      return skr_present_mode_mailbox;
+	case VK_PRESENT_MODE_IMMEDIATE_KHR:    return skr_present_mode_immediate;
+	default:                               return skr_present_mode_max;
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Presentation timing
+
+// A present timing report can trail its present by several frames
+#define SKR_TIMING_SETTLE_PRESENTS       8
+// A reported stamp further than this from its present is not a time at all;
+// seen on presents mailbox dropped
+#define SKR_TIMING_STAMP_SANITY_NS       1000000000ull
+// refreshDuration reads 0 until feedback has arrived, VRR can change it, and
+// the clock calibration drifts
+#define SKR_TIMING_REFRESH_REREAD_FRAMES 64
+
+// Timing extensions each declare per-surface support, and a swapchain may only
+// ask for the ones its surface confirmed
+static void _skr_surface_query_present_caps(const skr_surface_t* surface, bool* out_timing, uint32_t* out_timing_stages, bool* out_present_id2) {
+	*out_timing = false; *out_timing_stages = 0; *out_present_id2 = false;
+	if (vkGetPhysicalDeviceSurfaceCapabilities2KHR == NULL) return;
+	if (!_skr_vk.has_present_timing && !_skr_vk.has_present_wait2) return;
+
+	VkPresentTimingSurfaceCapabilitiesEXT timing_caps = { .sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT };
+	VkSurfaceCapabilitiesPresentId2KHR    id2_caps    = { .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR };
+	VkSurfaceCapabilitiesPresentWait2KHR  wait2_caps  = { .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR };
+	VkSurfaceCapabilities2KHR             caps2       = { .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR };
+	if (_skr_vk.has_present_timing) { timing_caps.pNext = caps2.pNext; caps2.pNext = &timing_caps; }
+	if (_skr_vk.has_present_wait2)  { id2_caps.pNext   = caps2.pNext; caps2.pNext = &id2_caps;
+	                                  wait2_caps.pNext = caps2.pNext; caps2.pNext = &wait2_caps; }
+	VkResult vr = vkGetPhysicalDeviceSurfaceCapabilities2KHR(_skr_vk.physical_device, &(VkPhysicalDeviceSurfaceInfo2KHR){
+		.sType   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+		.surface = surface->surface,
+	}, &caps2);
+	if (vr != VK_SUCCESS) return;
+
+	*out_timing        = _skr_vk.has_present_timing && timing_caps.presentTimingSupported;
+	*out_timing_stages = timing_caps.presentStageQueries;
+	*out_present_id2   = _skr_vk.has_present_wait2 && id2_caps.presentId2Supported && wait2_caps.presentWait2Supported;
+}
+
+static void _skr_surface_timing_read_refresh(skr_surface_t* ref_surface) {
+	if (ref_surface->timing) {
+		VkSwapchainTimingPropertiesEXT props   = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT };
+		uint64_t                       counter = 0;
+		if (vkGetSwapchainTimingPropertiesEXT(_skr_vk.device, ref_surface->swapchain, &props, &counter) == VK_SUCCESS)
+			ref_surface->ring.refresh_reported_ns = props.refreshDuration;
+	} else if (_skr_vk.has_display_timing_google) {
+		VkRefreshCycleDurationGOOGLE cycle = {0};
+		if (vkGetRefreshCycleDurationGOOGLE(_skr_vk.device, ref_surface->swapchain, &cycle) == VK_SUCCESS)
+			ref_surface->ring.refresh_reported_ns = cycle.refreshDuration;
+	}
+}
+
+static void _skr_surface_timing_calibrate(skr_surface_t* ref_surface);
+
+static void _skr_surface_timing_setup(skr_surface_t* ref_surface, bool timing, uint32_t stages) {
+	ref_surface->timing_stages           = stages & (VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT | VK_PRESENT_STAGE_REQUEST_DEQUEUED_BIT_EXT
+	                                               | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT);
+	// A surface with no queryable stage has nothing to report; the acquire tiers do better
+	ref_surface->timing                  = timing && ref_surface->timing_stages != 0 && vkSetSwapchainPresentTimingQueueSizeEXT != NULL;
+	ref_surface->timing_domain           = 0;
+	ref_surface->timing_domain_id        = 0;
+	ref_surface->timing_frames           = 0;
+	memset(ref_surface->timing_stage_offset_ns, 0, sizeof(ref_surface->timing_stage_offset_ns));
+	ref_surface->ring.refresh_reported_ns = 0;
+	_skr_surface_timing_read_refresh(ref_surface);
+	if (!ref_surface->timing) return;
+
+	vkSetSwapchainPresentTimingQueueSizeEXT(_skr_vk.device, ref_surface->swapchain, SKR_PRESENT_RING);
+
+	// The host clock when the driver offers it directly, else a swapchain
+	// local domain that gets calibrated against it each frame
+	VkSwapchainTimeDomainPropertiesEXT domains = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT };
+	uint64_t        counter = 0;
+	VkTimeDomainKHR types[8];
+	uint64_t        ids  [8];
+	vkGetSwapchainTimeDomainPropertiesEXT(_skr_vk.device, ref_surface->swapchain, &domains, &counter);
+	if (domains.timeDomainCount > 8) domains.timeDomainCount = 8;
+	domains.pTimeDomains   = types;
+	domains.pTimeDomainIds = ids;
+	vkGetSwapchainTimeDomainPropertiesEXT(_skr_vk.device, ref_surface->swapchain, &domains, &counter);
+	int32_t pick = -1;
+	for (uint32_t i = 0; i < domains.timeDomainCount && pick < 0; i++) if (types[i] == _skr_vk.host_time_domain)                 pick = (int32_t)i;
+	for (uint32_t i = 0; i < domains.timeDomainCount && pick < 0; i++) if (types[i] == VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT)         pick = (int32_t)i;
+	for (uint32_t i = 0; i < domains.timeDomainCount && pick < 0; i++) if (types[i] == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT)     pick = (int32_t)i;
+	if (pick < 0 && domains.timeDomainCount > 0) pick = 0;
+	if (pick >= 0) {
+		ref_surface->timing_domain    = types[pick];
+		ref_surface->timing_domain_id = ids  [pick];
+	}
+	_skr_surface_timing_calibrate(ref_surface);
+}
+
+static int32_t _skr_stage_index(VkPresentStageFlagsEXT stage) {
+	int32_t index = 0;
+	while (stage > 1) { stage >>= 1; index++; }
+	return index < 4 ? index : 3;
+}
+
+static uint64_t _skr_surface_domain_to_host(const skr_surface_t* surface, VkPresentStageFlagsEXT stage, uint64_t stamp) {
+	if (surface->timing_domain == _skr_vk.host_time_domain) return _skr_time_from_host_domain(stamp);
+	return (uint64_t)((int64_t)stamp + surface->timing_stage_offset_ns[_skr_stage_index(stage)]);
+}
+
+// One calibration per clock: a swapchain-local domain is a single clock,
+// a stage-local domain is one clock per stage the surface reports
+static void _skr_surface_timing_calibrate(skr_surface_t* ref_surface) {
+	if (ref_surface->timing_domain == _skr_vk.host_time_domain) return;
+	PFN_vkGetCalibratedTimestampsKHR get = _skr_vk.get_calibrated_timestamps;
+	if (get == NULL) return;
+
+	bool     per_stage = ref_surface->timing_domain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT;
+	uint32_t stages    = per_stage ? ref_surface->timing_stages : 1;
+	for (uint32_t stage = 1; stage <= 8; stage <<= 1) {
+		if (!(stages & stage)) continue;
+		VkSwapchainCalibratedTimestampInfoEXT swapchain_info = {
+			.sType        = VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT,
+			.swapchain    = ref_surface->swapchain,
+			.presentStage = per_stage ? stage : 0,
+			.timeDomainId = ref_surface->timing_domain_id,
+		};
+		VkCalibratedTimestampInfoKHR infos[2] = {
+			{ .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, .pNext = &swapchain_info, .timeDomain = ref_surface->timing_domain },
+			{ .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, .timeDomain = _skr_vk.host_time_domain },
+		};
+		uint64_t stamps[2], deviation;
+		if (get(_skr_vk.device, 2, infos, stamps, &deviation) != VK_SUCCESS) continue;
+		int64_t offset = (int64_t)_skr_time_from_host_domain(stamps[1]) - (int64_t)stamps[0];
+		if (per_stage) ref_surface->timing_stage_offset_ns[_skr_stage_index(stage)] = offset;
+		else for (int32_t i = 0; i < 4; i++) ref_surface->timing_stage_offset_ns[i] = offset;
+	}
+}
+
+static void _skr_surface_poll_timing(skr_surface_t* ref_surface) {
+	if (!ref_surface->timing) return;
+	if (++ref_surface->timing_frames >= SKR_TIMING_REFRESH_REREAD_FRAMES) {
+		ref_surface->timing_frames = 0;
+		_skr_surface_timing_read_refresh(ref_surface);
+		_skr_surface_timing_calibrate   (ref_surface);
+	}
+
+	VkPastPresentationTimingInfoEXT       info  = { .sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT, .swapchain = ref_surface->swapchain };
+	VkPastPresentationTimingPropertiesEXT props = { .sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT };
+	VkResult vr = vkGetPastPresentationTimingEXT(_skr_vk.device, &info, &props);
+	if ((vr != VK_SUCCESS && vr != VK_INCOMPLETE) || props.presentationTimingCount == 0) return;
+
+	VkPresentStageTimeEXT       stages [16][4];
+	VkPastPresentationTimingEXT results[16];
+	uint32_t count = props.presentationTimingCount < 16 ? props.presentationTimingCount : 16;
+	for (uint32_t i = 0; i < count; i++)
+		results[i] = (VkPastPresentationTimingEXT){ .sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT, .presentStageCount = 4, .pPresentStages = stages[i] };
+	props.presentationTimingCount = count;
+	props.pPresentationTimings    = results;
+	vr = vkGetPastPresentationTimingEXT(_skr_vk.device, &info, &props);
+	if (vr != VK_SUCCESS && vr != VK_INCOMPLETE) return;
+
+	for (uint32_t i = 0; i < props.presentationTimingCount; i++) {
+		// Without present ids chained the results carry 0 and arrive in order
+		uint64_t id = results[i].presentId ? results[i].presentId : ref_surface->timing_seq_id++;
+		skr_present_info_t* slot = _skr_present_slot(&ref_surface->ring, id);
+		if (slot == NULL) continue;
+
+		uint64_t visible = 0, out = 0;
+		for (uint32_t s = 0; s < results[i].presentStageCount; s++) {
+			// An uncalibrated local domain is anchored at its first stamp:
+			// intervals stay exact, absolute times land near now
+			int64_t* offset = &ref_surface->timing_stage_offset_ns[_skr_stage_index(stages[i][s].stage)];
+			if (ref_surface->timing_domain != _skr_vk.host_time_domain && *offset == 0)
+				*offset = (int64_t)_skr_time_get_ns() - (int64_t)stages[i][s].time;
+
+			uint64_t t = _skr_surface_domain_to_host(ref_surface, stages[i][s].stage, stages[i][s].time);
+			uint64_t now = _skr_time_get_ns();
+			if (t + SKR_TIMING_STAMP_SANITY_NS < slot->cpu_present_ns || t > now + SKR_TIMING_STAMP_SANITY_NS) continue;
+			switch (stages[i][s].stage) {
+			case VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT:       slot->gpu_done_ns = t; break;
+			case VK_PRESENT_STAGE_REQUEST_DEQUEUED_BIT_EXT:           slot->queued_ns   = t; break;
+			case VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT:      out     = t; break;
+			case VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT:  visible = t; break;
+			default: break;
+			}
+		}
+		if (visible || out) _skr_present_display(&ref_surface->ring, id, visible ? visible : out, skr_timing_source_reported);
+	}
+}
+
+static void _skr_surface_poll_google(skr_surface_t* ref_surface) {
+	if (!_skr_vk.has_display_timing_google || ref_surface->timing) return;
+	if (++ref_surface->timing_frames >= SKR_TIMING_REFRESH_REREAD_FRAMES) {
+		ref_surface->timing_frames = 0;
+		_skr_surface_timing_read_refresh(ref_surface);
+	}
+	uint32_t count = 0;
+	if (vkGetPastPresentationTimingGOOGLE(_skr_vk.device, ref_surface->swapchain, &count, NULL) != VK_SUCCESS || count == 0) return;
+	VkPastPresentationTimingGOOGLE results[16];
+	if (count > 16) count = 16;
+	VkResult vr = vkGetPastPresentationTimingGOOGLE(_skr_vk.device, ref_surface->swapchain, &count, results);
+	if (vr != VK_SUCCESS && vr != VK_INCOMPLETE) return;
+	for (uint32_t i = 0; i < count; i++)
+		_skr_present_display(&ref_surface->ring, results[i].presentID, results[i].actualPresentTime, skr_timing_source_reported);
+}
+
+// The image handed back was replaced on screen by the present after its own:
+// at about now if the acquire blocked, some time before if it didn't
+static void _skr_surface_note_release(skr_surface_t* ref_surface, uint32_t image, uint64_t now_ns, bool blocked) {
+	uint64_t prev = ref_surface->image_present_id[image];
+	bool     fifo = ref_surface->present_mode == skr_present_mode_fifo || ref_surface->present_mode == skr_present_mode_fifo_relaxed;
+	if (prev == 0 || !fifo) return;
+	_skr_present_display(&ref_surface->ring, prev + 1, now_ns, blocked ? skr_timing_source_estimate : skr_timing_source_coarse);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 // Helper to create/recreate swapchain and allocate resources
 static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys_device, uint32_t graphics_queue_family, skr_surface_t* ref_surface, VkSwapchainKHR old_swapchain) {
 	// Get surface capabilities. An unchecked failure here leaves the whole
@@ -76,16 +304,29 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		present_mode_count = sizeof(present_modes) / sizeof(present_modes[0]);
 	vkGetPhysicalDeviceSurfacePresentModesKHR(phys_device, ref_surface->surface, &present_mode_count, present_modes);
 
-	// Choose present mode: prefer FIFO_RELAXED (vsync but tolerant of missed
-	// deadlines), fall back to FIFO. MAILBOX doesn't vsync on many Linux
+	// The default prefers FIFO_RELAXED (vsync but tolerant of missed
+	// deadlines), falling back to FIFO. MAILBOX doesn't vsync on many Linux
 	// compositors, and FIFO cascades missed frames.
-	VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+	ref_surface->present_mode_mask = 0;
 	for (uint32_t i = 0; i < present_mode_count; i++) {
-		if (present_modes[i] == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
-			present_mode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-			break;
-		}
+		skr_present_mode_ mode = _skr_present_mode_from_vk(present_modes[i]);
+		if (mode != skr_present_mode_max) ref_surface->present_mode_mask |= 1u << mode;
 	}
+	skr_present_mode_ wanted = ref_surface->present_mode_request;
+	if (wanted == skr_present_mode_default || !(ref_surface->present_mode_mask & (1u << wanted)))
+		wanted = (ref_surface->present_mode_mask & (1u << skr_present_mode_fifo_relaxed)) ? skr_present_mode_fifo_relaxed : skr_present_mode_fifo;
+	bool     mode_changed     = wanted != ref_surface->present_mode;
+	uint32_t prev_image_count = ref_surface->image_count;
+	ref_surface->present_mode = wanted;
+	VkPresentModeKHR present_mode = _skr_present_mode_to_vk(wanted);
+
+	bool     timing        = false;
+	bool     present_id2   = false;
+	uint32_t timing_stages = 0;
+	_skr_surface_query_present_caps(ref_surface, &timing, &timing_stages, &present_id2);
+	VkSwapchainCreateFlagsKHR create_flags = 0;
+	if (timing)      create_flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+	if (present_id2) create_flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
 
 	// Determine extent. A currentExtent of UINT32_MAX means the surface cannot
 	// report a size and the client picks one; Wayland always answers this way,
@@ -121,6 +362,7 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 	// Create swapchain
 	VkSwapchainCreateInfoKHR swapchain_info = {
 		.sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+		.flags            = create_flags,
 		.surface          = ref_surface->surface,
 		.minImageCount    = image_count,
 		.imageFormat      = surface_format.format,
@@ -171,10 +413,25 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		}
 
 		// Reallocate images array
-		if (ref_surface->images) _skr_free(ref_surface->images);
-		ref_surface->images      = (skr_tex_t*)_skr_calloc(image_count, sizeof(skr_tex_t));
-		ref_surface->image_count = image_count;
+		if (ref_surface->images)           _skr_free(ref_surface->images);
+		if (ref_surface->image_present_id) _skr_free(ref_surface->image_present_id);
+		ref_surface->images           = (skr_tex_t*)_skr_calloc(image_count, sizeof(skr_tex_t));
+		ref_surface->image_present_id = (uint64_t*) _skr_calloc(image_count, sizeof(uint64_t));
+		ref_surface->image_count      = image_count;
 	}
+
+	// New images, and a new results queue: nothing from the old swapchain can
+	// be matched to them
+	memset(ref_surface->image_present_id, 0, sizeof(uint64_t) * image_count);
+	ref_surface->present_id2        = present_id2;
+	ref_surface->swapchain_first_id = ref_surface->ring.count + 1;
+	ref_surface->timing_seq_id      = ref_surface->swapchain_first_id;
+	_skr_surface_timing_setup(ref_surface, timing, timing_stages);
+
+	// Resizes rebuild too, and have nothing new to say
+	static const char* mode_names[] = { "default", "fifo", "fifo_relaxed", "mailbox", "immediate" };
+	if (mode_changed || image_count != prev_image_count)
+		skr_log(skr_log_info, "Swapchain: %u images, %s", image_count, mode_names[ref_surface->present_mode]);
 
 	// Update size
 	ref_surface->size = (skr_vec2i_t){extent.width, extent.height};
@@ -226,7 +483,7 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 	return true;
 }
 
-skr_err_ skr_surface_create(void* vk_surface_khr, skr_vec2i_t size, skr_surface_t* out_surface) {
+skr_err_ skr_surface_create(skr_surface_info_t info, skr_surface_t* out_surface) {
 	if (!out_surface) return skr_err_invalid_parameter;
 
 	// Zero out immediately
@@ -234,14 +491,15 @@ skr_err_ skr_surface_create(void* vk_surface_khr, skr_vec2i_t size, skr_surface_
 
 	// Only consulted when the surface cannot report its own extent, which is
 	// Wayland. The swapchain overwrites this with the extent it settled on.
-	out_surface->size = size;
+	out_surface->size                 = info.size;
+	out_surface->present_mode_request = info.present_mode;
 
 	if (!skr_is_capable(skr_capability_presentation)) {
 		skr_log(skr_log_critical, "skr_surface_create: VK_KHR_surface/VK_KHR_swapchain not available (headless?)");
 		return skr_err_unsupported;
 	}
 
-	VkSurfaceKHR vk_surface = (VkSurfaceKHR)vk_surface_khr;
+	VkSurfaceKHR vk_surface = (VkSurfaceKHR)info.native_surface;
 	if (!vk_surface) return skr_err_invalid_parameter;
 
 	// Check present support
@@ -304,6 +562,8 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 	// Callers destroy the native window as soon as this returns, so the
 	// swapchain and surface can't go on a command ring to be destroyed later.
 	_skr_device_wait_idle();
+	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++)
+		if (_skr_vk.frame_surface[i] == ref_surface) _skr_vk.frame_surface[i] = NULL;
 	_skr_surface_wait_presents(ref_surface);
 	skr_destroy_list_t list = _skr_destroy_list_create();
 
@@ -329,6 +589,7 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 		}
 		_skr_free(ref_surface->images);
 	}
+	if (ref_surface->image_present_id) _skr_free(ref_surface->image_present_id);
 
 	// Executes LIFO, so the surface outlives the swapchain
 	_skr_cmd_destroy_surface  (&list, ref_surface->surface  );
@@ -389,6 +650,9 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, 
 	if (size.x != ref_surface->size.x || size.y != ref_surface->size.y)
 		return skr_acquire_needs_resize;
 
+	_skr_surface_poll_timing(ref_surface);
+	_skr_surface_poll_google(ref_surface);
+
 	// Check if the surface needs to be recreated before touching any per-frame
 	// state. Some drivers (e.g. Adreno) do not return VK_SUBOPTIMAL_KHR on
 	// dimension mismatch — they silently scale in the compositor instead.
@@ -409,6 +673,7 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, 
 
 	// Wait on the future from N-frames-ago to ensure this frame slot is available
 	skr_future_wait(&ref_surface->frame_future[ref_surface->frame_idx]);
+	uint64_t acquire_start = _skr_time_get_ns();
 
 	// Acquire next image using per-frame acquire semaphore
 	// Frame fence ensures this semaphore is not in use from previous frames
@@ -431,36 +696,18 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, 
 		return skr_acquire_surface_lost;
 	}
 
-	// Handle swapchain out-of-date or suboptimal
-	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-		// If VK_SUBOPTIMAL_KHR, the semaphore was signaled even though we won't use the image
-		// We need to consume the semaphore with a dummy submit to unsignal it
-		if (result == VK_SUBOPTIMAL_KHR) {
-			VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	// Out of date acquired nothing; the semaphore stays unsignaled for a retry
+	if (result == VK_ERROR_OUT_OF_DATE_KHR) return skr_acquire_needs_resize;
 
-			mtx_lock(_skr_vk.graphics_queue_mutex);
-			vkQueueSubmit(_skr_vk.graphics_queue, 1, &(VkSubmitInfo){
-				.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-				.waitSemaphoreCount   = 1,
-				.pWaitSemaphores      = &ref_surface->semaphore_acquire[ref_surface->frame_idx],
-				.pWaitDstStageMask    = &wait_stage,
-				.commandBufferCount   = 0,  // No commands, just consume the semaphore
-			}, VK_NULL_HANDLE);
-
-			// Wait for the dummy submit to complete so semaphore is unsignaled
-			vkQueueWaitIdle(_skr_vk.graphics_queue);
-			mtx_unlock(_skr_vk.graphics_queue_mutex);
-		}
-
-		// Don't advance frame index - we can reuse the same (now unsignaled) semaphore
-		return skr_acquire_needs_resize;
-	}
-
-	// Handle other errors
-	if (result != VK_SUCCESS) {
+	// Suboptimal still delivered a usable image, and a real extent change is
+	// caught by the capabilities poll above. XWayland reports it every few
+	// frames for a buffer modifier copy, which no rebuild ever satisfies.
+	if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
 		skr_log(skr_log_critical, "Failed to acquire swapchain image: 0x%X", result);
 		return skr_acquire_error;
 	}
+
+	_skr_surface_note_release(ref_surface, ref_surface->current_image, wait_end, wait_end - acquire_start > SKR_PRESENT_ACQUIRE_BLOCKED_NS);
 
 	*out_tex = &ref_surface->images[ref_surface->current_image];
 	return skr_acquire_success;
@@ -468,6 +715,14 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, 
 
 skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 	if (!ref_surface) return skr_acquire_error;
+
+	uint64_t id = _skr_present_begin(&ref_surface->ring, _skr_time_get_ns())->id;
+	ref_surface->image_present_id[ref_surface->current_image] = id;
+	ref_surface->slot_present_id [ref_surface->frame_idx]     = id;
+	_skr_frame_note_present(ref_surface, id);
+
+	// pNext chain, built innermost first
+	const void* chain = NULL;
 
 	// This slot's fence is from SKR_MAX_FRAMES_IN_FLIGHT presents ago, so the
 	// wait is a formality; once attached, the fence pins down exactly when the
@@ -479,13 +734,38 @@ skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 		vkResetFences  (_skr_vk.device, 1, &fence);
 		fence_info.swapchainCount = 1;
 		fence_info.pFences        = &fence;
+		fence_info.pNext          = chain;
+		chain                     = &fence_info;
+	}
+
+	VkPresentIdKHR  id_info  = { .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,   .swapchainCount = 1, .pPresentIds = &id };
+	VkPresentId2KHR id2_info = { .sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR, .swapchainCount = 1, .pPresentIds = &id };
+	if      (ref_surface->present_id2)  { id2_info.pNext = chain; chain = &id2_info; }
+	else if (_skr_vk.has_present_wait)  { id_info.pNext  = chain; chain = &id_info;  }
+
+	VkPresentTimingInfoEXT timing_info = {
+		.sType               = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT,
+		.timeDomainId        = ref_surface->timing_domain_id,
+		.presentStageQueries = ref_surface->timing_stages,
+	};
+	VkPresentTimingsInfoEXT timings_info = { .sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT, .swapchainCount = 1, .pTimingInfos = &timing_info };
+	if (ref_surface->timing) {
+		timings_info.pNext = chain;
+		chain              = &timings_info;
+	}
+
+	VkPresentTimeGOOGLE      google_time  = { .presentID = (uint32_t)id };
+	VkPresentTimesInfoGOOGLE google_times = { .sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1, .pTimes = &google_time };
+	if (_skr_vk.has_display_timing_google && !ref_surface->timing) {
+		google_times.pNext = chain;
+		chain              = &google_times;
 	}
 
 	// Just present - all command buffer work happened before frame_end!
 	mtx_lock(_skr_vk.present_queue_mutex);
 	VkResult result = vkQueuePresentKHR(_skr_vk.present_queue, &(VkPresentInfoKHR){
 		.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-		.pNext              = fence != VK_NULL_HANDLE ? &fence_info : NULL,
+		.pNext              = chain,
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores    = &ref_surface->semaphore_submit[ref_surface->current_image],
 		.swapchainCount     = 1,
@@ -497,8 +777,8 @@ skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 	ref_surface->frame_idx = (ref_surface->frame_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
 
 	if (result == VK_ERROR_SURFACE_LOST_KHR)                                    return skr_acquire_surface_lost;
-	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)      return skr_acquire_needs_resize;
-	if (result != VK_SUCCESS)              { skr_log(skr_log_critical, "vkQueuePresentKHR failed: 0x%X", result); return skr_acquire_error; }
+	if (result == VK_ERROR_OUT_OF_DATE_KHR)                                     return skr_acquire_needs_resize;
+	if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) { skr_log(skr_log_critical, "vkQueuePresentKHR failed: 0x%X", result); return skr_acquire_error; }
 	return skr_acquire_success;
 }
 
@@ -508,4 +788,62 @@ bool skr_surface_is_valid(const skr_surface_t* surface) {
 
 skr_vec2i_t skr_surface_get_size(const skr_surface_t* surface) {
 	return surface ? surface->size : (skr_vec2i_t){0, 0};
+}
+
+skr_present_mode_ skr_surface_get_present_mode(const skr_surface_t* surface) {
+	return surface->present_mode;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+uint64_t skr_surface_get_refresh_ns(const skr_surface_t* surface) {
+	return _skr_present_refresh_ns(&surface->ring);
+}
+
+uint64_t skr_surface_get_next_id(const skr_surface_t* surface) {
+	return surface->ring.count + 1;
+}
+
+int32_t skr_surface_present_history(skr_surface_t* ref_surface, skr_present_info_t* out_infos, int32_t max_count) {
+	// Reports trail their present by a few frames; without them a slot's last
+	// signal is its successor's image coming back, a full lap of the swapchain
+	bool     reported = ref_surface->timing || _skr_vk.has_display_timing_google;
+	uint32_t settle   = reported ? SKR_TIMING_SETTLE_PRESENTS : ref_surface->image_count + 1;
+	return _skr_present_drain(&ref_surface->ring, settle, out_infos, max_count);
+}
+
+void skr_surface_set_refresh(skr_surface_t* ref_surface, uint64_t refresh_ns) {
+	ref_surface->ring.refresh_hint_ns = refresh_ns;
+}
+
+void skr_surface_set_vblank(skr_surface_t* ref_surface, uint64_t vblank_ns) {
+	_skr_present_vblank(&ref_surface->ring, vblank_ns);
+}
+
+bool skr_surface_wait_present(skr_surface_t* ref_surface, uint64_t id, uint64_t timeout_ns) {
+	if (id == 0 || id > ref_surface->ring.count) return false;
+	// Ids from before a rebuild belong to a swapchain that no longer exists,
+	// and everything it showed has long since been replaced
+	if (id < ref_surface->swapchain_first_id) return true;
+
+	VkResult vr = VK_ERROR_EXTENSION_NOT_PRESENT;
+	if (ref_surface->present_id2 && vkWaitForPresent2KHR) {
+		vr = vkWaitForPresent2KHR(_skr_vk.device, ref_surface->swapchain, &(VkPresentWait2InfoKHR){
+			.sType = VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR, .presentId = id, .timeout = timeout_ns });
+	} else if (_skr_vk.has_present_wait && vkWaitForPresentKHR) {
+		vr = vkWaitForPresentKHR(_skr_vk.device, ref_surface->swapchain, id, timeout_ns);
+	}
+	if (vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR) return true;
+	if (vr == VK_TIMEOUT)                            return false;
+
+	// No present wait: the closest thing is the frame that fed the present
+	// having finished on the GPU, plus its present fence where there is one
+	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
+		if (ref_surface->slot_present_id[i] != id) continue;
+		skr_future_wait(&ref_surface->frame_future[i]);
+		if (ref_surface->present_fence[i] != VK_NULL_HANDLE)
+			return vkWaitForFences(_skr_vk.device, 1, &ref_surface->present_fence[i], VK_TRUE, timeout_ns) == VK_SUCCESS;
+		return true;
+	}
+	return true;  // slot recycled: the present retired long ago
 }
