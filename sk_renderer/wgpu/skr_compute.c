@@ -188,7 +188,7 @@ void skr_compute_set_params(skr_compute_t* ref_compute, const void* data, uint32
 }
 
 void skr_compute_set_param(skr_compute_t* compute, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
-	if (compute == NULL || compute->param_buffer == NULL || name == NULL || data == NULL) return;
+	if (compute == NULL || compute->shader == NULL || compute->param_buffer == NULL || name == NULL || data == NULL) return;
 	const sksc_shader_meta_t* meta = &compute->shader->meta;
 	int32_t idx = sksc_shader_meta_get_var_index(meta, name);
 	if (idx < 0) return;
@@ -202,7 +202,7 @@ void skr_compute_set_param(skr_compute_t* compute, const char* name, sksc_shader
 }
 
 void skr_compute_get_param(const skr_compute_t* compute, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
-	if (compute == NULL || compute->param_buffer == NULL || name == NULL || out_data == NULL) return;
+	if (compute == NULL || compute->shader == NULL || compute->param_buffer == NULL || name == NULL || out_data == NULL) return;
 	const sksc_shader_meta_t* meta = &compute->shader->meta;
 	int32_t idx = sksc_shader_meta_get_var_index(meta, name);
 	if (idx < 0) return;
