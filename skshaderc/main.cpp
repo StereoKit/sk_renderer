@@ -62,7 +62,7 @@ typedef struct include_age_t {
 ///////////////////////////////////////////
 
 uint64_t exe_file_time = 0;
-const int32_t path_size = 2048;
+const int32_t max_path_size = 2048;
 
 ///////////////////////////////////////////
 
@@ -103,7 +103,7 @@ int main(int argc, const char **argv) {
 	compiler_settings_t settings = check_settings(argc, argv, &exit);
 	if (exit) return 0;
 
-	char exe[path_size];
+	char exe[max_path_size];
 	exe_path(argv[0], exe, sizeof(exe));
 	exe_file_time = file_time(exe);
 
@@ -240,10 +240,10 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			set_targets = true;
 			const char *targets = argv[i + 1];
 			size_t      len     = strlen(targets);
-			for (size_t i = 0; i < len; i++) {
-				if      (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
-				else if (targets[i] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
-				else { printf("Unrecognized shader language target '%c'\n", targets[i]); *exit = true; }
+			for (size_t t = 0; t < len; t++) {
+				if      (targets[t] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				else if (targets[t] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
+				else { printf("Unrecognized shader language target '%c'\n", targets[t]); *exit = true; }
 			}
 			i++;
 		}
@@ -337,9 +337,9 @@ Options:
 ///////////////////////////////////////////
 
 void compile_file(const char *src_filename, compiler_settings_t *settings) {
-	char dir     [path_size];
-	char name    [path_size];
-	char name_ext[path_size];
+	char dir     [max_path_size];
+	char name    [max_path_size];
+	char name_ext[max_path_size];
 	file_dir     (src_filename, dir,      sizeof(dir));
 	file_name    (src_filename, name,     sizeof(name));
 	file_name_ext(src_filename, name_ext, sizeof(name_ext));
@@ -353,9 +353,9 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		settings->output_raw_shaders == false && 
 		settings->output_skcs        == false);
 
-	char new_filename_sks[path_size];
-	char new_filename_h  [path_size];
-	char new_filename_cs [path_size];
+	char new_filename_sks[max_path_size];
+	char new_filename_h  [max_path_size];
+	char new_filename_cs [max_path_size];
 	snprintf(new_filename_sks, sizeof(new_filename_sks), "%s%s%s.sks",        dest_folder, trailing_slash, name_ext_mod);
 	snprintf(new_filename_h,   sizeof(new_filename_h  ), "%s%s%s.h",          dest_folder, trailing_slash, name_ext_mod);
 	snprintf(new_filename_cs,  sizeof(new_filename_cs ), "%s%sMaterial%s.cs", dest_folder, trailing_slash, name_ext_mod);
@@ -437,7 +437,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		// Write to file
 		if (!err) {
 			// Make sure the folder exists
-			char folder[path_size];
+			char folder[max_path_size];
 			file_dir(new_filename_sks, folder, sizeof(folder));
 			recurse_mkdir(folder);
 
@@ -495,7 +495,7 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, const char
 	for (uint32_t i = 0; i < file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &file->stages[i];
 
-		char        sub_filename[path_size];
+		char        sub_filename[max_path_size];
 		const char *stage_name = "";
 		const char *lang       = "";
 		switch (stage->language) {
@@ -571,7 +571,7 @@ char *read_file(const char *filename) {
 // Windows does have a _fullpath function, but there is no Linux equivalent, so
 // to keep the code consistent, both will use this code.
 char *path_absolute(const char *relative_dir) {
-	static char result[path_size];
+	static char result[max_path_size];
 	size_t write_at = 0;
 	result[0] = '\0';
 	
@@ -706,7 +706,7 @@ bool write_file_txt(const char *filename, void *file_data, size_t file_size) {
 ///////////////////////////////////////////
 
 bool write_header(const char *filename, void *file_data, size_t file_size, bool zipped, const sksc_shader_file_t *shader_file) {
-	char name[path_size];
+	char name[max_path_size];
 	file_name(filename, name, sizeof(name));
 
 	// '.' may be common, and will bork the variable name
@@ -808,9 +808,9 @@ void make_cs_name(const char *name, char *out_cs_name) {
 ///////////////////////////////////////////
 
 bool write_skcs(const char *filename, void *file_data, size_t file_size, const char *original_name, sksc_shader_file_t *file) {
-	char name      [path_size];
-	char cs_varname[path_size];
-	snprintf(name, path_size, "%s", original_name);
+	char name      [max_path_size];
+	char cs_varname[max_path_size];
+	snprintf(name, max_path_size, "%s", original_name);
 
 	// '.' may be common, and will bork the variable name
 	size_t len = strlen(name);
@@ -1061,7 +1061,7 @@ bool path_is_wild(const char *path) {
 void iterate_dir(const char *directory_path, void *callback_data, void (*on_item)(void *callback_data, const char *name, bool file)) {
 #if defined(_WIN32)
 	if (strcmp(directory_path, "") == 0) {
-		char drive_names[path_size];
+		char drive_names[max_path_size];
 		GetLogicalDriveStringsA(sizeof(drive_names), drive_names);
 		char *curr = drive_names;
 		while (*curr != '\0') {
@@ -1074,10 +1074,10 @@ void iterate_dir(const char *directory_path, void *callback_data, void (*on_item
 	WIN32_FIND_DATAA info;
 	HANDLE           handle = nullptr;
 
-	char directory[path_size];
+	char directory[max_path_size];
 	file_dir(directory_path, directory, sizeof(directory));
 
-	char   filter[path_size];
+	char   filter[max_path_size];
 	size_t path_len = strlen(directory_path);
 	if (path_is_wild(directory_path)) {
 		snprintf(filter, sizeof(filter), "%s", directory_path);
@@ -1092,7 +1092,7 @@ void iterate_dir(const char *directory_path, void *callback_data, void (*on_item
 
 	while (handle) {
 		if (strcmp(info.cFileName, ".") != 0 && strcmp(info.cFileName, "..") != 0) {
-			char file[path_size];
+			char file[max_path_size];
 			snprintf(file, sizeof(file), "%s%s", directory, info.cFileName);
 
 			if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)

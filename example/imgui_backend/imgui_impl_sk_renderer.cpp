@@ -72,7 +72,7 @@ static void ImGui_ImplSkRenderer_UpdateTexture(ImTextureData* tex) {
 
 		skr_tex_data_t data = {.data = tex->GetPixels(), .mip_count = 1, .layer_count = 1};
 		if (skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_dynamic, sampler,
-						   (skr_vec3i_t){tex->Width, tex->Height, 1}, 1, 1, &data, skr_tex) != skr_err_success) {
+						   {tex->Width, tex->Height, 1}, 1, 1, &data, skr_tex) != skr_err_success) {
 			free(skr_tex);
 			return;
 		}
@@ -123,7 +123,7 @@ extern "C" bool ImGui_ImplSkRenderer_Init() {
 	skr_shader_set_name(&bd->shader, "ImGui");
 
 	// Create material with alpha blending
-	skr_material_create((skr_material_info_t){
+	skr_material_create({
 		.shader       = &bd->shader,
 		.cull         = skr_cull_none,
 		.write_mask   = skr_write_default,
@@ -308,7 +308,7 @@ extern "C" void ImGui_ImplSkRenderer_RenderDrawData(int width, int height) {
 	// We're now INSIDE a render pass, just drawing.
 
 	// Set viewport
-	skr_renderer_set_viewport((skr_rect_t){0, 0, (float)width, (float)height});
+	skr_renderer_set_viewport({0, 0, (float)width, (float)height});
 
 	// Will project scissor/clipping rectangles into framebuffer space
 	ImVec2 clip_off = draw_data->DisplayPos;          // (0,0) unless using multi-viewports

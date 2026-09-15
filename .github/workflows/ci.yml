@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  native-win32:
+    name: Build (Windows)
+    runs-on: windows-latest
+    env:
+      FETCHCONTENT_BASE_DIR: ${{ github.workspace }}/.deps_cache
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: lukka/get-cmake@v4.3.3
+
+    - name: Get Cache
+      uses: actions/cache@v4
+      with:
+        key: DependencyCache-win32-msvc-${{ hashFiles('**/CMakeLists.txt') }}
+        restore-keys: |
+          DependencyCache-win32-msvc-
+        path: |
+          .deps_cache
+
+    - name: Build Native Win32 x64
+      run: |
+        cmake -B build -DFETCHCONTENT_BASE_DIR=${{ env.FETCHCONTENT_BASE_DIR }}
+        cmake --build build --config Release
+
+  native-macos:
+    name: Build (macOS)
+    runs-on: macos-14
+    env:
+      FETCHCONTENT_BASE_DIR: ${{ github.workspace }}/.deps_cache
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: lukka/get-cmake@v4.3.3
+
+    - name: Get Cache
+      uses: actions/cache@v4
+      with:
+        key: DependencyCache-macos-${{ hashFiles('**/CMakeLists.txt') }}
+        restore-keys: |
+          DependencyCache-macos-
+        path: |
+          .deps_cache
+
+    - name: Build Native macOS ARM64
+      run: |
+        cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFETCHCONTENT_BASE_DIR=${{ env.FETCHCONTENT_BASE_DIR }}
+        cmake --build build --config Release
+
+  native-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-22.04
+    env:
+      FETCHCONTENT_BASE_DIR: ${{ github.workspace }}/.deps_cache
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: lukka/get-cmake@v4.3.3
+
+    - name: Get Cache
+      uses: actions/cache@v4
+      with:
+        key: DependencyCache-linux-${{ hashFiles('**/CMakeLists.txt') }}
+        restore-keys: |
+          DependencyCache-linux-
+        path: |
+          .deps_cache
+
+    - name: Install Prerequisites
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm lld ninja-build pkg-config libx11-dev libxfixes-dev libxrandr-dev libxcursor-dev libxi-dev libfontconfig-dev libwayland-dev libxkbcommon-dev libdecor-0-dev mesa-vulkan-drivers
+
+    - name: Build Native Linux x64
+      run: |
+        cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFETCHCONTENT_BASE_DIR=${{ env.FETCHCONTENT_BASE_DIR }}
+        cmake --build build --config Release
+
+  native-android:
+    name: Build (Android)
+    runs-on: ubuntu-22.04
+    env:
+      FETCHCONTENT_BASE_DIR: ${{ github.workspace }}/.deps_cache
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: lukka/get-cmake@v4.3.3
+
+    - name: Get Cache
+      uses: actions/cache@v4
+      with:
+        key: DependencyCache-android-${{ hashFiles('**/CMakeLists.txt') }}
+        restore-keys: |
+          DependencyCache-android-
+        path: |
+          .deps_cache
+
+    - name: Set up Android NDK
+      uses: nttld/setup-ndk@v1.4.2
+      id: setup-ndk
+      with:
+        ndk-version: r25c
+        local-cache: true
+
+    - name: Restore Android Symlinks
+      run: |
+        directory="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        find "$directory" -type l | while read link; do
+            current_target=$(readlink "$link")
+            new_target="$directory/$(basename "$current_target")"
+            ln -sf "$new_target" "$link"
+            echo "Changed $(basename "$link") from $current_target to $new_target"
+        done
+
+    - name: Install Android SDK Platform
+      run: echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-29" "platforms;android-32" "platforms;android-33"
+
+    - name: Build Native Android ARM64
+      run: |
+        cmake -B build-android -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake -DCMAKE_ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }} -DANDROID_PLATFORM=android-32 -DCMAKE_SYSTEM_NAME=Android -DCMAKE_SYSTEM_VERSION=32 -DANDROID_ABI=arm64-v8a -DFETCHCONTENT_BASE_DIR=${{ env.FETCHCONTENT_BASE_DIR }}
+        cmake --build build-android --config Release
