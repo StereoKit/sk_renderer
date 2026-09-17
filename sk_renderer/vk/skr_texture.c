@@ -274,6 +274,14 @@ static VkAccessFlags _layout_to_access_flags(VkImageLayout layout) {
 	}
 }
 
+// UNDEFINED is free to leave unless something outside our queue timeline used
+// the image last, and may still be reading it.
+static VkPipelineStageFlags _tex_to_src_stage(const skr_tex_t* tex, VkImageLayout layout) {
+	if (tex->external_prior_use && layout == VK_IMAGE_LAYOUT_UNDEFINED)
+		return _SKR_ACQUIRE_WAIT_STAGE;
+	return _layout_to_src_stage(layout);
+}
+
 #ifdef SKR_DEBUG
 // Helper: Layout to string for debug logging
 static const char* _layout_to_string(VkImageLayout layout) {
@@ -362,7 +370,7 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 #endif
 
 	// Determine source stage and access from old layout
-	VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+	VkPipelineStageFlags src_stage  = _tex_to_src_stage      (ref_tex, old_layout);
 	VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
 
 	// Perform transition
@@ -471,7 +479,7 @@ void _skr_barrier_batch_add(_skr_barrier_batch_t* batch, VkCommandBuffer cmd, sk
 	if (!ref_tex->is_transient_discard && ref_tex->current_layout == new_layout && new_layout != VK_IMAGE_LAYOUT_GENERAL)
 		return;
 
-	VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+	VkPipelineStageFlags src_stage  = _tex_to_src_stage      (ref_tex, old_layout);
 	VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
 
 	batch->src_stages |= src_stage;

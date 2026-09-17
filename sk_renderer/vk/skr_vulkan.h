@@ -122,6 +122,7 @@ typedef struct skr_tex_t {
 	bool                   first_use;            // True until first transition (allows UNDEFINED optimization)
 	bool                   is_transient_discard; // True for non-readable depth/MSAA (always use UNDEFINED)
 	bool                   is_external;          // True if image/memory are externally owned (don't destroy)
+	bool                   external_prior_use;   // Last touched outside our queue timeline, see _tex_to_src_stage
 
 	// YCbCr conversion (Vulkan 1.1) for opaque YUV textures (e.g. AHB video frames)
 	VkSamplerYcbcrConversion ycbcr_conversion;   // VK_NULL_HANDLE if unused

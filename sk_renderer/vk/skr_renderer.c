@@ -674,11 +674,14 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			}
 		}
 
-		// Transition target texture to attachment layout
-		_skr_barrier_batch_add(&batch, ctx.cmd, to,
-			_skr_tex_attachment_layout(to),
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+		// A full blit's render pass loads nothing, so its initialLayout is
+		// UNDEFINED and the external dependency does this transition itself.
+		// Only a partial blit needs the target already in attachment layout.
+		if (!is_full_blit)
+			_skr_barrier_batch_add(&batch, ctx.cmd, to,
+				_skr_tex_attachment_layout(to),
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
 		_skr_barrier_batch_flush(&batch, ctx.cmd);
 	}

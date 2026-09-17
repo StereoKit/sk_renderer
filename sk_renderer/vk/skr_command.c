@@ -612,7 +612,7 @@ skr_future_t _skr_cmd_end_submit(const VkSemaphore* wait_semaphores, uint32_t wa
 
 	VkPipelineStageFlags wait_stages[SKR_MAX_SURFACES];
 	for (uint32_t i = 0; i < wait_count; i++) {
-		wait_stages[i] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		wait_stages[i] = _SKR_ACQUIRE_WAIT_STAGE;
 	}
 
 	// Submit with command buffer's fence

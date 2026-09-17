@@ -460,6 +460,7 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		ref_surface->images[i].current_queue_family = graphics_queue_family;
 		ref_surface->images[i].first_use            = true;
 		ref_surface->images[i].is_transient_discard = false;  // Swapchain images are not transient
+		ref_surface->images[i].external_prior_use   = true;  // The presentation engine
 
 		VkImageViewCreateInfo view_info = {
 			.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,

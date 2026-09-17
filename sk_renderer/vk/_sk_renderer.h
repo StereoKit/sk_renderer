@@ -92,6 +92,11 @@ _Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must
 #define SKR_POSTFX_MAX_ATTACHMENTS 8
 #define SKR_POSTFX_MAX_SUBPASSES   (SKR_PASS_MAX_POSTFX + 2)  // geometry + resolve + postfx
 
+// Stage the swapchain acquire semaphore is waited at (_skr_cmd_end_submit).
+// A first write to an acquired image must source from this stage, or it runs
+// ahead of the wait: barrier src scopes and external subpass dependencies.
+#define _SKR_ACQUIRE_WAIT_STAGE VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+
 #define SKR_VK_CHECK_RET(vkResult, fnName, returnVal) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); return returnVal; } }
 #define SKR_VK_CHECK_NRET(vkResult, fnName) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); } }
 
