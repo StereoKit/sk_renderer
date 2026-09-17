@@ -17,12 +17,22 @@
 
 #define _SKR_MAX_PASS_VIEWS 6
 
+// What a view's pass encoder currently has set, so list draws can skip
+// re-setting it
+typedef struct _skr_bound_state_t {
+	WGPURenderPipeline pipeline;
+	WGPUBindGroup      group;
+	uint32_t           offsets[3];
+	uint32_t           offset_count;
+} _skr_bound_state_t;
+
 typedef struct _skr_pass_state_t {
 	bool                    active;
 	uint32_t                view_count;
 	uint32_t                view_indices[_SKR_MAX_PASS_VIEWS];
 	WGPUCommandEncoder      encoders    [_SKR_MAX_PASS_VIEWS];
 	WGPURenderPassEncoder   passes      [_SKR_MAX_PASS_VIEWS];
+	_skr_bound_state_t      bound       [_SKR_MAX_PASS_VIEWS];
 	skr_pipeline_pass_key_t base_key;
 	skr_vec2i_t             size;
 } _skr_pass_state_t;
@@ -31,8 +41,9 @@ typedef struct _skr_pass_state_t {
 // writeBuffer stages data in queue order, so one buffer per usage works.
 typedef struct _skr_bump_t {
 	WGPUBuffer buffer;
-	uint64_t   capacity;
-	uint64_t   used;
+	uint32_t   capacity;
+	uint32_t   used;
+	uint32_t   window; // widened past _SKR_BUMP_SLACK when a list needs it, see _skr_bump_window
 } _skr_bump_t;
 
 typedef struct _skr_global_bind_t {
@@ -48,7 +59,7 @@ static _skr_global_bind_t _globals[16];
 static uint32_t           _global_count;
 
 // Most recent system-data allocation, reused by immediate draws
-static uint64_t _system_offset;
+static uint32_t _system_offset;
 static uint32_t _system_size;
 
 // Per-pass inputs for lowered postfx/resolve stages: on WebGPU, subpass
@@ -76,19 +87,33 @@ uint64_t _skr_bind_epoch     (void) { return _bind_epoch; }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static uint64_t _skr_bump_write(_skr_bump_t* bump, WGPUBufferUsage usage, const void* data, uint32_t size) {
-	uint64_t offset = (bump->used + _SKR_OFFSET_ALIGN - 1) & ~(uint64_t)(_SKR_OFFSET_ALIGN - 1);
-	uint64_t needed = offset + ((size + 3) & ~3u);
-	if (needed + _SKR_BUMP_SLACK > bump->capacity || bump->buffer == NULL) {
+// Bytes kept free past every offset handed out, and the size cached groups
+// bind the buffer with
+static uint32_t _skr_bump_window(const _skr_bump_t* bump) {
+	return bump->window > _SKR_BUMP_SLACK ? bump->window : _SKR_BUMP_SLACK;
+}
+
+// Offsets stay 32-bit: WebGPU takes dynamic offsets as uint32_t, and a bump
+// buffer can't outgrow maxBufferSize anyway.
+static uint32_t _skr_bump_write(_skr_bump_t* bump, WGPUBufferUsage usage, const void* data, uint32_t size) {
+	uint32_t offset = (bump->used + _SKR_OFFSET_ALIGN - 1) & ~(uint32_t)(_SKR_OFFSET_ALIGN - 1);
+	uint32_t needed = offset + ((size + 3) & ~3u);
+	// The one sum that can leave 32 bits, so growth is computed in 64
+	uint64_t reach = (uint64_t)needed + _skr_bump_window(bump);
+	if (reach > bump->capacity || bump->buffer == NULL) {
 		uint64_t new_cap = bump->capacity == 0 ? 256 * 1024 : bump->capacity;
-		while (needed + _SKR_BUMP_SLACK > new_cap) new_cap *= 2;
+		while (new_cap < reach) new_cap *= 2;
+		if (new_cap > UINT32_MAX) {
+			skr_log(skr_log_critical, "Bump buffer can't reach %llu bytes for a %u byte write", (unsigned long long)reach, size);
+			return 0;
+		}
 		// Old buffer stays alive for this frame's earlier bind groups via
 		// their own references; our release here is safe. Cached groups
 		// reference the old buffer too — the epoch bump retires them.
 		if (bump->buffer) wgpuBufferRelease(bump->buffer);
 		WGPUBufferDescriptor desc = { .usage = usage | WGPUBufferUsage_CopyDst, .size = new_cap };
 		bump->buffer   = wgpuDeviceCreateBuffer(_skr_wgpu.device, &desc);
-		bump->capacity = new_cap;
+		bump->capacity = (uint32_t)new_cap;
 		bump->used     = 0;
 		offset         = 0;
 		needed         = (size + 3) & ~3u;
@@ -110,7 +135,7 @@ static uint64_t _skr_bump_write(_skr_bump_t* bump, WGPUBufferUsage usage, const 
 ///////////////////////////////////////////////////////////////////////////////
 
 // Uniform-bump access for compute dispatch and mipgen parameter uploads
-WGPUBuffer _skr_bump_uniform_write(const void* data, uint32_t size, uint64_t* out_offset) {
+WGPUBuffer _skr_bump_uniform_write(const void* data, uint32_t size, uint32_t* out_offset) {
 	*out_offset = _skr_bump_write(&_bump_uniform, WGPUBufferUsage_Uniform, data, size);
 	return _bump_uniform.buffer;
 }
@@ -384,6 +409,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 		desc.timestampWrites = _skr_timer_pass_writes(&ts);
 		_pass.passes[v] = wgpuCommandEncoderBeginRenderPass(_pass.encoders[v], &desc);
 	}
+	memset(_pass.bound, 0, sizeof(_pass.bound));
 	_pass.active = true;
 }
 
@@ -459,10 +485,10 @@ static uint32_t _skr_meta_buffer_size(const sksc_shader_meta_t* meta, uint32_t s
 static void _skr_bump_ensure(_skr_bump_t* bump, WGPUBufferUsage usage) {
 	if (bump->buffer != NULL) return;
 	uint64_t cap = 256 * 1024;
-	while (cap < 2 * (uint64_t)_SKR_BUMP_SLACK) cap *= 2;
+	while (cap < 2ull * _skr_bump_window(bump)) cap *= 2;
 	WGPUBufferDescriptor desc = { .usage = usage | WGPUBufferUsage_CopyDst, .size = cap };
 	bump->buffer   = wgpuDeviceCreateBuffer(_skr_wgpu.device, &desc);
-	bump->capacity = cap;
+	bump->capacity = (uint32_t)cap;
 	bump->used     = 0;
 	_skr_bind_epoch_bump();
 }
@@ -480,13 +506,13 @@ uint32_t _skr_dynamic_offsets(const sksc_shader_meta_t* meta, uint8_t stage_mask
 	for (uint32_t i = 0; i < meta->buffer_count && n < 3; i++) {
 		if (!(meta->buffers[i].bind.stage_bits & stage_mask)) continue;
 		uint32_t slot = meta->buffers[i].bind.slot;
-		if      (slot == material_slot) { d[n].binding = slot; d[n].offset = (uint32_t)db->material_offset; n++; }
-		else if (slot == system_slot)   { d[n].binding = slot; d[n].offset = (uint32_t)db->system_offset;   n++; }
+		if      (slot == material_slot) { d[n].binding = slot; d[n].offset = db->material_offset; n++; }
+		else if (slot == system_slot)   { d[n].binding = slot; d[n].offset = db->system_offset;   n++; }
 	}
 	for (uint32_t i = 0; i < meta->resource_count && n < 3; i++) {
 		if (!(meta->resources[i].bind.stage_bits & stage_mask)) continue;
 		if (meta->resources[i].bind.register_type == skr_register_read_buffer && meta->resources[i].bind.slot == instance_slot) {
-			d[n].binding = instance_slot; d[n].offset = (uint32_t)db->instance_offset; n++;
+			d[n].binding = instance_slot; d[n].offset = db->instance_offset; n++;
 		}
 	}
 	// Insertion sort by binding — SetBindGroup consumes offsets in
@@ -523,7 +549,7 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, WGPUBin
 		}
 		if (slot == instance_slot && bind->bind.register_type == skr_register_read_buffer) {
 			_skr_bump_ensure(&_bump_storage, WGPUBufferUsage_Storage);
-			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = _bump_storage.buffer, .offset = 0, .size = _SKR_BUMP_SLACK };
+			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = _bump_storage.buffer, .offset = 0, .size = _skr_bump_window(&_bump_storage) };
 			continue;
 		}
 
@@ -695,6 +721,9 @@ static void _skr_draw_item(const skr_render_item_t* item, const _skr_draw_buffer
 	uint32_t dyn_count = _skr_dynamic_offsets(&key->shader->meta, (uint8_t)(skr_stage_vertex | skr_stage_pixel), db, dyn_offsets);
 
 	uint32_t vb_count = (item->flags & skr_item_flag_vb_count_mask) >> skr_item_flag_vb_count_shift;
+	// instance_index counts from firstInstance, which locates this item's
+	// run in the list-wide instance buffer
+	uint32_t first_instance = item->instance_data_size > 0 ? item->instance_offset / item->instance_data_size : 0;
 
 	for (uint32_t v = 0; v < _pass.view_count; v++) {
 		skr_pipeline_pass_key_t pass_key = _pass.base_key;
@@ -703,9 +732,23 @@ static void _skr_draw_item(const skr_render_item_t* item, const _skr_draw_buffer
 		WGPURenderPipeline pipeline = _skr_pipeline_get(item->pipeline_material_idx, &pass_key, item->pipeline_vert_idx);
 		if (pipeline == NULL) continue;
 
-		WGPURenderPassEncoder pass = _pass.passes[v];
-		wgpuRenderPassEncoderSetPipeline (pass, pipeline);
-		wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, dyn_count, dyn_offsets);
+		// Sorted lists repeat a material across items, so skip what's already
+		// set. An owned group dies after this draw and its handle may come back
+		// for a different group, so it never counts as bound.
+		WGPURenderPassEncoder pass  = _pass.passes[v];
+		_skr_bound_state_t*   bound = &_pass.bound[v];
+		if (bound->pipeline != pipeline) {
+			wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+			bound->pipeline = pipeline;
+		}
+		bool same_group = !owned && bound->group == bind_group && bound->offset_count == dyn_count
+		               && memcmp(bound->offsets, dyn_offsets, dyn_count * sizeof(uint32_t)) == 0;
+		if (!same_group) {
+			wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, dyn_count, dyn_offsets);
+			bound->group        = owned ? NULL : bind_group;
+			bound->offset_count = dyn_count;
+			memcpy(bound->offsets, dyn_offsets, dyn_count * sizeof(uint32_t));
+		}
 		for (uint32_t b = 0; b < vb_count; b++)
 			if (item->vertex_buffers[b])
 				wgpuRenderPassEncoderSetVertexBuffer(pass, b, item->vertex_buffers[b], 0, WGPU_WHOLE_SIZE);
@@ -713,9 +756,9 @@ static void _skr_draw_item(const skr_render_item_t* item, const _skr_draw_buffer
 		if (item->index_buffer && item->index_count > 0) {
 			wgpuRenderPassEncoderSetIndexBuffer(pass, item->index_buffer,
 				(item->flags & skr_item_flag_index_32bit) ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16, 0, WGPU_WHOLE_SIZE);
-			wgpuRenderPassEncoderDrawIndexed(pass, (uint32_t)item->index_count, item->instance_count, (uint32_t)item->first_index, item->vertex_offset, 0);
+			wgpuRenderPassEncoderDrawIndexed(pass, (uint32_t)item->index_count, item->instance_count, (uint32_t)item->first_index, item->vertex_offset, first_instance);
 		} else {
-			wgpuRenderPassEncoderDraw(pass, item->vert_count, item->instance_count, 0, 0);
+			wgpuRenderPassEncoderDraw(pass, item->vert_count, item->instance_count, 0, first_instance);
 		}
 	}
 	if (owned) wgpuBindGroupRelease(bind_group);
@@ -726,7 +769,7 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 
 	_skr_render_list_sort(list);
 
-	uint64_t material_base = 0, system_base = 0, instance_base = 0;
+	uint32_t material_base = 0, system_base = 0, instance_base = 0;
 	if (list->material_data_used > 0)
 		material_base = _skr_bump_write(&_bump_uniform, WGPUBufferUsage_Uniform, list->material_data, list->material_data_used);
 	if (system_data != NULL && system_data_size > 0) {
@@ -737,8 +780,18 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		system_base      = _system_offset;
 		system_data_size = _system_size;
 	}
-	if (list->instance_data_used > 0)
+	if (list->instance_data_used > 0) {
+		// The whole list binds through one window; a list that outgrows it
+		// widens the window, and the epoch bump rebuilds the groups that
+		// baked the old size
+		uint32_t window = _skr_bump_window(&_bump_storage);
+		if (list->instance_data_used > window) {
+			while (window < list->instance_data_used) window *= 2;
+			_bump_storage.window = window;
+			_skr_bind_epoch_bump();
+		}
 		instance_base = _skr_bump_write(&_bump_storage, WGPUBufferUsage_Storage, list->instance_data, list->instance_data_used);
+	}
 
 	for (uint32_t i = 0; i < list->count; i++) {
 		const skr_render_item_t* item = &list->items[i];
@@ -747,16 +800,8 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			.material_size   = item->param_buffer_size,
 			.system_offset   = system_base,
 			.system_size     = system_data_size,
-			.instance_offset = instance_base + item->instance_offset,
-			.instance_size   = item->instance_data_size * item->instance_count,
+			.instance_offset = instance_base,
 		};
-		// The instance binding is a fixed _SKR_BUMP_SLACK window; a bigger
-		// slice would fail device validation far from the cause, so skip it
-		// here with a pointed message instead
-		if (db.instance_size > _SKR_BUMP_SLACK) {
-			skr_log(skr_log_critical, "Draw skipped: %u bytes of instance data exceeds the %u byte per-draw limit", (uint32_t)db.instance_size, (uint32_t)_SKR_BUMP_SLACK);
-			continue;
-		}
 		_skr_draw_item(item, &db);
 	}
 }

@@ -60,6 +60,7 @@ extern const scene_vtable_t scene_yuv_test_vtable;
 extern const scene_vtable_t scene_gi_vtable;
 extern const scene_vtable_t scene_pbr_vtable;
 extern const scene_vtable_t scene_frame_pacing_vtable;
+extern const scene_vtable_t scene_desc_stress_vtable;
 #ifdef SKR_HAS_VIDEO
 extern const scene_vtable_t scene_video_vtable;
 #endif

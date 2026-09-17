@@ -236,8 +236,10 @@ static void _skr_register_internal_requests(void) {
 	_skr_ext_request(VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME);
 	_skr_ext_request(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);
 	_skr_ext_request(VK_QCOM_RENDER_PASS_STORE_OPS_EXTENSION_NAME);
-#ifndef __ANDROID__
-	_skr_ext_request(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); // Push descriptors have performance overhead per call on Adreno?
+	// Devices without the extension fall back to cached descriptor sets; define
+	// SKR_NO_PUSH_DESCRIPTORS to exercise that path on a device that has them.
+#ifndef SKR_NO_PUSH_DESCRIPTORS
+	_skr_ext_request(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 #endif
 #ifdef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
 	_skr_ext_request(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
@@ -1643,26 +1645,6 @@ bool skr_init(skr_settings_t settings) {
 	}, NULL, &_skr_vk.pipeline_cache);
 	SKR_VK_CHECK_RET(vr, "vkCreatePipelineCache", false);
 	_skr_cmd_destroy_pipeline_cache(&_skr_vk.destroy_list, _skr_vk.pipeline_cache);
-
-	// Create descriptor pool for compute shaders
-	VkDescriptorPoolSize pool_sizes[] = {
-		{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         .descriptorCount = 1000 },
-		{ .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          .descriptorCount = 1000 },
-		{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1000 },
-		{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         .descriptorCount = 1000 },
-	};
-
-	VkDescriptorPoolCreateInfo desc_pool_info = {
-		.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-		.maxSets       = 1000,
-		.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
-		.pPoolSizes    = pool_sizes,
-	};
-
-	vr = vkCreateDescriptorPool(_skr_vk.device, &desc_pool_info, NULL, &_skr_vk.descriptor_pool);
-	SKR_VK_CHECK_RET(vr, "vkCreateDescriptorPool", false);
-	_skr_cmd_destroy_descriptor_pool(&_skr_vk.destroy_list, _skr_vk.descriptor_pool);
 
 	_skr_pipeline_init();
 

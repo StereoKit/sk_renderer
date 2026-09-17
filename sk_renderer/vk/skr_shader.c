@@ -333,6 +333,39 @@ static const VkSampler* _skr_find_immutable_sampler(int32_t slot, const VkSample
 	return NULL;
 }
 
+// Must see the same meta, mask and push flag as _skr_shader_make_layout, or the
+// bindings named here won't be the ones the layout made dynamic.
+uint32_t _skr_shader_dyn_bindings(const sksc_shader_meta_t* meta, skr_stage_ stage_mask, bool has_push_descriptors, uint32_t out_bindings[3]) {
+	if (has_push_descriptors) return 0; // push descriptor sets can't hold dynamic descriptors
+
+	uint32_t material = SKR_BIND_SHIFT_BUFFER  + (uint32_t)_skr_vk.bind_settings.material_slot;
+	uint32_t system   = SKR_BIND_SHIFT_BUFFER  + (uint32_t)_skr_vk.bind_settings.system_slot;
+	uint32_t instance = SKR_BIND_SHIFT_TEXTURE + (uint32_t)_skr_vk.bind_settings.instance_slot;
+	uint32_t count    = 0;
+	for (uint32_t i = 0; i < meta->buffer_count && count < 3; i++) {
+		skr_bind_t bind = meta->buffers[i].bind;
+		if ((bind.stage_bits & stage_mask) && bind.register_type == skr_register_constant && (bind.slot == material || bind.slot == system))
+			out_bindings[count++] = bind.slot;
+	}
+	for (uint32_t i = 0; i < meta->resource_count && count < 3; i++) {
+		skr_bind_t bind = meta->resources[i].bind;
+		if ((bind.stage_bits & stage_mask) && bind.register_type == skr_register_read_buffer && bind.slot == instance)
+			out_bindings[count++] = bind.slot;
+	}
+	// Dynamic offsets are consumed in binding order
+	for (uint32_t i = 1; i < count; i++)
+		for (uint32_t j = i; j > 0 && out_bindings[j-1] > out_bindings[j]; j--) {
+			uint32_t t = out_bindings[j]; out_bindings[j] = out_bindings[j-1]; out_bindings[j-1] = t;
+		}
+	return count;
+}
+
+static bool _skr_is_dyn_binding(uint32_t slot, const uint32_t* bindings, uint32_t count) {
+	for (uint32_t i = 0; i < count; i++)
+		if (bindings[i] == slot) return true;
+	return false;
+}
+
 VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_descriptors, const sksc_shader_meta_t* meta, skr_stage_ stage_mask, const VkSampler* immutable_samplers, const int32_t* immutable_sampler_slots, int32_t immutable_sampler_count) {
 	if (meta->buffer_count == 0 && meta->resource_count == 0) {
 		return VK_NULL_HANDLE;
@@ -340,6 +373,11 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 
 	VkDescriptorSetLayoutBinding bindings[32];
 	uint32_t                     binding_count = 0;
+
+	// Without push descriptors the bump-buffer slots are dynamic, so a cached
+	// set survives across frames and the draw supplies the offsets
+	uint32_t dyn_bindings[3];
+	uint32_t dyn_count = _skr_shader_dyn_bindings(meta, stage_mask, has_push_descriptors, dyn_bindings);
 
 	// Add buffer bindings
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
@@ -363,6 +401,9 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 			case skr_register_tile_storage:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            break; // tile attachment, storage
 			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
+
+		if (desc_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && _skr_is_dyn_binding(bind.slot, dyn_bindings, dyn_count))
+			desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 
 		VkShaderStageFlags stages = 0;
 		if (bind.stage_bits & skr_stage_vertex ) stages |= VK_SHADER_STAGE_VERTEX_BIT;
@@ -403,6 +444,9 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 			case skr_register_tile_storage:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            break; // tile attachment, storage
 			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
+
+		if (desc_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && _skr_is_dyn_binding(bind.slot, dyn_bindings, dyn_count))
+			desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
 
 		VkShaderStageFlags stages = 0;
 		if (bind.stage_bits & skr_stage_vertex ) stages |= VK_SHADER_STAGE_VERTEX_BIT;

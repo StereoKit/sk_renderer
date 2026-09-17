@@ -21,6 +21,8 @@ typedef struct {
 	_skr_pipeline_material_key_t     key;
 	VkPipelineLayout                 layout;
 	VkDescriptorSetLayout            descriptor_layout;
+	uint32_t                         dyn_bindings[3]; // dynamic-offset bindings of descriptor_layout, ascending
+	uint32_t                         dyn_count;
 	int32_t                          ref_count;
 } _skr_pipeline_material_slot_t;
 
@@ -242,10 +244,15 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 		_skr_pipeline_grow_materials(&_skr_pipeline_cache, free_slot + 1);
 	}
 
+	// Both calls must see the same mask, or dyn_bindings names bindings the
+	// layout didn't make dynamic
+	skr_stage_ stage_mask = skr_stage_vertex | skr_stage_pixel | skr_stage_compute;
+
 	// Register new material
 	_skr_pipeline_cache.materials[free_slot].key               = *key;
-	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, skr_stage_vertex | skr_stage_pixel | skr_stage_compute, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
+	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, stage_mask, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
 	_skr_pipeline_cache.materials[free_slot].layout            = _skr_pipeline_create_layout(_skr_pipeline_cache.materials[free_slot].descriptor_layout);
+	_skr_pipeline_cache.materials[free_slot].dyn_count         = _skr_shader_dyn_bindings   (&key->shader->meta, stage_mask, _skr_vk.has_push_descriptors, _skr_pipeline_cache.materials[free_slot].dyn_bindings);
 	_skr_pipeline_cache.materials[free_slot].ref_count         = 1;
 
 	// Generate and set debug name for pipeline layout
@@ -579,6 +586,14 @@ VkDescriptorSetLayout _skr_pipeline_get_descriptor_layout(int32_t material_idx) 
 	if (_skr_pipeline_cache.materials[material_idx].ref_count <= 0)                return VK_NULL_HANDLE;
 
 	return _skr_pipeline_cache.materials[material_idx].descriptor_layout;
+}
+
+uint32_t _skr_pipeline_get_dyn_bindings(int32_t material_idx, uint32_t out_bindings[3]) {
+	if (material_idx < 0 || material_idx >= _skr_pipeline_cache.material_capacity) return 0;
+	const _skr_pipeline_material_slot_t* slot = &_skr_pipeline_cache.materials[material_idx];
+	if (slot->ref_count <= 0) return 0;
+	memcpy(out_bindings, slot->dyn_bindings, sizeof(slot->dyn_bindings));
+	return slot->dyn_count;
 }
 
 VkRenderPass _skr_pipeline_get_renderpass(int32_t renderpass_idx) {

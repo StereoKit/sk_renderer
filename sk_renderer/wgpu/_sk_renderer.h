@@ -61,9 +61,9 @@
 // Cached bind groups reference the bump buffers at offset 0 with fixed
 // binding sizes; per-draw positions arrive as dynamic offsets. Validation
 // needs dynamicOffset + bindingSize <= bufferSize for EVERY offset handed
-// out, so the bump buffers always keep this much slack past the last
-// allocation — and it is also the fixed window size the instance binding
-// declares, capping any single draw's instance data.
+// out, so each bump buffer keeps its window free past the last allocation.
+// This is the starting window; the instance window widens to fit the
+// largest list drawn.
 #define _SKR_BUMP_SLACK (1024 * 1024)
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -203,9 +203,9 @@ void _skr_command_sys_shutdown (void);
 
 // Per-draw buffer regions in the frame's bump allocations (skr_renderer.c)
 typedef struct _skr_draw_buffers_t {
-	uint64_t material_offset; uint32_t material_size;
-	uint64_t system_offset;   uint32_t system_size;
-	uint64_t instance_offset; uint32_t instance_size;
+	uint32_t material_offset; uint32_t material_size;
+	uint32_t system_offset;   uint32_t system_size;
+	uint32_t instance_offset;
 } _skr_draw_buffers_t;
 
 // Bind group assembly from shader meta + a material-style bind list; used by
@@ -232,7 +232,7 @@ _skr_bind_cache_t* _skr_bind_cache_slot      (int32_t start); // draw thread; cr
 void               _skr_bind_cache_invalidate(int32_t start); // any thread; marks stale
 
 // Write into the frame's uniform bump allocation (skr_renderer.c)
-WGPUBuffer _skr_bump_uniform_write(const void* data, uint32_t size, uint64_t* out_offset);
+WGPUBuffer _skr_bump_uniform_write(const void* data, uint32_t size, uint32_t* out_offset);
 
 // Draw-order sort (skr_render_list.c)
 void _skr_render_list_sort(skr_render_list_t* ref_list);

@@ -474,130 +474,110 @@ void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Bump Allocator
-///////////////////////////////////////////////////////////////////////////////
+// Bump ring, see _skr_bump_ring_t
 
-void _skr_bump_alloc_init(skr_bump_alloc_t* ref_alloc, skr_buffer_type_ type, uint32_t alignment) {
-	*ref_alloc = (skr_bump_alloc_t){
-		.buffer_type    = type,
-		.alignment      = alignment > 0 ? alignment : 1,
-		.high_water_mark = 0,
+#define _SKR_BUMP_RING_MIN        (64 * 1024)
+#define _SKR_BUMP_RING_WINDOW_MIN 4096
+
+void _skr_bump_ring_init(_skr_bump_ring_t* out_ring, skr_buffer_type_ type, uint32_t alignment, const _skr_cmd_ring_slot_t* slots) {
+	*out_ring = (_skr_bump_ring_t){
+		.buffer_type = type,
+		.alignment   = alignment > 0 ? alignment : 1,
+		.slots       = slots,
 	};
 }
 
-void _skr_bump_alloc_destroy(skr_bump_alloc_t* ref_alloc) {
-	if (!ref_alloc) return;
-
-	// Destroy main buffer
-	if (ref_alloc->main_valid) {
-		skr_buffer_destroy(&ref_alloc->main_buffer);
-	}
-
-	// Destroy all overflow buffers (individually allocated)
-	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		skr_buffer_destroy(ref_alloc->overflow[i]);
-		_skr_free(ref_alloc->overflow[i]);
-	}
-	_skr_free(ref_alloc->overflow);
-
-	*ref_alloc = (skr_bump_alloc_t){0};
+void _skr_bump_ring_destroy(_skr_bump_ring_t* ref_ring) {
+	skr_buffer_destroy(&ref_ring->buffer);
+	*ref_ring = (_skr_bump_ring_t){0};
 }
 
-void _skr_bump_alloc_reset(skr_bump_alloc_t* ref_alloc) {
-	if (!ref_alloc) return;
-
-	// Resize main buffer if high-water mark exceeds current capacity
-	uint32_t main_capacity = ref_alloc->main_valid ? ref_alloc->main_buffer.size : 0;
-	if (ref_alloc->high_water_mark > main_capacity) {
-		// Destroy old main buffer
-		if (ref_alloc->main_valid) {
-			skr_buffer_destroy(&ref_alloc->main_buffer);
-			ref_alloc->main_valid = false;
-		}
-
-		// Create new buffer sized to high-water mark (with some headroom)
-		uint32_t new_size = ref_alloc->high_water_mark + (ref_alloc->high_water_mark / 4);  // +25% headroom
-		if (new_size < 4096) new_size = 4096;  // Minimum 4KB
-
-		skr_buffer_create(NULL, new_size, 1, ref_alloc->buffer_type, skr_use_dynamic, &ref_alloc->main_buffer);
-		ref_alloc->main_valid = true;
-	}
-
-	// Reset main buffer offset
-	ref_alloc->main_used = 0;
-
-	// Destroy overflow buffers from previous frame (GPU is done with them now)
-	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		skr_buffer_destroy(ref_alloc->overflow[i]);
-		_skr_free(ref_alloc->overflow[i]);
-	}
-	ref_alloc->overflow_count = 0;
-
-	// Reset high-water mark for this frame
-	ref_alloc->high_water_mark = 0;
+// Widens the range every offset must be able to reach, for callers that bind
+// a fixed window from a varying offset.
+uint32_t _skr_bump_ring_reserve_window(_skr_bump_ring_t* ref_ring, uint32_t bytes) {
+	while (ref_ring->window < bytes)
+		ref_ring->window = ref_ring->window == 0 ? _SKR_BUMP_RING_WINDOW_MIN : ref_ring->window * 2;
+	return ref_ring->window;
 }
 
-skr_bump_result_t _skr_bump_alloc_write(skr_bump_alloc_t* ref_alloc, const void* data, uint32_t size) {
-	skr_bump_result_t result = { .buffer = NULL, .offset = 0 };
-	if (!ref_alloc || !data || size == 0) return result;
+void _skr_bump_ring_slot_begin(_skr_bump_ring_t* ref_ring, uint32_t slot) {
+	ref_ring->slot        = slot;
+	ref_ring->start[slot] = ref_ring->head;
+	ref_ring->end  [slot] = ref_ring->head;
+}
 
-	// Align the allocation
-	uint32_t aligned_offset = (ref_alloc->main_used + ref_alloc->alignment - 1) & ~(ref_alloc->alignment - 1);
-	uint32_t main_capacity = ref_alloc->main_valid ? ref_alloc->main_buffer.size : 0;
+// Oldest position any slot still reads, or head when nothing is live
+static uint64_t _skr_bump_ring_tail(const _skr_bump_ring_t* ring) {
+	uint64_t tail = ring->head;
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++)
+		if (ring->start[i] != ring->end[i] && ring->start[i] < tail) tail = ring->start[i];
+	return tail;
+}
 
-	// Try to allocate from main buffer
-	if (ref_alloc->main_valid && aligned_offset + size <= main_capacity) {
-		// Write to main buffer
-		memcpy((uint8_t*)ref_alloc->main_buffer.mapped + aligned_offset, data, size);
-		ref_alloc->main_used = aligned_offset + size;
+// A slot whose fence has signaled no longer reads its range. Only worth the
+// driver calls when the ring is full.
+static void _skr_bump_ring_poll(_skr_bump_ring_t* ref_ring) {
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++) {
+		if (i == ref_ring->slot || ref_ring->start[i] == ref_ring->end[i]) continue;
+		if (vkGetFenceStatus(_skr_vk.device, ref_ring->slots[i].fence) == VK_SUCCESS)
+			ref_ring->end[i] = ref_ring->start[i];
+	}
+}
 
-		// Track high-water mark
-		if (ref_alloc->main_used > ref_alloc->high_water_mark) {
-			ref_alloc->high_water_mark = ref_alloc->main_used;
+// In-flight slots and descriptors written earlier still read the old buffer;
+// skr_buffer_destroy defers it behind this slot's fence, which orders after
+// every earlier submission.
+static bool _skr_bump_ring_grow(_skr_bump_ring_t* ref_ring, uint32_t min_capacity) {
+	uint32_t capacity = ref_ring->capacity == 0 ? _SKR_BUMP_RING_MIN : ref_ring->capacity;
+	while (capacity < min_capacity && capacity != 0) capacity *= 2;
+	if (capacity == 0) {
+		skr_log(skr_log_critical, "Bump ring can't hold a %u byte write", min_capacity);
+		return false;
+	}
+	// Create first, so a failed grow keeps the old buffer instead of none
+	skr_buffer_t grown = {0};
+	skr_err_ err = skr_buffer_create(NULL, capacity, 1, ref_ring->buffer_type, skr_use_dynamic, &grown);
+	if (err != skr_err_success) {
+		skr_log(skr_log_critical, "Bump ring couldn't grow to %u bytes: %d", capacity, err);
+		return false;
+	}
+	skr_buffer_destroy(&ref_ring->buffer);
+	ref_ring->buffer   = grown;
+	ref_ring->capacity = capacity;
+	ref_ring->head     = 0;
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++) {
+		ref_ring->start[i] = 0;
+		ref_ring->end  [i] = 0;
+	}
+	return true;
+}
+
+skr_bump_result_t _skr_bump_ring_write(_skr_bump_ring_t* ref_ring, const void* data, uint32_t size) {
+	skr_bump_result_t result = {0};
+	if (size == 0) return result;
+
+	// Every offset must be able to reach `window` bytes without running off
+	// the end, since dynamic descriptors bind that range from any offset
+	uint32_t reach = size > ref_ring->window ? size : ref_ring->window;
+	if (ref_ring->capacity < reach && !_skr_bump_ring_grow(ref_ring, reach)) return result;
+
+	for (int32_t attempt = 0; ; attempt++) {
+		uint64_t pos    = (ref_ring->head + ref_ring->alignment - 1) & ~(uint64_t)(ref_ring->alignment - 1);
+		uint32_t offset = (uint32_t)(pos % ref_ring->capacity);
+		if (offset + reach > ref_ring->capacity) { // never straddle the end
+			pos   += ref_ring->capacity - offset;
+			offset = 0;
 		}
-
-		result.buffer = &ref_alloc->main_buffer;
-		result.offset = aligned_offset;
-		return result;
-	}
-
-	// Main buffer is full or doesn't exist - create overflow buffer
-	// Grow pointer array if needed (only the pointer array can realloc,
-	// individual buffers are stable so previous results stay valid)
-	if (ref_alloc->overflow_count >= ref_alloc->overflow_capacity) {
-		uint32_t new_cap = ref_alloc->overflow_capacity == 0 ? 4 : ref_alloc->overflow_capacity * 2;
-		skr_buffer_t** new_overflow = _skr_realloc(ref_alloc->overflow, new_cap * sizeof(skr_buffer_t*));
-		if (!new_overflow) {
-			skr_log(skr_log_critical, "Failed to grow bump allocator overflow array");
-			return result;
+		uint64_t end = pos + size;
+		if (end - _skr_bump_ring_tail(ref_ring) <= ref_ring->capacity) {
+			memcpy((uint8_t*)ref_ring->buffer.mapped + offset, data, size);
+			uint32_t slot = ref_ring->slot;
+			if (ref_ring->start[slot] == ref_ring->end[slot]) ref_ring->start[slot] = pos;
+			ref_ring->end[slot] = end;
+			ref_ring->head      = end;
+			return (skr_bump_result_t){ .buffer = ref_ring->buffer.buffer, .offset = offset };
 		}
-		ref_alloc->overflow = new_overflow;
-		ref_alloc->overflow_capacity = new_cap;
+		if (attempt == 0) { _skr_bump_ring_poll(ref_ring); continue; }
+		if (!_skr_bump_ring_grow(ref_ring, ref_ring->capacity * 2)) return result;
 	}
-
-	// Allocate individual overflow buffer (stable address, never moved by realloc)
-	skr_buffer_t* overflow = _skr_malloc(sizeof(skr_buffer_t));
-	if (!overflow) {
-		skr_log(skr_log_critical, "Failed to allocate bump overflow buffer");
-		return result;
-	}
-	*overflow = (skr_buffer_t){0};
-
-	skr_buffer_create(data, size, 1, ref_alloc->buffer_type, skr_use_dynamic, overflow);
-	ref_alloc->overflow[ref_alloc->overflow_count] = overflow;
-	ref_alloc->overflow_count++;
-
-	// Track total usage in high-water mark (main + all overflow buffers)
-	uint32_t overflow_total = 0;
-	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		overflow_total += ref_alloc->overflow[i]->size;
-	}
-	uint32_t total_used = ref_alloc->main_used + overflow_total;
-	if (total_used > ref_alloc->high_water_mark) {
-		ref_alloc->high_water_mark = total_used;
-	}
-
-	result.buffer = overflow;
-	result.offset = 0;
-	return result;
 }

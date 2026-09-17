@@ -4,6 +4,10 @@
 
 #include "skr_pipeline.h"
 
+static inline uint32_t _skr_align_up(uint32_t value, uint32_t align) {
+	return align > 1 ? (value + align - 1) / align * align : value;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_err_ skr_render_list_create(skr_render_list_t* out_list) {
@@ -110,7 +114,16 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 	// Copy material params at an aligned offset so bind offsets stay legal
 	uint32_t aligned_mat_offset = (ref_list->material_data_used + _SKR_OFFSET_ALIGN - 1) & ~(_SKR_OFFSET_ALIGN - 1);
 	item->param_data_offset = aligned_mat_offset;
-	if (material->param_buffer && material->param_buffer_size > 0) {
+	// Consecutive adds of an unchanged material share one param slice, so
+	// their draws share bind offsets too
+	const skr_render_item_t* prev = ref_list->count > 1 ? &ref_list->items[ref_list->count - 2] : NULL;
+	bool share_params = prev && material->param_buffer && material->param_buffer_size > 0
+		&& prev->bind_start        == material->bind_start
+		&& prev->param_buffer_size == material->param_buffer_size
+		&& memcmp(&ref_list->material_data[prev->param_data_offset], material->param_buffer, material->param_buffer_size) == 0;
+	if (share_params) {
+		item->param_data_offset = prev->param_data_offset;
+	} else if (material->param_buffer && material->param_buffer_size > 0) {
 		uint32_t needed = aligned_mat_offset + material->param_buffer_size;
 		while (needed > ref_list->material_data_capacity) {
 			ref_list->material_data_capacity *= 2;
@@ -120,7 +133,9 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 		ref_list->material_data_used = aligned_mat_offset + material->param_buffer_size;
 	}
 
-	uint32_t aligned_inst_offset = (ref_list->instance_data_used + _SKR_OFFSET_ALIGN - 1) & ~(_SKR_OFFSET_ALIGN - 1);
+	// The whole list binds as one buffer and each draw addresses its run by
+	// firstInstance, so a run must start on a multiple of its own stride
+	uint32_t aligned_inst_offset  = _skr_align_up(ref_list->instance_data_used, single_instance_data_size);
 	int32_t  resolved_index_count = index_count > 0 ? index_count : (int32_t)mesh->ind_count;
 	item->sort_key           = _skr_render_sort_key(material, item->vertex_buffers[0], first_index, resolved_index_count, vertex_offset);
 	item->instance_offset    = aligned_inst_offset;
@@ -158,4 +173,18 @@ void _skr_render_list_sort(skr_render_list_t* ref_list) {
 	if (ref_list == NULL || !ref_list->needs_sort) return;
 	qsort(ref_list->items, ref_list->count, sizeof(skr_render_item_t), _skr_item_compare);
 	ref_list->needs_sort = false;
+
+	// Sorting put each material's items together. Ones added with identical
+	// params can share one param slice, and so one bind group offset.
+	for (uint32_t i = 1; i < ref_list->count; i++) {
+		skr_render_item_t*       item = &ref_list->items[i];
+		const skr_render_item_t* prev = &ref_list->items[i - 1];
+		if (item->bind_start        != prev->bind_start        ||
+		    item->param_buffer_size != prev->param_buffer_size ||
+		    item->param_data_offset == prev->param_data_offset ||
+		    item->param_buffer_size == 0)
+			continue;
+		if (memcmp(&ref_list->material_data[item->param_data_offset], &ref_list->material_data[prev->param_data_offset], item->param_buffer_size) == 0)
+			item->param_data_offset = prev->param_data_offset;
+	}
 }

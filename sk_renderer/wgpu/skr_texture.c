@@ -746,7 +746,7 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_filter_sh
 		skr_material_set_param(material, "src_mip_level", sksc_shader_var_uint, 1, &src_mip);
 		skr_material_set_param(material, "mip_max",       sksc_shader_var_uint, 1, &mip_max);
 
-		uint64_t   param_offset = 0;
+		uint32_t   param_offset = 0;
 		WGPUBuffer param_buffer = _skr_bump_uniform_write(material->param_buffer, param_size, &param_offset);
 
 		// Source view restricted to the previous mip, keeping it disjoint

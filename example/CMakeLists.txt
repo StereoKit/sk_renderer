@@ -186,6 +186,7 @@ target_sources(sk_renderer_test PRIVATE
 	scene_gi.c
 	scene_pbr.c
 	scene_frame_pacing.c
+	scene_desc_stress.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c

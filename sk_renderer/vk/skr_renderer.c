@@ -643,38 +643,18 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 	_skr_flush_pending_compute_barrier(ctx.cmd);
 
-	// Build per-draw descriptor writes
-	VkWriteDescriptorSet   writes      [32];
-	VkDescriptorBufferInfo buffer_infos[16];
-	VkDescriptorImageInfo  image_infos [16];
-	uint32_t write_ct  = 0;
-	uint32_t buffer_ct = 0;
-	uint32_t image_ct  = 0;
-
-	skr_bump_result_t param_bump = {0};
+	_skr_desc_writes_t desc;
+	_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
 	if (material->param_buffer_size > 0) {
-		param_bump = _skr_bump_alloc_write(ctx.const_bump, material->param_buffer, material->param_buffer_size);
-		if (param_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = param_bump.buffer->buffer,
-				.offset = param_bump.offset,
-				.range  = material->param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
+		skr_bump_result_t param_bump = _skr_bump_ring_write(ctx.const_ring, material->param_buffer, material->param_buffer_size);
+		if (param_bump.buffer)
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.offset, material->param_buffer_size);
 	}
 
 	// Material texture and buffer binds
 	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 	const int32_t ignore_slots[] = { SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot };
 
-	_skr_bind_pool_lock();
 	skr_material_bind_t* mat_binds = _skr_bind_pool_get(material->bind_start);
 
 	// Batch source + target transitions into a single barrier. Transition
@@ -703,12 +683,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		_skr_barrier_batch_flush(&batch, ctx.cmd);
 	}
 
-	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-		writes,       sizeof(writes      )/sizeof(writes      [0]),
-		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-		&write_ct, &buffer_ct, &image_ct);
-	_skr_bind_pool_unlock();
+	int32_t fail_idx = _skr_material_add_writes(mat_binds, material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
 	if (fail_idx >= 0) {
 		_skr_cmd_release(ctx.cmd);
 		_skr_pipeline_unlock();
@@ -783,12 +758,10 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){(float)bounds_px.x, (float)(bounds_px.y + height), (float)width, -(float)height, 0.0f, 1.0f});
 			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{bounds_px.x, bounds_px.y}, {width, height}});
 
-			_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                      _skr_pipeline_get_layout(material->pipeline_material_idx),
-			                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx),
-			                      writes, write_ct);
-
-			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
+			bool bound = _skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, material->bind_start,
+			                      _skr_pipeline_get_layout           (material->pipeline_material_idx),
+			                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx), &desc);
+			if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
 		}
 
 		vkCmdEndRenderPass(ctx.cmd);
@@ -817,12 +790,10 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){(float)bounds_px.x, (float)(bounds_px.y + height), (float)width, -(float)height, 0.0f, 1.0f});
 			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{bounds_px.x, bounds_px.y}, {width, height}});
 
-			_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                      _skr_pipeline_get_layout(material->pipeline_material_idx),
-			                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx),
-			                      writes, write_ct);
-
-			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+			bool bound = _skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, material->bind_start,
+			                      _skr_pipeline_get_layout           (material->pipeline_material_idx),
+			                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx), &desc);
+			if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
 		}
 
 		vkCmdEndRenderPass(ctx.cmd);
@@ -836,6 +807,52 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	_skr_cmd_release(ctx.cmd);
 
 	_skr_pipeline_unlock();
+}
+
+// The instance buffer binds the whole list; each draw reaches its own run
+// through firstInstance rather than a per-draw descriptor offset.
+static bool _skr_list_bind_descriptors(const _skr_cmd_ctx_t* ctx, const skr_render_item_t* item,
+                                       skr_bump_result_t material_bump,
+                                       skr_bump_result_t system_bump,   uint32_t system_data_size,
+                                       skr_bump_result_t instance_bump, uint32_t instance_range) {
+	_skr_desc_writes_t desc;
+	_skr_desc_writes_begin(&desc, item->pipeline_material_idx);
+
+	if (item->param_buffer_size > 0 && material_bump.buffer)
+		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.offset + item->param_data_offset, item->param_buffer_size);
+	if ((item->flags & skr_item_flag_system_buffer) && system_bump.buffer)
+		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,   false, system_bump.buffer,   system_bump.offset,   system_data_size);
+	if ((item->flags & skr_item_flag_instance_buffer) && instance_bump.buffer)
+		_skr_write_buffer(&desc, SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot, true,  instance_bump.buffer, instance_bump.offset, instance_range);
+
+	const int32_t ignore_slots[] = {
+		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
+		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
+		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
+
+	const skr_material_bind_t* binds = _skr_bind_pool_get(item->bind_start);
+	int32_t fail_idx = _skr_material_add_writes(binds, item->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
+	if (fail_idx >= 0) {
+		int32_t       slot = binds[fail_idx].bind.slot;
+		skr_register_ type = (skr_register_)binds[fail_idx].bind.register_type;
+		char          reg_char;
+		int32_t       reg_num;
+		switch (type) {
+		case skr_register_constant:         reg_char = 'b'; reg_num = slot - SKR_BIND_SHIFT_BUFFER;           break;
+		case skr_register_texture:
+		case skr_register_read_buffer:      reg_char = 't'; reg_num = slot - SKR_BIND_SHIFT_TEXTURE;          break;
+		case skr_register_readwrite:
+		case skr_register_readwrite_tex:    reg_char = 'u'; reg_num = slot - SKR_BIND_SHIFT_UAV;              break;
+		case skr_register_input_attachment: reg_char = 'i'; reg_num = slot - SKR_BIND_SHIFT_INPUT_ATTACHMENT; break;
+		default:                            reg_char = '?'; reg_num = slot;                                   break;
+		}
+		skr_log(skr_log_critical, "Draw call missing binding for register(%c%d)", reg_char, reg_num);
+		return false;
+	}
+
+	return _skr_bind_descriptors(ctx->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, item->bind_start,
+		_skr_pipeline_get_layout           (item->pipeline_material_idx),
+		_skr_pipeline_get_descriptor_layout(item->pipeline_material_idx), &desc);
 }
 
 void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_t system_data_size) {
@@ -853,17 +870,30 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 	skr_bump_result_t instance_bump = {0};
 
 	if (system_data && system_data_size > 0) {
-		system_bump = _skr_bump_alloc_write(ctx.const_bump, system_data, system_data_size);
+		system_bump = _skr_bump_ring_write(ctx.const_ring, system_data, system_data_size);
 	}
 	if (list->material_data_used > 0) {
-		material_bump = _skr_bump_alloc_write(ctx.const_bump, list->material_data, list->material_data_used);
+		material_bump = _skr_bump_ring_write(ctx.const_ring, list->material_data, list->material_data_used);
 	}
+	// A cached set bakes the range in, so the pool path binds the ring's window
+	// instead of this list's size; the ring keeps that much reachable from every
+	// offset it hands out.
+	uint32_t instance_range = 0;
 	if (list->instance_data_used > 0) {
-		instance_bump = _skr_bump_alloc_write(ctx.storage_bump, list->instance_data, list->instance_data_used);
+		uint32_t window = _skr_vk.has_push_descriptors ? 0 : _skr_bump_ring_reserve_window(ctx.storage_ring, list->instance_data_used);
+		instance_bump   = _skr_bump_ring_write(ctx.storage_ring, list->instance_data, list->instance_data_used);
+		if (instance_bump.buffer)
+			instance_range = _skr_vk.has_push_descriptors ? list->instance_data_used : window;
 	}
 
-	// Draw items with batching
-	VkPipeline bound_pipeline = VK_NULL_HANDLE;
+	// Descriptors only change with the material slice, and the list is sorted
+	// by material, so most batches go straight to the draw
+	VkPipeline bound_pipeline     = VK_NULL_HANDLE;
+	int32_t    bound_bind_start   = -1;
+	uint16_t   bound_material_idx = 0;
+	uint32_t   bound_param_offset = 0;
+	VkBuffer   bound_index_buffer = VK_NULL_HANDLE;
+	VkBuffer   bound_vertex_buffers[SKR_MAX_VERTEX_BUFFERS] = {0};
 	for (uint32_t i = 0; i < list->count; ) {
 		const skr_render_item_t* item = &list->items[i];
 
@@ -881,7 +911,6 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		// Compare inlined data instead of pointers
 		uint32_t batch_count     = 1;
 		uint32_t total_instances = item->instance_count;
-		uint32_t total_inst_data = item->instance_data_size * item->instance_count;
 		while (i + batch_count < list->count) {
 			const skr_render_item_t* next = &list->items[i + batch_count];
 			// Can only batch if mesh, material, AND draw parameters all match
@@ -893,7 +922,6 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			    next->vertex_offset          != item->vertex_offset)
 				break;
 			total_instances += next->instance_count;
-			total_inst_data += next->instance_data_size * next->instance_count;
 			batch_count++;
 		}
 
@@ -903,105 +931,22 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			bound_pipeline = pipeline;
 		}
 
-		// Build per-draw descriptor writes
-		VkWriteDescriptorSet   writes      [32];
-		VkDescriptorBufferInfo buffer_infos[16];
-		VkDescriptorImageInfo  image_infos [16];
-		uint32_t write_ct  = 0;
-		uint32_t buffer_ct = 0;
-		uint32_t image_ct  = 0;
-
-		// Material parameter buffer (using inlined param_buffer_size and param_data_offset)
-		if (item->param_buffer_size > 0 && material_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = material_bump.buffer->buffer,
-				.offset = material_bump.offset + item->param_data_offset,
-				.range  = item->param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
-
-		// System data buffer
-		if ((item->flags & skr_item_flag_system_buffer) && system_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = system_bump.buffer->buffer,
-				.offset = system_bump.offset,
-				.range  = system_data_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
-
-		// Instance data buffer (only if shader declares one)
-		if ((item->flags & skr_item_flag_instance_buffer) && instance_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = instance_bump.buffer->buffer,
-				.offset = instance_bump.offset + item->instance_offset,
-				.range  = total_inst_data,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
-
-		const int32_t ignore_slots[] = {
-			SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
-			SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
-			SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
-
-		// Material texture and buffer binds (using inlined bind_start/bind_count)
-		_skr_bind_pool_lock();
-		const skr_material_bind_t* binds = _skr_bind_pool_get(item->bind_start);
-		int32_t fail_idx = _skr_material_add_writes(binds, item->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-			writes,       sizeof(writes      )/sizeof(writes      [0]),
-			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-			&write_ct, &buffer_ct, &image_ct);
-
-		if (fail_idx >= 0) {
-			int32_t       slot = binds[fail_idx].bind.slot;
-			skr_register_ type = (skr_register_)binds[fail_idx].bind.register_type;
-			char          reg_char;
-			int32_t       reg_num;
-			switch (type) {
-			case skr_register_constant:      reg_char = 'b'; reg_num = slot - SKR_BIND_SHIFT_BUFFER;  break;
-			case skr_register_texture:
-			case skr_register_read_buffer:   reg_char = 't'; reg_num = slot - SKR_BIND_SHIFT_TEXTURE; break;
-			case skr_register_readwrite:
-			case skr_register_readwrite_tex:     reg_char = 'u'; reg_num = slot - SKR_BIND_SHIFT_UAV;              break;
-			case skr_register_input_attachment:   reg_char = 'i'; reg_num = slot - SKR_BIND_SHIFT_INPUT_ATTACHMENT; break;
-			default:                              reg_char = '?'; reg_num = slot;                                   break;
+		bool same_binds = bound_bind_start   == item->bind_start
+		               && bound_material_idx == item->pipeline_material_idx
+		               && bound_param_offset == item->param_data_offset;
+		if (!same_binds) {
+			if (!_skr_list_bind_descriptors(&ctx, item, material_bump, system_bump, system_data_size, instance_bump, instance_range)) {
+				bound_bind_start = -1;
+				i += batch_count;
+				continue;
 			}
-			skr_log(skr_log_critical, "Draw call missing binding for register(%c%d)", reg_char, reg_num);
-			_skr_bind_pool_unlock();
-			i += batch_count;
-			continue;
+			bound_bind_start   = item->bind_start;
+			bound_material_idx = item->pipeline_material_idx;
+			bound_param_offset = item->param_data_offset;
 		}
-		_skr_bind_pool_unlock();
 
-		// Push all descriptors at once (using inlined pipeline_material_idx)
-		_skr_bind_descriptors(cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-		                      _skr_pipeline_get_layout(item->pipeline_material_idx),
-		                      _skr_pipeline_get_descriptor_layout(item->pipeline_material_idx),
-		                      writes, write_ct);
-
-		// Bind vertex buffers (using inlined VkBuffer handles)
-		{
+		// Sorted lists repeat a mesh across batches, so only rebind what changed
+		if (memcmp(bound_vertex_buffers, item->vertex_buffers, sizeof(bound_vertex_buffers)) != 0) {
 			uint32_t vb_count = (item->flags & skr_item_flag_vb_count_mask) >> skr_item_flag_vb_count_shift;
 			VkBuffer     buffers[SKR_MAX_VERTEX_BUFFERS];
 			VkDeviceSize offsets[SKR_MAX_VERTEX_BUFFERS];
@@ -1018,14 +963,20 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 			if (bind_count > 0) {
 				vkCmdBindVertexBuffers(cmd, 0, bind_count, buffers, offsets);
 			}
+			memcpy(bound_vertex_buffers, item->vertex_buffers, sizeof(bound_vertex_buffers));
 		}
 
-		// Draw with instancing
+		// SV_InstanceID counts from firstInstance, which locates this batch's
+		// run in the list-wide instance buffer
+		uint32_t first_instance = item->instance_data_size > 0 ? item->instance_offset / item->instance_data_size : 0;
 		if (item->index_buffer != VK_NULL_HANDLE) {
-			vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (item->flags & skr_item_flag_index_32bit) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
-			vkCmdDrawIndexed(cmd, (uint32_t)item->index_count, total_instances, item->first_index, item->vertex_offset, 0);
+			if (item->index_buffer != bound_index_buffer) {
+				vkCmdBindIndexBuffer(cmd, item->index_buffer, 0, (item->flags & skr_item_flag_index_32bit) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+				bound_index_buffer = item->index_buffer;
+			}
+			vkCmdDrawIndexed(cmd, (uint32_t)item->index_count, total_instances, item->first_index, item->vertex_offset, first_instance);
 		} else {
-			vkCmdDraw(cmd, item->vert_count, total_instances, 0, 0);
+			vkCmdDraw(cmd, item->vert_count, total_instances, 0, first_instance);
 		}
 
 		i += batch_count;
@@ -1055,32 +1006,12 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	// Bind pipeline
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-	// Build descriptor writes
-	VkWriteDescriptorSet   writes      [32];
-	VkDescriptorBufferInfo buffer_infos[16];
-	VkDescriptorImageInfo  image_infos [16];
-	uint32_t write_ct  = 0;
-	uint32_t buffer_ct = 0;
-	uint32_t image_ct  = 0;
-
-	// Upload material parameters to bump allocator if needed
-	skr_bump_result_t material_bump = {0};
+	_skr_desc_writes_t desc;
+	_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
 	if (material->param_buffer_size > 0) {
-		material_bump = _skr_bump_alloc_write(ctx.const_bump, material->param_buffer, material->param_buffer_size);
-		if (material_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = material_bump.buffer->buffer,
-				.offset = material_bump.offset,
-				.range  = material->param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
+		skr_bump_result_t material_bump = _skr_bump_ring_write(ctx.const_ring, material->param_buffer, material->param_buffer_size);
+		if (material_bump.buffer)
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.offset, material->param_buffer_size);
 	}
 
 	// No system buffer or instance buffer for immediate draws
@@ -1092,25 +1023,20 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	// Add material texture and buffer bindings
 	const sksc_shader_meta_t* meta = &material->key.shader->meta;
 
-	_skr_bind_pool_lock();
-	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-		writes,       sizeof(writes      )/sizeof(writes      [0]),
-		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-		&write_ct, &buffer_ct, &image_ct);
-	_skr_bind_pool_unlock();
-
+	int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
 	if (fail_idx >= 0) {
 		skr_log(skr_log_critical, "Immediate draw missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		_skr_cmd_release(cmd);
 		return;
 	}
 
-	// Bind descriptors
-	_skr_bind_descriptors(cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                      _skr_pipeline_get_layout(material->pipeline_material_idx),
-	                      _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx),
-	                      writes, write_ct);
+	bool bound = _skr_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, material->bind_start,
+	                                   _skr_pipeline_get_layout           (material->pipeline_material_idx),
+	                                   _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx), &desc);
+	if (!bound) {
+		_skr_cmd_release(cmd);
+		return;
+	}
 
 	// Bind vertex buffers
 	if (mesh->vertex_buffer_count > 0) {
@@ -1195,56 +1121,21 @@ void skr_pass_add_resolve(skr_pass_t* pass, skr_material_t* resolve_material) {
 // Build descriptor writes for a material's parameter buffer, system buffer,
 // and resource bindings. Used by resolve and postfx subpasses. Returns -1 on
 // success, or the failing bind index.
-static int32_t _skr_build_material_descriptors(
-	_skr_cmd_ctx_t*         ctx,
-	skr_material_t*         mat,
-	const void*             system_data,   uint32_t system_data_size,
-	VkWriteDescriptorSet*   writes,        uint32_t write_max,
-	VkDescriptorBufferInfo* buffer_infos,  uint32_t buffer_max,
-	VkDescriptorImageInfo*  image_infos,   uint32_t image_max,
-	uint32_t* out_write_ct, uint32_t* out_buffer_ct, uint32_t* out_image_ct)
-{
-	uint32_t write_ct  = 0;
-	uint32_t buffer_ct = 0;
-	uint32_t image_ct  = 0;
+static int32_t _skr_build_material_descriptors(_skr_cmd_ctx_t* ctx, skr_material_t* mat, const void* system_data, uint32_t system_data_size, _skr_desc_writes_t* out_writes) {
+	_skr_desc_writes_begin(out_writes, mat->pipeline_material_idx);
 
-	// Material parameter buffer
 	if (mat->param_buffer_size > 0) {
-		skr_bump_result_t param_bump = _skr_bump_alloc_write(ctx->const_bump, mat->param_buffer, mat->param_buffer_size);
-		if (param_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = param_bump.buffer->buffer,
-				.offset = param_bump.offset,
-				.range  = mat->param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
+		skr_bump_result_t param_bump = _skr_bump_ring_write(ctx->const_ring, mat->param_buffer, mat->param_buffer_size);
+		if (param_bump.buffer)
+			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.offset, mat->param_buffer_size);
 	}
 
-	// System data buffer — the same per-pass data the geometry draws get, so
+	// System data buffer, the same per-pass data the geometry draws get, so
 	// postfx shaders can use view/projection matrices and friends.
 	if (mat->has_system_buffer && system_data && system_data_size > 0) {
-		skr_bump_result_t system_bump = _skr_bump_alloc_write(ctx->const_bump, system_data, system_data_size);
-		if (system_bump.buffer) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = system_bump.buffer->buffer,
-				.offset = system_bump.offset,
-				.range  = system_data_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
+		skr_bump_result_t system_bump = _skr_bump_ring_write(ctx->const_ring, system_data, system_data_size);
+		if (system_bump.buffer)
+			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot, false, system_bump.buffer, system_bump.offset, system_data_size);
 	}
 
 	// Material texture/buffer/input attachment binds. The instance buffer is
@@ -1255,21 +1146,9 @@ static int32_t _skr_build_material_descriptors(
 		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,
 		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot };
 
-	_skr_bind_pool_lock();
-	skr_material_bind_t* mat_binds = _skr_bind_pool_get(mat->bind_start);
-	int32_t fail_idx = _skr_material_add_writes(mat_binds, mat->bind_count,
+	return _skr_material_add_writes(_skr_bind_pool_get(mat->bind_start), mat->bind_count,
 		(skr_stage_)(skr_stage_vertex | skr_stage_pixel),
-		ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-		writes,       write_max,
-		buffer_infos, buffer_max,
-		image_infos,  image_max,
-		&write_ct, &buffer_ct, &image_ct);
-	_skr_bind_pool_unlock();
-
-	*out_write_ct  = write_ct;
-	*out_buffer_ct = buffer_ct;
-	*out_image_ct  = image_ct;
-	return fail_idx;
+		ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), out_writes);
 }
 
 void skr_pass_submit(skr_pass_t* pass) {
@@ -1684,16 +1563,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 				}
 			}
 
-			VkWriteDescriptorSet   writes      [32];
-			VkDescriptorBufferInfo buffer_infos[16];
-			VkDescriptorImageInfo  image_infos [16];
-			uint32_t write_ct = 0, buffer_ct = 0, image_ct = 0;
-
+			_skr_desc_writes_t desc = {0};
 			if (!resolve_skip) {
-				int32_t fail_idx = _skr_build_material_descriptors(&ctx, resolve_mat,
-					pass->draws[0].system_data, pass->draws[0].system_data_size,
-					writes, 32, buffer_infos, 16, image_infos, 16,
-					&write_ct, &buffer_ct, &image_ct);
+				int32_t fail_idx = _skr_build_material_descriptors(&ctx, resolve_mat, pass->draws[0].system_data, pass->draws[0].system_data_size, &desc);
 				if (fail_idx >= 0) {
 					skr_log(skr_log_critical, "Resolve subpass missing binding '%s'. Skipping the resolve, its output is undefined", _skr_material_bind_name(&resolve_mat->key.shader->meta, fail_idx));
 					resolve_skip = true;
@@ -1708,12 +1580,10 @@ void skr_pass_submit(skr_pass_t* pass) {
 				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){fx_viewport.x, fx_viewport.y + fx_viewport.h, fx_viewport.w, -fx_viewport.h, 0.0f, 1.0f});
 				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{fx_scissor.x, fx_scissor.y}, {(uint32_t)fx_scissor.w, (uint32_t)fx_scissor.h}});
 
-				_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-				                      _skr_pipeline_get_layout(resolve_mat->pipeline_material_idx),
-				                      _skr_pipeline_get_descriptor_layout(resolve_mat->pipeline_material_idx),
-				                      writes, write_ct);
-
-				vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+				bool bound = _skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, resolve_mat->bind_start,
+				                      _skr_pipeline_get_layout           (resolve_mat->pipeline_material_idx),
+				                      _skr_pipeline_get_descriptor_layout(resolve_mat->pipeline_material_idx), &desc);
+				if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
 			}
 
 			// After resolve, postfx reads from the resolve output (scene_color / resolve target)
@@ -1749,15 +1619,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 			if (fx_in->input_depth)
 				skr_material_set_tex(postfx_mat, "depth", depth_resolve_tex ? depth_resolve_tex : depth);
 
-			VkWriteDescriptorSet   writes      [32];
-			VkDescriptorBufferInfo buffer_infos[16];
-			VkDescriptorImageInfo  image_infos [16];
-			uint32_t write_ct = 0, buffer_ct = 0, image_ct = 0;
-
-			int32_t fail_idx = _skr_build_material_descriptors(&ctx, postfx_mat,
-				pass->draws[0].system_data, pass->draws[0].system_data_size,
-				writes, 32, buffer_infos, 16, image_infos, 16,
-				&write_ct, &buffer_ct, &image_ct);
+			_skr_desc_writes_t desc;
+			int32_t fail_idx = _skr_build_material_descriptors(&ctx, postfx_mat, pass->draws[0].system_data, pass->draws[0].system_data_size, &desc);
 			if (fail_idx >= 0) {
 				skr_log(skr_log_critical, "PostFX %u missing binding '%s'", p, _skr_material_bind_name(&postfx_mat->key.shader->meta, fail_idx));
 				continue;
@@ -1772,12 +1635,10 @@ void skr_pass_submit(skr_pass_t* pass) {
 				vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){fx_viewport.x, fx_viewport.y + fx_viewport.h, fx_viewport.w, -fx_viewport.h, 0.0f, 1.0f});
 				vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{fx_scissor.x, fx_scissor.y}, {(uint32_t)fx_scissor.w, (uint32_t)fx_scissor.h}});
 
-				_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-				                      _skr_pipeline_get_layout(postfx_mat->pipeline_material_idx),
-				                      _skr_pipeline_get_descriptor_layout(postfx_mat->pipeline_material_idx),
-				                      writes, write_ct);
-
-				vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
+				bool bound = _skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postfx_mat->bind_start,
+				                      _skr_pipeline_get_layout           (postfx_mat->pipeline_material_idx),
+				                      _skr_pipeline_get_descriptor_layout(postfx_mat->pipeline_material_idx), &desc);
+				if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
 			}
 
 			// Update prev_color for next postfx in chain

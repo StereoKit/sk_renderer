@@ -29,6 +29,10 @@
 
 _Static_assert(sizeof(skr_render_item_t) <= 80, "skr_render_item_t grew beyond 80 bytes!");
 
+static inline uint32_t _skr_align_up(uint32_t value, uint32_t align) {
+	return align > 1 ? (value + align - 1) / align * align : value;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_err_ skr_render_list_create(skr_render_list_t* out_list) {
@@ -167,7 +171,16 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 	uint32_t ubo_align          = _skr_vk.min_ubo_offset_align;
 	uint32_t aligned_mat_offset = (ref_list->material_data_used + ubo_align - 1) & ~(ubo_align - 1);
 	item->param_data_offset     = aligned_mat_offset;
-	if (material->param_buffer && material->param_buffer_size > 0) {
+	// Consecutive adds of an unchanged material share one param slice, so
+	// their draws share descriptors too
+	const skr_render_item_t* prev = ref_list->count > 1 ? &ref_list->items[ref_list->count - 2] : NULL;
+	bool share_params = prev && material->param_buffer && material->param_buffer_size > 0
+		&& prev->bind_start        == material->bind_start
+		&& prev->param_buffer_size == material->param_buffer_size
+		&& memcmp(&ref_list->material_data[prev->param_data_offset], material->param_buffer, material->param_buffer_size) == 0;
+	if (share_params) {
+		item->param_data_offset = prev->param_data_offset;
+	} else if (material->param_buffer && material->param_buffer_size > 0) {
 		uint32_t needed = aligned_mat_offset + material->param_buffer_size;
 		// Resize material data if needed
 		while (needed > ref_list->material_data_capacity) {
@@ -185,9 +198,9 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 	}
 
 	// Render item data
-	// Align instance offset for storage buffer access (minStorageBufferOffsetAlignment)
-	uint32_t ssbo_align          = _skr_vk.min_ssbo_offset_align;
-	uint32_t aligned_inst_offset = (ref_list->instance_data_used + ssbo_align - 1) & ~(ssbo_align - 1);
+	// The whole list binds as one buffer and each draw addresses its run by
+	// firstInstance, so a run must start on a multiple of its own stride
+	uint32_t aligned_inst_offset = _skr_align_up(ref_list->instance_data_used, single_instance_data_size);
 	// Resolve index_count at add-time: 0 means "use mesh default"
 	int32_t resolved_index_count  = index_count > 0 ? index_count : (int32_t)mesh->ind_count;
 	item->sort_key               = _skr_render_sort_key(material, item->vertex_buffers[0], first_index, resolved_index_count, vertex_offset);
@@ -388,66 +401,91 @@ void _skr_render_list_sort(skr_render_list_t* ref_list) {
 	}
 
 reorder_instance_data:
-	// After sorting, instance_offset values no longer match the sorted order
-	// Rebuild instance data in sorted order
-	if (ref_list->instance_data_used > 0) {
-		// Keep sorted buffer same size as instance_data buffer
-		if (ref_list->instance_data_sorted_capacity != ref_list->instance_data_capacity) {
-			_skr_free(ref_list->instance_data_sorted);
-			ref_list->instance_data_sorted          = _skr_malloc(ref_list->instance_data_capacity);
-			ref_list->instance_data_sorted_capacity = ref_list->instance_data_capacity;
-			if (!ref_list->instance_data_sorted) {
-				skr_log(skr_log_critical, "Failed to allocate render list sorted instance data");
-				ref_list->instance_data_sorted_capacity = 0;
-				return;
-			}
-		}
-
-		// Copy instance data in sorted order and update offsets
-		// Batch consecutive runs to minimize memcpy calls
-		uint32_t sorted_offset = 0;
-		uint32_t i = 0;
-		while (i < ref_list->count) {
-			skr_render_item_t* item = &ref_list->items[i];
-			uint32_t           size = item->instance_data_size * item->instance_count;
-
-			if (size > 0) {
-				// Find run of consecutive items in source buffer
-				uint32_t run_start_src = item->instance_offset;
-				uint32_t run_start_dst = sorted_offset;
-				uint32_t run_size      = size;
-				uint32_t run_items     = 1;
-
-				item->instance_offset = sorted_offset;
-				sorted_offset += size;
-
-				// Check if next items are consecutive in source
-				while (i + run_items < ref_list->count) {
-					skr_render_item_t* next_item = &ref_list->items[i + run_items];
-					uint32_t           next_size = next_item->instance_data_size * next_item->instance_count;
-
-					if (next_size > 0 && next_item->instance_offset == run_start_src + run_size) {
-						next_item->instance_offset = sorted_offset;
-						sorted_offset += next_size;
-						run_size      += next_size;
-						run_items++;
-					} else {
-						break;
-					}
-				}
-
-				// Copy the entire run at once
-				memcpy(&ref_list->instance_data_sorted[run_start_dst], &ref_list->instance_data[run_start_src], run_size);
-
-				i += run_items;
-			} else {
-				i++;
-			}
-		}
-
-		// Swap the buffers
-		uint8_t* temp = ref_list->instance_data;
-		ref_list->instance_data        = ref_list->instance_data_sorted;
-		ref_list->instance_data_sorted = temp;
+	// Sorting put each material's items together. Ones added with identical
+	// params can share one param slice, and so one descriptor bind.
+	for (uint32_t i = 1; i < ref_list->count; i++) {
+		skr_render_item_t*       item = &ref_list->items[i];
+		const skr_render_item_t* prev = &ref_list->items[i - 1];
+		if (item->bind_start        != prev->bind_start        ||
+		    item->param_buffer_size != prev->param_buffer_size ||
+		    item->param_data_offset == prev->param_data_offset ||
+		    item->param_buffer_size == 0)
+			continue;
+		if (memcmp(&ref_list->material_data[item->param_data_offset], &ref_list->material_data[prev->param_data_offset], item->param_buffer_size) == 0)
+			item->param_data_offset = prev->param_data_offset;
 	}
+
+	// Sorting reorders items but not their instance data. Repack the data in
+	// sorted order, each run realigned to its own stride for firstInstance
+	if (ref_list->instance_data_used == 0) return;
+
+	// Realignment can add padding, so size the destination first. Only a
+	// stride change can misalign, so only then pay for the division.
+	uint32_t needed = 0;
+	uint32_t stride = 0;
+	for (uint32_t i = 0; i < ref_list->count; i++) {
+		const skr_render_item_t* item = &ref_list->items[i];
+		uint32_t                 size = item->instance_data_size * item->instance_count;
+		if (size == 0) continue;
+		if (item->instance_data_size != stride) {
+			stride = item->instance_data_size;
+			needed = _skr_align_up(needed, stride);
+		}
+		needed += size;
+	}
+	if (ref_list->instance_data_sorted_capacity < needed) {
+		uint32_t capacity = ref_list->instance_data_capacity > needed ? ref_list->instance_data_capacity : needed;
+		_skr_free(ref_list->instance_data_sorted);
+		ref_list->instance_data_sorted          = _skr_malloc(capacity);
+		ref_list->instance_data_sorted_capacity = capacity;
+		if (!ref_list->instance_data_sorted) {
+			skr_log(skr_log_critical, "Failed to allocate render list sorted instance data");
+			ref_list->instance_data_sorted_capacity = 0;
+			return;
+		}
+	}
+
+	// Runs that stay contiguous in both source and destination copy as one memcpy
+	uint32_t sorted_offset = 0;
+	uint32_t i             = 0;
+	stride = 0;
+	while (i < ref_list->count) {
+		skr_render_item_t* item = &ref_list->items[i];
+		uint32_t           size = item->instance_data_size * item->instance_count;
+		i++;
+		if (size == 0) continue;
+
+		if (item->instance_data_size != stride) {
+			stride        = item->instance_data_size;
+			sorted_offset = _skr_align_up(sorted_offset, stride);
+		}
+		uint32_t run_src      = item->instance_offset;
+		uint32_t run_dst      = sorted_offset;
+		uint32_t run_size     = size;
+		item->instance_offset = sorted_offset;
+		sorted_offset        += size;
+
+		while (i < ref_list->count) {
+			skr_render_item_t* next      = &ref_list->items[i];
+			uint32_t           next_size = next->instance_data_size * next->instance_count;
+			if (next_size == 0 ||
+			    next->instance_data_size != stride ||
+			    next->instance_offset != run_src + run_size)
+				break;
+			next->instance_offset = sorted_offset;
+			sorted_offset        += next_size;
+			run_size             += next_size;
+			i++;
+		}
+		memcpy(&ref_list->instance_data_sorted[run_dst], &ref_list->instance_data[run_src], run_size);
+	}
+	ref_list->instance_data_used = sorted_offset;
+
+	// Swap the buffers, capacities travel with them
+	uint8_t* tmp_data = ref_list->instance_data;
+	uint32_t tmp_cap  = ref_list->instance_data_capacity;
+	ref_list->instance_data                 = ref_list->instance_data_sorted;
+	ref_list->instance_data_capacity        = ref_list->instance_data_sorted_capacity;
+	ref_list->instance_data_sorted          = tmp_data;
+	ref_list->instance_data_sorted_capacity = tmp_cap;
 }

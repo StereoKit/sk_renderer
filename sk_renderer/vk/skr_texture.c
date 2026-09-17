@@ -1865,82 +1865,28 @@ static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, 
 		if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (compute mip dst)"); continue; }
 		_skr_cmd_destroy_image_view(ctx.destroy_list, dst_view);
 
-		VkWriteDescriptorSet   writes      [32];
-		VkDescriptorBufferInfo buffer_infos[16];
-		VkDescriptorImageInfo  image_infos [16];
-		uint32_t write_ct  = 0;
-		uint32_t buffer_ct = 0;
-		uint32_t image_ct  = 0;
-
-		// Handle material parameters if present ($Global buffer with per-mip offset)
-		if (skr_buffer_is_valid(&params_buffer)) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = params_buffer.buffer,
-				.offset = (mip - 1) * aligned_stride,
-				.range  = material->param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
-
-		// Per-mip source and destination views, both in GENERAL
-		image_infos[image_ct] = (VkDescriptorImageInfo){
-			.sampler     = ref_tex->sampler,
-			.imageView   = src_view,
-			.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-		};
-		writes[write_ct++] = (VkWriteDescriptorSet){
-			.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstBinding      = bind_source.slot,
-			.descriptorCount = 1,
-			.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.pImageInfo      = &image_infos[image_ct++],
-		};
-		image_infos[image_ct] = (VkDescriptorImageInfo){
-			.sampler     = VK_NULL_HANDLE,
-			.imageView   = dst_view,
-			.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-		};
-		writes[write_ct++] = (VkWriteDescriptorSet){
-			.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstBinding      = bind_dst.slot,
-			.descriptorCount = 1,
-			.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-			.pImageInfo      = &image_infos[image_ct++],
-		};
+		_skr_desc_writes_t desc;
+		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
+		if (skr_buffer_is_valid(&params_buffer))
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, (mip - 1) * aligned_stride, material->param_buffer_size);
+		// Both views are in GENERAL, not the texture's canonical sample layout
+		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, VK_IMAGE_LAYOUT_GENERAL);
+		_skr_write_image(&desc, bind_dst.slot,    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          VK_NULL_HANDLE,   dst_view, VK_IMAGE_LAYOUT_GENERAL);
 
 		const int32_t ignore_slots[] = {
 			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
 			bind_source.slot,                                             // Source view (per-mip, handled above)
 			bind_dst.slot                                                 // Destination view (per-mip, handled above)
 		};
-
-		_skr_bind_pool_lock();
-		int32_t fail_idx = _skr_material_add_writes(
-			_skr_bind_pool_get(material->bind_start), material->bind_count,
-			skr_stage_compute,
-			ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-			writes,       sizeof(writes      )/sizeof(writes      [0]),
-			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-			&write_ct, &buffer_ct, &image_ct
-		);
-		_skr_bind_pool_unlock();
-
+		int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, skr_stage_compute, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
 		if (fail_idx >= 0) {
 			const sksc_shader_meta_t* meta = &material->key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 			continue;
 		}
 
-		_skr_bind_descriptors(ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_COMPUTE, layout, desc_layout, writes, write_ct);
-
-		vkCmdDispatch(ctx.cmd, ((uint32_t)mip_dims.x + 7) / 8, ((uint32_t)mip_dims.y + 7) / 8, ref_tex->layer_count);
+		if (_skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, material->bind_start, layout, desc_layout, &desc))
+			vkCmdDispatch(ctx.cmd, ((uint32_t)mip_dims.x + 7) / 8, ((uint32_t)mip_dims.y + 7) / 8, ref_tex->layer_count);
 
 		// Make this mip's writes visible: the next iteration samples it in
 		// compute, and the last mip goes straight to whatever samples the
@@ -2154,63 +2100,20 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 
 
 		// Build descriptor writes (shared across layers)
-		VkWriteDescriptorSet   writes      [32];
-		VkDescriptorBufferInfo buffer_infos[16];
-		VkDescriptorImageInfo  image_infos [16];
-		uint32_t write_ct  = 0;
-		uint32_t buffer_ct = 0;
-		uint32_t image_ct  = 0;
-
-		// Handle material parameters if present ($Global buffer with per-mip offset)
-		if (skr_buffer_is_valid(&params_buffer)) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = params_buffer.buffer,
-				.offset = (mip - 1) * aligned_stride,
-				.range  = material->param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
-
-		// Manually add source texture binding (since we create it per-mip).
+		_skr_desc_writes_t desc;
+		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
+		if (skr_buffer_is_valid(&params_buffer))
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, (mip - 1) * aligned_stride, material->param_buffer_size);
 		// Both ref_tex mip 0 and scratch mips sit in SHADER_READ_ONLY_OPTIMAL
-		// during the mip loop regardless of ref_tex's canonical sample layout.
-		image_infos[image_ct] = (VkDescriptorImageInfo){
-			.sampler     = ref_tex->sampler,
-			.imageView   = src_view,
-			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		};
-		writes[write_ct++] = (VkWriteDescriptorSet){
-			.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstBinding      = bind_source.slot,
-			.descriptorCount = 1,
-			.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.pImageInfo      = &image_infos[image_ct++],
-		};
+		// during the mip loop, whatever ref_tex's canonical sample layout is.
+		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 		// Add any other material bindings (textures/buffers, including globals)
 		const int32_t ignore_slots[] = {
 			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
 			bind_source.slot                                               // Source texture (per-mip, handled above)
 		};
-
-		_skr_bind_pool_lock();
-		int32_t fail_idx = _skr_material_add_writes(
-			_skr_bind_pool_get(material->bind_start), material->bind_count,
-			(skr_stage_)(skr_stage_vertex | skr_stage_pixel),
-			ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-			writes,       sizeof(writes      )/sizeof(writes      [0]),
-			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-			&write_ct, &buffer_ct, &image_ct
-		);
-		_skr_bind_pool_unlock();
-
+		int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
 		if (fail_idx >= 0) {
 			const sksc_shader_meta_t* meta = &material->key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
@@ -2274,13 +2177,10 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)mip_height, (float)mip_width, -(float)mip_height, 0.0f, 1.0f});
 			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
 
-			_skr_bind_descriptors(
-				ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			bool bound = _skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, material->bind_start,
 				_skr_pipeline_get_layout           (material->pipeline_material_idx),
-				_skr_pipeline_get_descriptor_layout(material->pipeline_material_idx),
-				writes, write_ct);
-
-			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
+				_skr_pipeline_get_descriptor_layout(material->pipeline_material_idx), &desc);
+			if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
 			vkCmdEndRenderPass(ctx.cmd);
 		}
 

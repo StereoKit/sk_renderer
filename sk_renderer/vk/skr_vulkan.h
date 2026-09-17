@@ -328,7 +328,7 @@ typedef struct skr_compute_t {
 	VkDescriptorSetLayout  descriptor_layout;
 	VkPipeline             pipeline;
 
-	skr_material_bind_t*   binds;
+	int32_t                bind_start;  // Index into the bind pool, shared with materials
 	uint32_t               bind_count;
 
 	// CPU-side parameter staging
