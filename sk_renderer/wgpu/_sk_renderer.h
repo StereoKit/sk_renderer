@@ -25,18 +25,33 @@
 	#define _skr_load_acquire(p)      (*(p))
 	#define _skr_store_release(p, v)  (*(p) = (v))
 	#define _skr_fetch_add(p, v)      ((*(p) += (v)) - (v))
-#else
+#elif defined(_MSC_VER)
 	#include <threads.h>
-	#include <stdatomic.h>
+	#include <intrin.h>
 	typedef mtx_t _skr_mtx_t;
 	#define _skr_mtx_init(m)    mtx_init((m), mtx_plain)
 	#define _skr_mtx_destroy(m) mtx_destroy(m)
 	#define _skr_mtx_lock(m)    mtx_lock(m)
 	#define _skr_mtx_unlock(m)  mtx_unlock(m)
-	#define _skr_atomic(T)      _Atomic(T)
-	#define _skr_load_acquire(p)      atomic_load_explicit((p), memory_order_acquire)
-	#define _skr_store_release(p, v)  atomic_store_explicit((p), (v), memory_order_release)
-	#define _skr_fetch_add(p, v)      atomic_fetch_add_explicit((p), (v), memory_order_acq_rel)
+	#define _skr_atomic(T)      T volatile
+	#if defined(_M_ARM64) || defined(_M_ARM64EC)
+		#define _skr_load_acquire(p)  ((void*)__ldar64((volatile __int64*)(p)))
+	#else
+		#define _skr_load_acquire(p)  (*(p)) // x86/x64 loads carry acquire already
+	#endif
+	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
+	#define _skr_fetch_add(p, v)      _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
+#else
+	#include <threads.h>
+	typedef mtx_t _skr_mtx_t;
+	#define _skr_mtx_init(m)    mtx_init((m), mtx_plain)
+	#define _skr_mtx_destroy(m) mtx_destroy(m)
+	#define _skr_mtx_lock(m)    mtx_lock(m)
+	#define _skr_mtx_unlock(m)  mtx_unlock(m)
+	#define _skr_atomic(T)      T
+	#define _skr_load_acquire(p)      __atomic_load_n  ((p),      __ATOMIC_ACQUIRE)
+	#define _skr_store_release(p, v)  __atomic_store_n ((p), (v), __ATOMIC_RELEASE)
+	#define _skr_fetch_add(p, v)      __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////

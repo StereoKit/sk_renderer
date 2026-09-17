@@ -11,13 +11,24 @@
 
 #include <volk.h>
 #include <threads.h>
-#include <stdatomic.h>
 
 // Registries coordinate writers with one mutex and publish to lock-free
-// readers with release/acquire pointer stores
-#define _skr_atomic(T)            _Atomic(T)
-#define _skr_load_acquire(p)      atomic_load_explicit((p), memory_order_acquire)
-#define _skr_store_release(p, v)  atomic_store_explicit((p), (v), memory_order_release)
+// readers with release/acquire pointer stores. MSVC gates C11 <stdatomic.h>
+// behind /experimental:c11atomics, so use the intrinsics both compilers ship.
+#if defined(_MSC_VER)
+	#include <intrin.h>
+	#define _skr_atomic(T)            T volatile
+	#if defined(_M_ARM64) || defined(_M_ARM64EC)
+		#define _skr_load_acquire(p)  ((void*)__ldar64((volatile __int64*)(p)))
+	#else
+		#define _skr_load_acquire(p)  (*(p)) // x86/x64 loads carry acquire already
+	#endif
+	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
+#else
+	#define _skr_atomic(T)            T
+	#define _skr_load_acquire(p)      __atomic_load_n ((p),      __ATOMIC_ACQUIRE)
+	#define _skr_store_release(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // Memory allocation wrappers
