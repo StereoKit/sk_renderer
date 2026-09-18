@@ -7,25 +7,21 @@ include(FetchContent)
 # Dependencies
 ###############################################################################
 
-# sk_app for windowing and platform abstraction
-set(SKA_BUILD_EXAMPLES OFF CACHE BOOL "Disable sk_app examples" FORCE)
-# Ensure sk_app is built with PIC for Android shared library
-if(ANDROID)
-	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# sk_app for windowing and platform abstraction. SKR_SK_APP_DIR swaps in a
+# local checkout for the pinned release.
+set(SKA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+if(SKR_SK_APP_DIR)
+	message(STATUS "Using sk_app from ${SKR_SK_APP_DIR}")
+	set(FETCHCONTENT_SOURCE_DIR_SK_APP "${SKR_SK_APP_DIR}")
 endif()
 message(STATUS "Fetching sk_app...")
 FetchContent_Declare(sk_app
 	GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-	GIT_TAG        v2026.3.11
+	GIT_TAG        v2026.9.10
 	GIT_SHALLOW    TRUE
 	GIT_PROGRESS   TRUE
 )
 FetchContent_MakeAvailable(sk_app)
-#set(sk_app_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../sk_app)
-#add_subdirectory(${sk_app_SOURCE_DIR} ${sk_app_SOURCE_DIR}/build)
-if(ANDROID)
-	set_target_properties(sk_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
-endif()
 
 # stb for image loading
 message(STATUS "Fetching stb...")
@@ -48,13 +44,14 @@ FetchContent_MakeAvailable(cgltf)
 message(STATUS "Fetching cimgui...")
 FetchContent_Declare(cimgui
 	GIT_REPOSITORY https://github.com/cimgui/cimgui.git
-	GIT_TAG        1.91.6
+	GIT_TAG        1.92.9
 	GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(cimgui)
 
-# FFmpeg for video playback (Linux only for now)
-if(UNIX AND NOT ANDROID AND NOT APPLE)
+# FFmpeg for video playback (Linux only for now; the zero-copy path imports
+# VkImages, so it's Vulkan-backend only)
+if(UNIX AND NOT ANDROID AND NOT APPLE AND NOT SKR_USE_WEBGPU)
 	find_package(PkgConfig QUIET)
 	if(PkgConfig_FOUND)
 		pkg_check_modules(FFMPEG
@@ -112,15 +109,37 @@ set_target_properties(sk_renderer_test PROPERTIES
 	CXX_STANDARD_REQUIRED ON
 )
 
+skr_target_warnings(sk_renderer_test)
+
 if(UNIX AND NOT ANDROID)
 	target_link_libraries(sk_renderer_test PRIVATE m)
+endif()
+
+if(EMSCRIPTEN)
+	# The pre-init JS requests the WebGPU adapter/device before main() runs;
+	# EXIT_RUNTIME lets test runs report a real exit code through emrun
+	target_link_options(sk_renderer_test PRIVATE
+		"SHELL:--pre-js ${CMAKE_CURRENT_SOURCE_DIR}/web/pre.js"
+		"SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html"
+		-sEXIT_RUNTIME=1
+		# The scenes keep matrices/instance staging on the stack; emscripten's
+		# 64KB default is far below the 8MB native builds enjoy
+		-sSTACK_SIZE=2MB)
+	# Size pass: closure-compile the JS glue in MinSizeRel builds (pre.js uses
+	# quoted Module properties so the minifier can't break the boundary)
+	if(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+		target_link_options(sk_renderer_test PRIVATE --closure=1)
+	endif()
+	set_property(TARGET sk_renderer_test APPEND PROPERTY LINK_DEPENDS
+		"${CMAKE_CURRENT_SOURCE_DIR}/web/pre.js"
+		"${CMAKE_CURRENT_SOURCE_DIR}/web/shell.html")
 endif()
 
 # Static link MinGW runtime when cross-compiling to Windows
 if(MINGW)
 	target_link_options       (sk_renderer_test PRIVATE -static-libgcc -static-libstdc++ -static)
 	target_link_libraries     (sk_renderer_test PRIVATE pthread)
-	target_include_directories(sk_renderer_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	target_include_directories(sk_renderer_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 	# MSVC enables SSE4.1 intrinsics on x64 unconditionally; mingw-w64 GCC needs
 	# -msse4.1 explicitly so BC1/ETC SIMD paths can compile.
 	if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -131,10 +150,10 @@ endif()
 # macOS needs pthread fallback for C11 threads (no static linking)
 if(APPLE)
 	target_link_libraries     (sk_renderer_test PRIVATE pthread)
-	target_include_directories(sk_renderer_test PRIVATE ${CMAKE_SOURCE_DIR}/sk_renderer/threads)
+	target_include_directories(sk_renderer_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 endif()
 
-target_link_libraries(sk_renderer_test PRIVATE sk_renderer)
+target_link_libraries(sk_renderer_test PRIVATE sk_renderer sk_renderer_imgui)
 skr_copy_moltenvk(sk_renderer_test)
 target_include_directories(sk_renderer_test PRIVATE
 	${stb_SOURCE_DIR}
@@ -166,11 +185,15 @@ target_sources(sk_renderer_test PRIVATE
 	scene_yuv_test.c
 	scene_gi.c
 	scene_pbr.c
+	scene_frame_pacing.c
+	scene_desc_stress.c
 	bloom.c
 	text/text.c
 	tools/scene_util.c
-	tools/tex_compress.c
-	imgui_backend/imgui_impl_sk_renderer.cpp
+	tools/pacer.c
+	tools/compress/tex_compress.c
+	tools/tex_psnr.c
+	tools/compress/astc_io.c
 	${sk_app_SOURCE_DIR}/examples/imgui_example/imgui_impl_sk_app.cpp
 	${cimgui_SOURCE_DIR}/imgui/imgui.cpp
 	${cimgui_SOURCE_DIR}/imgui/imgui_draw.cpp
@@ -202,17 +225,22 @@ endif()
 # Shader compilation
 ###############################################################################
 
-# Compile ImGui shader to header file (no debug info, embedded in binary)
-# Output goes to imgui_backend/ to keep all ImGui backend files together
-skshaderc_compile_headers(sk_renderer_test ${CMAKE_CURRENT_SOURCE_DIR}/imgui_backend "-o3 -e -t s"
-	imgui_backend/imgui.hlsl
-)
+# A container carries one language, so the target follows the backend. WGSL
+# comes only from the SVSL backend, so those builds pass -svsl; the web host
+# tool may still carry glslang, and mixing backends isn't allowed.
+# (The ImGui shader comes from the sk_renderer_imgui target.)
+if(SKR_USE_WEBGPU) # includes EMSCRIPTEN, which forces it ON above
+	set(_skr_example_shader_targets "-svsl -t w")
+else()
+	set(_skr_example_shader_targets "-t s")
+endif()
 
 # Compile other shaders to .sks files
-skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders "" _
+skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders "${_skr_example_shader_targets}" _
 	assets/shaders/bloom_composite.hlsl
 	assets/shaders/bloom_downsample.hlsl
 	assets/shaders/bloom_upsample.hlsl
+	assets/shaders/buffer_fill.hlsl
 	assets/shaders/compute_test.hlsl
 	assets/shaders/cubemap_mipgen.hlsl
 	assets/shaders/cubemap_reflection.hlsl
@@ -251,13 +279,45 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/gi_fast_voxelize.hlsl
 	assets/shaders/gi_voxel_to_sh.hlsl
 	assets/shaders/postfx_invert.hlsl
+	assets/shaders/postfx_depth_fog.hlsl
+	assets/shaders/postfx_depth_fog_ms.hlsl
+	assets/shaders/frame_pacing.hlsl
+	assets/shaders/postfx_fog_density.svsl
+	assets/shaders/postfx_fog_scatter.svsl
+	assets/shaders/postfx_fog_scatter_taps.svsl
+	assets/shaders/postfx_fog_tile.svsl
+	assets/shaders/postfx_halation.svsl
 	assets/shaders/msaa_resolve.hlsl
 	assets/shaders/msaa_resolve_wide.hlsl
 	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
+	assets/shaders/tex_compare.hlsl
+	# GPU texture compression toolkit — sources live with the tool code in
+	# tools/compress/ (see tools/compress/README.md); compiled .sks output
+	# lands in generated/shaders/ alongside everything else.
+	tools/compress/shaders/bc1_compress.hlsl
+	tools/compress/shaders/bc6h_compress.hlsl
+	tools/compress/shaders/bc7_compress.hlsl
+	tools/compress/shaders/astc4x4_compress.hlsl
+	tools/compress/shaders/astc6x6_compress.hlsl
+	tools/compress/shaders/astc8x8hdr_compress.hlsl
+	tools/compress/shaders/tex_psnr.hlsl
+
+	INCLUDES
+	assets/shaders/common.hlsli
+	assets/shaders/gpu_sort_common.hlsli
+	assets/shaders/pbr.hlsli
+	tools/compress/shaders/astc_common.hlsli
+	tools/compress/shaders/bc_common.hlsli
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+###############################################################################
+# ASTC encoder validation tool (desktop only)
+###############################################################################
+
+add_subdirectory(tools/compress/validate)
 
 ###############################################################################
 # "run" command

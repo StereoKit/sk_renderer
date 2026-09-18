@@ -14,7 +14,9 @@ float  _pad3;
 
 struct Particle {
 	float3 position;
+	float  _pad0;
 	float3 velocity;
+	float  _pad1;
 };
 StructuredBuffer  <Particle> particles     : register(t3, space0);
 RWStructuredBuffer<Particle> particles_out : register(u2, space0);

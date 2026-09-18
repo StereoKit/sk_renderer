@@ -1,0 +1,53 @@
+//--name = postfx_fog_density
+//--fog_density = 0.08
+//--fog_max     = 0.8
+
+#include "common.hlsli"
+
+// Stage 1 of the fog + scatter pair (see postfx_fog_scatter.svsl): reads depth
+// pixel-local as an input attachment — on-tile resolved under MSAA, same as
+// postfx_depth_fog — and packs fog density into the alpha channel with the
+// scene color passed through untouched. Depth itself never leaves tile memory;
+// this postfx is what keeps the depth buffer's storeOp at DONT_CARE. No fog is
+// applied here; the scatter blit does the color work so the blur can widen
+// with density first.
+
+float fog_density;
+float fog_max;    // hard ceiling on fog density so distant geometry never fully vanishes
+
+[[vk::input_attachment_index(0)]] SubpassInput<float4> color;
+[[vk::input_attachment_index(1)]] SubpassInput<float>  depth;
+
+struct psIn {
+	float4 pos : SV_POSITION;
+};
+
+psIn vs(uint id : SV_VertexID) {
+	psIn o;
+	float2 uv = float2(id & 2, (id << 1) & 2);
+	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+
+float4 ps(psIn input) : SV_TARGET {
+	float4 c = color.SubpassLoad();
+	float  d = depth.SubpassLoad();
+
+	// Reconstruct view-space distance from [0,1] depth using the projection the
+	// scene was rendered with (system buffer), mirroring cubemap_skybox's
+	// clip→view mul — so the fog can never drift from the camera the way a
+	// hardcoded near/far would. The reconstruction touches only clip z/w, so it's
+	// view-independent; projection_inv[0] is correct even under multiview.
+	float4 vpos = mul(float4(0, 0, d, 1), projection_inv[0]);
+	float  dist = -vpos.z / vpos.w;
+
+	// Exponential-squared (GL_EXP2) fog: transmittance = exp(-(dist*fog_density)^2),
+	// density = 1 - transmittance. The squared term keeps the foreground crisp and
+	// pushes the ramp into the distance, unlike the plain exp() in postfx_depth_fog.
+	// Capped at fog_max here at the source, so both scatter variants (which read
+	// this alpha back) inherit it — no need to re-clamp in the blit.
+	float fog_amt = dist * fog_density;
+	float density = min(1.0 - saturate(exp(-fog_amt * fog_amt)), fog_max);
+
+	return float4(c.rgb, density);
+}

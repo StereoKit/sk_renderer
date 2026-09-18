@@ -15,191 +15,132 @@
 #include <assert.h>
 
 ///////////////////////////////////////////////////////////////////////////////
-// Bind pool implementation
-///////////////////////////////////////////////////////////////////////////////
+// Bind pool: slices live in fixed chunks that never move, so readers index
+// them lock-free while one mutex serializes allocation and the destroy list
+// defers frees past the frame. Setters write slot fields unlocked, so a
+// material must not be modified while another thread is drawing with it.
 
-#define SKR_BIND_POOL_INITIAL_CAPACITY 256
-#define SKR_BIND_POOL_FREE_INITIAL     16
+#define _SKR_BIND_CHUNK_SHIFT 8
+#define _SKR_BIND_CHUNK_SIZE  (1u << _SKR_BIND_CHUNK_SHIFT)
+#define _SKR_BIND_CHUNK_MASK  (_SKR_BIND_CHUNK_SIZE - 1)
+#define _SKR_BIND_MAX_CHUNKS  1024 // 256k binds; slices recycle, so this is headroom, not a leak budget
+
+typedef struct { uint32_t start, count; } _skr_bind_range_t;
+
+static _skr_atomic(skr_material_bind_t*) _bind_chunks[_SKR_BIND_MAX_CHUNKS];
+static uint32_t           _bind_chunk_count; // writer mutex from here down
+static uint32_t           _bind_chunk_used;  // entries used in the newest chunk
+static _skr_bind_range_t* _bind_free;
+static uint32_t           _bind_free_count;
+static uint32_t           _bind_free_capacity;
+static mtx_t              _bind_mutex;
 
 void _skr_bind_pool_init(void) {
-	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
-
-	mtx_init(&pool->mutex, mtx_plain);
-
-	pool->capacity            = SKR_BIND_POOL_INITIAL_CAPACITY;
-	pool->binds               = (_skr_calloc(pool->capacity, sizeof(skr_material_bind_t)));
-	pool->free_range_capacity = SKR_BIND_POOL_FREE_INITIAL;
-	pool->free_range_count    = 1;
-	pool->free_ranges         = (_skr_malloc(pool->free_range_capacity * sizeof(_skr_bind_range_t)));
-
-	// Initially all slots are free as one contiguous range
-	pool->free_ranges[0] = (_skr_bind_range_t){ .start = 0, .count = pool->capacity };
+	mtx_init(&_bind_mutex, mtx_plain);
 }
 
 void _skr_bind_pool_shutdown(void) {
-	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
+	for (uint32_t i = 0; i < _bind_chunk_count; i++) {
+		_skr_free(_skr_load_acquire(&_bind_chunks[i]));
+		_skr_store_release(&_bind_chunks[i], (skr_material_bind_t*)NULL);
+	}
+	_skr_free(_bind_free);
+	_bind_free          = NULL;
+	_bind_free_count    = 0;
+	_bind_free_capacity = 0;
+	_bind_chunk_count   = 0;
+	_bind_chunk_used    = 0;
+	mtx_destroy(&_bind_mutex);
+}
 
-	mtx_destroy(&pool->mutex);
-
-	_skr_free(pool->binds);
-	_skr_free(pool->free_ranges);
-	*pool = (_skr_bind_pool_t){0};
+static void _skr_bind_range_push(_skr_bind_range_t range) {
+	if (_bind_free_count >= _bind_free_capacity) {
+		_bind_free_capacity = _bind_free_capacity == 0 ? 16 : _bind_free_capacity * 2;
+		_bind_free          = _skr_realloc(_bind_free, sizeof(_skr_bind_range_t) * _bind_free_capacity);
+	}
+	_bind_free[_bind_free_count++] = range;
 }
 
 int32_t _skr_bind_pool_alloc(uint32_t count) {
 	if (count == 0) return -1;
+	if (count > _SKR_BIND_CHUNK_SIZE) {
+		skr_log(skr_log_critical, "Material needs %u binds, above the pool's %u limit", count, _SKR_BIND_CHUNK_SIZE);
+		return -1;
+	}
+	mtx_lock(&_bind_mutex);
 
-	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
 	int32_t result = -1;
-
-	mtx_lock(&pool->mutex);
-
-	// First-fit search through free ranges
-	for (uint32_t i = 0; i < pool->free_range_count; i++) {
-		if (pool->free_ranges[i].count >= count) {
-			uint32_t start = pool->free_ranges[i].start;
-
-			// Shrink or remove this range
-			if (pool->free_ranges[i].count == count) {
-				// Remove range by swapping with last
-				pool->free_ranges[i] = pool->free_ranges[--pool->free_range_count];
-			} else {
-				// Shrink range
-				pool->free_ranges[i].start += count;
-				pool->free_ranges[i].count -= count;
+	for (uint32_t i = 0; i < _bind_free_count; i++) {
+		if (_bind_free[i].count < count) continue;
+		result = (int32_t)_bind_free[i].start;
+		if (_bind_free[i].count == count) _bind_free[i] = _bind_free[--_bind_free_count];
+		else { _bind_free[i].start += count; _bind_free[i].count -= count; }
+		break;
+	}
+	if (result < 0) {
+		// A slice that doesn't fit the newest chunk opens another, tail freed
+		if (_bind_chunk_count == 0 || _bind_chunk_used + count > _SKR_BIND_CHUNK_SIZE) {
+			if (_bind_chunk_count >= _SKR_BIND_MAX_CHUNKS) {
+				skr_log(skr_log_critical, "Bind pool is out of chunks");
+				mtx_unlock(&_bind_mutex);
+				return -1;
 			}
-
-			// Zero out the allocated slots
-			memset(&pool->binds[start], 0, count * sizeof(skr_material_bind_t));
-			result = (int32_t)start;
-			goto done;
+			uint32_t tail = _bind_chunk_count > 0 ? _SKR_BIND_CHUNK_SIZE - _bind_chunk_used : 0;
+			if (tail > 0)
+				_skr_bind_range_push((_skr_bind_range_t){ .start = ((_bind_chunk_count - 1) << _SKR_BIND_CHUNK_SHIFT) + _bind_chunk_used, .count = tail });
+			skr_material_bind_t* chunk = _skr_calloc(_SKR_BIND_CHUNK_SIZE, sizeof(skr_material_bind_t));
+			_skr_store_release(&_bind_chunks[_bind_chunk_count], chunk);
+			_bind_chunk_count += 1;
+			_bind_chunk_used   = 0;
 		}
+		result = (int32_t)(((_bind_chunk_count - 1) << _SKR_BIND_CHUNK_SHIFT) + _bind_chunk_used);
+		_bind_chunk_used += count;
 	}
+	skr_material_bind_t* chunk = _skr_load_acquire(&_bind_chunks[result >> _SKR_BIND_CHUNK_SHIFT]);
+	memset(&chunk[result & _SKR_BIND_CHUNK_MASK], 0, sizeof(skr_material_bind_t) * count);
 
-	// No suitable range found, grow the pool
-	uint32_t old_capacity = pool->capacity;
-	uint32_t new_capacity = pool->capacity * 2;
-	while (new_capacity - old_capacity < count) {
-		new_capacity *= 2;
-	}
-
-	skr_material_bind_t* new_binds = _skr_realloc(pool->binds, new_capacity * sizeof(skr_material_bind_t));
-	if (!new_binds) {
-		skr_log(skr_log_critical, "Failed to grow bind pool");
-		goto done;
-	}
-	pool->binds    = new_binds;
-	pool->capacity = new_capacity;
-
-	// Zero new memory
-	memset(&pool->binds[old_capacity], 0, (new_capacity - old_capacity) * sizeof(skr_material_bind_t));
-
-	// Add the new free space (minus what we're about to allocate)
-	uint32_t remaining = (new_capacity - old_capacity) - count;
-	if (remaining > 0) {
-		// Grow free range array if needed
-		if (pool->free_range_count >= pool->free_range_capacity) {
-			uint32_t new_range_capacity = pool->free_range_capacity * 2;
-			_skr_bind_range_t* new_ranges = _skr_realloc(pool->free_ranges, new_range_capacity * sizeof(_skr_bind_range_t));
-			if (!new_ranges) {
-				skr_log(skr_log_warning, "Failed to grow bind pool free range array");
-				// Not fatal - we just can't track this free space
-			} else {
-				pool->free_ranges         = new_ranges;
-				pool->free_range_capacity = new_range_capacity;
-				pool->free_ranges[pool->free_range_count++] = (_skr_bind_range_t){
-					.start = old_capacity + count,
-					.count = remaining
-				};
-			}
-		} else {
-			pool->free_ranges[pool->free_range_count++] = (_skr_bind_range_t){
-				.start = old_capacity + count,
-				.count = remaining
-			};
-		}
-	}
-
-	result = (int32_t)old_capacity;
-
-done:
-	mtx_unlock(&pool->mutex);
+	mtx_unlock(&_bind_mutex);
 	return result;
 }
 
 void _skr_bind_pool_free(int32_t start, uint32_t count) {
 	if (start < 0 || count == 0) return;
+	uint32_t ustart = (uint32_t)start;
+	uint32_t end    = ustart + count;
+	uint32_t chunk  = ustart >> _SKR_BIND_CHUNK_SHIFT;
+	mtx_lock(&_bind_mutex);
 
-	_skr_bind_pool_t* pool = &_skr_vk.bind_pool;
+	memset(_skr_bind_pool_get(start), 0, sizeof(skr_material_bind_t) * count); // catches use-after-free
 
-	mtx_lock(&pool->mutex);
-
-	// Clear the freed slots (helps catch use-after-free)
-	memset(&pool->binds[start], 0, count * sizeof(skr_material_bind_t));
-
-	// Try to coalesce with adjacent ranges
-	uint32_t freed_start = (uint32_t)start;
-	uint32_t freed_end   = freed_start + count;
-
-	for (uint32_t i = 0; i < pool->free_range_count; i++) {
-		uint32_t range_end = pool->free_ranges[i].start + pool->free_ranges[i].count;
-
-		// Check if this range is immediately before the freed region
-		if (range_end == freed_start) {
-			pool->free_ranges[i].count += count;
-
-			// Check if we can also merge with a range after
-			for (uint32_t j = 0; j < pool->free_range_count; j++) {
-				if (j != i && pool->free_ranges[j].start == freed_end) {
-					pool->free_ranges[i].count += pool->free_ranges[j].count;
-					pool->free_ranges[j] = pool->free_ranges[--pool->free_range_count];
+	// Coalesce with an adjacent free range, but never across a chunk boundary
+	bool merged = false;
+	for (uint32_t i = 0; i < _bind_free_count && !merged; i++) {
+		if ((_bind_free[i].start >> _SKR_BIND_CHUNK_SHIFT) != chunk) continue;
+		if (_bind_free[i].start + _bind_free[i].count == ustart) {
+			_bind_free[i].count += count;
+			for (uint32_t j = 0; j < _bind_free_count; j++)
+				if (j != i && _bind_free[j].start == end && (_bind_free[j].start >> _SKR_BIND_CHUNK_SHIFT) == chunk) {
+					_bind_free[i].count += _bind_free[j].count;
+					_bind_free[j] = _bind_free[--_bind_free_count];
 					break;
 				}
-			}
-			goto done;
-		}
-
-		// Check if this range is immediately after the freed region
-		if (pool->free_ranges[i].start == freed_end) {
-			pool->free_ranges[i].start  = freed_start;
-			pool->free_ranges[i].count += count;
-			goto done;
+			merged = true;
+		} else if (_bind_free[i].start == end) {
+			_bind_free[i].start  = ustart;
+			_bind_free[i].count += count;
+			merged = true;
 		}
 	}
+	if (!merged)
+		_skr_bind_range_push((_skr_bind_range_t){ .start = ustart, .count = count });
 
-	// No adjacent range found, add new range
-	if (pool->free_range_count >= pool->free_range_capacity) {
-		uint32_t new_capacity = pool->free_range_capacity * 2;
-		_skr_bind_range_t* new_ranges = _skr_realloc(pool->free_ranges, new_capacity * sizeof(_skr_bind_range_t));
-		if (!new_ranges) {
-			skr_log(skr_log_warning, "Failed to grow bind pool free range array during free");
-			goto done;  // Can't track this free space, but memory is cleared
-		}
-		pool->free_ranges         = new_ranges;
-		pool->free_range_capacity = new_capacity;
-	}
-	pool->free_ranges[pool->free_range_count++] = (_skr_bind_range_t){
-		.start = freed_start,
-		.count = count
-	};
-
-done:
-	mtx_unlock(&pool->mutex);
+	mtx_unlock(&_bind_mutex);
 }
 
 skr_material_bind_t* _skr_bind_pool_get(int32_t start) {
-	// NOTE: Caller should hold the pool lock via _skr_bind_pool_lock() if there's
-	// any chance of concurrent _skr_bind_pool_alloc() calls that might grow the pool.
-	if (start < 0 || (uint32_t)start >= _skr_vk.bind_pool.capacity) return NULL;
-	return &_skr_vk.bind_pool.binds[start];
-}
-
-void _skr_bind_pool_lock(void) {
-	mtx_lock(&_skr_vk.bind_pool.mutex);
-}
-
-void _skr_bind_pool_unlock(void) {
-	mtx_unlock(&_skr_vk.bind_pool.mutex);
+	if (start < 0) return NULL;
+	skr_material_bind_t* chunk = _skr_load_acquire(&_bind_chunks[start >> _SKR_BIND_CHUNK_SHIFT]);
+	return chunk ? &chunk[start & _SKR_BIND_CHUNK_MASK] : NULL;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -228,6 +169,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		.stencil_front     = info.stencil_front,
 		.stencil_back      = info.stencil_back,
 	};
+	_skr_shader_resolve_spec_constants(&info.shader->meta, info.spec_constants, info.spec_constant_count, out_material->key.spec_constant_values);
 	out_material->queue_offset = info.queue_offset;
 
 	const sksc_shader_meta_t* meta = &out_material->key.shader->meta;
@@ -263,7 +205,13 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	}
 	skr_material_bind_t* binds = _skr_bind_pool_get(out_material->bind_start);
 	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i                   ].bind = meta->buffers  [i].bind;
-	for (uint32_t i = 0; i < meta->resource_count; i++) binds[i+meta->buffer_count].bind = meta->resources[i].bind;
+	for (uint32_t i = 0; i < meta->resource_count; i++) {
+		binds[i+meta->buffer_count].bind = meta->resources[i].bind;
+		// Shape bit 6 on sampled textures: the shader uses QCOM image-processing
+		// ops, which require the dedicated IMAGE_PROCESSING sampler at descriptor
+		// time. On storage images the same bit records write usage instead.
+		binds[i+meta->buffer_count].image_proc_sampler = meta->resources[i].bind.register_type == skr_register_texture && (meta->resources[i].shape & SKSC_SHAPE_WRITTEN) != 0; // QCOM sampler bit on sampled textures
+	}
 
 	// Check if we have a buffer bound to the system buffer slot
 	out_material->has_system_buffer = false;
@@ -318,12 +266,15 @@ void skr_material_set_pipeline(skr_material_t* ref_material, skr_material_info_t
 	ref_material->key.wireframe         = info.wireframe;
 	ref_material->key.stencil_front     = info.stencil_front;
 	ref_material->key.stencil_back      = info.stencil_back;
+	_skr_shader_resolve_spec_constants(&ref_material->key.shader->meta, info.spec_constants, info.spec_constant_count, ref_material->key.spec_constant_values);
 	ref_material->queue_offset          = info.queue_offset;
 	ref_material->pipeline_material_idx = _skr_pipeline_register_material(&ref_material->key);
 }
 
 bool skr_material_is_valid(const skr_material_t* material) {
-	return material && material->pipeline_material_idx >= 0;
+	// The shader check matters for zero-initialized materials that were never
+	// created: pipeline_material_idx is 0 there, which reads as a valid index.
+	return material && material->key.shader != NULL && material->pipeline_material_idx >= 0;
 }
 
 void skr_material_destroy(skr_material_t* ref_material) {
@@ -360,10 +311,8 @@ void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_te
 		return;
 	}
 
-	_skr_bind_pool_lock();
 	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
 	binds[meta->buffer_count + idx].texture = texture;
-	_skr_bind_pool_unlock();
 
 	// Auto-detect YCbCr immutable sampler: if the texture carries a ycbcr_sampler,
 	// bake it into the descriptor set layout for this binding slot. This is required
@@ -436,11 +385,9 @@ void skr_material_set_buffer(skr_material_t* ref_material, const char* name, skr
 		}
 	}
 
-	_skr_bind_pool_lock();
 	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
 	if (idx >= 0) {
 		binds[idx].buffer = buffer;
-		_skr_bind_pool_unlock();
 		return;
 	}
 
@@ -457,7 +404,6 @@ void skr_material_set_buffer(skr_material_t* ref_material, const char* name, skr
 	} else {
 		skr_log(skr_log_warning, "Buffer name '%s' not found", name);
 	}
-	_skr_bind_pool_unlock();
 }
 
 void skr_material_set_params(skr_material_t* ref_material, const void* data, uint32_t size) {
@@ -484,15 +430,18 @@ static uint32_t _skr_shader_var_size(sksc_shader_var_ type) {
 	}
 }
 
-void skr_material_set_param(skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
+// Packs a shader parameter into any param buffer with the shader's $Global
+// layout, so per-draw parameter blocks can be built without staging them
+// through a material's own (possibly shared) buffer.
+void _skr_shader_param_write(const sksc_shader_meta_t* meta, void* param_buffer, uint32_t param_buffer_size, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
 
-	int32_t var_index = sksc_shader_meta_get_var_index(&material->key.shader->meta, name);
+	int32_t var_index = sksc_shader_meta_get_var_index(meta, name);
 	if (var_index < 0) {
 		skr_log(skr_log_warning, "Material parameter '%s' not found", name);
 		return;
 	}
 
-	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(&material->key.shader->meta, var_index);
+	const sksc_shader_var_t* var = sksc_shader_meta_get_var_info(meta, var_index);
 	if (!var) return;
 
 	// When type is uint8, treat count as raw byte count and skip type check
@@ -507,12 +456,16 @@ void skr_material_set_param(skr_material_t* material, const char* name, sksc_sha
 		copy_size = _skr_shader_var_size(type) * count;
 	}
 
-	if (var->offset + copy_size > material->param_buffer_size) {
+	if (var->offset + copy_size > param_buffer_size) {
 		skr_log(skr_log_warning, "Material parameter '%s' write would exceed buffer size", name);
 		return;
 	}
 
-	memcpy((uint8_t*)material->param_buffer + var->offset, data, copy_size);
+	memcpy((uint8_t*)param_buffer + var->offset, data, copy_size);
+}
+
+void skr_material_set_param(skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, const void* data) {
+	_skr_shader_param_write(&material->key.shader->meta, material->param_buffer, material->param_buffer_size, name, type, count, data);
 }
 
 void skr_material_get_param(const skr_material_t* material, const char* name, sksc_shader_var_ type, uint32_t count, void* out_data) {
@@ -568,10 +521,15 @@ const char* _skr_material_bind_name(const sksc_shader_meta_t* meta, int32_t bind
 	return "unknown";
 }
 
-int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, const int32_t* ignore_slots, int32_t ignore_ct, VkWriteDescriptorSet* ref_writes, uint32_t write_max, VkDescriptorBufferInfo* ref_buffer_infos, uint32_t buffer_max, VkDescriptorImageInfo* ref_image_infos, uint32_t image_max, uint32_t* ref_write_ct, uint32_t* ref_buffer_ct, uint32_t* ref_image_ct) {
- 	for (uint32_t i = 0; i < bind_ct; i++) {
+int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, _skr_desc_writes_t* ref_writes) {
+	for (uint32_t i = 0; i < bind_ct; i++) {
 		int32_t       slot          = binds[i].bind.slot;
 		skr_register_ register_type = binds[i].bind.register_type;
+
+		// Resources outside the pipeline's stages get no descriptor: a graphics
+		// bind must not write a vs/ps/cs shader's compute-only storage image
+		// (often holding a storage-less default texture), and vice versa.
+		if ((binds[i].bind.stage_bits & stage_mask) == 0) continue;
 
 		bool skip = false;
 		for (int32_t s = 0; s < ignore_ct; s++) {
@@ -584,8 +542,6 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 
 		switch(register_type) {
 		case skr_register_constant: { // cbuffer, (b in HLSL)
-			if (*ref_write_ct >= write_max || *ref_buffer_ct >= buffer_max) continue;
-
 			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_BUFFER];
 			uint32_t      offset  = 0;
 			uint32_t      range   = 0;
@@ -596,24 +552,9 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			}
 			if (!buffer) return (int32_t)i;
 
-			ref_buffer_infos[*ref_buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = buffer->buffer,
-				.offset = offset,
-				.range  = range > 0 ? range : buffer->size,
-			};
-			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &ref_buffer_infos[*ref_buffer_ct],
-			};
-			(*ref_write_ct)++;
-			(*ref_buffer_ct)++;
+			_skr_write_buffer(ref_writes, (uint32_t)slot, false, buffer->buffer, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_read_buffer: { // StructuredBuffer, (t in HLSL)
-			if (*ref_write_ct >= write_max || *ref_buffer_ct >= buffer_max) continue;
-
 			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_TEXTURE];
 			uint32_t      offset  = 0;
 			uint32_t      range   = 0;
@@ -624,24 +565,9 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			}
 			if (!buffer) return (int32_t)i;
 
-			ref_buffer_infos[*ref_buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = buffer->buffer,
-				.offset = offset,
-				.range  = range > 0 ? range : buffer->size,
-			};
-			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-				.pBufferInfo     = &ref_buffer_infos[*ref_buffer_ct],
-			};
-			(*ref_write_ct)++;
-			(*ref_buffer_ct)++;
+			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_texture: { // Textures (Texture2D, etc.) (t in HLSL)
-			if (*ref_write_ct >= write_max || *ref_image_ct >= image_max) continue;
-
 			skr_tex_t* tex = _skr_vk.global_textures[slot-SKR_BIND_SHIFT_TEXTURE];
 			if (!tex)  tex = binds[i].texture;
 			if (!tex) return (int32_t)i;
@@ -660,24 +586,16 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			// the descriptor agree by construction. The producer of an external
 			// texture is responsible for transitioning it to this layout before
 			// any draw that samples it.
-			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
-				.sampler     = tex->sampler,
-				.imageView   = tex->view,
-				.imageLayout = _skr_tex_sample_layout(tex),
-			};
-			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-				.pImageInfo      = &ref_image_infos[*ref_image_ct],
-			};
-			(*ref_write_ct)++;
-			(*ref_image_ct)++;
+			// Image-processing bindings (BoxFilterQCOM etc.) are only legal with
+			// the dedicated IMAGE_PROCESSING sampler, never the texture's own.
+			// The fallback to tex->sampler only happens when the device lacks the
+			// extension — in which case skr_shader_check_support already failed
+			// this shader and the pipeline is expected to be rejected anyway.
+			VkSampler sampler = (binds[i].image_proc_sampler && _skr_vk.sampler_image_proc != VK_NULL_HANDLE)
+				? _skr_vk.sampler_image_proc : tex->sampler;
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler, tex->view, _skr_tex_sample_layout(tex));
 		} break;
 		case skr_register_readwrite: { // RWStructuredBuffer (u in HLSL)
-			if (*ref_write_ct >= write_max || *ref_buffer_ct >= buffer_max) continue;
-
 			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_UAV];
 			uint32_t      offset  = 0;
 			uint32_t      range   = 0;
@@ -688,24 +606,9 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			}
 			if (!buffer) return (int32_t)i;
 
-			ref_buffer_infos[*ref_buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = buffer->buffer,
-				.offset = offset,
-				.range  = range > 0 ? range : buffer->size,
-			};
-			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-				.pBufferInfo     = &ref_buffer_infos[*ref_buffer_ct],
-			};
-			(*ref_write_ct)++;
-			(*ref_buffer_ct)++;
+			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_readwrite_tex: { // Storage images (RWTexture2D, etc.)
-			if (*ref_write_ct >= write_max || *ref_image_ct >= image_max) continue;
-
 			skr_tex_t* tex = _skr_vk.global_textures[slot-SKR_BIND_SHIFT_UAV];
 			if (!tex)  tex = binds[i].texture;
 			if (!tex) return (int32_t)i;
@@ -713,41 +616,33 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			// _skr_tex_sample_layout returns GENERAL for compute-flagged textures —
 			// same value the spec mandates for STORAGE_IMAGE, but routes through the
 			// single canonical-layout helper for consistency with the sampled path.
-			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
-				.sampler     = tex->sampler,
-				.imageView   = tex->view,
-				.imageLayout = _skr_tex_sample_layout(tex),
-			};
-			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-				.pImageInfo      = &ref_image_infos[*ref_image_ct],
-			};
-			(*ref_write_ct)++;
-			(*ref_image_ct)++;
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, tex->sampler, tex->view, _skr_tex_sample_layout(tex));
 		} break;
 		case skr_register_input_attachment: { // Input attachments (SubpassInput)
-			if (*ref_write_ct >= write_max || *ref_image_ct >= image_max) continue;
-
 			skr_tex_t* tex = binds[i].texture;
 			if (!tex) return (int32_t)i;
 
-			ref_image_infos[*ref_image_ct] = (VkDescriptorImageInfo){
-				.sampler     = VK_NULL_HANDLE,
-				.imageView   = tex->view,
-				.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			};
-			ref_writes[*ref_write_ct] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
-				.pImageInfo      = &ref_image_infos[*ref_image_ct],
-			};
-			(*ref_write_ct)++;
-			(*ref_image_ct)++;
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_NULL_HANDLE, tex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		} break;
+		case skr_register_tile_sampled:      // [tile_attachment] Texture2D — VK_QCOM_tile_shading
+		case skr_register_tile_storage: {    // [tile_attachment] RWTexture2D
+			skr_tex_t* tex = binds[i].texture;
+			if (!tex) return (int32_t)i;
+
+			// The bound image must be an attachment of the current tile shading
+			// render pass, and the descriptor layout must match the image's
+			// layout during the reading subpass. Sampled: the postfx chain also
+			// references it as an input attachment there, which puts it in
+			// SHADER_READ_ONLY_OPTIMAL — the same layout _skr_tex_sample_layout
+			// reports for a readable color texture. Storage: storage-image
+			// descriptors require GENERAL unconditionally
+			// (VUID-VkWriteDescriptorSet-descriptorType-04152), so the caller
+			// must keep the attachment in GENERAL across the reading subpass.
+			bool sampled = register_type == skr_register_tile_sampled;
+			_skr_write_image(ref_writes, (uint32_t)slot,
+				sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				sampled ? tex->sampler : VK_NULL_HANDLE, tex->view,
+				sampled ? _skr_tex_sample_layout(tex) : VK_IMAGE_LAYOUT_GENERAL);
 		} break;
 		default: break;}
 	}

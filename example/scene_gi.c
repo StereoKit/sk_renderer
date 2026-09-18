@@ -496,7 +496,7 @@ static scene_t* _scene_gi_create(void) {
 
 	// GI decay compute shader (voxel-only decay at cycle start, SH handled by EMA)
 	scene->gi_decay_shader = su_shader_load("shaders/gi_clear.hlsl.sks", "gi_decay");
-	skr_compute_create(&scene->gi_decay_shader, &scene->gi_decay_compute);
+	skr_compute_create(&scene->gi_decay_shader, (skr_compute_info_t){0}, &scene->gi_decay_compute);
 
 	// Voxel radiance textures (double-buffered)
 	scene->gi_voxel_write = 0;
@@ -510,7 +510,7 @@ static scene_t* _scene_gi_create(void) {
 
 	// Voxelize compute shader
 	scene->gi_voxelize_shader = su_shader_load("shaders/gi_voxelize.hlsl.sks", "gi_voxelize");
-	skr_compute_create(&scene->gi_voxelize_shader, &scene->gi_voxelize_compute);
+	skr_compute_create(&scene->gi_voxelize_shader, (skr_compute_info_t){0}, &scene->gi_voxelize_compute);
 	skr_compute_set_tex  (&scene->gi_voxelize_compute, "capture_tex", &scene->gi_capture_color);
 	skr_compute_set_param(&scene->gi_voxelize_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
@@ -529,12 +529,12 @@ static scene_t* _scene_gi_create(void) {
 
 	// Fast voxelize compute shader
 	scene->gi_fast_voxelize_shader = su_shader_load("shaders/gi_fast_voxelize.hlsl.sks", "gi_fast_voxelize");
-	skr_compute_create(&scene->gi_fast_voxelize_shader, &scene->gi_fast_voxelize_compute);
+	skr_compute_create(&scene->gi_fast_voxelize_shader, (skr_compute_info_t){0}, &scene->gi_fast_voxelize_compute);
 	skr_compute_set_param(&scene->gi_fast_voxelize_compute, "grid_size", sksc_shader_var_uint, 1, &(uint32_t){GI_GRID_SIZE});
 
 	// Voxel-to-SH conversion (ray march the completed voxel volume → SH)
 	scene->gi_voxel_to_sh_shader = su_shader_load("shaders/gi_voxel_to_sh.hlsl.sks", "gi_voxel_to_sh");
-	skr_compute_create(&scene->gi_voxel_to_sh_shader, &scene->gi_voxel_to_sh_compute);
+	skr_compute_create(&scene->gi_voxel_to_sh_shader, (skr_compute_info_t){0}, &scene->gi_voxel_to_sh_compute);
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_r", &scene->gi_sh_r);
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_g", &scene->gi_sh_g);
 	skr_compute_set_tex  (&scene->gi_voxel_to_sh_compute, "sh_b", &scene->gi_sh_b);
@@ -1361,7 +1361,7 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_gi_t* scene = (scene_gi_t*)base;
 	float delta_time  = scene->delta_time;
 
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 
 #ifdef __ANDROID__
 	// Arc rotation camera (touch)
@@ -1526,7 +1526,7 @@ static void _scene_gi_render_ui(scene_t* base) {
 	igText("Light");
 	igSliderFloat("Angle",     &scene->light_angle,     0.0f, 360.0f, "%.0f deg", 0);
 	igSliderFloat("Elevation", &scene->light_elevation, -1, 1,  "%.2f",     0);
-	igColorEdit3("Color", &scene->light_color.x, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+	igColorEdit3("Color", (float*)&scene->light_color, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 
 	igSeparator();
 
@@ -1573,13 +1573,11 @@ static void _scene_gi_render_ui(scene_t* base) {
 				if (igButton("Pause", (ImVec2){0, 0})) scene->gi_stepping = true;
 			}
 
-			ImVec2 avail;
-			igGetContentRegionAvail(&avail);
+			ImVec2 avail    = igGetContentRegionAvail();
 			float  img_size = avail.x > 0 ? avail.x : 128;
-			igImage((ImTextureID)(uintptr_t)&scene->gi_capture_color,
+			igImage((ImTextureRef){._TexID = (ImTextureID)(uintptr_t)&scene->gi_capture_color},
 				(ImVec2){img_size, img_size},
-				(ImVec2){0, 0}, (ImVec2){1, 1},
-				(ImVec4){1, 1, 1, 1}, (ImVec4){0.5f, 0.5f, 0.5f, 0.5f});
+				(ImVec2){0, 0}, (ImVec2){1, 1});
 		}
 	}
 

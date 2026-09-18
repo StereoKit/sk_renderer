@@ -274,6 +274,14 @@ static VkAccessFlags _layout_to_access_flags(VkImageLayout layout) {
 	}
 }
 
+// UNDEFINED is free to leave unless something outside our queue timeline used
+// the image last, and may still be reading it.
+static VkPipelineStageFlags _tex_to_src_stage(const skr_tex_t* tex, VkImageLayout layout) {
+	if (tex->external_prior_use && layout == VK_IMAGE_LAYOUT_UNDEFINED)
+		return _SKR_ACQUIRE_WAIT_STAGE;
+	return _layout_to_src_stage(layout);
+}
+
 #ifdef SKR_DEBUG
 // Helper: Layout to string for debug logging
 static const char* _layout_to_string(VkImageLayout layout) {
@@ -362,7 +370,7 @@ void _skr_tex_transition(VkCommandBuffer cmd, skr_tex_t* ref_tex, VkImageLayout 
 #endif
 
 	// Determine source stage and access from old layout
-	VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+	VkPipelineStageFlags src_stage  = _tex_to_src_stage      (ref_tex, old_layout);
 	VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
 
 	// Perform transition
@@ -471,7 +479,7 @@ void _skr_barrier_batch_add(_skr_barrier_batch_t* batch, VkCommandBuffer cmd, sk
 	if (!ref_tex->is_transient_discard && ref_tex->current_layout == new_layout && new_layout != VK_IMAGE_LAYOUT_GENERAL)
 		return;
 
-	VkPipelineStageFlags src_stage  = _layout_to_src_stage   (old_layout);
+	VkPipelineStageFlags src_stage  = _tex_to_src_stage      (ref_tex, old_layout);
 	VkAccessFlags        src_access = _layout_to_access_flags(old_layout);
 
 	batch->src_stages |= src_stage;
@@ -531,8 +539,9 @@ void _skr_barrier_batch_flush(_skr_barrier_batch_t* batch, VkCommandBuffer cmd) 
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static void _skr_tex_generate_mips_blit  (skr_tex_t* tex, int32_t mip_levels, VkFilter filter_mode);
-static void _skr_tex_generate_mips_render(VkDevice  device,    skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* fragment_shader);
+static void _skr_tex_generate_mips_blit   (skr_tex_t* tex, int32_t mip_levels, VkFilter filter_mode);
+static void _skr_tex_generate_mips_render (VkDevice  device,    skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* fragment_shader);
+static bool _skr_tex_generate_mips_compute(VkDevice  device,    skr_tex_t* tex, int32_t mip_levels, const skr_shader_t* shader);
 
 // Upload texture data from skr_tex_data_t descriptor
 // Handles multiple mips and layers in mip-major layout
@@ -699,6 +708,7 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 		skr_log(skr_log_critical, "_skr_tex_create_yuv: vkCreateImage failed: 0x%X", (uint32_t)vr);
 		return skr_err_device_error;
 	}
+	out_tex->usage = image_info.usage;
 
 	// Single allocation for all planes (non-disjoint)
 	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
@@ -880,8 +890,12 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	// Zero out immediately
 	*out_tex = (skr_tex_t){0};
 
-	// YUV formats use a completely separate creation path
+	// The YUV path ignores flags and mip_count; warn on the ones a caller expects to work.
 	if (_skr_tex_fmt_is_yuv(format)) {
+		if (flags & skr_tex_flags_gen_mips)
+			skr_log(skr_log_warning, "skr_tex_create: YUV formats can't generate mipmaps; ignoring skr_tex_flags_gen_mips");
+		if (mip_count > 1)
+			skr_log(skr_log_warning, "skr_tex_create: YUV formats are single-mip; ignoring requested mip_count %d", mip_count);
 		return _skr_tex_create_yuv(format, sampler, size, opt_data, out_tex);
 	}
 
@@ -1020,8 +1034,10 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 	}
 
-	// For input attachments (SubpassInput in shaders)
-	if (out_tex->flags & skr_tex_flags_input_attachment) {
+	// For input attachments (SubpassInput in shaders). In-tile MSAA
+	// attachments get it too: a manual-resolve subpass reads the raw
+	// samples that way, and the usage is transient-compatible.
+	if (out_tex->flags & (skr_tex_flags_input_attachment | skr_tex_flags_in_tile_msaa)) {
 		usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 	}
 
@@ -1063,6 +1079,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		skr_log(skr_log_critical, "vkCreateImage failed");
 		return skr_err_device_error;
 	}
+	out_tex->usage = usage;
 
 	// Allocate memory using helper
 	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_transient_candidate, &out_tex->memory) == VK_NULL_HANDLE) {
@@ -1192,6 +1209,7 @@ skr_err_ _skr_tex_create_scratch(const skr_tex_t* template_src, skr_tex_t* out_t
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
+	out_tex->usage = usage;
 
 	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
 		skr_log(skr_log_critical, "Failed to allocate scratch texture memory");
@@ -1332,7 +1350,84 @@ skr_err_ skr_tex_set_data(skr_tex_t* ref_tex, const skr_tex_data_t* data) {
 	if (!ref_tex || !data || !data->data) return skr_err_invalid_parameter;
 	if (ref_tex->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
 
+	// The generic upload issues a single COLOR-aspect copy, invalid for multi-plane
+	// YUV; its pixel data must be supplied at creation instead.
+	if (_skr_tex_fmt_is_yuv(ref_tex->format)) {
+		skr_log(skr_log_warning, "skr_tex_set_data: YUV textures can't be updated after creation; supply data via skr_tex_create");
+		return skr_err_unsupported;
+	}
+
 	return _skr_tex_upload_data(ref_tex, data);
+}
+
+skr_err_ skr_tex_set_buffer(skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint32_t base_mip, uint32_t mip_count) {
+	if (!ref_tex || !buffer) return skr_err_invalid_parameter;
+	if (ref_tex->image == VK_NULL_HANDLE || buffer->buffer == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+	if (mip_count == 0) return skr_err_invalid_parameter;
+
+	if (base_mip + mip_count > ref_tex->mip_levels) {
+		skr_log(skr_log_warning, "skr_tex_set_buffer: mip range [%u, %u) exceeds texture mip count %u",
+			base_mip, base_mip + mip_count, ref_tex->mip_levels);
+		return skr_err_invalid_parameter;
+	}
+
+	skr_vec3i_t base_size = ref_tex->size;
+
+	// Build copy regions, one per mip level
+	VkBufferImageCopy* regions = _skr_malloc(sizeof(VkBufferImageCopy) * mip_count);
+	if (!regions) return skr_err_out_of_memory;
+
+	VkDeviceSize offset = 0;
+	for (uint32_t m = 0; m < mip_count; m++) {
+		uint32_t    mip      = base_mip + m;
+		skr_vec3i_t mip_size = skr_tex_calc_mip_dimensions(base_size, mip);
+		uint64_t    mip_data = skr_tex_calc_mip_size(ref_tex->format, base_size, mip);
+
+		regions[m] = (VkBufferImageCopy){
+			.bufferOffset      = offset,
+			.bufferRowLength   = 0,
+			.bufferImageHeight = 0,
+			.imageSubresource  = {
+				.aspectMask     = ref_tex->aspect_mask,
+				.mipLevel       = mip,
+				.baseArrayLayer = 0,
+				.layerCount     = ref_tex->layer_count,
+			},
+			.imageOffset = {0, 0, 0},
+			.imageExtent = {mip_size.x, mip_size.y, mip_size.z},
+		};
+
+		offset += mip_data * ref_tex->layer_count;
+	}
+
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+
+	// Barrier: compute shader writes → transfer reads
+	VkMemoryBarrier barrier = {
+		.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	};
+	vkCmdPipelineBarrier(ctx.cmd,
+		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 1, &barrier, 0, NULL, 0, NULL);
+
+	_skr_tex_transition(ctx.cmd, ref_tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+	vkCmdCopyBufferToImage(ctx.cmd, buffer->buffer, ref_tex->image,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mip_count, regions);
+
+	VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	if (ref_tex->flags & skr_tex_flags_compute) {
+		shader_stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	}
+	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, shader_stages);
+
+	_skr_cmd_release(ctx.cmd);
+	_skr_free(regions);
+	return skr_err_success;
 }
 
 void skr_tex_set_name(skr_tex_t* ref_tex, const char* name) {
@@ -1368,7 +1463,7 @@ static void _skr_tex_safe_transition_all_mips(skr_tex_t* ref_tex) {
 	_skr_cmd_release(ctx.cmd);
 }
 
-void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
+void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_filter_shader) {
 	if (!skr_tex_is_valid(ref_tex)) {
 		skr_log(skr_log_warning, "Cannot generate mipmaps for invalid texture");
 		return;
@@ -1382,9 +1477,23 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_shader) {
 		return;
 	}
 
-	// Caller-supplied shader: trust them, use the render path.
-	if (opt_shader != NULL) {
-		_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, opt_shader);
+	// Caller-supplied shader: a compute stage plus storage usage plus
+	// format-Unknown storage support runs the chain as dispatches, writing
+	// each mip in place with no render passes, scratch, or copy-backs. The
+	// pixel stage is the fallback for everything else.
+	if (opt_filter_shader != NULL) {
+		if (opt_filter_shader->compute_stage.shader != VK_NULL_HANDLE &&
+		    (ref_tex->flags & skr_tex_flags_compute) != 0             &&
+		    _skr_vk.has_storage_without_format                        &&
+		    _skr_tex_generate_mips_compute(_skr_vk.device, ref_tex, mip_levels, opt_filter_shader)) {
+			return;
+		}
+		if (opt_filter_shader->pixel_stage.shader != VK_NULL_HANDLE) {
+			_skr_tex_generate_mips_render(_skr_vk.device, ref_tex, mip_levels, opt_filter_shader);
+			return;
+		}
+		skr_log(skr_log_critical, "Mip filter shader has no stage usable with this texture; leaving mips ungenerated");
+		_skr_tex_safe_transition_all_mips(ref_tex);
 		return;
 	}
 
@@ -1504,6 +1613,323 @@ static void _skr_tex_generate_mips_blit(skr_tex_t* ref_tex, int32_t mip_levels, 
 	_skr_cmd_release(ctx.cmd);
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Mipgen materials
+///////////////////////////////////////////////////////////////////////////////
+
+// Each filter shader's mipgen material, owned by the renderer for the
+// shader's lifetime. A per-call material would drop the pipeline slot's last
+// reference on destroy, tearing down the compiled PSOs and recompiling them
+// on the next call. Sharing is thread-safe because mipgen never routes
+// per-mip parameters through the material; they stage via
+// _skr_shader_param_write into per-call buffers.
+#define _SKR_MIPGEN_MATERIAL_MAX 8
+
+typedef struct _skr_mipgen_material_t {
+	const skr_shader_t* shader;
+	skr_material_t      material;
+	VkPipeline          compute_pipeline; // lazily built for the compute path
+} _skr_mipgen_material_t;
+
+static _skr_mipgen_material_t _skr_mipgen_materials[_SKR_MIPGEN_MATERIAL_MAX];
+static mtx_t                  _skr_mipgen_material_mutex;
+
+void _skr_mipgen_materials_init(void) {
+	mtx_init(&_skr_mipgen_material_mutex, mtx_plain);
+}
+
+void _skr_mipgen_materials_shutdown(void) {
+	for (int32_t i = 0; i < _SKR_MIPGEN_MATERIAL_MAX; i++) {
+		if (_skr_mipgen_materials[i].shader != NULL) {
+			if (_skr_mipgen_materials[i].compute_pipeline != VK_NULL_HANDLE)
+				_skr_cmd_destroy_pipeline(NULL, _skr_mipgen_materials[i].compute_pipeline);
+			skr_material_destroy(&_skr_mipgen_materials[i].material);
+		}
+		_skr_mipgen_materials[i] = (_skr_mipgen_material_t){0};
+	}
+	mtx_destroy(&_skr_mipgen_material_mutex);
+}
+
+// Returns the shader's mipgen material, creating it on first use. NULL when
+// the table is full; entries otherwise live until their shader is destroyed,
+// so the returned pointer stays valid for the caller's whole generation.
+static skr_material_t* _skr_mipgen_material_get(const skr_shader_t* shader, skr_material_info_t info) {
+	mtx_lock(&_skr_mipgen_material_mutex);
+	skr_material_t* result    = NULL;
+	int32_t         free_slot = -1;
+	for (int32_t i = 0; i < _SKR_MIPGEN_MATERIAL_MAX; i++) {
+		if (_skr_mipgen_materials[i].shader == shader) { result = &_skr_mipgen_materials[i].material; break; }
+		if (_skr_mipgen_materials[i].shader == NULL && free_slot == -1) free_slot = i;
+	}
+	if (result == NULL && free_slot != -1) {
+		skr_material_t material;
+		skr_material_create(info, &material);
+		if (skr_material_is_valid(&material)) {
+			_skr_mipgen_materials[free_slot].shader   = shader;
+			_skr_mipgen_materials[free_slot].material = material;
+			result = &_skr_mipgen_materials[free_slot].material;
+		}
+	}
+	mtx_unlock(&_skr_mipgen_material_mutex);
+	return result;
+}
+
+// A destroyed shader's material must not keep a pipeline slot keyed on freed
+// shader data alive; skr_shader_destroy calls this for every shader.
+void _skr_mipgen_material_release(const skr_shader_t* shader) {
+	mtx_lock(&_skr_mipgen_material_mutex);
+	for (int32_t i = 0; i < _SKR_MIPGEN_MATERIAL_MAX; i++) {
+		if (_skr_mipgen_materials[i].shader == shader) {
+			if (_skr_mipgen_materials[i].compute_pipeline != VK_NULL_HANDLE)
+				_skr_cmd_destroy_pipeline(NULL, _skr_mipgen_materials[i].compute_pipeline);
+			skr_material_destroy(&_skr_mipgen_materials[i].material);
+			_skr_mipgen_materials[i] = (_skr_mipgen_material_t){0};
+			break;
+		}
+	}
+	mtx_unlock(&_skr_mipgen_material_mutex);
+}
+
+// The compute path's pipeline for a cached mipgen material, built on first
+// use with the material slot's own layout so both paths share descriptors.
+// The layout is passed in rather than fetched here: fetching would need the
+// pipeline lock, which _skr_mipgen_material_get acquires in the opposite
+// order of this function's own mutex.
+static VkPipeline _skr_mipgen_compute_pipeline_get(const skr_shader_t* shader, VkPipelineLayout layout) {
+	mtx_lock(&_skr_mipgen_material_mutex);
+	VkPipeline result = VK_NULL_HANDLE;
+	for (int32_t i = 0; i < _SKR_MIPGEN_MATERIAL_MAX; i++) {
+		if (_skr_mipgen_materials[i].shader != shader) continue;
+
+		if (_skr_mipgen_materials[i].compute_pipeline == VK_NULL_HANDLE) {
+			uint32_t spec_values[SKR_MAX_SPEC_CONSTANTS];
+			_skr_shader_resolve_spec_constants(&shader->meta, NULL, 0, spec_values);
+			VkSpecializationMapEntry    spec_entries[SKR_MAX_SPEC_CONSTANTS];
+			VkSpecializationInfo        spec_info;
+			const VkSpecializationInfo* spec = _skr_shader_make_spec_info(&shader->meta, spec_values, spec_entries, &spec_info);
+
+			VkComputePipelineCreateInfo pipeline_info = {
+				.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+				.stage  = (VkPipelineShaderStageCreateInfo){
+					.sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+					.stage               = VK_SHADER_STAGE_COMPUTE_BIT,
+					.module              = shader->compute_stage.shader,
+					.pName               = "cs",
+					.pSpecializationInfo = spec,
+				},
+				.layout = layout,
+			};
+			VkResult vr = vkCreateComputePipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &_skr_mipgen_materials[i].compute_pipeline);
+			if (vr != VK_SUCCESS) {
+				SKR_VK_CHECK_NRET(vr, "vkCreateComputePipelines (mipgen)");
+				_skr_mipgen_materials[i].compute_pipeline = VK_NULL_HANDLE;
+			}
+		}
+		result = _skr_mipgen_materials[i].compute_pipeline;
+		break;
+	}
+	mtx_unlock(&_skr_mipgen_material_mutex);
+	return result;
+}
+
+// Builds the per-mip parameter buffer both mipgen paths bind at aligned
+// offsets: one $Global block per destination mip, seeded with the material's
+// defaults. Staging never touches the shared material, so concurrent
+// generations are safe. Returns the aligned stride, 0 when the shader has no
+// parameters.
+static uint32_t _skr_mipgen_build_params(const skr_material_t* material, const skr_shader_t* shader, const skr_tex_t* ref_tex, int32_t mip_levels, skr_buffer_t* out_buffer) {
+	*out_buffer = (skr_buffer_t){0};
+	if (material->param_buffer_size == 0) return 0;
+
+	// Align stride to minUniformBufferOffsetAlignment for descriptor offsets
+	uint32_t align          = _skr_vk.min_ubo_offset_align;
+	uint32_t aligned_stride = (material->param_buffer_size + align - 1) & ~(align - 1);
+	int32_t  num_mips       = mip_levels - 1;
+	uint8_t* all_params     = _skr_calloc(num_mips, aligned_stride);
+
+	const sksc_shader_meta_t* shader_meta = &shader->meta;
+	for (int32_t mip = 1; mip < mip_levels; mip++) {
+		skr_vec3i_t dst_dims = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
+		skr_vec3i_t src_dims = skr_tex_calc_mip_dimensions(ref_tex->size, mip - 1);
+
+		skr_vec2i_t src_size = {src_dims.x, src_dims.y};
+		skr_vec2i_t dst_size = {dst_dims.x, dst_dims.y};
+		uint32_t    src_mip  = mip - 1;
+
+		uint8_t* params = all_params + (mip - 1) * aligned_stride;
+		memcpy(params, material->param_buffer, material->param_buffer_size);
+		_skr_shader_param_write(shader_meta, params, material->param_buffer_size, "src_size",      sksc_shader_var_uint, 2, &src_size);
+		_skr_shader_param_write(shader_meta, params, material->param_buffer_size, "dst_size",      sksc_shader_var_uint, 2, &dst_size);
+		_skr_shader_param_write(shader_meta, params, material->param_buffer_size, "src_mip_level", sksc_shader_var_uint, 1, &src_mip);
+		_skr_shader_param_write(shader_meta, params, material->param_buffer_size, "mip_max",       sksc_shader_var_uint, 1, &mip_levels);
+	}
+
+	skr_buffer_create(all_params, num_mips, aligned_stride, skr_buffer_type_constant, skr_use_static, out_buffer);
+	_skr_free(all_params);
+	return aligned_stride;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Compute path: each mip is one dispatch writing the destination in place
+// through a storage view, so there are no render passes, no scratch texture,
+// and no copy-backs; the only cost between mips is a single-subresource
+// compute barrier. Returns false when it can't run (no cached material slot,
+// pipeline failure), letting the caller fall back to the render path.
+static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, int32_t mip_levels, const skr_shader_t* shader) {
+	skr_bind_t bind_source = skr_shader_get_bind(shader, "src_tex");
+	skr_bind_t bind_dst    = skr_shader_get_bind(shader, "dst_tex");
+	if ((bind_source.stage_bits & skr_stage_compute) == 0 ||
+	    (bind_dst   .stage_bits & skr_stage_compute) == 0) {
+		skr_log(skr_log_warning, "Compute mip shader needs compute-stage 'src_tex' and 'dst_tex' bindings");
+		return false;
+	}
+
+	skr_material_info_t mat_info = {
+		.shader      = shader,
+		.depth_test  = skr_compare_always,
+		.write_mask  = skr_write_rgba,
+	};
+	// Compute needs a cached slot to hold its pipeline; a full table falls
+	// back to the render path rather than rebuilding the pipeline per call.
+	skr_material_t* material = _skr_mipgen_material_get(shader, mat_info);
+	if (material == NULL || !skr_material_is_valid(material)) return false;
+
+	_skr_pipeline_lock();
+	VkPipelineLayout      layout      = _skr_pipeline_get_layout           (material->pipeline_material_idx);
+	VkDescriptorSetLayout desc_layout = _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx);
+	_skr_pipeline_unlock();
+
+	VkPipeline pipeline = _skr_mipgen_compute_pipeline_get(shader, layout);
+	if (pipeline == VK_NULL_HANDLE) return false;
+
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+	if (!ctx.cmd) return false;
+
+	skr_buffer_t params_buffer;
+	uint32_t     aligned_stride = _skr_mipgen_build_params(material, shader, ref_tex, mip_levels, &params_buffer);
+
+	VkImageViewType src_view_type = VK_IMAGE_VIEW_TYPE_2D;
+	if      (ref_tex->flags & skr_tex_flags_cubemap) src_view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+	else if (ref_tex->flags & skr_tex_flags_array)   src_view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	VkImageViewType dst_view_type = ref_tex->layer_count > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+	VkFormat        format        = skr_tex_fmt_to_native(ref_tex->format);
+
+	// The whole image works in GENERAL: mip 0 keeps its contents, while the
+	// higher mips are fully overwritten, so whatever inconsistent layouts
+	// upstream passes left them in can discard through UNDEFINED.
+	{
+		VkImageMemoryBarrier to_general[2] = {
+			{
+				.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				.srcAccessMask       = _layout_to_access_flags(ref_tex->current_layout),
+				.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+				.oldLayout           = ref_tex->current_layout,
+				.newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.image               = ref_tex->image,
+				.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ref_tex->layer_count },
+			},
+			{
+				.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				.srcAccessMask       = 0,
+				.dstAccessMask       = VK_ACCESS_SHADER_WRITE_BIT,
+				.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+				.newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.image               = ref_tex->image,
+				.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 1, (uint32_t)(mip_levels - 1), 0, ref_tex->layer_count },
+			},
+		};
+		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, to_general);
+	}
+
+	vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+	for (int32_t mip = 1; mip < mip_levels; mip++) {
+		skr_vec3i_t mip_dims = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
+
+		VkImageView src_view = VK_NULL_HANDLE;
+		VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
+			.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image            = ref_tex->image,
+			.viewType         = src_view_type,
+			.format           = format,
+			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)(mip - 1), 1, 0, ref_tex->layer_count },
+		}, NULL, &src_view);
+		if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (compute mip src)"); continue; }
+		_skr_cmd_destroy_image_view(ctx.destroy_list, src_view);
+
+		VkImageView dst_view = VK_NULL_HANDLE;
+		vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
+			.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image            = ref_tex->image,
+			.viewType         = dst_view_type,
+			.format           = format,
+			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)mip, 1, 0, ref_tex->layer_count },
+		}, NULL, &dst_view);
+		if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (compute mip dst)"); continue; }
+		_skr_cmd_destroy_image_view(ctx.destroy_list, dst_view);
+
+		_skr_desc_writes_t desc;
+		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
+		if (skr_buffer_is_valid(&params_buffer))
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, (mip - 1) * aligned_stride, material->param_buffer_size);
+		// Both views are in GENERAL, not the texture's canonical sample layout
+		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, VK_IMAGE_LAYOUT_GENERAL);
+		_skr_write_image(&desc, bind_dst.slot,    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          VK_NULL_HANDLE,   dst_view, VK_IMAGE_LAYOUT_GENERAL);
+
+		const int32_t ignore_slots[] = {
+			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
+			bind_source.slot,                                             // Source view (per-mip, handled above)
+			bind_dst.slot                                                 // Destination view (per-mip, handled above)
+		};
+		int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, skr_stage_compute, ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
+		if (fail_idx >= 0) {
+			const sksc_shader_meta_t* meta = &material->key.shader->meta;
+			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
+			continue;
+		}
+
+		if (_skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, material->bind_start, layout, desc_layout, &desc))
+			vkCmdDispatch(ctx.cmd, ((uint32_t)mip_dims.x + 7) / 8, ((uint32_t)mip_dims.y + 7) / 8, ref_tex->layer_count);
+
+		// Make this mip's writes visible: the next iteration samples it in
+		// compute, and the last mip goes straight to whatever samples the
+		// texture afterwards. GENERAL is already the canonical layout for
+		// compute-flagged textures, so no final transition follows.
+		bool last = mip + 1 >= mip_levels;
+		VkImageMemoryBarrier barrier = {
+			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT,
+			.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout           = VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image               = ref_tex->image,
+			.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)mip, 1, 0, ref_tex->layer_count },
+		};
+		vkCmdPipelineBarrier(ctx.cmd,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			last ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			0, 0, NULL, 0, NULL, 1, &barrier);
+	}
+
+	// The image is uniformly in GENERAL now. For compute-flagged textures
+	// that IS the canonical sample layout; for anything else this moves it.
+	_skr_tex_transition_notify_layout(ref_tex, VK_IMAGE_LAYOUT_GENERAL);
+	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+	_skr_cmd_release(ctx.cmd);
+	skr_buffer_destroy(&params_buffer);
+	return true;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, int32_t mip_levels, const skr_shader_t* fragment_shader) {
 	if (ref_tex->layer_count > 1 && ref_tex->layer_count > _skr_vk.max_multiview_view_count) {
 		skr_log(skr_log_critical, "Mipgen requires %u multiview layers, device supports %u", ref_tex->layer_count, _skr_vk.max_multiview_view_count);
@@ -1521,15 +1947,20 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		return;
 	}
 
-	// Create material from shader (handles pipeline registration automatically)
-	skr_material_t material;
-	skr_material_create((skr_material_info_t){
+	skr_material_info_t mat_info = {
 		.shader      = fragment_shader,
-		.cull        = skr_cull_none,
 		.depth_test  = skr_compare_always,
 		.write_mask  = skr_write_rgba,
-	}, &material);
-	if (!skr_material_is_valid(&material)) {
+	};
+	// The renderer owns one mipgen material per filter shader; a full table
+	// falls back to a per-call material and accepts the PSO recompile.
+	skr_material_t  temp_material = {0};
+	skr_material_t* material      = _skr_mipgen_material_get(fragment_shader, mat_info);
+	if (material == NULL) {
+		skr_material_create(mat_info, &temp_material);
+		material = &temp_material;
+	}
+	if (!skr_material_is_valid(material)) {
 		skr_log(skr_log_warning, "Failed to create material for mipmap generation");
 		return;
 	}
@@ -1557,7 +1988,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(renderpass_idx);
 	if (render_pass == VK_NULL_HANDLE) {
 		_skr_pipeline_unlock();
-		skr_material_destroy(&material);
+		if (material == &temp_material) skr_material_destroy(&temp_material);
 		return;
 	}
 
@@ -1566,24 +1997,31 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	if (!ctx.cmd) {
 		skr_log(skr_log_warning, "Failed to acquire command buffer for mipmap generation");
 		_skr_pipeline_unlock();
-		skr_material_destroy(&material);
+		if (material == &temp_material) skr_material_destroy(&temp_material);
 		return;
 	}
 
-	// Acquire a scratch texture matching ref_tex. Mips are filtered into scratch
-	// (which has COLOR_ATTACHMENT usage), then copied back to ref_tex. This keeps
-	// ref_tex free of COLOR_ATTACHMENT_BIT so the driver can keep it compressed.
-	skr_tex_t* scratch = _skr_scratch_acquire(ref_tex);
-	if (scratch == NULL) {
-		skr_log(skr_log_warning, "Failed to acquire scratch texture for mipmap generation");
-		_skr_cmd_release(ctx.cmd);
-		_skr_pipeline_unlock();
-		skr_material_destroy(&material);
-		return;
+	// Textures with attachment usage render each mip directly into place. For
+	// sampled-only textures, mips filter into a scratch texture (which has
+	// COLOR_ATTACHMENT usage) and copy back, keeping ref_tex free of
+	// COLOR_ATTACHMENT_BIT so the driver can keep it compressed.
+	bool direct = (ref_tex->flags & skr_tex_flags_writeable) != 0
+	           && (ref_tex->aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+
+	skr_tex_t* scratch = NULL;
+	if (!direct) {
+		scratch = _skr_scratch_acquire(ref_tex);
+		if (scratch == NULL) {
+			skr_log(skr_log_warning, "Failed to acquire scratch texture for mipmap generation");
+			_skr_cmd_release(ctx.cmd);
+			_skr_pipeline_unlock();
+			if (material == &temp_material) skr_material_destroy(&temp_material);
+			return;
+		}
+		// Scratch contents from any previous mipgen are discarded — treat as fresh.
+		scratch->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		scratch->first_use      = true;
 	}
-	// Scratch contents from any previous mipgen are discarded — treat as fresh.
-	scratch->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-	scratch->first_use      = true;
 
 	// Determine view type for layer rendering
 	VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
@@ -1594,53 +2032,20 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	}
 
 	// Get cached pipeline (lazy creation via 3D cache: material × renderpass × vertformat)
-	VkPipeline pipeline = _skr_pipeline_get(material.pipeline_material_idx, renderpass_idx, vert_idx);
+	VkPipeline pipeline = _skr_pipeline_get(material->pipeline_material_idx, renderpass_idx, vert_idx);
 	if (pipeline == VK_NULL_HANDLE) {
 		skr_log(skr_log_warning, "Failed to get pipeline for mipmap generation");
 		_skr_scratch_release(scratch);
 		_skr_cmd_release(ctx.cmd);
 		_skr_pipeline_unlock();
-		skr_material_destroy(&material);
+		if (material == &temp_material) skr_material_destroy(&temp_material);
 		return;
 	}
 
-	// Pre-populate parameter buffers for all mip levels
-	// Use material API to set values (handles different $Global layouts per shader)
-	int32_t      num_mips       = mip_levels - 1;
-	uint8_t*     all_params     = NULL;
-	skr_buffer_t params_buffer  = {0};
-	uint32_t     aligned_stride = 0;
-
-	if (material.param_buffer_size > 0) {
-		// Align stride to minUniformBufferOffsetAlignment for descriptor offsets
-		uint32_t align = _skr_vk.min_ubo_offset_align;
-		aligned_stride = (material.param_buffer_size + align - 1) & ~(align - 1);
-
-		all_params = _skr_calloc(num_mips, aligned_stride);
-
-		for (int32_t mip = 1; mip < mip_levels; mip++) {
-			skr_vec3i_t dst_dims = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
-			skr_vec3i_t src_dims = skr_tex_calc_mip_dimensions(ref_tex->size, mip - 1);
-
-			// Use material API to populate values (handles different shader layouts)
-			skr_vec2i_t src_size = {src_dims.x, src_dims.y};
-			skr_vec2i_t dst_size = {dst_dims.x, dst_dims.y};
-			uint32_t src_mip = mip - 1;
-			skr_material_set_param(&material, "src_size", sksc_shader_var_uint, 2, &src_size);
-			skr_material_set_param(&material, "dst_size", sksc_shader_var_uint, 2, &dst_size);
-			skr_material_set_param(&material, "src_mip_level", sksc_shader_var_uint, 1, &src_mip);
-			skr_material_set_param(&material, "mip_max", sksc_shader_var_uint, 1, &mip_levels);
-
-			// Copy material's parameter buffer for this mip (preserves other values)
-			memcpy(all_params + (mip - 1) * aligned_stride,
-			       material.param_buffer,
-			       material.param_buffer_size);
-		}
-
-		// Create GPU buffer with all mip parameters
-		skr_buffer_create(all_params, num_mips, aligned_stride, skr_buffer_type_constant, skr_use_static, &params_buffer);
-		_skr_free(all_params);
-	}
+	// Pre-populate parameter buffers for all mip levels, one block per mip
+	// bound at aligned offsets.
+	skr_buffer_t params_buffer;
+	uint32_t     aligned_stride = _skr_mipgen_build_params(material, fragment_shader, ref_tex, mip_levels, &params_buffer);
 
 	// Ensure ref_tex mip 0 is in SHADER_READ_ONLY so the first iteration can
 	// sample it, and that cross-submission writes are visible. Only touch mip 0
@@ -1667,8 +2072,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &mip0_barrier);
 	}
 
-	// Generate each mip level. Iteration 1 samples ref_tex mip 0 (source data);
-	// later iterations sample the previous mip of scratch.
+	// Generate each mip level. Iteration 1 samples ref_tex mip 0 (source
+	// data); later iterations sample the previous mip, from ref_tex itself on
+	// the direct path, or from scratch otherwise.
 	for (int32_t mip = 1; mip < mip_levels; mip++) {
 		skr_vec3i_t mip_dims   = skr_tex_calc_mip_dimensions(ref_tex->size, mip);
 		uint32_t    mip_width  = mip_dims.x;
@@ -1676,10 +2082,11 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 
 		// Source view for sampling the previous mip. Scratch skips ref_tex's mip 0,
 		// so its indexing is shifted by one: scratch mip 0 ≡ ref_tex mip 1.
+		//   direct:   sample ref_tex mip (mip - 1)
 		//   mip == 1: sample ref_tex mip 0
 		//   mip >= 2: sample scratch mip (mip - 2)
-		VkImage     src_image    = (mip == 1) ? ref_tex->image : scratch->image;
-		uint32_t    src_mip_base = (mip == 1) ? 0 : (uint32_t)(mip - 2);
+		VkImage     src_image    = (direct || mip == 1) ? ref_tex->image : scratch->image;
+		uint32_t    src_mip_base = direct ? (uint32_t)(mip - 1) : ((mip == 1) ? 0 : (uint32_t)(mip - 2));
 		VkImageView src_view     = VK_NULL_HANDLE;
 		{
 			VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
@@ -1701,64 +2108,22 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 
 
 		// Build descriptor writes (shared across layers)
-		VkWriteDescriptorSet   writes      [32];
-		VkDescriptorBufferInfo buffer_infos[16];
-		VkDescriptorImageInfo  image_infos [16];
-		uint32_t write_ct  = 0;
-		uint32_t buffer_ct = 0;
-		uint32_t image_ct  = 0;
-
-		// Handle material parameters if present ($Global buffer with per-mip offset)
-		if (skr_buffer_is_valid(&params_buffer)) {
-			buffer_infos[buffer_ct] = (VkDescriptorBufferInfo){
-				.buffer = params_buffer.buffer,
-				.offset = (mip - 1) * aligned_stride,
-				.range  = material.param_buffer_size,
-			};
-			writes[write_ct++] = (VkWriteDescriptorSet){
-				.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstBinding      = SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,
-				.descriptorCount = 1,
-				.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo     = &buffer_infos[buffer_ct++],
-			};
-		}
-
-		// Manually add source texture binding (since we create it per-mip).
+		_skr_desc_writes_t desc;
+		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
+		if (skr_buffer_is_valid(&params_buffer))
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, (mip - 1) * aligned_stride, material->param_buffer_size);
 		// Both ref_tex mip 0 and scratch mips sit in SHADER_READ_ONLY_OPTIMAL
-		// during the mip loop regardless of ref_tex's canonical sample layout.
-		image_infos[image_ct] = (VkDescriptorImageInfo){
-			.sampler     = ref_tex->sampler,
-			.imageView   = src_view,
-			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		};
-		writes[write_ct++] = (VkWriteDescriptorSet){
-			.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstBinding      = bind_source.slot,
-			.descriptorCount = 1,
-			.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.pImageInfo      = &image_infos[image_ct++],
-		};
+		// during the mip loop, whatever ref_tex's canonical sample layout is.
+		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 		// Add any other material bindings (textures/buffers, including globals)
 		const int32_t ignore_slots[] = {
 			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
 			bind_source.slot                                               // Source texture (per-mip, handled above)
 		};
-
-		_skr_bind_pool_lock();
-		int32_t fail_idx = _skr_material_add_writes(
-			_skr_bind_pool_get(material.bind_start), material.bind_count,
-			ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]),
-			writes,       sizeof(writes      )/sizeof(writes      [0]),
-			buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-			image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-			&write_ct, &buffer_ct, &image_ct
-		);
-		_skr_bind_pool_unlock();
-
+		int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
 		if (fail_idx >= 0) {
-			const sksc_shader_meta_t* meta = &material.key.shader->meta;
+			const sksc_shader_meta_t* meta = &material->key.shader->meta;
 			skr_log(skr_log_critical, "Mipmap generation missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 			continue;
 		}
@@ -1769,21 +2134,22 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			VkImageView mip_view = VK_NULL_HANDLE;
 			{
 				// For framebuffer attachments, use 2D_ARRAY even for cubemaps
-				VkImageViewType fb_view_type = (scratch->layer_count > 1)
+				VkImageViewType fb_view_type = (ref_tex->layer_count > 1)
 					? VK_IMAGE_VIEW_TYPE_2D_ARRAY
 					: VK_IMAGE_VIEW_TYPE_2D;
-				// Framebuffer targets scratch — mip index shifted by 1 (scratch has no mip 0)
+				// Direct targets ref_tex's own mip; scratch's indexing is
+				// shifted by 1 (scratch has no mip 0)
 				VkResult vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
 					.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-					.image      = scratch->image,
+					.image      = direct ? ref_tex->image : scratch->image,
 					.viewType   = fb_view_type,
 					.format     = format,
 					.subresourceRange = {
 						.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-						.baseMipLevel   = (uint32_t)(mip - 1),
+						.baseMipLevel   = direct ? (uint32_t)mip : (uint32_t)(mip - 1),
 						.levelCount     = 1,
 						.baseArrayLayer = 0,
-						.layerCount     = scratch->layer_count,
+						.layerCount     = ref_tex->layer_count,
 					},
 				}, NULL, &mip_view);
 				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip target)"); continue; }
@@ -1814,21 +2180,20 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			}, VK_SUBPASS_CONTENTS_INLINE);
 
 			vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, 0, (float)mip_width, (float)mip_height, 0.0f, 1.0f});
+			// Flipped viewport, matching every other pass — fullscreen
+			// shaders use the canonical negated-y vertex formula
+			vkCmdSetViewport (ctx.cmd, 0, 1, &(VkViewport){0, (float)mip_height, (float)mip_width, -(float)mip_height, 0.0f, 1.0f});
 			vkCmdSetScissor  (ctx.cmd, 0, 1, &(VkRect2D  ){{0, 0}, {mip_width, mip_height}});
 
-			_skr_bind_descriptors(
-				ctx.cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_GRAPHICS,
-				_skr_pipeline_get_layout           (material.pipeline_material_idx),
-				_skr_pipeline_get_descriptor_layout(material.pipeline_material_idx),
-				writes, write_ct);
-
-			vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
+			bool bound = _skr_bind_descriptors(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, material->bind_start,
+				_skr_pipeline_get_layout           (material->pipeline_material_idx),
+				_skr_pipeline_get_descriptor_layout(material->pipeline_material_idx), &desc);
+			if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
 			vkCmdEndRenderPass(ctx.cmd);
 		}
 
-		// Transition just-written scratch mip (shifted index) to SHADER_READ so
-		// the next iteration can sample it.
+		// Transition just the written mip to SHADER_READ so the next
+		// iteration can sample it.
 		VkImageMemoryBarrier barrier = {
 			.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 			.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -1837,13 +2202,13 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 			.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			.image               = scratch->image,
+			.image               = direct ? ref_tex->image : scratch->image,
 			.subresourceRange    = {
 				.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel   = (uint32_t)(mip - 1),
+				.baseMipLevel   = direct ? (uint32_t)mip : (uint32_t)(mip - 1),
 				.levelCount     = 1,
 				.baseArrayLayer = 0,
-				.layerCount     = scratch->layer_count,
+				.layerCount     = ref_tex->layer_count,
 			},
 		};
 		vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
@@ -1851,8 +2216,9 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 
 	// Copy scratch → ref_tex mips 1..N-1. Mip 0 of ref_tex was not touched during
 	// the loop and retains its source contents. Scratch's mips are shifted by 1
-	// (scratch mip k ↔ ref_tex mip k+1).
-	if (mip_levels > 1) {
+	// (scratch mip k ↔ ref_tex mip k+1). The direct path already wrote every
+	// mip in place and left them in SHADER_READ_ONLY.
+	if (!direct && mip_levels > 1) {
 		// Batch both layout transitions into one vkCmdPipelineBarrier:
 		//   scratch mips 0..N-2 (all of scratch): SHADER_READ → TRANSFER_SRC
 		//   ref_tex mips 1..N-1:                   UNDEFINED  → TRANSFER_DST (discard; overwriting)
@@ -1930,8 +2296,8 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 	_skr_pipeline_unlock();
 
 	// Destroy after unlocking - skr_material_destroy internally locks the pipeline mutex
-	skr_buffer_destroy  (&params_buffer);
-	skr_material_destroy(&material);
+	skr_buffer_destroy(&params_buffer);
+	if (material == &temp_material) skr_material_destroy(&temp_material);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2173,6 +2539,7 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 
 		// ETC formats (4x4 blocks)
 		case skr_tex_fmt_etc1_rgb:
+		case skr_tex_fmt_etc1_rgb_srgb:
 			block_w = 4; block_h = 4; block_bytes = 8; break;
 		case skr_tex_fmt_etc2_rgba:
 		case skr_tex_fmt_etc2_rgba_srgb:
@@ -2196,6 +2563,16 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_astc4x4_rgba:
 		case skr_tex_fmt_astc4x4_rgba_srgb:
 			block_w = 4; block_h = 4; block_bytes = 16; break;
+
+		// ASTC 6x6 (16 bytes per block)
+		case skr_tex_fmt_astc6x6_rgba:
+		case skr_tex_fmt_astc6x6_rgba_srgb:
+			block_w = 6; block_h = 6; block_bytes = 16; break;
+
+		// ASTC 8x8 (16 bytes per block; same VK format as LDR 8x8 — HDR
+		// signalled per-block via CEM, not by Vulkan format).
+		case skr_tex_fmt_astc8x8_rgba_hdr:
+			block_w = 8; block_h = 8; block_bytes = 16; break;
 
 		// Uncompressed formats (1x1 "blocks")
 		case skr_tex_fmt_r8:
@@ -2230,6 +2607,12 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_rgba64si:
 		case skr_tex_fmt_rgba64f:       block_bytes = 8;  break;
 		case skr_tex_fmt_rgba128f:      block_bytes = 16; break;
+
+		// YUV 4:2:0 has no real block; a 2x2 texel region's total multi-plane byte
+		// footprint keeps size math correct (uploads still need the YUV path).
+		case skr_tex_fmt_nv12:
+		case skr_tex_fmt_yuv420p:       block_w = 2; block_h = 2; block_bytes = 6;  break;
+		case skr_tex_fmt_p010:          block_w = 2; block_h = 2; block_bytes = 12; break;
 
 		default:                        block_bytes = 0;  break;
 	}
@@ -2325,6 +2708,9 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = layer_count;
 	out_tex->aspect_mask = aspect_mask;
+	// Adopted image: the true usage is unknown, carry only what the caller's
+	// flags promise (input attachment is the one bit pass submission gates on)
+	out_tex->usage       = (info.flags & skr_tex_flags_input_attachment) ? VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT : 0;
 	out_tex->is_external = !info.owns_image;  // If we don't own it, it's external
 
 	// Layout tracking
@@ -2373,28 +2759,10 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 }
 
 void skr_tex_set_fragment_density_map(skr_tex_t* ref_tex, skr_tex_t* fdm) {
-	if (ref_tex == NULL) return;
-
-	// If the device can't do FDM, ignore the association so the target renders normally.
-	if (fdm != NULL && !_skr_vk.capabilities[skr_capability_fragment_density_map])
-		fdm = NULL;
-	if (ref_tex->fdm == fdm) return;
-
-	ref_tex->fdm = fdm;
-
-	// Attaching/detaching/swapping the FDM changes both the render pass (the key carries
-	// a fragment_density_map bit) and the framebuffer attachment set, so any cached
-	// framebuffer is stale. Drop it; the next pass rebuilds against the correct render pass.
-	if (ref_tex->framebuffer != VK_NULL_HANDLE) {
-		_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
-		ref_tex->framebuffer      = VK_NULL_HANDLE;
-		ref_tex->framebuffer_pass = VK_NULL_HANDLE;
-	}
-	if (ref_tex->framebuffer_depth != VK_NULL_HANDLE) {
-		_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
-		ref_tex->framebuffer_depth      = VK_NULL_HANDLE;
-		ref_tex->framebuffer_depth_pass = VK_NULL_HANDLE;
-	}
+	// Without device support the target just renders unfoveated. The cached
+	// framebuffer needs no attention: the density map's view is part of its
+	// fingerprint, and attaching one changes the render pass key.
+	ref_tex->fdm = _skr_vk.capabilities[skr_capability_fragment_density_map] ? fdm : NULL;
 }
 
 skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t update) {
@@ -2407,6 +2775,12 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 	if (update.view != VK_NULL_HANDLE) {
 		new_view = update.view;
 	} else {
+		// A recreated view can't carry this texture's YCbCr conversion, so YUV callers must supply update.view.
+		if (ref_tex->ycbcr_conversion != VK_NULL_HANDLE) {
+			skr_log(skr_log_warning, "skr_tex_update_external: YUV textures require a caller-supplied view");
+			return skr_err_unsupported;
+		}
+
 		VkFormat vk_format = skr_tex_fmt_to_native(ref_tex->format);
 
 		VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
@@ -2642,6 +3016,7 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 	out_tex->mip_levels  = mip_levels;
 	out_tex->layer_count = layer_count;
 	out_tex->aspect_mask = aspect_mask;
+	out_tex->usage       = image_info.usage;
 	out_tex->is_external = false;  // We own the imported memory
 
 	// Layout tracking
@@ -2849,6 +3224,7 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = 1;
 	out_tex->aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
+	out_tex->usage       = image_info.usage;
 	out_tex->is_external = false; // We own the imported memory
 
 	// Layout tracking
@@ -3101,6 +3477,7 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 	out_tex->mip_levels  = 1;
 	out_tex->layer_count = layer_count;
 	out_tex->aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
+	out_tex->usage       = image_info.usage;
 	out_tex->is_external = false;  // We own the imported memory
 
 	// AHB tracking
@@ -3341,6 +3718,12 @@ skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t arr
 	if (!tex || !out_readback)        return skr_err_invalid_parameter;
 	if (tex->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
 
+	// The COLOR-aspect copy below can't read multi-plane YUV (which is also never readable).
+	if (_skr_tex_fmt_is_yuv(tex->format)) {
+		skr_log(skr_log_critical, "skr_tex_readback: YUV multi-plane textures can't be read back");
+		return skr_err_unsupported;
+	}
+
 	// Check mip/layer bounds
 	if (mip_level >= tex->mip_levels || array_layer >= tex->layer_count) {
 		skr_log(skr_log_critical, "skr_tex_readback: mip/layer out of bounds");
@@ -3487,16 +3870,13 @@ void skr_tex_readback_destroy(skr_tex_readback_t* ref_readback) {
 
 	_skr_tex_readback_internal_t* internal = (_skr_tex_readback_internal_t*)ref_readback->_internal;
 
-	// Wait for GPU to complete before destroying (in case user forgot)
-	skr_future_wait(&ref_readback->future);
-
-	// Unmap and free staging resources
-	vkUnmapMemory  (_skr_vk.device, internal->staging_memory);
-	vkFreeMemory   (_skr_vk.device, internal->staging_memory, NULL);
-	vkDestroyBuffer(_skr_vk.device, internal->staging_buffer, NULL);
-
+	// No wait: the copy may sit in a command buffer this thread has yet to
+	// submit, and blocking on that here deadlocks. Deferred destruction
+	// releases the staging once the GPU is done with it (LIFO: memory first).
+	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
+	_skr_cmd_destroy_memory(NULL, internal->staging_memory);
+	_skr_cmd_destroy_buffer(NULL, internal->staging_buffer);
 	_skr_free(internal);
 
-	// Zero out the readback struct
 	*ref_readback = (skr_tex_readback_t){0};
 }

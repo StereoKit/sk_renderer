@@ -10,7 +10,64 @@
 #include <stdlib.h>
 #include <string.h>
 
-skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compute) {
+// Builds a pipeline into *out_pipeline from the compute's shader stage, applying
+// wave_size and info's resolved spec constants. Reads compute->shader/->layout
+// only; never touches compute->pipeline, so callers can build into a temp and
+// swap on success. On failure returns skr_err_device_error, *out_pipeline stays
+// VK_NULL_HANDLE. Assumes compute->layout is already valid.
+static skr_err_ _skr_compute_build_pipeline(const skr_compute_t* compute, skr_compute_info_t info, VkPipeline* out_pipeline) {
+	const skr_shader_t* shader = compute->shader;
+
+	// Optionally pin the compute subgroup/wave size. Driven by `//--wave_size = N`
+	// in the shader; requires VK_EXT_subgroup_size_control. Mismatched values
+	// fall back to the implementation default and emit a warning.
+	VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+	};
+	void* stage_pNext = NULL;
+	if (shader->meta.wave_size != 0) {
+		if (!_skr_vk.has_subgroup_size_control) {
+			skr_log(skr_log_warning, "Shader '%s' requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.name, shader->meta.wave_size);
+		} else if (shader->meta.wave_size < _skr_vk.min_subgroup_size || shader->meta.wave_size > _skr_vk.max_subgroup_size) {
+			skr_log(skr_log_warning, "Shader '%s' requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.name, shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
+		} else if ((_skr_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+			skr_log(skr_log_warning, "Shader '%s' requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.name, shader->meta.wave_size);
+		} else {
+			required_subgroup_size.requiredSubgroupSize = shader->meta.wave_size;
+			stage_pNext = &required_subgroup_size;
+		}
+	}
+
+	uint32_t spec_values[SKR_MAX_SPEC_CONSTANTS];
+	_skr_shader_resolve_spec_constants(&shader->meta, info.spec_constants, info.spec_constant_count, spec_values);
+
+	VkSpecializationMapEntry    spec_entries[SKR_MAX_SPEC_CONSTANTS];
+	VkSpecializationInfo        spec_info;
+	const VkSpecializationInfo* spec = _skr_shader_make_spec_info(&shader->meta, spec_values, spec_entries, &spec_info);
+
+	VkComputePipelineCreateInfo pipeline_info = {
+		.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+		.stage  = (VkPipelineShaderStageCreateInfo){
+			.sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.pNext               = stage_pNext,
+			.stage               = VK_SHADER_STAGE_COMPUTE_BIT,
+			.module              = shader->compute_stage.shader,
+			.pName               = "cs",
+			.pSpecializationInfo = spec,
+		},
+		.layout = compute->layout,
+	};
+
+	VkResult vr = vkCreateComputePipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, out_pipeline);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkCreateComputePipelines");
+		*out_pipeline = VK_NULL_HANDLE;
+		return skr_err_device_error;
+	}
+	return skr_err_success;
+}
+
+skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info, skr_compute_t* out_compute) {
 	if (!out_compute) return skr_err_invalid_parameter;
 
 	// Zero out immediately
@@ -23,7 +80,9 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 
 	out_compute->shader = shader;
 
-	// Create descriptor set layout
+	// Must keep producing no dynamic descriptors: skr_compute_execute binds with
+	// zero offsets, and a compute $Global at b0 collides with material_slot, so
+	// _skr_shader_make_layout would silently make it dynamic.
 	if (shader->meta.buffer_count > 0 || shader->meta.resource_count > 0) {
 		VkDescriptorSetLayoutBinding bindings[32];
 		uint32_t binding_count = 0;
@@ -95,55 +154,22 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 		return skr_err_device_error;
 	}
 
-	// Optionally pin the compute subgroup/wave size. Driven by `//--wave_size = N`
-	// in the shader; requires VK_EXT_subgroup_size_control. Mismatched values
-	// fall back to the implementation default and emit a warning.
-	VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-	};
-	void* stage_pNext = NULL;
-	if (shader->meta.wave_size != 0) {
-		if (!_skr_vk.has_subgroup_size_control) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but VK_EXT_subgroup_size_control is unavailable; using implementation default", shader->meta.wave_size);
-		} else if (shader->meta.wave_size < _skr_vk.min_subgroup_size || shader->meta.wave_size > _skr_vk.max_subgroup_size) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but device subgroup range is [%u, %u]; using implementation default", shader->meta.wave_size, _skr_vk.min_subgroup_size, _skr_vk.max_subgroup_size);
-		} else if ((_skr_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
-			skr_log(skr_log_warning, "Shader requests wave_size=%u but the device does not allow required subgroup size on compute stages; using implementation default", shader->meta.wave_size);
-		} else {
-			required_subgroup_size.requiredSubgroupSize = shader->meta.wave_size;
-			stage_pNext = &required_subgroup_size;
-		}
-	}
-
-	// Create compute pipeline
-	VkComputePipelineCreateInfo pipeline_info = {
-		.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-		.stage  = (VkPipelineShaderStageCreateInfo){
-			.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			.pNext  = stage_pNext,
-			.stage  = VK_SHADER_STAGE_COMPUTE_BIT,
-			.module = shader->compute_stage.shader,
-			.pName  = "cs",
-		},
-		.layout = out_compute->layout,
-	};
-
-	vr = vkCreateComputePipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &out_compute->pipeline);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkCreateComputePipelines");
+	skr_err_ err = _skr_compute_build_pipeline(out_compute, info, &out_compute->pipeline);
+	if (err != skr_err_success) {
 		vkDestroyPipelineLayout(_skr_vk.device, out_compute->layout, NULL);
 		if (out_compute->descriptor_layout) {
 			vkDestroyDescriptorSetLayout(_skr_vk.device, out_compute->descriptor_layout, NULL);
 		}
 		*out_compute = (skr_compute_t){0};
-		return skr_err_device_error;
+		return err;
 	}
 
-	// Allocate memory for our resource binds
+	// The bind pool slice doubles as this dispatch's descriptor cache key
 	out_compute->bind_count = shader->meta.resource_count + shader->meta.buffer_count;
-	out_compute->binds      = (skr_material_bind_t*)_skr_calloc(out_compute->bind_count, sizeof(skr_material_bind_t));
-	for (uint32_t i = 0; i < shader->meta.buffer_count;   i++) out_compute->binds[i                          ].bind = shader->meta.buffers  [i].bind;
-	for (uint32_t i = 0; i < shader->meta.resource_count; i++) out_compute->binds[i+shader->meta.buffer_count].bind = shader->meta.resources[i].bind;
+	out_compute->bind_start = _skr_bind_pool_alloc(out_compute->bind_count);
+	skr_material_bind_t* binds = _skr_bind_pool_get(out_compute->bind_start);
+	for (uint32_t i = 0; i < shader->meta.buffer_count;   i++) binds[i                          ].bind = shader->meta.buffers  [i].bind;
+	for (uint32_t i = 0; i < shader->meta.resource_count; i++) binds[i+shader->meta.buffer_count].bind = shader->meta.resources[i].bind;
 
 	// Initialize parameter buffer if shader has $Global cbuffer
 	const sksc_shader_meta_t* meta = &shader->meta;
@@ -167,6 +193,28 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_t* out_compu
 	return skr_err_success;
 }
 
+void skr_compute_set_pipeline(skr_compute_t* ref_compute, skr_compute_info_t info) {
+	if (!ref_compute || !ref_compute->shader) return;
+
+	// The compute is locked to its create-time shader; only spec values change.
+	// layout, descriptor_layout, binds, and param_buffer are all retained.
+	const skr_shader_t* shader = ref_compute->shader;
+
+	// Build into a temp first: a failed rebuild must leave the still-working
+	// pipeline in place rather than stranding the object with no pipeline.
+	VkPipeline new_pipeline = VK_NULL_HANDLE;
+	skr_err_   err          = _skr_compute_build_pipeline(ref_compute, info, &new_pipeline);
+	if (err != skr_err_success) {
+		skr_log(skr_log_critical, "skr_compute_set_pipeline: failed to rebuild pipeline for '%s'; keeping previous pipeline", shader->meta.name);
+		return;
+	}
+
+	// Swap in the new pipeline, deferred-destroy the old (safe for in-flight
+	// command buffers).
+	_skr_cmd_destroy_pipeline(NULL, ref_compute->pipeline);
+	ref_compute->pipeline = new_pipeline;
+}
+
 bool skr_compute_is_valid(const skr_compute_t* compute) {
 	return compute && compute->pipeline != VK_NULL_HANDLE;
 }
@@ -186,7 +234,7 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 	_skr_cmd_destroy_pipeline_layout      (NULL, ref_compute->layout);
 	_skr_cmd_destroy_descriptor_set_layout(NULL, ref_compute->descriptor_layout);
 
-	_skr_free(ref_compute->binds);
+	_skr_cmd_destroy_bind_pool_slots(NULL, ref_compute->bind_start, ref_compute->bind_count);
 	_skr_free(ref_compute->param_buffer);
 
 	*ref_compute = (skr_compute_t){0};
@@ -204,8 +252,9 @@ void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_bu
 		}
 	}
 
+	skr_material_bind_t* binds = _skr_bind_pool_get(ref_compute->bind_start);
 	if (idx >= 0) {
-		ref_compute->binds[idx].buffer = buffer;
+		binds[idx].buffer = buffer;
 		return;
 	}
 
@@ -218,7 +267,7 @@ void skr_compute_set_buffer(skr_compute_t* ref_compute, const char* name, skr_bu
 	}
 
 	if (idx >= 0) {
-		ref_compute->binds[meta->buffer_count + idx].buffer = buffer;
+		binds[meta->buffer_count + idx].buffer = buffer;
 	} else {
 		skr_log(skr_log_warning, "Buffer name '%s' not found", name);
 	}
@@ -242,7 +291,7 @@ void skr_compute_set_tex(skr_compute_t* ref_compute, const char* name, skr_tex_t
 		return;
 	}
 
-	ref_compute->binds[meta->buffer_count + idx].texture = texture;
+	_skr_bind_pool_get(ref_compute->bind_start)[meta->buffer_count + idx].texture = texture;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -341,7 +390,8 @@ void skr_compute_get_param(const skr_compute_t* compute, const char* name, sksc_
 void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uint32_t z) {
 	if (!skr_compute_is_valid(ref_compute)) return;
 
-	const sksc_shader_meta_t* meta = &ref_compute->shader->meta;
+	const sksc_shader_meta_t* meta  = &ref_compute->shader->meta;
+	skr_material_bind_t*      binds = _skr_bind_pool_get(ref_compute->bind_start);
 
 	// Acquire command buffer first so we have a valid future
 	_skr_cmd_ctx_t  ctx = _skr_cmd_acquire();
@@ -351,21 +401,20 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 		return;
 	}
 
-	// Upload parameter buffer to bump allocator if it exists
+	// $Global params go straight into this dispatch's writes rather than
+	// through the bind slot, so the slot is skipped below
+	_skr_desc_writes_t desc;
+	_skr_desc_writes_begin(&desc, -1); // compute layouts have no dynamic bindings
+	int32_t global_slot = -1;
 	if (ref_compute->param_buffer && meta->global_buffer_id >= 0) {
-		// Write to command buffer's bump allocator
-		skr_bump_result_t result = _skr_bump_alloc_write(ctx.const_bump, ref_compute->param_buffer, ref_compute->param_buffer_size);
-
+		skr_bump_result_t result = _skr_bump_ring_write(ctx.const_ring, ref_compute->param_buffer, ref_compute->param_buffer_size);
 		if (!result.buffer) {
 			skr_log(skr_log_warning, "skr_compute_execute: bump allocator failed");
 			_skr_cmd_release(cmd);
 			return;
 		}
-
-		// Set up bind with offset
-		ref_compute->binds[meta->global_buffer_id].buffer        = result.buffer;
-		ref_compute->binds[meta->global_buffer_id].buffer_offset = result.offset;
-		ref_compute->binds[meta->global_buffer_id].buffer_range  = ref_compute->param_buffer_size;
+		global_slot = meta->buffers[meta->global_buffer_id].bind.slot;
+		_skr_write_buffer(&desc, (uint32_t)global_slot, false, result.buffer, result.offset, ref_compute->param_buffer_size);
 		ref_compute->param_dirty = false;
 	}
 
@@ -373,34 +422,20 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 
 	// Transition all bound textures to appropriate layouts before dispatch
 	for (uint32_t i = 0; i < ref_compute->bind_count; i++) {
-		skr_material_bind_t *res = &ref_compute->binds[i];
+		skr_material_bind_t *res = &binds[i];
 		if      (res->bind.register_type == skr_register_readwrite_tex && res->texture) {_skr_tex_transition_for_storage    (cmd, res->texture); }
 		else if (res->bind.register_type == skr_register_texture       && res->texture) {_skr_tex_transition_for_shader_read(cmd, res->texture, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); }
 	}
 
-	VkWriteDescriptorSet   writes      [32];
-	VkDescriptorBufferInfo buffer_infos[16];
-	VkDescriptorImageInfo  image_infos [16];
-	uint32_t write_ct  = 0;
-	uint32_t buffer_ct = 0;
-	uint32_t image_ct  = 0;
-	int32_t fail_idx = _skr_material_add_writes(ref_compute->binds, ref_compute->bind_count, NULL, 0,
-		writes,       sizeof(writes      )/sizeof(writes      [0]),
-		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-		&write_ct, &buffer_ct, &image_ct);
+	int32_t fail_idx = _skr_material_add_writes(binds, ref_compute->bind_count, skr_stage_compute, &global_slot, global_slot >= 0 ? 1 : 0, &desc);
 	if (fail_idx >= 0) {
 		skr_log(skr_log_critical, "Compute dispatch missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		_skr_cmd_release(cmd);
 		return;
 	}
 
-	//_skr_log_descriptor_writes(writes, write_ct, buffer_ct, image_ct);
-
-	_skr_bind_descriptors(cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_COMPUTE,
-	                      ref_compute->layout, ref_compute->descriptor_layout, writes, write_ct);
-
-	vkCmdDispatch(cmd, x, y, z);
+	if (_skr_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ref_compute->bind_start, ref_compute->layout, ref_compute->descriptor_layout, &desc))
+		vkCmdDispatch(cmd, x, y, z);
 
 	// Compute→compute memory barrier (immediate). Compute→graphics barrier is
 	// deferred via pending_compute_barrier and flushed before the next render pass.
@@ -420,7 +455,8 @@ void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uin
 void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indirect_args) {
 	if (!skr_compute_is_valid(ref_compute) || !indirect_args) return;
 
-	const sksc_shader_meta_t* meta = &ref_compute->shader->meta;
+	const sksc_shader_meta_t* meta  = &ref_compute->shader->meta;
+	skr_material_bind_t*      binds = _skr_bind_pool_get(ref_compute->bind_start);
 
 	// Acquire command buffer first so we have a valid future
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
@@ -430,21 +466,20 @@ void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indi
 		return;
 	}
 
-	// Upload parameter buffer to bump allocator if it exists
+	// $Global params go straight into this dispatch's writes rather than
+	// through the bind slot, so the slot is skipped below
+	_skr_desc_writes_t desc;
+	_skr_desc_writes_begin(&desc, -1); // compute layouts have no dynamic bindings
+	int32_t global_slot = -1;
 	if (ref_compute->param_buffer && meta->global_buffer_id >= 0) {
-		// Write to command buffer's bump allocator
-		skr_bump_result_t result = _skr_bump_alloc_write(ctx.const_bump, ref_compute->param_buffer, ref_compute->param_buffer_size);
-
+		skr_bump_result_t result = _skr_bump_ring_write(ctx.const_ring, ref_compute->param_buffer, ref_compute->param_buffer_size);
 		if (!result.buffer) {
 			skr_log(skr_log_warning, "skr_compute_execute_indirect: bump allocator failed");
 			_skr_cmd_release(cmd);
 			return;
 		}
-
-		// Set up bind with offset
-		ref_compute->binds[meta->global_buffer_id].buffer        = result.buffer;
-		ref_compute->binds[meta->global_buffer_id].buffer_offset = result.offset;
-		ref_compute->binds[meta->global_buffer_id].buffer_range  = ref_compute->param_buffer_size;
+		global_slot = meta->buffers[meta->global_buffer_id].bind.slot;
+		_skr_write_buffer(&desc, (uint32_t)global_slot, false, result.buffer, result.offset, ref_compute->param_buffer_size);
 		ref_compute->param_dirty = false;
 	}
 
@@ -452,7 +487,7 @@ void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indi
 
 	// Transition all bound textures to appropriate layouts before dispatch
 	for (uint32_t i = 0; i < ref_compute->bind_count; i++) {
-		skr_material_bind_t *res = &ref_compute->binds[i];
+		skr_material_bind_t *res = &binds[i];
 		if      (res->bind.register_type == skr_register_readwrite_tex && res->texture) {_skr_tex_transition_for_storage    (cmd, res->texture); }
 		else if (res->bind.register_type == skr_register_texture       && res->texture) {_skr_tex_transition_for_shader_read(cmd, res->texture, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); }
 	}
@@ -466,27 +501,15 @@ void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indi
 			.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
 		}, 0, NULL, 0, NULL);
 
-	VkWriteDescriptorSet   writes      [32];
-	VkDescriptorBufferInfo buffer_infos[16];
-	VkDescriptorImageInfo  image_infos [16];
-	uint32_t write_ct = 0;
-	uint32_t buffer_ct = 0;
-	uint32_t image_ct = 0;
-	int32_t fail_idx = _skr_material_add_writes(ref_compute->binds, ref_compute->bind_count, NULL, 0,
-		writes,       sizeof(writes      )/sizeof(writes      [0]),
-		buffer_infos, sizeof(buffer_infos)/sizeof(buffer_infos[0]),
-		image_infos,  sizeof(image_infos )/sizeof(image_infos [0]),
-		&write_ct, &buffer_ct, &image_ct);
+	int32_t fail_idx = _skr_material_add_writes(binds, ref_compute->bind_count, skr_stage_compute, &global_slot, global_slot >= 0 ? 1 : 0, &desc);
 	if (fail_idx >= 0) {
 		skr_log(skr_log_critical, "Compute indirect dispatch missing binding '%s' in shader '%s'", _skr_material_bind_name(meta, fail_idx), meta->name);
 		_skr_cmd_release(cmd);
 		return;
 	}
 
-	_skr_bind_descriptors(cmd, ctx.descriptor_pool, VK_PIPELINE_BIND_POINT_COMPUTE,
-	                      ref_compute->layout, ref_compute->descriptor_layout, writes, write_ct);
-
-	vkCmdDispatchIndirect(cmd, indirect_args->buffer, 0);
+	if (_skr_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ref_compute->bind_start, ref_compute->layout, ref_compute->descriptor_layout, &desc))
+		vkCmdDispatchIndirect(cmd, indirect_args->buffer, 0);
 
 	// Compute→compute memory barrier (immediate). Compute→graphics deferred.
 	vkCmdPipelineBarrier(cmd,

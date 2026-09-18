@@ -21,12 +21,24 @@ typedef struct {
 	_skr_pipeline_material_key_t     key;
 	VkPipelineLayout                 layout;
 	VkDescriptorSetLayout            descriptor_layout;
+	uint32_t                         dyn_bindings[3]; // dynamic-offset bindings of descriptor_layout, ascending
+	uint32_t                         dyn_count;
 	int32_t                          ref_count;
 } _skr_pipeline_material_slot_t;
 
+// A VkRenderPass and the key that built it. subpass_index is not part of a
+// VkRenderPass's identity, so object keys always have subpass_index == 0.
 typedef struct {
 	skr_pipeline_renderpass_key_t    key;
 	VkRenderPass                     render_pass;
+	int32_t                          ref_count;  // Number of slots pointing here
+} _skr_pipeline_renderpass_object_t;
+
+// A cache slot is (renderpass identity + subpass_index), and its index is the
+// renderpass axis of the pipelines 3D array.
+typedef struct {
+	skr_pipeline_renderpass_key_t    key;         // Full key, including subpass_index
+	int32_t                          object_idx;  // Index into renderpass_objects
 	int32_t                          ref_count;
 } _skr_pipeline_renderpass_slot_t;
 
@@ -36,17 +48,16 @@ typedef struct {
 } _skr_pipeline_vertformat_slot_t;
 
 typedef struct {
-	_skr_pipeline_material_slot_t*   materials;
-	_skr_pipeline_renderpass_slot_t* renderpasses;
-	_skr_pipeline_vertformat_slot_t* vertformats;
-	VkPipeline*                      pipelines;       // 3D array: [material][renderpass][vertformat]
-	int32_t                          material_count;
-	int32_t                          material_capacity;
-	int32_t                          renderpass_count;
-	int32_t                          renderpass_capacity;
-	int32_t                          vertformat_count;
-	int32_t                          vertformat_capacity;
-	mtx_t                            mutex;           // Thread safety for cache access
+	_skr_pipeline_material_slot_t*     materials;
+	_skr_pipeline_renderpass_slot_t*   renderpasses;
+	_skr_pipeline_renderpass_object_t* renderpass_objects;
+	_skr_pipeline_vertformat_slot_t*   vertformats;
+	VkPipeline*                        pipelines;       // 3D array: [material][renderpass][vertformat]
+	int32_t                            material_capacity;
+	int32_t                            renderpass_capacity;
+	int32_t                            renderpass_object_capacity;
+	int32_t                            vertformat_capacity;
+	mtx_t                              mutex;           // Thread safety for cache access
 } _skr_pipeline_cache_t;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -54,6 +65,21 @@ typedef struct {
 ///////////////////////////////////////////////////////////////////////////////
 
 static _skr_pipeline_cache_t _skr_pipeline_cache = {0};
+
+// Stored in the pipelines[] cache to mark a slot whose creation permanently
+// failed (incompatible mesh/shader vertex formats), distinct from
+// VK_NULL_HANDLE which means "not created yet". Without it a failed slot stays
+// VK_NULL_HANDLE and _skr_pipeline_get re-runs the whole remap — and re-logs
+// the error — on every affected draw, every frame. 0xFFFF… is never a real
+// Vulkan handle. It never escapes the cache: _skr_pipeline_get maps it back to
+// VK_NULL_HANDLE for callers, and the destroy paths skip it.
+#define SKR_PIPELINE_FAILED ((VkPipeline)(uintptr_t)-1)
+
+// A cache slot holds a real, destroyable pipeline only when it is neither the
+// "not created" nor the "creation failed" sentinel.
+static inline bool _skr_pipeline_is_real(VkPipeline p) {
+	return p != VK_NULL_HANDLE && p != SKR_PIPELINE_FAILED;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Forward declarations
@@ -124,7 +150,7 @@ void _skr_pipeline_shutdown(void) {
 			for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 				for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 					int32_t idx = _skr_pipeline_index_3d(m, r, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-					if (_skr_pipeline_cache.pipelines[idx] != VK_NULL_HANDLE) {
+					if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx])) {
 						vkDestroyPipeline(_skr_vk.device, _skr_pipeline_cache.pipelines[idx], NULL);
 					}
 				}
@@ -148,19 +174,16 @@ void _skr_pipeline_shutdown(void) {
 		_skr_free(_skr_pipeline_cache.materials);
 	}
 
-	// Destroy render passes (shared handles may appear in multiple slots)
-	if (_skr_pipeline_cache.renderpasses) {
-		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
-			VkRenderPass rp = _skr_pipeline_cache.renderpasses[r].render_pass;
-			if (_skr_pipeline_cache.renderpasses[r].ref_count <= 0 || rp == VK_NULL_HANDLE) continue;
-
-			vkDestroyRenderPass(_skr_vk.device, rp, NULL);
-			// Null out any other slots sharing this handle to avoid double-free
-			for (int32_t j = r + 1; j < _skr_pipeline_cache.renderpass_capacity; j++) {
-				if (_skr_pipeline_cache.renderpasses[j].render_pass == rp)
-					_skr_pipeline_cache.renderpasses[j].render_pass = VK_NULL_HANDLE;
-			}
+	// Destroy render passes, each handle lives in exactly one object entry
+	if (_skr_pipeline_cache.renderpass_objects) {
+		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_object_capacity; r++) {
+			VkRenderPass rp = _skr_pipeline_cache.renderpass_objects[r].render_pass;
+			if (_skr_pipeline_cache.renderpass_objects[r].ref_count > 0 && rp != VK_NULL_HANDLE)
+				vkDestroyRenderPass(_skr_vk.device, rp, NULL);
 		}
+		_skr_free(_skr_pipeline_cache.renderpass_objects);
+	}
+	if (_skr_pipeline_cache.renderpasses) {
 		_skr_free(_skr_pipeline_cache.renderpasses);
 	}
 
@@ -221,18 +244,19 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 		_skr_pipeline_grow_materials(&_skr_pipeline_cache, free_slot + 1);
 	}
 
+	// Both calls must see the same mask, or dyn_bindings names bindings the
+	// layout didn't make dynamic
+	skr_stage_ stage_mask = skr_stage_vertex | skr_stage_pixel | skr_stage_compute;
+
 	// Register new material
 	_skr_pipeline_cache.materials[free_slot].key               = *key;
-	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, skr_stage_vertex | skr_stage_pixel | skr_stage_compute, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
+	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, stage_mask, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
 	_skr_pipeline_cache.materials[free_slot].layout            = _skr_pipeline_create_layout(_skr_pipeline_cache.materials[free_slot].descriptor_layout);
+	_skr_pipeline_cache.materials[free_slot].dyn_count         = _skr_shader_dyn_bindings   (&key->shader->meta, stage_mask, _skr_vk.has_push_descriptors, _skr_pipeline_cache.materials[free_slot].dyn_bindings);
 	_skr_pipeline_cache.materials[free_slot].ref_count         = 1;
 
-	if (free_slot >= _skr_pipeline_cache.material_count) {
-		_skr_pipeline_cache.material_count = free_slot + 1;
-	}
-
 	// Generate and set debug name for pipeline layout
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	const char* shader_name = key->shader->meta.name[0] ? key->shader->meta.name : "unknown";
 	snprintf(name, sizeof(name), "layout_%s_", shader_name);
 	_skr_append_material_config(name, sizeof(name), key);
@@ -271,42 +295,31 @@ static void _skr_pipeline_grow_renderpasses(_skr_pipeline_cache_t* ref_cache, in
 	ref_cache->renderpass_capacity = new_capacity;
 }
 
-// Compare two renderpass keys ignoring subpass_index. Keys that match on all
-// other fields describe the same VkRenderPass — subpass_index only affects
-// which subpass a pipeline targets within that renderpass.
-static bool _skr_renderpass_key_matches_base(const skr_pipeline_renderpass_key_t* a, const skr_pipeline_renderpass_key_t* b) {
-	return a->color_format             == b->color_format
-	    && a->depth_format             == b->depth_format
-	    && a->resolve_format           == b->resolve_format
-	    && a->samples                  == b->samples
-	    && a->depth_store_op           == b->depth_store_op
-	    && a->color_load_op            == b->color_load_op
-	    && a->view_mask                == b->view_mask
-	    && a->correlation_mask         == b->correlation_mask
-	    && a->postfx_count             == b->postfx_count
-	    && a->has_resolve_subpass      == b->has_resolve_subpass
-	    && a->use_custom_resolve_flags == b->use_custom_resolve_flags
-	    && a->postfx_output_format     == b->postfx_output_format
-	    && a->final_color_layout       == b->final_color_layout
-	    && a->final_resolve_layout     == b->final_resolve_layout
-	    && a->final_depth_layout       == b->final_depth_layout;
+// Object indices are not a pipeline array axis, unlike slot indices, so this
+// grows independently of the pipelines 3D array.
+static void _skr_pipeline_grow_renderpass_objects(_skr_pipeline_cache_t* ref_cache, int32_t min_capacity) {
+	if (min_capacity <= ref_cache->renderpass_object_capacity) return;
+
+	int32_t old_capacity = ref_cache->renderpass_object_capacity;
+	int32_t new_capacity = old_capacity == 0 ? 4 : old_capacity * 2;
+	while (new_capacity < min_capacity) {
+		new_capacity *= 2;
+	}
+
+	ref_cache->renderpass_objects = _skr_realloc(ref_cache->renderpass_objects, new_capacity * sizeof(_skr_pipeline_renderpass_object_t));
+	memset(&ref_cache->renderpass_objects[old_capacity], 0, (new_capacity - old_capacity) * sizeof(_skr_pipeline_renderpass_object_t));
+
+	ref_cache->renderpass_object_capacity = new_capacity;
 }
 
 // Unlocked version - caller must hold the mutex via _skr_pipeline_lock()
 int32_t _skr_pipeline_register_renderpass_unlocked(const skr_pipeline_renderpass_key_t* key) {
-	// Find existing or free slot
-	int32_t free_slot  = -1;
-	int32_t share_slot = -1; // Slot with same base key (different subpass_index) to share VkRenderPass from
+	int32_t free_slot = -1;
 	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_capacity; i++) {
 		if (_skr_pipeline_cache.renderpasses[i].ref_count > 0) {
-			// Exact match (including subpass_index): reuse this slot entirely
 			if (memcmp(&_skr_pipeline_cache.renderpasses[i].key, key, sizeof(skr_pipeline_renderpass_key_t)) == 0) {
 				_skr_pipeline_cache.renderpasses[i].ref_count++;
 				return i;
-			}
-			// Base match: candidate to borrow the VkRenderPass from
-			if (share_slot == -1 && _skr_renderpass_key_matches_base(&_skr_pipeline_cache.renderpasses[i].key, key)) {
-				share_slot = i;
 			}
 		} else if (free_slot == -1) {
 			free_slot = i;
@@ -319,19 +332,37 @@ int32_t _skr_pipeline_register_renderpass_unlocked(const skr_pipeline_renderpass
 		_skr_pipeline_grow_renderpasses(&_skr_pipeline_cache, free_slot + 1);
 	}
 
-	// Register new slot. Share the VkRenderPass if another slot with the same
-	// base key already exists (different subpass_index, same renderpass object).
-	_skr_pipeline_cache.renderpasses[free_slot].key       = *key;
-	_skr_pipeline_cache.renderpasses[free_slot].ref_count = 1;
-	if (share_slot >= 0) {
-		_skr_pipeline_cache.renderpasses[free_slot].render_pass = _skr_pipeline_cache.renderpasses[share_slot].render_pass;
+	// Find or create the VkRenderPass object shared by every subpass_index
+	skr_pipeline_renderpass_key_t obj_key = *key;
+	obj_key.subpass_index = 0;
+	int32_t object_idx = -1;
+	int32_t free_obj   = -1;
+	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_object_capacity; i++) {
+		if (_skr_pipeline_cache.renderpass_objects[i].ref_count > 0) {
+			if (memcmp(&_skr_pipeline_cache.renderpass_objects[i].key, &obj_key, sizeof(skr_pipeline_renderpass_key_t)) == 0) {
+				object_idx = i;
+				break;
+			}
+		} else if (free_obj == -1) {
+			free_obj = i;
+		}
+	}
+	if (object_idx >= 0) {
+		_skr_pipeline_cache.renderpass_objects[object_idx].ref_count++;
 	} else {
-		_skr_pipeline_cache.renderpasses[free_slot].render_pass = _skr_pipeline_create_renderpass(key);
+		if (free_obj == -1) {
+			free_obj = _skr_pipeline_cache.renderpass_object_capacity;
+			_skr_pipeline_grow_renderpass_objects(&_skr_pipeline_cache, free_obj + 1);
+		}
+		_skr_pipeline_cache.renderpass_objects[free_obj].key         = obj_key;
+		_skr_pipeline_cache.renderpass_objects[free_obj].render_pass = _skr_pipeline_create_renderpass(&obj_key);
+		_skr_pipeline_cache.renderpass_objects[free_obj].ref_count   = 1;
+		object_idx = free_obj;
 	}
 
-	if (free_slot >= _skr_pipeline_cache.renderpass_count) {
-		_skr_pipeline_cache.renderpass_count = free_slot + 1;
-	}
+	_skr_pipeline_cache.renderpasses[free_slot].key        = *key;
+	_skr_pipeline_cache.renderpasses[free_slot].object_idx = object_idx;
+	_skr_pipeline_cache.renderpasses[free_slot].ref_count  = 1;
 
 	return free_slot;
 }
@@ -356,7 +387,8 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 	for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(material_idx, r, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-			_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
+				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -364,6 +396,8 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 	// Destroy material resources
 	_skr_cmd_destroy_pipeline_layout      (NULL, _skr_pipeline_cache.materials[material_idx].layout);
 	_skr_cmd_destroy_descriptor_set_layout(NULL, _skr_pipeline_cache.materials[material_idx].descriptor_layout);
+	_skr_pipeline_cache.materials[material_idx].layout            = VK_NULL_HANDLE;
+	_skr_pipeline_cache.materials[material_idx].descriptor_layout = VK_NULL_HANDLE;
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
@@ -381,25 +415,24 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(m, renderpass_idx, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-			_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
+				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
 
-	// Only destroy VkRenderPass if no other slot shares the same handle
-	VkRenderPass rp = _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
-	bool shared = false;
-	for (int32_t i = 0; i < _skr_pipeline_cache.renderpass_capacity; i++) {
-		if (i == renderpass_idx) continue;
-		if (_skr_pipeline_cache.renderpasses[i].ref_count > 0 && _skr_pipeline_cache.renderpasses[i].render_pass == rp) {
-			shared = true;
-			break;
+	// Release the slot's object; the last slot out destroys the VkRenderPass
+	int32_t object_idx = _skr_pipeline_cache.renderpasses[renderpass_idx].object_idx;
+	if (object_idx >= 0 && object_idx < _skr_pipeline_cache.renderpass_object_capacity) {
+		_skr_pipeline_renderpass_object_t* obj = &_skr_pipeline_cache.renderpass_objects[object_idx];
+		obj->ref_count--;
+		if (obj->ref_count <= 0) {
+			if (obj->render_pass != VK_NULL_HANDLE)
+				_skr_cmd_destroy_render_pass(NULL, obj->render_pass);
+			obj->render_pass = VK_NULL_HANDLE;
 		}
 	}
-	if (!shared) {
-		_skr_cmd_destroy_render_pass(NULL, rp);
-	}
-	_skr_pipeline_cache.renderpasses[renderpass_idx].render_pass = VK_NULL_HANDLE;
+	_skr_pipeline_cache.renderpasses[renderpass_idx].object_idx = -1;
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
@@ -440,6 +473,21 @@ static bool _skr_vert_type_equals(const skr_vert_type_t* a, const skr_vert_type_
 	if (a->component_count > 0 && memcmp(a->attributes, b->attributes, sizeof(VkVertexInputAttributeDescription) * a->component_count) != 0)
 		return false;
 
+	// Compare the semantic-carrying fields the baked attributes don't capture.
+	// The pipeline remap (_skr_pipeline_create) now wires attributes to shader
+	// inputs by semantic + slot, reading them from the *cached* vert type. Two
+	// vert types with identical baked attributes but a different semantic ->
+	// offset mapping (e.g. position/normal vs normal/position, same formats)
+	// must not alias to one cache slot, or a mesh would silently inherit the
+	// other's wiring. (location rides in the struct too; compare it for
+	// completeness — a field-by-field loop also sidesteps struct padding.)
+	for (uint32_t i = 0; i < a->component_count; i++) {
+		if (a->components[i].semantic      != b->components[i].semantic      ||
+		    a->components[i].semantic_slot != b->components[i].semantic_slot ||
+		    a->components[i].location      != b->components[i].location)
+			return false;
+	}
+
 	return true;
 }
 
@@ -469,10 +517,6 @@ int32_t _skr_pipeline_register_vertformat_unlocked(skr_vert_type_t vert_type) {
 	_skr_pipeline_cache.vertformats[free_slot].vert_type  = vert_type;
 	_skr_pipeline_cache.vertformats[free_slot].ref_count  = 1;
 
-	if (free_slot >= _skr_pipeline_cache.vertformat_count) {
-		_skr_pipeline_cache.vertformat_count = free_slot + 1;
-	}
-
 	return free_slot;
 }
 
@@ -496,7 +540,8 @@ void _skr_pipeline_unregister_vertformat(int32_t vertformat_idx) {
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
 		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 			int32_t idx = _skr_pipeline_index_3d(m, r, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-			_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
+				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -512,15 +557,19 @@ VkPipeline _skr_pipeline_get(int32_t material_idx, int32_t renderpass_idx, int32
 	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count <= 0)                 return VK_NULL_HANDLE;
 	if (_skr_pipeline_cache.vertformats [vertformat_idx].ref_count <= 0)                 return VK_NULL_HANDLE;
 
-	// Check if pipeline already exists
-	int32_t idx = _skr_pipeline_index_3d(material_idx, renderpass_idx, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
-	if (_skr_pipeline_cache.pipelines[idx] != VK_NULL_HANDLE) {
-		return _skr_pipeline_cache.pipelines[idx];
-	}
+	// Check the cache slot. A prior creation that failed is remembered as
+	// SKR_PIPELINE_FAILED so we neither retry it nor re-log its error every
+	// frame; report it to callers as VK_NULL_HANDLE (their "skip this draw"
+	// signal), never the raw sentinel.
+	int32_t    idx    = _skr_pipeline_index_3d(material_idx, renderpass_idx, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
+	VkPipeline cached = _skr_pipeline_cache.pipelines[idx];
+	if (cached == SKR_PIPELINE_FAILED) return VK_NULL_HANDLE;
+	if (cached != VK_NULL_HANDLE)      return cached;
 
-	// Create pipeline
+	// First request for this slot — create, and remember a failure so the
+	// descriptive error (logged inside _skr_pipeline_create) fires just once.
 	VkPipeline pipeline = _skr_pipeline_create(material_idx, renderpass_idx, vertformat_idx);
-	_skr_pipeline_cache.pipelines[idx] = pipeline;
+	_skr_pipeline_cache.pipelines[idx] = (pipeline == VK_NULL_HANDLE) ? SKR_PIPELINE_FAILED : pipeline;
 
 	return pipeline;
 }
@@ -539,40 +588,209 @@ VkDescriptorSetLayout _skr_pipeline_get_descriptor_layout(int32_t material_idx) 
 	return _skr_pipeline_cache.materials[material_idx].descriptor_layout;
 }
 
+uint32_t _skr_pipeline_get_dyn_bindings(int32_t material_idx, uint32_t out_bindings[3]) {
+	if (material_idx < 0 || material_idx >= _skr_pipeline_cache.material_capacity) return 0;
+	const _skr_pipeline_material_slot_t* slot = &_skr_pipeline_cache.materials[material_idx];
+	if (slot->ref_count <= 0) return 0;
+	memcpy(out_bindings, slot->dyn_bindings, sizeof(slot->dyn_bindings));
+	return slot->dyn_count;
+}
+
 VkRenderPass _skr_pipeline_get_renderpass(int32_t renderpass_idx) {
 	if (renderpass_idx < 0 || renderpass_idx >= _skr_pipeline_cache.renderpass_capacity) return VK_NULL_HANDLE;
 	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count <= 0)                 return VK_NULL_HANDLE;
 
-	return _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
+	int32_t object_idx = _skr_pipeline_cache.renderpasses[renderpass_idx].object_idx;
+	if (object_idx < 0 || object_idx >= _skr_pipeline_cache.renderpass_object_capacity)  return VK_NULL_HANDLE;
+
+	return _skr_pipeline_cache.renderpass_objects[object_idx].render_pass;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Internal helpers
 ///////////////////////////////////////////////////////////////////////////////
 
-static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipeline_renderpass_key_t* key) {
-	VkAttachmentDescription attachments[SKR_POSTFX_MAX_ATTACHMENTS];
-	uint32_t                attachment_count = 0;
+// Down-converts a VkRenderPassCreateInfo2 to a core-1.0 vkCreateRenderPass
+// call for devices without VK_KHR_create_renderpass2. Depth-feature keys
+// never get here — per-reference aspect masks and depth-stencil resolve
+// chains would be silently dropped by this conversion.
+static VkRenderPass _skr_renderpass_create_compat(const VkRenderPassCreateInfo2* info, uint32_t view_mask) {
+	VkAttachmentDescription attachments [SKR_POSTFX_MAX_ATTACHMENTS];
+	VkSubpassDescription    subpasses   [SKR_POSTFX_MAX_SUBPASSES];
+	VkSubpassDependency     dependencies[SKR_POSTFX_MAX_SUBPASSES + 10];
+	VkAttachmentReference   refs        [SKR_POSTFX_MAX_SUBPASSES * 5]; // ≤2 input + color + resolve + depth per subpass
+	uint32_t                ref_count = 0;
 
-	bool use_msaa  = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
-	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
-	bool has_depth = key->depth_format != VK_FORMAT_UNDEFINED;
+	for (uint32_t i = 0; i < info->attachmentCount; i++) {
+		const VkAttachmentDescription2* a = &info->pAttachments[i];
+		attachments[i] = (VkAttachmentDescription){
+			.flags = a->flags,          .format         = a->format,
+			.samples = a->samples,      .loadOp         = a->loadOp,
+			.storeOp = a->storeOp,      .stencilLoadOp  = a->stencilLoadOp,
+			.stencilStoreOp = a->stencilStoreOp,
+			.initialLayout  = a->initialLayout,
+			.finalLayout    = a->finalLayout,
+		};
+	}
+
+	for (uint32_t s = 0; s < info->subpassCount; s++) {
+		const VkSubpassDescription2* sp = &info->pSubpasses[s];
+
+		const VkAttachmentReference* inputs = &refs[ref_count];
+		for (uint32_t i = 0; i < sp->inputAttachmentCount; i++)
+			refs[ref_count++] = (VkAttachmentReference){ sp->pInputAttachments[i].attachment, sp->pInputAttachments[i].layout };
+		const VkAttachmentReference* colors = &refs[ref_count];
+		for (uint32_t i = 0; i < sp->colorAttachmentCount; i++)
+			refs[ref_count++] = (VkAttachmentReference){ sp->pColorAttachments[i].attachment, sp->pColorAttachments[i].layout };
+		const VkAttachmentReference* resolves = NULL;
+		if (sp->pResolveAttachments) {
+			resolves = &refs[ref_count];
+			for (uint32_t i = 0; i < sp->colorAttachmentCount; i++)
+				refs[ref_count++] = (VkAttachmentReference){ sp->pResolveAttachments[i].attachment, sp->pResolveAttachments[i].layout };
+		}
+		const VkAttachmentReference* depth = NULL;
+		if (sp->pDepthStencilAttachment) {
+			depth = &refs[ref_count];
+			refs[ref_count++] = (VkAttachmentReference){ sp->pDepthStencilAttachment->attachment, sp->pDepthStencilAttachment->layout };
+		}
+
+		subpasses[s] = (VkSubpassDescription){
+			.flags                   = sp->flags,
+			.pipelineBindPoint       = sp->pipelineBindPoint,
+			.inputAttachmentCount    = sp->inputAttachmentCount,
+			.pInputAttachments       = sp->inputAttachmentCount ? inputs : NULL,
+			.colorAttachmentCount    = sp->colorAttachmentCount,
+			.pColorAttachments       = sp->colorAttachmentCount ? colors : NULL,
+			.pResolveAttachments     = resolves,
+			.pDepthStencilAttachment = depth,
+		};
+	}
+
+	for (uint32_t d = 0; d < info->dependencyCount; d++) {
+		const VkSubpassDependency2* dep = &info->pDependencies[d];
+		dependencies[d] = (VkSubpassDependency){
+			.srcSubpass      = dep->srcSubpass,    .dstSubpass      = dep->dstSubpass,
+			.srcStageMask    = dep->srcStageMask,  .dstStageMask    = dep->dstStageMask,
+			.srcAccessMask   = dep->srcAccessMask, .dstAccessMask   = dep->dstAccessMask,
+			.dependencyFlags = dep->dependencyFlags,
+		};
+	}
+
+	uint32_t view_masks[SKR_POSTFX_MAX_SUBPASSES];
+	for (uint32_t s = 0; s < info->subpassCount; s++)
+		view_masks[s] = view_mask;
+
+	VkRenderPassMultiviewCreateInfo multiview_info = {
+		.sType                = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+		.subpassCount         = info->subpassCount,
+		.pViewMasks           = view_masks,
+		.correlationMaskCount = info->correlatedViewMaskCount,
+		.pCorrelationMasks    = info->pCorrelatedViewMasks,
+	};
+
+	VkRenderPassCreateInfo render_pass_info = {
+		.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		.pNext           = view_mask != 0 ? &multiview_info : NULL,
+		.attachmentCount = info->attachmentCount,
+		.pAttachments    = attachments,
+		.subpassCount    = info->subpassCount,
+		.pSubpasses      = subpasses,
+		.dependencyCount = info->dependencyCount,
+		.pDependencies   = dependencies,
+	};
+
+	VkRenderPass render_pass;
+	VkResult vr = vkCreateRenderPass(_skr_vk.device, &render_pass_info, NULL, &render_pass);
+	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass (postfx compat)", VK_NULL_HANDLE);
+	return render_pass;
+}
+
+// Built with renderpass2 structs so postfx depth input attachments get
+// per-reference aspect masks and the geometry subpass can chain a
+// VkSubpassDescriptionDepthStencilResolve. Devices without
+// VK_KHR_create_renderpass2 go through _skr_renderpass_create_compat above,
+// which only ever sees keys without depth features (callers gate on the
+// extension flags).
+// What a subpass past 0 first writes, which sets how wide its external
+// dependency has to reach back.
+typedef enum {
+	_skr_first_resolve,      // manual resolve target
+	_skr_first_intermediate, // pooled, and read back as an input attachment
+	_skr_first_output,       // caller's final output, may carry depth
+} _skr_first_;
+
+static const struct {
+	VkPipelineStageFlags src_stage, dst_stage;
+	VkAccessFlags        src_access, dst_access;
+} _skr_first_use_dep[] = {
+	[_skr_first_resolve] = {
+		.src_stage  = _SKR_ACQUIRE_WAIT_STAGE | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		.dst_stage  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.dst_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT },
+	[_skr_first_intermediate] = {
+		.src_stage  = _SKR_ACQUIRE_WAIT_STAGE | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		.dst_stage  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		.src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.dst_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT },
+	[_skr_first_output] = {
+		.src_stage  = _SKR_ACQUIRE_WAIT_STAGE | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		.dst_stage  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		.src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		.dst_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT },
+};
+
+static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipeline_renderpass_key_t* key) {
+	VkAttachmentDescription2 attachments[SKR_POSTFX_MAX_ATTACHMENTS];
+	uint32_t                 attachment_count = 0;
+
+	bool use_msaa      = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
+	bool has_color     = key->color_format != VK_FORMAT_UNDEFINED;
+	bool has_depth     = key->depth_format != VK_FORMAT_UNDEFINED;
+	bool reads_depth   = (key->flags & skr_rp_flag_postfx_reads_depth)  && has_depth;
+	bool resolve_reads = (key->flags & skr_rp_flag_resolve_reads_depth) && has_depth;
+	// MS-declared postfx depth reads the MSAA attachment directly, so no
+	// resolve attachment and no 1x transient - the depth input reference below
+	// falls through to depth_idx exactly as it does in a single-sample pass.
+	bool resolve_depth = (reads_depth || resolve_reads) && key->samples > VK_SAMPLE_COUNT_1_BIT && !(key->flags & skr_rp_flag_postfx_depth_ms);
+
+	if ((reads_depth || resolve_reads) && !_skr_vk.has_create_renderpass2) {
+		skr_log(skr_log_critical, "PostFX depth read requires VK_KHR_create_renderpass2");
+		return VK_NULL_HANDLE;
+	}
+	if (resolve_depth && !_skr_vk.has_depth_stencil_resolve) {
+		skr_log(skr_log_critical, "PostFX depth read with MSAA requires VK_KHR_depth_stencil_resolve");
+		return VK_NULL_HANDLE;
+	}
+
+	// Contents are undefined under both, but DONT_CARE still counts as a store
+	// *access* that races the subpass-boundary transition. NONE performs none.
+	VkAttachmentStoreOp discard_op = _skr_vk.has_store_op_none
+		? VK_ATTACHMENT_STORE_OP_NONE
+		: VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+	// Callers spell "discard" as DONT_CARE, so depth needs routing through it too
+	VkAttachmentStoreOp depth_store = key->depth_store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE
+		? discard_op
+		: key->depth_store_op;
 
 	// --- Attachment indices (assigned as we go) ---
-	int32_t color_idx   = -1;
-	int32_t resolve_idx = -1;
-	int32_t depth_idx   = -1;
-	int32_t output_idx  = -1;
+	int32_t color_idx         = -1;
+	int32_t resolve_idx       = -1;
+	int32_t depth_idx         = -1;
+	int32_t depth_resolve_idx = -1;
+	int32_t output_idx        = -1;
 	int32_t intermediate_start = -1;
 
 	// [0] Color attachment (MSAA or direct) — geometry subpass output
 	if (has_color) {
 		color_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription){
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->color_format,
 			.samples        = key->samples,
 			.loadOp         = key->color_load_op,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE, // postfx reads via input attachment, no need to store
+			.storeOp        = discard_op, // postfx reads via input attachment, no need to store
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
@@ -582,18 +800,25 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 
 	// [1] Resolve attachment (for MSAA) — resolved result, then input for postfx
 	// When resolve-only (no postfx), this IS the final output and must be stored.
-	bool resolve_is_final = use_msaa && key->has_resolve_subpass && key->postfx_count == 0;
+	// A resolve subpass implies MSAA, so this never falls through to the
+	// postfx_output_format read in the final-output block below.
+	bool resolve_is_final = use_msaa && (key->flags & skr_rp_flag_resolve_subpass) && key->postfx_count == 0;
 	if (use_msaa) {
 		resolve_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription){
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->resolve_format,
 			.samples        = VK_SAMPLE_COUNT_1_BIT,
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.storeOp        = resolve_is_final ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.storeOp        = resolve_is_final ? VK_ATTACHMENT_STORE_OP_STORE : discard_op,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			// Matches its last use as a postfx input. Any mismatch makes
+			// EndRenderPass transition it again, conflicting with its own store.
+			.finalLayout    = (!resolve_is_final && key->postfx_count > 0)
+				? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+				: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
 	}
 
@@ -602,13 +827,14 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	if (has_depth) {
 		bool has_stencil = _skr_format_has_stencil(key->depth_format);
 		depth_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription){
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->depth_format,
 			.samples        = key->samples,
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp        = key->depth_store_op,
+			.storeOp        = depth_store,
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.stencilStoreOp = has_stencil ? depth_store                 : discard_op,
 			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
 				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL  // Readable depth: explicitly transitioned before render pass
 				: VK_IMAGE_LAYOUT_UNDEFINED,                        // Transient discard: loadOp=CLEAR handles it
@@ -616,7 +842,24 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 	}
 
-	// [3..] Intermediate transient color attachments for postfx chaining
+	// [3] Depth resolve attachment — pooled 1x transient the geometry subpass
+	// resolves depth into, read by postfx as an input attachment.
+	if (resolve_depth) {
+		depth_resolve_idx = (int32_t)attachment_count;
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+			.format         = key->depth_format,
+			.samples        = VK_SAMPLE_COUNT_1_BIT,
+			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.storeOp        = discard_op, // transient, consumed as input
+			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+			.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		};
+	}
+
+	// [4..] Intermediate transient color attachments for postfx chaining
 	VkFormat intermediate_format = use_msaa ? key->resolve_format : key->color_format;
 	if (key->postfx_output_format != VK_FORMAT_UNDEFINED)
 		intermediate_format = key->postfx_output_format;
@@ -625,11 +868,12 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	if (intermediate_count > 0) {
 		intermediate_start = (int32_t)attachment_count;
 		for (uint32_t i = 0; i < intermediate_count; i++) {
-			attachments[attachment_count++] = (VkAttachmentDescription){
+			attachments[attachment_count++] = (VkAttachmentDescription2){
+				.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 				.format         = intermediate_format,
 				.samples        = VK_SAMPLE_COUNT_1_BIT,
 				.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE, // transient, consumed as input
+				.storeOp        = discard_op, // transient, consumed as input
 				.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 				.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -645,7 +889,8 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			? key->postfx_output_format
 			: (use_msaa ? key->resolve_format : key->color_format);
 		output_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription){
+		attachments[attachment_count++] = (VkAttachmentDescription2){
+			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = output_format,
 			.samples        = VK_SAMPLE_COUNT_1_BIT,
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -664,33 +909,71 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// --- Build subpass descriptions ---
-	uint32_t resolve_subpass_count = key->has_resolve_subpass ? 1 : 0;
+	uint32_t resolve_subpass_count = (key->flags & skr_rp_flag_resolve_subpass) ? 1 : 0;
 	uint32_t subpass_count = 1 + resolve_subpass_count + key->postfx_count;
 
-	// Attachment references (pre-allocate max needed)
-	VkAttachmentReference color_refs  [SKR_POSTFX_MAX_SUBPASSES];
-	VkAttachmentReference resolve_refs[SKR_POSTFX_MAX_SUBPASSES];
-	VkAttachmentReference input_refs  [SKR_POSTFX_MAX_SUBPASSES];
-	VkAttachmentReference depth_ref = { .attachment = VK_ATTACHMENT_UNUSED, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
-	if (depth_idx >= 0) depth_ref.attachment = (uint32_t)depth_idx;
+	VkImageAspectFlags depth_aspect = has_depth
+		? (VK_IMAGE_ASPECT_DEPTH_BIT | (_skr_format_has_stencil(key->depth_format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0))
+		: 0;
 
-	VkSubpassDescription subpasses[SKR_POSTFX_MAX_SUBPASSES];
+	// Attachment references (pre-allocate max needed; input_refs is
+	// [subpass][color, depth] — InputAttachmentIndex 0 = color, 1 = depth)
+	VkAttachmentReference2 color_refs  [SKR_POSTFX_MAX_SUBPASSES];
+	VkAttachmentReference2 resolve_refs[SKR_POSTFX_MAX_SUBPASSES];
+	VkAttachmentReference2 input_refs  [SKR_POSTFX_MAX_SUBPASSES][2];
+	VkAttachmentReference2 depth_ref = {
+		.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+		.attachment = depth_idx >= 0 ? (uint32_t)depth_idx : VK_ATTACHMENT_UNUSED,
+		.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		.aspectMask = depth_aspect,
+	};
+
+	VkSubpassDescription2 subpasses[SKR_POSTFX_MAX_SUBPASSES];
 	memset(subpasses, 0, sizeof(subpasses));
 
 	// Subpass 0: Geometry
 	// When manual resolve is active, NO pResolveAttachments — the resolve subpass
 	// reads the MSAA color directly as an input attachment instead.
-	color_refs[0] = (VkAttachmentReference){
+	color_refs[0] = (VkAttachmentReference2){
+		.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 		.attachment = has_color ? (uint32_t)color_idx : VK_ATTACHMENT_UNUSED,
 		.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	};
-	resolve_refs[0] = (VkAttachmentReference){
+	resolve_refs[0] = (VkAttachmentReference2){
+		.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 		.attachment = use_msaa ? (uint32_t)resolve_idx : VK_ATTACHMENT_UNUSED,
 		.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	};
-	bool use_auto_resolve = use_msaa && !key->has_resolve_subpass;
-	subpasses[0] = (VkSubpassDescription){
+	// On-tile depth resolve: geometry subpass resolves depth into the 1x
+	// transient so postfx reads single-sample depth at MSAA settings too.
+	VkAttachmentReference2 depth_resolve_ref = {
+		.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+		.attachment = resolve_depth ? (uint32_t)depth_resolve_idx : VK_ATTACHMENT_UNUSED,
+		.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+	};
+	VkSubpassDescriptionDepthStencilResolve depth_resolve_info = {
+		.sType                          = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+		.depthResolveMode               = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, // The only mode Vulkan mandates
+		.stencilResolveMode             = VK_RESOLVE_MODE_NONE,
+		.pDepthStencilResolveAttachment = &depth_resolve_ref,
+	};
+	bool use_auto_resolve = use_msaa && !(key->flags & skr_rp_flag_resolve_subpass);
+	// Tile shading apron: the subpasses that *produce* the tile data (geometry,
+	// and manual resolve below) rasterize into the apron border so a later
+	// tile-attachment read finds valid neighbors at tile edges. The reading
+	// postfx subpasses do NOT get the bit — their fragments only run on real
+	// tile pixels, keeping every read within tile + apron.
+	VkSubpassDescriptionFlags apron_flag = ((key->flags & skr_rp_flag_tile_shading) && (key->tile_apron[0] | key->tile_apron[1]))
+		? VK_SUBPASS_DESCRIPTION_TILE_SHADING_APRON_BIT_QCOM : 0;
+	subpasses[0] = (VkSubpassDescription2){
+		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+		.pNext                   = resolve_depth ? &depth_resolve_info : NULL,
+		.flags                   = apron_flag,
 		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
+		.viewMask                = key->view_mask,
 		.colorAttachmentCount    = has_color ? 1 : 0,
 		.pColorAttachments       = has_color ? &color_refs[0] : NULL,
 		.pResolveAttachments     = use_auto_resolve ? &resolve_refs[0] : NULL,
@@ -698,58 +981,93 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	};
 
 	// Subpass 1 (optional): Manual MSAA resolve
-	// Reads MSAA color as multisampled input attachment, writes 1x resolved output.
-	// No depth — frees tile memory after geometry subpass.
+	// Reads MSAA color as multisampled input attachment, writes 1x resolved
+	// output. Depth stays out of its input refs unless the resolve material
+	// itself reads it, freeing tile memory after the geometry subpass.
+	// Indexed by subpass; only entries past 0 are read
+	_skr_first_ sp_first[SKR_POSTFX_MAX_SUBPASSES] = {0};
+
 	uint32_t next_sp = 1;
-	if (key->has_resolve_subpass) {
-		input_refs[0] = (VkAttachmentReference){
+	if (key->flags & skr_rp_flag_resolve_subpass) {
+		input_refs[1][0] = (VkAttachmentReference2){
+			.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 			.attachment = (uint32_t)color_idx,
 			.layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		};
-		color_refs[1] = (VkAttachmentReference){
+		if (resolve_reads) {
+			input_refs[1][1] = (VkAttachmentReference2){
+				.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+				.attachment = (uint32_t)(resolve_depth ? depth_resolve_idx : depth_idx),
+				.layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+			};
+		}
+		color_refs[1] = (VkAttachmentReference2){
+			.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 			.attachment = (uint32_t)resolve_idx,
 			.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		};
-		subpasses[1] = (VkSubpassDescription){
-			.flags                   = key->use_custom_resolve_flags
+		subpasses[1] = (VkSubpassDescription2){
+			.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+			.flags                   = apron_flag | ((key->flags & skr_rp_flag_custom_resolve)
 				? (VK_SUBPASS_DESCRIPTION_FRAGMENT_REGION_BIT_QCOM | VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM)
-				: 0,
+				: 0),
 			.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			.inputAttachmentCount    = 1,
-			.pInputAttachments       = &input_refs[0],
+			.viewMask                = key->view_mask,
+			.inputAttachmentCount    = resolve_reads ? 2u : 1u,
+			.pInputAttachments       = &input_refs[1][0],
 			.colorAttachmentCount    = 1,
 			.pColorAttachments       = &color_refs[1],
 		};
-		next_sp = 2;
+		sp_first[1] = _skr_first_resolve;
+		next_sp     = 2;
 	}
 
-	// PostFX subpasses: read previous output as input attachment
-	int32_t prev_color_attachment = (use_msaa || key->has_resolve_subpass) ? resolve_idx : color_idx;
+	// PostFX subpasses: read previous output (and optionally depth) as input attachments
+	int32_t prev_color_attachment = (use_msaa || (key->flags & skr_rp_flag_resolve_subpass)) ? resolve_idx : color_idx;
+	int32_t depth_input_attachment = resolve_depth ? depth_resolve_idx : depth_idx;
 
 	for (uint32_t p = 0; p < key->postfx_count; p++) {
 		uint32_t sp      = next_sp + p;
-		bool     is_last = (p == key->postfx_count - 1);
-		uint32_t iref    = resolve_subpass_count + p; // offset past resolve input_ref
+		bool     is_last = (p + 1 == key->postfx_count);
 
-		// Input: previous color only. Depth is NOT included as input attachment
-		// to avoid forcing the driver to keep MSAA depth in tile memory.
-		input_refs[iref] = (VkAttachmentReference){
+		// InputAttachmentIndex 0: previous color
+		input_refs[sp][0] = (VkAttachmentReference2){
+			.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 			.attachment = (uint32_t)prev_color_attachment,
 			.layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		};
+		// InputAttachmentIndex 1: depth, only when a postfx shader asks for it —
+		// otherwise depth stays out of the input refs to free tile memory.
+		if (reads_depth) {
+			input_refs[sp][1] = (VkAttachmentReference2){
+				.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+				.attachment = (uint32_t)depth_input_attachment,
+				.layout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+			};
+		}
 
 		// Output: last postfx writes to final output, others to intermediate
 		int32_t this_output = is_last ? output_idx : intermediate_start + (int32_t)p;
+		sp_first[sp]        = is_last ? _skr_first_output : _skr_first_intermediate;
 
-		color_refs[sp] = (VkAttachmentReference){
+		color_refs[sp] = (VkAttachmentReference2){
+			.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
 			.attachment = (uint32_t)this_output,
 			.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		};
 
-		subpasses[sp] = (VkSubpassDescription){
+		subpasses[sp] = (VkSubpassDescription2){
+			.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
 			.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			.inputAttachmentCount    = 1,
-			.pInputAttachments       = &input_refs[iref],
+			.viewMask                = key->view_mask,
+			.inputAttachmentCount    = reads_depth ? 2u : 1u,
+			.pInputAttachments       = &input_refs[sp][0],
 			.colorAttachmentCount    = 1,
 			.pColorAttachments       = &color_refs[sp],
 		};
@@ -758,35 +1076,85 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	}
 
 	// --- Subpass dependencies ---
-	VkSubpassDependency dependencies[SKR_POSTFX_MAX_SUBPASSES + 4]; // +4: 2 external→0, N-1 chains, up to 2 subpass→external
+	VkSubpassDependency2 dependencies[SKR_POSTFX_MAX_SUBPASSES * 4 + 8]; // per subpass: chain, depth, first-use external, plus a few fixed
 	uint32_t dep_count = 0;
 
-	// External → subpass 0: color
-	dependencies[dep_count++] = (VkSubpassDependency){
+	// External → subpass 0: color. The scene color/resolve here may be a
+	// pooled transient still in use by an earlier pass on this queue, so
+	// unlike the single-subpass path, this always orders against prior
+	// color writes and input attachment reads.
+	dependencies[dep_count++] = (VkSubpassDependency2){
+		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 		.srcSubpass    = VK_SUBPASS_EXTERNAL,
 		.dstSubpass    = 0,
-		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
-			? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-			: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.srcAccessMask = 0,
+		.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	};
-	// External → subpass 0: depth
+	// External → subpass 0: depth. With no later subpass reading depth its store
+	// lands at the subpass 0 boundary, WAW against the next frame's loadOp.
 	if (has_depth) {
-		dependencies[dep_count++] = (VkSubpassDependency){
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 			.srcSubpass    = VK_SUBPASS_EXTERNAL,
 			.dstSubpass    = 0,
-			.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			.srcStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 			.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.srcAccessMask = 0,
+			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 		};
 	}
+	// External → subpass 0: pooled depth-resolve transient — order its
+	// UNDEFINED transition after any prior-pass use on this queue.
+	if (resolve_depth) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = VK_SUBPASS_EXTERNAL,
+			.dstSubpass    = 0,
+			.srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		};
+	}
 
-	// Subpass N → N+1: tile-local dependency (covers resolve + postfx chain)
+	// Every subpass past 0 writes a colour attachment first used there: the
+	// resolve target, a pooled intermediate, or the final output. Its layout
+	// transition lands at that subpass boundary, so external→0 never covers it,
+	// and a pooled target may still be in use by an earlier pass on this queue.
+	for (uint32_t sp = 1; sp < subpass_count; sp++) {
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.srcSubpass    = VK_SUBPASS_EXTERNAL,
+			.dstSubpass    = sp,
+			.srcStageMask  = _skr_first_use_dep[sp_first[sp]].src_stage,
+			.dstStageMask  = _skr_first_use_dep[sp_first[sp]].dst_stage,
+			.srcAccessMask = _skr_first_use_dep[sp_first[sp]].src_access,
+			.dstAccessMask = _skr_first_use_dep[sp_first[sp]].dst_access,
+		};
+	}
+
+	// Subpass N → N+1: tile-local dependency (covers resolve + postfx chain).
+	// In a tile shading pass the consuming subpass reads the attachment as a
+	// tile attachment too; that access is a 64-bit sync2 flag, so it's carried
+	// by a chained VkMemoryBarrier2 (which supersedes the dependency's own
+	// masks). BY_REGION in a tile shading pass is tile-granular rather than
+	// pixel-granular — exactly what makes the neighborhood reads legal.
+	VkMemoryBarrier2 tile_read_barriers[SKR_POSTFX_MAX_SUBPASSES];
 	for (uint32_t s = 0; s + 1 < subpass_count; s++) {
-		dependencies[dep_count++] = (VkSubpassDependency){
+		if (key->flags & skr_rp_flag_tile_shading) {
+			tile_read_barriers[s] = (VkMemoryBarrier2){
+				.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+				.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+				.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+				.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+				.dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_2_SHADER_TILE_ATTACHMENT_READ_BIT_QCOM,
+			};
+		}
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			.pNext           = (key->flags & skr_rp_flag_tile_shading) ? &tile_read_barriers[s] : NULL,
 			.srcSubpass      = s,
 			.dstSubpass      = s + 1,
 			.srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -797,320 +1165,54 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 	}
 
+	// Geometry → each depth-reading subpass: depth writes (and the on-tile
+	// depth resolve, which Vulkan places in late fragment tests / color
+	// output) must land before depth is read as an input attachment.
+	if (reads_depth || resolve_reads) {
+		for (uint32_t sp = 1; sp < subpass_count; sp++) {
+			bool is_resolve_sp = (key->flags & skr_rp_flag_resolve_subpass) && sp == 1;
+			if (is_resolve_sp ? !resolve_reads : !reads_depth) continue;
+			dependencies[dep_count++] = (VkSubpassDependency2){
+				.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+				.srcSubpass      = 0,
+				.dstSubpass      = sp,
+				.srcStageMask    = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				.dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				.srcAccessMask   = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				.dstAccessMask   = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+				.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+			};
+		}
+	}
+
 	// Subpass → EXTERNAL: ensure writes complete before downstream shader reads
 	// when finalLayout transitions to a readable layout (free on tilers).
 	if (final_output_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
 	    (resolve_is_final && key->final_resolve_layout && key->final_resolve_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
-		dependencies[dep_count++] = (VkSubpassDependency){
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 			.srcSubpass    = subpass_count - 1,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
 	}
 	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-		dependencies[dep_count++] = (VkSubpassDependency){
-			.srcSubpass    = 0,  // Depth is only used in geometry subpass
+		dependencies[dep_count++] = (VkSubpassDependency2){
+			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
+			// A subpass that never touched depth can't source its write
+			.srcSubpass    = reads_depth ? subpass_count - 1 : (resolve_reads ? 1 : 0),
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
-			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.srcStageMask  = (reads_depth || resolve_reads) ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
 	}
 
-	// --- Multiview ---
-	uint32_t view_masks[SKR_POSTFX_MAX_SUBPASSES];
-	for (uint32_t s = 0; s < subpass_count; s++)
-		view_masks[s] = key->view_mask;
-
-	VkRenderPassMultiviewCreateInfo multiview_info = {
-		.sType                = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
-		.subpassCount         = subpass_count,
-		.pViewMasks           = view_masks,
-		.correlationMaskCount = key->correlation_mask ? 1 : 0,
-		.pCorrelationMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
-	};
-
-	VkRenderPassCreateInfo render_pass_info = {
-		.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.pNext           = key->view_mask != 0 ? &multiview_info : NULL,
-		.attachmentCount = attachment_count,
-		.pAttachments    = attachments,
-		.subpassCount    = subpass_count,
-		.pSubpasses      = subpasses,
-		.dependencyCount = dep_count,
-		.pDependencies   = dependencies,
-	};
-
-	VkRenderPass render_pass;
-	VkResult vr = vkCreateRenderPass(_skr_vk.device, &render_pass_info, NULL, &render_pass);
-	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass (postfx)", VK_NULL_HANDLE);
-
-	char name[256];
-	snprintf(name, sizeof(name), "rpass_%s%s%u_",
-		key->has_resolve_subpass ? "resolve_" : "",
-		key->use_custom_resolve_flags ? "cr_" : "",
-		key->postfx_count);
-	_skr_append_renderpass_config(name, sizeof(name), key);
-	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
-
-	return render_pass;
-}
-
-// Render pass 2 variant of the multi-subpass (postfx / manual-resolve) path. Mirrors the v1
-// function above with VkRenderPassCreateInfo2 structs and a per-subpass viewMask (instead of
-// the chained VkRenderPassMultiviewCreateInfo), so both paths stay feature-equivalent.
-static VkRenderPass _skr_pipeline_create_multisubpass_renderpass_v2(const skr_pipeline_renderpass_key_t* key) {
-	VkAttachmentDescription2 attachments[SKR_POSTFX_MAX_ATTACHMENTS];
-	uint32_t                 attachment_count = 0;
-
-	bool use_msaa  = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
-	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
-	bool has_depth = key->depth_format != VK_FORMAT_UNDEFINED;
-
-	int32_t color_idx   = -1;
-	int32_t resolve_idx = -1;
-	int32_t depth_idx   = -1;
-	int32_t output_idx  = -1;
-	int32_t intermediate_start = -1;
-
-	// [0] Color attachment (MSAA or direct) — geometry subpass output
-	if (has_color) {
-		color_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription2){
-			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-			.format         = key->color_format,
-			.samples        = key->samples,
-			.loadOp         = key->color_load_op,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		};
-	}
-
-	// [1] Resolve attachment (for MSAA)
-	bool resolve_is_final = use_msaa && key->has_resolve_subpass && key->postfx_count == 0;
-	if (use_msaa) {
-		resolve_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription2){
-			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-			.format         = key->resolve_format,
-			.samples        = VK_SAMPLE_COUNT_1_BIT,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.storeOp        = resolve_is_final ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		};
-	}
-
-	// [2] Depth attachment
-	VkImageLayout depth_final       = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	bool          depth_has_stencil = has_depth && _skr_format_has_stencil(key->depth_format);
-	if (has_depth) {
-		depth_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription2){
-			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-			.format         = key->depth_format,
-			.samples        = key->samples,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp        = key->depth_store_op,
-			.stencilLoadOp  = depth_has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = depth_has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = depth_final,
-		};
-	}
-
-	// [3..] Intermediate transient color attachments for postfx chaining
-	VkFormat intermediate_format = use_msaa ? key->resolve_format : key->color_format;
-	if (key->postfx_output_format != VK_FORMAT_UNDEFINED)
-		intermediate_format = key->postfx_output_format;
-	uint32_t intermediate_count = key->postfx_count > 1 ? key->postfx_count - 1 : 0;
-	if (intermediate_count > 0) {
-		intermediate_start = (int32_t)attachment_count;
-		for (uint32_t i = 0; i < intermediate_count; i++) {
-			attachments[attachment_count++] = (VkAttachmentDescription2){
-				.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-				.format         = intermediate_format,
-				.samples        = VK_SAMPLE_COUNT_1_BIT,
-				.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-				.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			};
-		}
-	}
-
-	// [last] Final postfx output attachment (skip when resolve-only)
-	VkImageLayout final_output_layout = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	if (!resolve_is_final) {
-		VkFormat output_format = key->postfx_output_format != VK_FORMAT_UNDEFINED ? key->postfx_output_format : (use_msaa ? key->resolve_format : key->color_format);
-		output_idx = (int32_t)attachment_count;
-		attachments[attachment_count++] = (VkAttachmentDescription2){
-			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-			.format         = output_format,
-			.samples        = VK_SAMPLE_COUNT_1_BIT,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = final_output_layout,
-		};
-	} else if (resolve_idx >= 0 && key->final_resolve_layout) {
-		attachments[resolve_idx].finalLayout = key->final_resolve_layout;
-	}
-
-	// --- Subpasses ---
-	uint32_t resolve_subpass_count = key->has_resolve_subpass ? 1 : 0;
-	uint32_t subpass_count         = 1 + resolve_subpass_count + key->postfx_count;
-
-	VkAttachmentReference2 color_refs  [SKR_POSTFX_MAX_SUBPASSES];
-	VkAttachmentReference2 resolve_refs[SKR_POSTFX_MAX_SUBPASSES];
-	VkAttachmentReference2 input_refs  [SKR_POSTFX_MAX_SUBPASSES];
-	VkAttachmentReference2 depth_ref   = {
-		.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-		.attachment = VK_ATTACHMENT_UNUSED,
-		.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-		.aspectMask = (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (depth_has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)),
-	};
-	if (depth_idx >= 0) depth_ref.attachment = (uint32_t)depth_idx;
-
-	VkSubpassDescription2 subpasses[SKR_POSTFX_MAX_SUBPASSES];
-	memset(subpasses, 0, sizeof(subpasses));
-
-	// Subpass 0: Geometry
-	color_refs[0] = (VkAttachmentReference2){
-		.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-		.attachment = has_color ? (uint32_t)color_idx : VK_ATTACHMENT_UNUSED,
-		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	};
-	resolve_refs[0] = (VkAttachmentReference2){
-		.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-		.attachment = use_msaa ? (uint32_t)resolve_idx : VK_ATTACHMENT_UNUSED,
-		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	};
-	bool use_auto_resolve = use_msaa && !key->has_resolve_subpass;
-	subpasses[0] = (VkSubpassDescription2){
-		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
-		.viewMask                = key->view_mask,
-		.colorAttachmentCount    = has_color ? 1 : 0,
-		.pColorAttachments       = has_color ? &color_refs[0] : NULL,
-		.pResolveAttachments     = use_auto_resolve ? &resolve_refs[0] : NULL,
-		.pDepthStencilAttachment = has_depth ? &depth_ref : NULL,
-	};
-
-	// Subpass 1 (optional): Manual MSAA resolve
-	uint32_t next_sp = 1;
-	if (key->has_resolve_subpass) {
-		input_refs[0] = (VkAttachmentReference2){
-			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-			.attachment = (uint32_t)color_idx, .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		};
-		color_refs[1] = (VkAttachmentReference2){
-			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-			.attachment = (uint32_t)resolve_idx, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		};
-		subpasses[1] = (VkSubpassDescription2){
-			.sType                = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-			.flags                = key->use_custom_resolve_flags ? (VK_SUBPASS_DESCRIPTION_FRAGMENT_REGION_BIT_QCOM | VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM) : 0,
-			.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			.viewMask             = key->view_mask,
-			.inputAttachmentCount = 1,
-			.pInputAttachments    = &input_refs[0],
-			.colorAttachmentCount = 1,
-			.pColorAttachments    = &color_refs[1],
-		};
-		next_sp = 2;
-	}
-
-	// PostFX subpasses
-	int32_t prev_color_attachment = (use_msaa || key->has_resolve_subpass) ? resolve_idx : color_idx;
-	for (uint32_t p = 0; p < key->postfx_count; p++) {
-		uint32_t sp      = next_sp + p;
-		bool     is_last = (p == key->postfx_count - 1);
-		uint32_t iref    = resolve_subpass_count + p;
-		input_refs[iref] = (VkAttachmentReference2){
-			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-			.attachment = (uint32_t)prev_color_attachment, .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		};
-		int32_t this_output = is_last ? output_idx : intermediate_start + (int32_t)p;
-		color_refs[sp] = (VkAttachmentReference2){
-			.sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-			.attachment = (uint32_t)this_output, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-		};
-		subpasses[sp] = (VkSubpassDescription2){
-			.sType                = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-			.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			.viewMask             = key->view_mask,
-			.inputAttachmentCount = 1,
-			.pInputAttachments    = &input_refs[iref],
-			.colorAttachmentCount = 1,
-			.pColorAttachments    = &color_refs[sp],
-		};
-		prev_color_attachment = this_output;
-	}
-
-	// --- Dependencies ---
-	VkSubpassDependency2 dependencies[SKR_POSTFX_MAX_SUBPASSES + 4];
-	uint32_t dep_count = 0;
-	dependencies[dep_count++] = (VkSubpassDependency2){
-		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-		.srcSubpass    = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
-		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.srcAccessMask = 0, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	};
-	if (has_depth) {
-		dependencies[dep_count++] = (VkSubpassDependency2){
-			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			.srcSubpass    = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
-			.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.srcAccessMask = 0, .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-		};
-	}
-	for (uint32_t s = 0; s + 1 < subpass_count; s++) {
-		dependencies[dep_count++] = (VkSubpassDependency2){
-			.sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			.srcSubpass      = s, .dstSubpass = s + 1,
-			.srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			.srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			.dstAccessMask   = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
-			.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
-		};
-	}
-	if (final_output_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-	    (resolve_is_final && key->final_resolve_layout && key->final_resolve_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
-		dependencies[dep_count++] = (VkSubpassDependency2){
-			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			.srcSubpass    = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL,
-			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		};
-	}
-	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-		dependencies[dep_count++] = (VkSubpassDependency2){
-			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			.srcSubpass    = 0, .dstSubpass = VK_SUBPASS_EXTERNAL,
-			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		};
-	}
-
+	// --- Create ---
 	VkRenderPassCreateInfo2 render_pass_info = {
 		.sType                   = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
 		.attachmentCount         = attachment_count,
@@ -1123,36 +1225,103 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass_v2(const skr_pi
 		.pCorrelatedViewMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
 	};
 
-	VkRenderPass render_pass;
-	VkResult vr = vkCreateRenderPass2KHR(_skr_vk.device, &render_pass_info, NULL, &render_pass);
-	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass2KHR (postfx)", VK_NULL_HANDLE);
+	// Mark the whole render pass as a tile shading pass with the requested apron
+	VkRenderPassTileShadingCreateInfoQCOM tile_shading_info = {
+		.sType         = VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM,
+		.flags         = VK_TILE_SHADING_RENDER_PASS_ENABLE_BIT_QCOM,
+		.tileApronSize = { key->tile_apron[0], key->tile_apron[1] },
+	};
+	if (key->flags & skr_rp_flag_tile_shading) {
+		tile_shading_info.pNext = (void*)render_pass_info.pNext;
+		render_pass_info.pNext  = &tile_shading_info;
+	}
 
-	char name[256];
-	snprintf(name, sizeof(name), "rpass2_%s%s%u_", key->has_resolve_subpass ? "resolve_" : "", key->use_custom_resolve_flags ? "cr_" : "", key->postfx_count);
+	// Subpass merge feedback — drivers that report it tell us whether this
+	// chain actually merged into one tile pass. Tile-locality of the whole
+	// postfx system depends on merging, so surface it in the log.
+	VkRenderPassCreationFeedbackInfoEXT       merge_feedback      = {0};
+	VkRenderPassCreationFeedbackCreateInfoEXT merge_feedback_info = {
+		.sType               = VK_STRUCTURE_TYPE_RENDER_PASS_CREATION_FEEDBACK_CREATE_INFO_EXT,
+		.pRenderPassFeedback = &merge_feedback,
+	};
+	VkRenderPassSubpassFeedbackInfoEXT       subpass_feedback     [SKR_POSTFX_MAX_SUBPASSES] = {0};
+	VkRenderPassSubpassFeedbackCreateInfoEXT subpass_feedback_info[SKR_POSTFX_MAX_SUBPASSES];
+	bool merge_report = _skr_vk.has_subpass_merge_feedback && _skr_vk.has_create_renderpass2;
+	if (merge_report) {
+		for (uint32_t s = 0; s < subpass_count; s++) {
+			subpass_feedback_info[s] = (VkRenderPassSubpassFeedbackCreateInfoEXT){
+				.sType            = VK_STRUCTURE_TYPE_RENDER_PASS_SUBPASS_FEEDBACK_CREATE_INFO_EXT,
+				.pNext            = subpasses[s].pNext,
+				.pSubpassFeedback = &subpass_feedback[s],
+			};
+			subpasses[s].pNext = &subpass_feedback_info[s];
+		}
+		merge_feedback_info.pNext = render_pass_info.pNext;
+		render_pass_info.pNext    = &merge_feedback_info;
+	}
+
+	VkRenderPass render_pass;
+	if (_skr_vk.has_create_renderpass2) {
+		PFN_vkCreateRenderPass2 create2 = vkCreateRenderPass2 ? vkCreateRenderPass2 : vkCreateRenderPass2KHR;
+		VkResult vr = create2(_skr_vk.device, &render_pass_info, NULL, &render_pass);
+		SKR_VK_CHECK_RET(vr, "vkCreateRenderPass2 (postfx)", VK_NULL_HANDLE);
+
+		// Render passes are cached, so this logs once per unique pass config
+		if (merge_report) {
+			skr_log(skr_log_info, "Postfx render pass: %u subpasses ran as %u after merging", subpass_count, merge_feedback.postMergeSubpassCount);
+			for (uint32_t s = 0; s < subpass_count; s++) {
+				if (subpass_feedback[s].subpassMergeStatus != VK_SUBPASS_MERGE_STATUS_MERGED_EXT)
+					skr_log(skr_log_info, "  subpass %u unmerged (status %u): %s", s, (uint32_t)subpass_feedback[s].subpassMergeStatus, subpass_feedback[s].description);
+			}
+		}
+	} else {
+		render_pass = _skr_renderpass_create_compat(&render_pass_info, key->view_mask);
+		if (render_pass == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+	}
+
+	char name[512]; // shader name is up to 256, plus the config suffixes
+	snprintf(name, sizeof(name), "rpass_%s%s%s%s%u_",
+		(key->flags & skr_rp_flag_resolve_subpass)     ? "resolve_" : "",
+		(key->flags & skr_rp_flag_custom_resolve)      ? "cr_"      : "",
+		(key->flags & skr_rp_flag_resolve_reads_depth) ? "rdin_"    : "",
+		(key->flags & skr_rp_flag_postfx_reads_depth)  ? "din_"     : "",
+		key->postfx_count);
 	_skr_append_renderpass_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
+
 	return render_pass;
 }
 
-// Render pass 2 variant of the single-subpass path. Behavior-identical to the v1 function
-// below — same attachments, refs, dependencies — but built with VkRenderPassCreateInfo2
-// (multiview via the built-in viewMask instead of a chained struct). This is the prerequisite
-// for MSRTSS, so it's used whenever the device supports VK_KHR_create_renderpass2.
-static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_renderpass_key_t* key) {
-	VkAttachmentDescription2 attachments[4];
-	uint32_t attachment_count = 0;
+// Single-subpass render pass. Built with renderpass2 structs so the subpass can
+// chain VkMultisampledRenderToSingleSampledInfoEXT and the create info can
+// chain the fragment density map attachment. Devices without
+// VK_KHR_create_renderpass2 go through _skr_renderpass_create_compat, which
+// never sees those keys: both features require the extension.
+static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpass_key_t* key) {
+	// Multi-subpass path for postfx and/or manual resolve
+	if (key->postfx_count > 0 || (key->flags & skr_rp_flag_resolve_subpass))
+		return _skr_pipeline_create_multisubpass_renderpass(key);
 
-	bool use_msaa  = !key->msrtss && key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
+	bool msrtss    = (key->flags & skr_rp_flag_msrtss) != 0;
+	bool fdm       = (key->flags & skr_rp_flag_fragment_density_map) != 0;
+	bool use_msaa  = !msrtss && key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
 	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
-	// MSRTSS renders into single-sample attachments at `samples` and resolves in-tile on store,
-	// so there's no separate resolve attachment and the attachments themselves are 1-sample.
-	VkSampleCountFlagBits attach_samples = key->msrtss ? VK_SAMPLE_COUNT_1_BIT : key->samples;
+	bool has_depth = key->depth_format != VK_FORMAT_UNDEFINED;
+	if ((msrtss || fdm) && !_skr_vk.has_create_renderpass2) {
+		skr_log(skr_log_critical, "MSRTSS and fragment density maps require VK_KHR_create_renderpass2");
+		return VK_NULL_HANDLE;
+	}
 
-	VkAttachmentReference2 color_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 };
+	// MSRTSS attachments are single-sample; the subpass rasterizes at key->samples
+	// and resolves into them on store.
+	VkSampleCountFlagBits attach_samples = msrtss ? VK_SAMPLE_COUNT_1_BIT : key->samples;
+
+	VkAttachmentDescription2 attachments[4];
+	uint32_t                 attachment_count = 0;
+
+	VkAttachmentReference2 color_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, .attachment = VK_ATTACHMENT_UNUSED };
 	if (has_color) {
-		VkImageLayout color_initial = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD)
-			? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-			: VK_IMAGE_LAYOUT_UNDEFINED;
+		// When loading previous contents, initialLayout must match the current layout
 		attachments[attachment_count] = (VkAttachmentDescription2){
 			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->color_format,
@@ -1161,16 +1330,15 @@ static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_render
 			.storeOp        = use_msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = color_initial,
+			.initialLayout  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
 			.finalLayout    = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
-		color_ref.attachment = attachment_count;
+		color_ref.attachment = attachment_count++;
 		color_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 		color_ref.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		attachment_count++;
 	}
 
-	VkAttachmentReference2 resolve_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 };
+	VkAttachmentReference2 resolve_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, .attachment = VK_ATTACHMENT_UNUSED };
 	if (use_msaa) {
 		attachments[attachment_count] = (VkAttachmentDescription2){
 			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
@@ -1183,16 +1351,15 @@ static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_render
 			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
 			.finalLayout    = key->final_resolve_layout ? key->final_resolve_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		};
-		resolve_ref.attachment = attachment_count;
+		resolve_ref.attachment = attachment_count++;
 		resolve_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 		resolve_ref.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		attachment_count++;
 	}
 
-	VkAttachmentReference2 depth_ref = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 };
-	VkImageLayout depth_final = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	if (key->depth_format != VK_FORMAT_UNDEFINED) {
-		bool has_stencil = _skr_format_has_stencil(key->depth_format);
+	VkAttachmentReference2 depth_ref   = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, .attachment = VK_ATTACHMENT_UNUSED };
+	VkImageLayout          depth_final = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	bool                   has_stencil = has_depth && _skr_format_has_stencil(key->depth_format);
+	if (has_depth) {
 		attachments[attachment_count] = (VkAttachmentDescription2){
 			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->depth_format,
@@ -1202,18 +1369,19 @@ static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_render
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
-				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-				: VK_IMAGE_LAYOUT_UNDEFINED,
+				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL  // Readable depth: explicitly transitioned before render pass
+				: VK_IMAGE_LAYOUT_UNDEFINED,                        // Transient discard: never explicitly transitioned, loadOp=CLEAR handles it
 			.finalLayout    = depth_final,
 		};
-		depth_ref.attachment = attachment_count;
+		depth_ref.attachment = attachment_count++;
 		depth_ref.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-		depth_ref.aspectMask = (VkImageAspectFlags)(VK_IMAGE_ASPECT_DEPTH_BIT | (has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0));
-		attachment_count++;
+		depth_ref.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | (has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
 	}
 
-	uint32_t fdm_attachment_index = VK_ATTACHMENT_UNUSED;
-	if (key->fragment_density_map) {
+	// The density map is referenced by VkRenderPassFragmentDensityMapCreateInfoEXT,
+	// not by the subpass. The runtime fills it and it stays in FDM layout.
+	uint32_t fdm_attachment = VK_ATTACHMENT_UNUSED;
+	if (fdm) {
 		attachments[attachment_count] = (VkAttachmentDescription2){
 			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = VK_FORMAT_R8G8_UNORM,
@@ -1225,77 +1393,88 @@ static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_render
 			.initialLayout  = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
 			.finalLayout    = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
 		};
-		fdm_attachment_index = attachment_count;
-		attachment_count++;
+		fdm_attachment = attachment_count++;
 	}
 
-	// MSRTSS: rasterize at `samples` into the single-sample attachments and resolve on store. A
-	// stored depth attachment is resolved in-place (no separate resolve attachment), so when
-	// there's depth we specify resolve modes; SAMPLE_ZERO is always supported.
-	bool has_stencil_fmt = key->depth_format != VK_FORMAT_UNDEFINED && _skr_format_has_stencil(key->depth_format);
+	// MSRTSS resolves a stored depth attachment in place, so the subpass needs
+	// resolve modes; SAMPLE_ZERO is always supported.
 	VkSubpassDescriptionDepthStencilResolve depth_resolve = {
 		.sType              = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
 		.depthResolveMode   = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-		.stencilResolveMode = has_stencil_fmt ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
+		.stencilResolveMode = has_stencil ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
 	};
 	VkMultisampledRenderToSingleSampledInfoEXT msrtss_info = {
 		.sType                                   = VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT,
-		.pNext                                   = key->depth_format != VK_FORMAT_UNDEFINED ? &depth_resolve : NULL,
+		.pNext                                   = has_depth ? &depth_resolve : NULL,
 		.multisampledRenderToSingleSampledEnable = VK_TRUE,
 		.rasterizationSamples                    = key->samples,
 	};
 	VkSubpassDescription2 subpass = {
 		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-		.pNext                   = key->msrtss ? &msrtss_info : NULL,
+		.pNext                   = msrtss ? &msrtss_info : NULL,
 		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
 		.viewMask                = key->view_mask,
 		.colorAttachmentCount    = has_color ? 1 : 0,
-		.pColorAttachments       = has_color ? &color_ref : NULL,
-		.pResolveAttachments     = use_msaa ? &resolve_ref : NULL,
-		.pDepthStencilAttachment = key->depth_format != VK_FORMAT_UNDEFINED ? &depth_ref : NULL,
+		.pColorAttachments       = has_color ? &color_ref   : NULL,
+		.pResolveAttachments     = use_msaa  ? &resolve_ref : NULL,
+		.pDepthStencilAttachment = has_depth ? &depth_ref   : NULL,
 	};
 
+	// Subpass dependencies
+	// srcStageMask must cover the implicit initialLayout transition, not just the
+	// loadOp. loadOp=CLEAR discards previous *contents*, but the transition is
+	// itself a full-image write that happens inside this dependency — so a
+	// TOP_OF_PIPE source (which orders against nothing) leaves it unsynchronized
+	// against both the acquire semaphore and the prior frame's storeOp.
+	// Each dependency sources from the stage matching its own attachment type, so
+	// depth work doesn't get serialized behind unrelated color work, or vice versa.
 	VkSubpassDependency2 dependencies[4];
-	uint32_t dep_count = 0;
+	uint32_t             dep_count = 0;
 	dependencies[dep_count++] = (VkSubpassDependency2){
 		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 		.srcSubpass    = VK_SUBPASS_EXTERNAL,
 		.dstSubpass    = 0,
-		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.srcAccessMask = 0,
+		// The transition/loadOp write is WAW against the prior frame's storeOp on
+		// the same image, so this needs a memory dependency, not just execution.
+		.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	};
 	dependencies[dep_count++] = (VkSubpassDependency2){
 		.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 		.srcSubpass    = VK_SUBPASS_EXTERNAL,
 		.dstSubpass    = 0,
-		.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		.srcStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 		.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-		.srcAccessMask = 0,
+		.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 	};
+
+	// When finalLayout differs from the in-pass layout, the render pass performs
+	// an implicit transition. Add subpass→EXTERNAL dependency to ensure writes
+	// complete before downstream shader reads. This is free on tile-based GPUs.
 	VkImageLayout color_final   = key->final_color_layout   ? key->final_color_layout   : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	VkImageLayout resolve_final = key->final_resolve_layout ? key->final_resolve_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	if ((has_color && color_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ||
+	if ((has_color && color_final   != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ||
 	    (use_msaa  && resolve_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 			.srcSubpass    = 0,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
 	}
-	if (key->depth_format != VK_FORMAT_UNDEFINED && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 			.srcSubpass    = 0,
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
@@ -1303,12 +1482,11 @@ static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_render
 
 	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = {
 		.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
-		.fragmentDensityMapAttachment = { .attachment = fdm_attachment_index, .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT },
+		.fragmentDensityMapAttachment = { .attachment = fdm_attachment, .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT },
 	};
-
 	VkRenderPassCreateInfo2 render_pass_info = {
 		.sType                   = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
-		.pNext                   = key->fragment_density_map ? (const void*)&fdm_info : NULL,
+		.pNext                   = fdm ? &fdm_info : NULL,
 		.attachmentCount         = attachment_count,
 		.pAttachments            = attachments,
 		.subpassCount            = 1,
@@ -1320,220 +1498,16 @@ static VkRenderPass _skr_pipeline_create_renderpass_v2(const skr_pipeline_render
 	};
 
 	VkRenderPass render_pass;
-	VkResult vr = vkCreateRenderPass2KHR(_skr_vk.device, &render_pass_info, NULL, &render_pass);
-	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass2KHR", VK_NULL_HANDLE);
-
-	char name[256];
-	snprintf(name, sizeof(name), "rpass2_");
-	_skr_append_renderpass_config(name, sizeof(name), key);
-	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
-	return render_pass;
-}
-
-static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpass_key_t* key) {
-	// Multi-subpass path for postfx and/or manual resolve. Prefer render pass 2 when available.
-	if (key->postfx_count > 0 || key->has_resolve_subpass)
-		return _skr_vk.has_renderpass2
-			? _skr_pipeline_create_multisubpass_renderpass_v2(key)
-			: _skr_pipeline_create_multisubpass_renderpass(key);
-
-	// Single-subpass: prefer render pass 2 when available (required for MSRTSS); v1 below is the fallback.
-	if (_skr_vk.has_renderpass2)
-		return _skr_pipeline_create_renderpass_v2(key);
-
-	VkAttachmentDescription attachments[4];
-	uint32_t attachment_count = 0;
-
-	bool use_msaa  = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
-	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
-
-	// Color attachment (MSAA if samples > 1) - only if we have a color format
-	VkAttachmentReference color_ref = {0};
-	if (has_color) {
-		// When loading previous contents, initialLayout must match the current layout
-		VkImageLayout color_initial = (key->color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD)
-			? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-			: VK_IMAGE_LAYOUT_UNDEFINED;
-		attachments[attachment_count] = (VkAttachmentDescription){
-			.format         = key->color_format,
-			.samples        = key->samples,
-			.loadOp         = key->color_load_op,
-			.storeOp        = use_msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = color_initial,
-			.finalLayout    = key->final_color_layout ? key->final_color_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		};
-
-		color_ref.attachment = attachment_count;
-		color_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		attachment_count++;
+	if (_skr_vk.has_create_renderpass2) {
+		PFN_vkCreateRenderPass2 create2 = vkCreateRenderPass2 ? vkCreateRenderPass2 : vkCreateRenderPass2KHR;
+		VkResult vr = create2(_skr_vk.device, &render_pass_info, NULL, &render_pass);
+		SKR_VK_CHECK_RET(vr, "vkCreateRenderPass2", VK_NULL_HANDLE);
+	} else {
+		render_pass = _skr_renderpass_create_compat(&render_pass_info, key->view_mask);
+		if (render_pass == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 	}
 
-	// Resolve attachment (for MSAA)
-	VkAttachmentReference resolve_ref = {0};
-	if (use_msaa) {
-		attachments[attachment_count] = (VkAttachmentDescription){
-			.format         = key->resolve_format,  // Use the actual resolve target format
-			.samples        = VK_SAMPLE_COUNT_1_BIT,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
-			.finalLayout    = key->final_resolve_layout ? key->final_resolve_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		};
-		resolve_ref.attachment = attachment_count;
-		resolve_ref.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		attachment_count++;
-	}
-
-	// Depth attachment (if present)
-	VkAttachmentReference depth_ref = {0};
-	VkImageLayout depth_final = key->final_depth_layout ? key->final_depth_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	if (key->depth_format != VK_FORMAT_UNDEFINED) {
-		// Check if this is a depth+stencil format
-		bool has_stencil = _skr_format_has_stencil(key->depth_format);
-
-		attachments[attachment_count] = (VkAttachmentDescription){
-			.format         = key->depth_format,
-			.samples        = key->samples,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp        = key->depth_store_op,  // Use the store op from the key (based on readable flag)
-			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = has_stencil ? key->depth_store_op         : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = key->depth_store_op == VK_ATTACHMENT_STORE_OP_STORE
-				? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL  // Readable depth: explicitly transitioned before render pass
-				: VK_IMAGE_LAYOUT_UNDEFINED,                        // Transient discard: never explicitly transitioned, loadOp=CLEAR handles it
-			.finalLayout    = depth_final,
-		};
-
-		depth_ref.attachment = attachment_count;
-		depth_ref.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-		attachment_count++;
-	}
-
-	// Fragment density map attachment (foveation). Not referenced by the subpass like
-	// color/depth — only by VkRenderPassFragmentDensityMapCreateInfoEXT below. The runtime
-	// fills its contents (LOAD), and it stays in FDM-optimal layout (no transition).
-	uint32_t fdm_attachment_index = VK_ATTACHMENT_UNUSED;
-	if (key->fragment_density_map) {
-		attachments[attachment_count] = (VkAttachmentDescription){
-			.format         = VK_FORMAT_R8G8_UNORM,  // FDM images are always R8G8_UNORM
-			.samples        = VK_SAMPLE_COUNT_1_BIT,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
-			.finalLayout    = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
-		};
-		fdm_attachment_index = attachment_count;
-		attachment_count++;
-	}
-
-	// Subpass
-	VkSubpassDescription subpass = {
-		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
-		.colorAttachmentCount    = has_color ? 1 : 0,
-		.pColorAttachments       = has_color ? &color_ref : NULL,
-		.pResolveAttachments     = use_msaa ? &resolve_ref : NULL,
-		.pDepthStencilAttachment = key->depth_format != VK_FORMAT_UNDEFINED ? &depth_ref : NULL,
-	};
-
-	// Subpass dependencies
-	// Use TOP_OF_PIPE for clears to avoid unnecessary execution dependency on
-	// prior fragment/color work. loadOp=CLEAR discards previous contents so
-	// there's no data hazard with earlier passes.
-	VkSubpassDependency dependencies[4];
-	uint32_t dep_count = 0;
-
-	dependencies[dep_count++] = (VkSubpassDependency){
-		.srcSubpass    = VK_SUBPASS_EXTERNAL,
-		.dstSubpass    = 0,
-		.srcStageMask  = key->color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR
-			? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-			: VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.srcAccessMask = 0,
-		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	};
-	dependencies[dep_count++] = (VkSubpassDependency){
-		.srcSubpass    = VK_SUBPASS_EXTERNAL,
-		.dstSubpass    = 0,
-		.srcStageMask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // Depth always clears, no prior dependency needed
-		.dstStageMask  = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-		.srcAccessMask = 0,
-		.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-	};
-
-	// When finalLayout differs from the in-pass layout, the render pass performs
-	// an implicit transition. Add subpass→EXTERNAL dependency to ensure writes
-	// complete before downstream shader reads. This is free on tile-based GPUs.
-	VkImageLayout color_final   = key->final_color_layout   ? key->final_color_layout   : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	VkImageLayout resolve_final = key->final_resolve_layout  ? key->final_resolve_layout  : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	if ((has_color && color_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) ||
-	    (use_msaa  && resolve_final != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
-		dependencies[dep_count++] = (VkSubpassDependency){
-			.srcSubpass    = 0,
-			.dstSubpass    = VK_SUBPASS_EXTERNAL,
-			.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		};
-	}
-	if (key->depth_format != VK_FORMAT_UNDEFINED && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-		dependencies[dep_count++] = (VkSubpassDependency){
-			.srcSubpass    = 0,
-			.dstSubpass    = VK_SUBPASS_EXTERNAL,
-			.srcStageMask  = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		};
-	}
-
-	// Chain multiview info when view_mask is set
-	VkRenderPassMultiviewCreateInfo multiview_info = {
-		.sType                = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
-		.subpassCount         = 1,
-		.pViewMasks           = &key->view_mask,
-		.correlationMaskCount = key->correlation_mask ? 1 : 0,
-		.pCorrelationMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
-	};
-
-	// Build the render pass pNext chain: [fdm] -> [multiview] -> NULL, including only what's set.
-	const void* rp_next = key->view_mask != 0 ? (const void*)&multiview_info : NULL;
-	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = {
-		.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
-		.fragmentDensityMapAttachment = {
-			.attachment = fdm_attachment_index,
-			.layout     = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
-		},
-	};
-	if (key->fragment_density_map) {
-		fdm_info.pNext = rp_next;
-		rp_next        = &fdm_info;
-	}
-
-	VkRenderPassCreateInfo render_pass_info = {
-		.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.pNext           = rp_next,
-		.attachmentCount = attachment_count,
-		.pAttachments    = attachments,
-		.subpassCount    = 1,
-		.pSubpasses      = &subpass,
-		.dependencyCount = dep_count,
-		.pDependencies   = dependencies,
-	};
-
-	VkRenderPass render_pass;
-	VkResult vr = vkCreateRenderPass(_skr_vk.device, &render_pass_info, NULL, &render_pass);
-	SKR_VK_CHECK_RET(vr, "vkCreateRenderPass", VK_NULL_HANDLE);
-
-	// Generate debug name based on render pass configuration
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	snprintf(name, sizeof(name), "rpass_");
 	_skr_append_renderpass_config(name, sizeof(name), key);
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)render_pass, name);
@@ -1558,12 +1532,59 @@ static VkPipelineLayout _skr_pipeline_create_layout(VkDescriptorSetLayout descri
 	return layout;
 }
 
+// Max vertex attributes a pipeline can wire. Vulkan guarantees
+// maxVertexInputAttributes >= 16, which comfortably covers every builtin and
+// realistic mesh format.
+#define SKR_MAX_VERTEX_ATTRIBUTES 16
+
+static const char* _skr_vert_class_name(skr_vert_class_ cls) {
+	switch (cls) {
+		case skr_vert_class_sint: return "int";
+		case skr_vert_class_uint: return "uint";
+		default:                  return "float";
+	}
+}
+
+// Logs a descriptive vertex-layout error naming both sides by semantic, so a
+// mismatch reads as a diagnosable message instead of garbage geometry or a
+// validation-layer crash. `reason` states which input failed and why.
+static void _skr_log_vertex_layout_error(const skr_shader_t* shader, const skr_vert_type_t* vert_type, const char* reason) {
+	char   shader_wants[256];
+	char   mesh_has    [256];
+	size_t pos;
+
+	const sksc_shader_meta_t* meta = &shader->meta;
+	pos = 0;
+	shader_wants[0] = '\0';
+	for (int32_t i = 0; i < meta->vertex_input_count && pos < sizeof(shader_wants); i++) {
+		const skr_vert_component_t* v = &meta->vertex_inputs[i];
+		pos += snprintf(shader_wants + pos, sizeof(shader_wants) - pos, "%s%s%d(loc%d)",
+			i == 0 ? "" : ", ", _skr_semantic_name(v->semantic), v->semantic_slot, v->location);
+	}
+	pos = 0;
+	mesh_has[0] = '\0';
+	for (uint32_t i = 0; i < vert_type->component_count && pos < sizeof(mesh_has); i++) {
+		const skr_vert_component_t* v = &vert_type->components[i];
+		pos += snprintf(mesh_has + pos, sizeof(mesh_has) - pos, "%s%s%d",
+			i == 0 ? "" : ", ", _skr_semantic_name(v->semantic), v->semantic_slot);
+	}
+
+	skr_log(skr_log_critical, "Shader '%s' vertex input mismatch: %s\n  shader inputs: %s\n  mesh provides: %s",
+		meta->name[0] ? meta->name : "shader", reason, shader_wants, mesh_has);
+}
+
 static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_idx, int32_t vertformat_idx) {
 	const _skr_pipeline_material_key_t*  mat_key   = &_skr_pipeline_cache.materials   [material_idx  ].key;
 	const skr_pipeline_renderpass_key_t* rp_key    = &_skr_pipeline_cache.renderpasses[renderpass_idx].key;
 	const skr_vert_type_t*               vert_type = &_skr_pipeline_cache.vertformats [vertformat_idx].vert_type;
 	const VkPipelineLayout               layout    =  _skr_pipeline_cache.materials   [material_idx  ].layout;
-	const VkRenderPass                   rp        =  _skr_pipeline_cache.renderpasses[renderpass_idx].render_pass;
+	const VkRenderPass                   rp        =  _skr_pipeline_get_renderpass(renderpass_idx);
+
+	// One specialization info is shared by both stages; Vulkan ignores map
+	// entries whose constantID isn't present in a stage's module.
+	VkSpecializationMapEntry  spec_entries[SKR_MAX_SPEC_CONSTANTS];
+	VkSpecializationInfo      spec_info;
+	const VkSpecializationInfo* spec = _skr_shader_make_spec_info(&mat_key->shader->meta, mat_key->spec_constant_values, spec_entries, &spec_info);
 
 	// Shader stages
 	VkPipelineShaderStageCreateInfo shader_stages[2];
@@ -1575,7 +1596,7 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 			.stage               = VK_SHADER_STAGE_VERTEX_BIT,
 			.module              = mat_key->shader->vertex_stage.shader,
 			.pName               = "vs",
-			.pSpecializationInfo = NULL,
+			.pSpecializationInfo = spec,
 		};
 	}
 
@@ -1585,17 +1606,73 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 			.stage               = VK_SHADER_STAGE_FRAGMENT_BIT,
 			.module              = mat_key->shader->pixel_stage.shader,
 			.pName               = "ps",
-			.pSpecializationInfo = NULL,
+			.pSpecializationInfo = spec,
 		};
 	}
 
-	// Vertex input - baked from vertex type
+	// Vertex input — wire mesh components to shader inputs by semantic + slot
+	// rather than by array position, so a mesh's component order is free of the
+	// shader's input declaration order. The attribute's location comes from the
+	// shader meta (the SPIR-V input location); format/offset/binding are reused
+	// from the vert type's baked attributes. Mesh components the shader does not
+	// consume are simply not emitted. See docs/PLAN_attribute_remap.md.
+	VkVertexInputAttributeDescription vert_attrs[SKR_MAX_VERTEX_ATTRIBUTES];
+	uint32_t                          vert_attr_count = 0;
+	if (vert_type) {
+		const sksc_shader_meta_t* meta = &mat_key->shader->meta;
+		for (int32_t in = 0; in < meta->vertex_input_count; in++) {
+			const skr_vert_component_t* input = &meta->vertex_inputs[in];
+
+			// Find the mesh component that carries this input's semantic + slot.
+			int32_t match = -1;
+			for (uint32_t c = 0; c < vert_type->component_count; c++) {
+				if (vert_type->components[c].semantic      == input->semantic &&
+				    vert_type->components[c].semantic_slot == input->semantic_slot) {
+					match = (int32_t)c;
+					break;
+				}
+			}
+			if (match == -1) {
+				char reason[128];
+				snprintf(reason, sizeof(reason), "no mesh component supplies input %s%d",
+					_skr_semantic_name(input->semantic), input->semantic_slot);
+				_skr_log_vertex_layout_error(mat_key->shader, vert_type, reason);
+				return VK_NULL_HANDLE;
+			}
+
+			// A buffer format's numeric class (int/uint/float, normalized ->
+			// float) must match the shader input's, or Vulkan reads garbage.
+			skr_vert_class_ mesh_class  = _skr_vert_fmt_class(vert_type->components[match].format);
+			skr_vert_class_ input_class = _skr_vert_fmt_class(input->format);
+			if (mesh_class != input_class) {
+				char reason[128];
+				snprintf(reason, sizeof(reason), "input %s%d expects %s but mesh supplies %s",
+					_skr_semantic_name(input->semantic), input->semantic_slot,
+					_skr_vert_class_name(input_class), _skr_vert_class_name(mesh_class));
+				_skr_log_vertex_layout_error(mat_key->shader, vert_type, reason);
+				return VK_NULL_HANDLE;
+			}
+
+			if (vert_attr_count >= SKR_MAX_VERTEX_ATTRIBUTES) {
+				skr_log(skr_log_critical, "Shader '%s' declares more than %d vertex inputs",
+					meta->name[0] ? meta->name : "shader", SKR_MAX_VERTEX_ATTRIBUTES);
+				return VK_NULL_HANDLE;
+			}
+			vert_attrs[vert_attr_count++] = (VkVertexInputAttributeDescription){
+				.location = input->location,
+				.binding  = vert_type->attributes[match].binding,
+				.format   = vert_type->attributes[match].format,
+				.offset   = vert_type->attributes[match].offset,
+			};
+		}
+	}
+
 	VkPipelineVertexInputStateCreateInfo vertex_input = {
 		.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount   = vert_type ? vert_type->binding_count : 0,
 		.pVertexBindingDescriptions      = vert_type ? vert_type->bindings : NULL,
-		.vertexAttributeDescriptionCount = vert_type ? vert_type->component_count : 0,
-		.pVertexAttributeDescriptions    = vert_type ? vert_type->attributes : NULL,
+		.vertexAttributeDescriptionCount = vert_attr_count,
+		.pVertexAttributeDescriptions    = vert_attr_count ? vert_attrs : NULL,
 	};
 
 	// Input assembly
@@ -1736,18 +1813,18 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 	};
 
 	// Build debug name before creation so it's available for error logging
-	char name[256];
+	char name[512]; // shader name is up to 256, plus the config suffixes
 	const char* shader_name = mat_key->shader->meta.name[0]
 		? mat_key->shader->meta.name
 		: "shader";
 
 	snprintf(name, sizeof(name), "pipeline_%s_(", shader_name);
-	_skr_append_material_config(name, sizeof(name), mat_key);
-	strcat(name, ")_(");
+	_skr_append_material_config  (name, sizeof(name), mat_key);
+	_skr_append_str              (name, sizeof(name), ")_(");
 	_skr_append_renderpass_config(name, sizeof(name), rp_key);
-	strcat(name, ")_(");
+	_skr_append_str              (name, sizeof(name), ")_(");
 	_skr_append_vertex_format    (name, sizeof(name), vert_type->components, vert_type->component_count);
-	strcat(name, ")");
+	_skr_append_str              (name, sizeof(name), ")");
 
 	VkPipeline pipeline;
 	VkResult   result = vkCreateGraphicsPipelines(_skr_vk.device, _skr_vk.pipeline_cache, 1, &pipeline_info, NULL, &pipeline);
@@ -1764,6 +1841,14 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 ///////////////////////////////////////////////////////////////////////////////
 // Framebuffer creation
 ///////////////////////////////////////////////////////////////////////////////
+
+// The density map rides on the image that ends up on screen: the resolve target
+// under separate-attachment MSAA, otherwise the color target. NULL = no foveation.
+skr_tex_t* _skr_framebuffer_fdm(skr_tex_t* opt_color, skr_tex_t* opt_resolve) {
+	if (opt_resolve && opt_resolve->fdm) return opt_resolve->fdm;
+	if (opt_color   && opt_color  ->fdm) return opt_color  ->fdm;
+	return NULL;
+}
 
 VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve) {
 	VkImageView attachments[4];
@@ -1795,11 +1880,10 @@ VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass,
 		// Multiview handles array layers via view_mask, so layers stays 1
 	}
 
-	// Fragment density map comes last, matching the render pass attachment order. It rides
-	// on the swapchain image: the resolve target under MSAA, otherwise the color target.
-	skr_tex_t* fdm_host = (opt_resolve && opt_resolve->fdm) ? opt_resolve : color;
-	if (fdm_host && fdm_host->fdm)
-		attachments[attachment_count++] = fdm_host->fdm->view;
+	// Fragment density map comes last, matching the render pass attachment order
+	skr_tex_t* fdm = _skr_framebuffer_fdm(color, opt_resolve);
+	if (fdm)
+		attachments[attachment_count++] = fdm->view;
 
 	VkFramebufferCreateInfo framebuffer_info = {
 		.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,

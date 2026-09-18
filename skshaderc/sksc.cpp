@@ -8,12 +8,14 @@
 #include "_sksc.h"
 
 #include "array.h"
+#include "smolv.h"
 
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 ///////////////////////////////////////////
 
@@ -21,20 +23,190 @@ void sksc_log_shader_info(const sksc_shader_file_t *file);
 
 ///////////////////////////////////////////
 
+static const char *_last_sep(const char *path) {
+	const char *sep  = strrchr(path, '/');
+	const char *back = strrchr(path, '\\');
+	if (back && (!sep || back > sep)) sep = back;
+	return sep;
+}
+
+///////////////////////////////////////////
+
+static bool _is_file(const char *path) {
+	struct stat info;
+	// POSIX fopen("rb") succeeds on a directory, so ask for a regular file
+	return stat(path, &info) == 0 && S_ISREG(info.st_mode);
+}
+
+///////////////////////////////////////////
+
+// The dependency walk dedupes by path string, so separators have to agree
+static void _normalize_seps(char *ref_path) {
+	for (char *at = ref_path; *at != '\0'; at++)
+		if (*at == '\\') *at = '/';
+}
+
+///////////////////////////////////////////
+
+static bool _is_absolute(const char *path) {
+	return path[0] == '/' || path[0] == '\\' || (path[0] != '\0' && path[1] == ':');
+}
+
+///////////////////////////////////////////
+
+bool sksc_include_resolve(const char *path, const char *requester, const sksc_settings_t *settings, char *out_full, size_t full_size) {
+	if (_is_absolute(path)) {
+		snprintf(out_full, full_size, "%s", path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+		out_full[0] = '\0';
+		return false;
+	}
+
+	const char *slash = requester ? _last_sep(requester) : nullptr;
+	if (slash) {
+		snprintf(out_full, full_size, "%.*s/%s", (int32_t)(slash - requester), requester, path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+	} else if (requester) {
+		// A bare filename's folder is the cwd
+		snprintf(out_full, full_size, "%s", path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+	}
+
+	for (int32_t i = 0; i < settings->include_folder_ct; i++) {
+		snprintf(out_full, full_size, "%s/%s", settings->include_folders[i], path);
+		_normalize_seps(out_full);
+		if (_is_file(out_full)) return true;
+	}
+
+	out_full[0] = '\0';
+	return false;
+}
+
+///////////////////////////////////////////
+
+char *sksc_file_read(const char *path, int32_t *opt_out_len) {
+	FILE *fp = fopen(path, "rb");
+	if (!fp) return nullptr;
+	fseek(fp, 0, SEEK_END);
+	long size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	// ftell returns -1 for an unseekable stream, so reject a bad size before it
+	// wraps to a huge malloc/fread.
+	if (size < 0) { fclose(fp); return nullptr; }
+	char *data = (char*)malloc((size_t)size + 1);
+	if (!data) { fclose(fp); return nullptr; }
+	size_t got = fread(data, 1, (size_t)size, fp);
+	fclose(fp);
+	data[got] = '\0';
+	if (opt_out_len) *opt_out_len = (int32_t)got;
+	return data;
+}
+
+///////////////////////////////////////////
+
+static bool _parse_include(const char *line, char *out_path, size_t path_size) {
+	const char *at = line;
+	while (*at == ' ' || *at == '\t') at++;
+	if (*at != '#') return false;
+	at++;
+	while (*at == ' ' || *at == '\t') at++;
+	if (strncmp(at, "include", 7) != 0) return false;
+	at += 7;
+	if (*at != ' ' && *at != '\t' && *at != '"' && *at != '<') return false;
+	while (*at == ' ' || *at == '\t') at++;
+
+	char close = *at == '"' ? '"' : (*at == '<' ? '>' : '\0');
+	if (close == '\0') return false;
+	at++;
+
+	size_t len = 0;
+	while (at[len] != close && at[len] != '\0' && at[len] != '\n' && at[len] != '\r') len++;
+	if (at[len] != close || len == 0 || len >= path_size) return false;
+
+	memcpy(out_path, at, len);
+	out_path[len] = '\0';
+	return true;
+}
+
+///////////////////////////////////////////
+
+static bool _include_walk(const char *filename, const sksc_settings_t *settings, void (*on_dep)(void *user, const char *path), void *user, array_t<char*> *ref_visited, int32_t depth) {
+	if (depth > 32) return false; // cycles are caught by ref_visited, this is a backstop
+
+	char *text = sksc_file_read(filename, nullptr);
+	if (!text) return false;
+
+	bool        complete = true;
+	const char *line     = text;
+	while (*line != '\0') {
+		char inc[SKSC_PATH_MAX];
+		if (_parse_include(line, inc, sizeof(inc))) {
+			char full[SKSC_PATH_MAX];
+			if (!sksc_include_resolve(inc, filename, settings, full, sizeof(full))) {
+				complete = false;
+			} else {
+				bool seen = false;
+				for (size_t i = 0; i < ref_visited->count && !seen; i++)
+					seen = strcmp(ref_visited->data[i], full) == 0;
+
+				if (!seen) {
+					size_t len  = strlen(full) + 1;
+					char  *keep = (char*)malloc(len);
+					memcpy(keep, full, len);
+					ref_visited->add(keep);
+
+					on_dep(user, full);
+					if (!_include_walk(full, settings, on_dep, user, ref_visited, depth + 1))
+						complete = false;
+				}
+			}
+		}
+
+		const char *next = strchr(line, '\n');
+		if (!next) break;
+		line = next + 1;
+	}
+	free(text);
+	return complete;
+}
+
+///////////////////////////////////////////
+
+bool sksc_include_walk(const char *filename, const sksc_settings_t *settings, void (*on_dep)(void *user, const char *path), void *user) {
+	array_t<char*> visited = {};
+	bool           complete = _include_walk(filename, settings, on_dep, user, &visited, 0);
+
+	visited.each([](char *&p) { free(p); });
+	visited.free();
+	return complete;
+}
+
+///////////////////////////////////////////
+
 void sksc_init() {
+#ifdef SKSC_HAS_GLSLANG
 	sksc_glslang_init();
+#endif
 }
 
 ///////////////////////////////////////////
 
 void sksc_shutdown() {
+#ifdef SKSC_HAS_GLSLANG
 	sksc_glslang_shutdown();
+#endif
 }
 
 ///////////////////////////////////////////
 
+#ifdef SKSC_HAS_GLSLANG
 // Repack all dynamically-allocated meta sub-arrays into a single contiguous
 // block. After this, sksc_shader_meta_free() only needs free(meta->buffers).
+// Only the glslang path builds meta piecewise; SVSL's container arrives already
+// packed via sksc_shader_file_load_memory.
 static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	uint32_t total_var_count     = 0;
 	uint32_t total_defaults_size = 0;
@@ -44,11 +216,13 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 			total_defaults_size += meta->buffers[i].size;
 	}
 
-	size_t buffers_size = sizeof(sksc_shader_buffer_t  ) * meta->buffer_count;
-	size_t res_size     = sizeof(sksc_shader_resource_t) * meta->resource_count;
-	size_t vars_size    = sizeof(sksc_shader_var_t     ) * total_var_count;
-	size_t vinputs_size = sizeof(skr_vert_component_t  ) * meta->vertex_input_count;
-	size_t total_size   = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size;
+	size_t buffers_size = sizeof(sksc_shader_buffer_t       ) * meta->buffer_count;
+	size_t res_size     = sizeof(sksc_shader_resource_t     ) * meta->resource_count;
+	size_t vars_size    = sizeof(sksc_shader_var_t          ) * total_var_count;
+	size_t vinputs_size = sizeof(skr_vert_component_t       ) * meta->vertex_input_count;
+	size_t spec_size    = sizeof(sksc_shader_spec_constant_t) * meta->spec_constant_count;
+	size_t sampler_size = sizeof(sksc_shader_sampler_t      ) * meta->sampler_count;
+	size_t total_size   = buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size + sampler_size;
 
 	if (total_size == 0) return;
 
@@ -56,15 +230,19 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	memset(block, 0, total_size);
 
 	// Copy top-level arrays
-	sksc_shader_buffer_t   *new_buffers  = (sksc_shader_buffer_t  *)(block);
-	sksc_shader_resource_t *new_res      = (sksc_shader_resource_t*)(block + buffers_size);
-	uint8_t                *vars_cursor  = block + buffers_size + res_size;
-	uint8_t                *def_cursor   = block + buffers_size + res_size + vars_size;
-	skr_vert_component_t   *new_vinputs  = (skr_vert_component_t  *)(block + buffers_size + res_size + vars_size + total_defaults_size);
+	sksc_shader_buffer_t        *new_buffers = (sksc_shader_buffer_t       *)(block);
+	sksc_shader_resource_t      *new_res     = (sksc_shader_resource_t     *)(block + buffers_size);
+	uint8_t                     *vars_cursor = block + buffers_size + res_size;
+	uint8_t                     *def_cursor  = block + buffers_size + res_size + vars_size;
+	skr_vert_component_t        *new_vinputs = (skr_vert_component_t       *)(block + buffers_size + res_size + vars_size + total_defaults_size);
+	sksc_shader_spec_constant_t *new_specs   = (sksc_shader_spec_constant_t*)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size);
+	sksc_shader_sampler_t       *new_samps   = (sksc_shader_sampler_t      *)(block + buffers_size + res_size + vars_size + total_defaults_size + vinputs_size + spec_size);
 
-	memcpy(new_buffers, meta->buffers,       buffers_size);
-	memcpy(new_res,     meta->resources,     res_size);
-	memcpy(new_vinputs, meta->vertex_inputs, vinputs_size);
+	if (buffers_size > 0) memcpy(new_buffers, meta->buffers,        buffers_size);
+	if (res_size     > 0) memcpy(new_res,     meta->resources,      res_size);
+	if (vinputs_size > 0) memcpy(new_vinputs, meta->vertex_inputs,  vinputs_size);
+	if (spec_size    > 0) memcpy(new_specs,   meta->spec_constants, spec_size);
+	if (sampler_size > 0) memcpy(new_samps,   meta->samplers,       sampler_size);
 
 	// Copy per-buffer vars and defaults, update pointers
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
@@ -91,17 +269,64 @@ static void _sksc_meta_pack(sksc_shader_meta_t *meta) {
 	free(meta->buffers);
 	free(meta->resources);
 	free(meta->vertex_inputs);
+	free(meta->spec_constants);
+	free(meta->samplers);
 
 	// Point meta at the packed block
-	meta->buffers       = new_buffers;
-	meta->resources     = new_res;
-	meta->vertex_inputs = new_vinputs;
+	meta->buffers        = new_buffers;
+	meta->resources      = new_res;
+	meta->vertex_inputs  = new_vinputs;
+	meta->spec_constants = new_specs;
+	meta->samplers       = new_samps;
+	meta->samplers_owned = false;
+}
+#endif // SKSC_HAS_GLSLANG
+
+// Case-insensitive check for a trailing ".svsl" on the source path.
+static bool _sksc_has_svsl_ext(const char *filename) {
+	if (!filename) return false;
+	size_t len = strlen(filename);
+	const char *ext = ".svsl";
+	size_t elen = strlen(ext);
+	if (len < elen) return false;
+	const char *tail = filename + (len - elen);
+	for (size_t i = 0; i < elen; i++)
+		if (tolower((unsigned char)tail[i]) != ext[i]) return false;
+	return true;
 }
 
 bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *settings, sksc_shader_file_t *out_file) {
 	*out_file = {};
 	 out_file->meta = {};
 	 out_file->meta.global_buffer_id = -1;
+
+	// The SVSL backend is used when explicitly requested (-svsl) or when the
+	// source file carries a .svsl extension.
+	bool want_svsl = settings->use_svsl || _sksc_has_svsl_ext(filename);
+#if defined(SKSC_HAS_SVSL) && !defined(SKSC_HAS_GLSLANG)
+	// No glslang backend in this build, so SVSL handles everything.
+	want_svsl = true;
+#endif
+	if (want_svsl) {
+#ifdef SKSC_HAS_SVSL
+		bool ok = sksc_svsl_compile(filename, hlsl_text, settings, out_file);
+		if (ok && !settings->silent_info)
+			sksc_log_shader_info(out_file);
+		return ok;
+#else
+		sksc_log(sksc_log_level_err, "SVSL backend requested, but skshaderc was built without it (SKSHADERC_ENABLE_SVSL=OFF)");
+		return false;
+#endif
+	}
+
+#ifdef SKSC_HAS_GLSLANG
+	// WGSL comes only from SVSL's native emitter, and a .sks never mixes
+	// compiler backends across its stages — so the glslang pipeline refuses
+	// the target outright rather than emitting a partial file.
+	if (settings->target_langs[skr_shader_lang_wgsl]) {
+		sksc_log(sksc_log_level_err, "The WGSL target ('-t w') is only available through the SVSL backend; compile '%s' with -svsl (or a .svsl source file)", filename);
+		return false;
+	}
 
 	array_t<sksc_shader_file_stage_t> stages       = {};
 	array_t<sksc_meta_item_t>         var_meta     = sksc_meta_find_defaults(hlsl_text);
@@ -116,7 +341,7 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 		// Build SPIRV
 		sksc_shader_file_stage_t spirv_stage  = {};
-		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], NULL, 0, &spirv_stage);
+		compile_result_          spirv_result = sksc_hlsl_to_spirv(filename, hlsl_text, settings, compile_stages[i], &spirv_stage);
 		if (spirv_result == compile_result_fail) {
 			sksc_log(sksc_log_level_err, "SPIRV compile failed");
 			return false;
@@ -159,6 +384,11 @@ bool sksc_compile(const char *filename, const char *hlsl_text, sksc_settings_t *
 
 	_sksc_meta_pack(&out_file->meta);
 	return true;
+#else
+	(void)hlsl_text;
+	sksc_log(sksc_log_level_err, "Compiling '%s' needs the glslang backend, but skshaderc was built without it (SKSHADERC_ENABLE_GLSLANG=OFF). Use the SVSL backend (-svsl, or a .svsl source file).", filename);
+	return false;
+#endif
 }
 
 ///////////////////////////////////////////
@@ -273,6 +503,21 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 		}
 	}
 
+	// List specialization constants
+	if (meta->spec_constant_count > 0) {
+		info.append("|--Spec Constants--");
+		for (uint32_t i = 0; i < meta->spec_constant_count; i++) {
+			sksc_shader_spec_constant_t *spec = &meta->spec_constants[i];
+			float   as_float; memcpy(&as_float, &spec->default_value, sizeof(as_float));
+			int32_t as_int;   memcpy(&as_int,   &spec->default_value, sizeof(as_int));
+			switch (spec->type) {
+			case sksc_shader_var_float: info.append("|  [%u] %-15s: float = %.3g", spec->constant_id, spec->name, as_float);            break;
+			case sksc_shader_var_uint:  info.append("|  [%u] %-15s: uint  = %u",   spec->constant_id, spec->name, spec->default_value); break;
+			default:                    info.append("|  [%u] %-15s: int   = %d",   spec->constant_id, spec->name, as_int);              break;
+			}
+		}
+	}
+
 	// Show the vertex shader's input format
 	if (meta->vertex_input_count > 0) {
 		info.append("|--Mesh Input--");
@@ -297,7 +542,7 @@ char* sksc_shader_file_info(const sksc_shader_file_t *file) {
 				case skr_semantic_texcoord:     semantic = "TexCoord";     break;
 				default:                        semantic = "NA";           break;
 			}
-			info.append("|  %s%d : %s%d", format, meta->vertex_inputs[i].count, semantic, meta->vertex_inputs[i].semantic_slot);
+			info.append("|  loc %d : %s%d : %s%d", meta->vertex_inputs[i].location, format, meta->vertex_inputs[i].count, semantic, meta->vertex_inputs[i].semantic_slot);
 		}
 	}
 
@@ -380,19 +625,131 @@ struct file_data_t {
 
 ///////////////////////////////////////////
 
-void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *out_size) {
+// Device-feature mask: scans a SPIR-V blob's OpCapability/OpExtension
+// declarations (raw opcode numbers, like the op counting in sksc_meta.cpp)
+// and maps them onto sksc_feature_bit_ values. Declarations with no assigned
+// bit set sksc_feature_bit_unknown so runtimes never silently under-check.
+static uint64_t sksc_spirv_features(const uint32_t *words, uint32_t word_count) {
+	// capability value → feature bit; one bit can cover several capabilities
+	static const struct { uint32_t cap; uint8_t bit; } cap_bits[] = {
+		{ 9,    sksc_feature_bit_float16 },          // Float16
+		{ 4433, sksc_feature_bit_storage16 },        // StorageBuffer16BitAccess
+		{ 4434, sksc_feature_bit_storage16 },        // UniformAndStorageBuffer16BitAccess
+		{ 4435, sksc_feature_bit_storage16 },        // StoragePushConstant16
+		{ 4448, sksc_feature_bit_storage8 },         // StorageBuffer8BitAccess
+		{ 4449, sksc_feature_bit_storage8 },         // UniformAndStorageBuffer8BitAccess
+		{ 4450, sksc_feature_bit_storage8 },         // StoragePushConstant8
+		{ 49,   sksc_feature_bit_extended_formats }, // StorageImageExtendedFormats
+		{ 61,   sksc_feature_bit_subgroups },        // GroupNonUniform
+		{ 62,   sksc_feature_bit_subgroups },        // ...Vote
+		{ 63,   sksc_feature_bit_subgroups },        // ...Arithmetic
+		{ 64,   sksc_feature_bit_subgroups },        // ...Ballot
+		{ 65,   sksc_feature_bit_subgroups },        // ...Shuffle
+		{ 66,   sksc_feature_bit_subgroups },        // ...ShuffleRelative
+		{ 67,   sksc_feature_bit_subgroups },        // ...Clustered
+		{ 68,   sksc_feature_bit_subgroups },        // ...Quad
+		{ 4439, sksc_feature_bit_multiview },        // MultiView
+		{ 5379, sksc_feature_bit_demote },           // DemoteToHelperInvocationEXT
+		{ 11,   sksc_feature_bit_int64 },            // Int64
+		{ 10,   sksc_feature_bit_float64 },          // Float64
+		{ 22,   sksc_feature_bit_int16 },            // Int16
+		{ 39,   sksc_feature_bit_int8 },             // Int8
+		{ 55,   sksc_feature_bit_formatless },       // StorageImageReadWithoutFormat
+		{ 56,   sksc_feature_bit_formatless },       // StorageImageWriteWithoutFormat
+		{ 4166, sksc_feature_bit_tile_image },       // TileImageColorReadAccessEXT
+		{ 4167, sksc_feature_bit_tile_image },       // TileImageDepthReadAccessEXT
+		{ 4168, sksc_feature_bit_tile_image },       // TileImageStencilReadAccessEXT
+		{ 6033, sksc_feature_bit_float_atomics },    // AtomicFloat32AddEXT
+		{ 5612, sksc_feature_bit_float_atomics },    // AtomicFloat32MinMaxEXT
+		{ 4484, sksc_feature_bit_qcom_sample_weighted }, // TextureSampleWeightedQCOM
+		{ 4485, sksc_feature_bit_qcom_box_filter },      // TextureBoxFilterQCOM
+		{ 4486, sksc_feature_bit_qcom_block_match },     // TextureBlockMatchQCOM
+		{ 4498, sksc_feature_bit_qcom_image_proc2 },     // TextureBlockMatch2QCOM
+		{ 4495, sksc_feature_bit_qcom_tile_shading },    // TileShadingQCOM
+		{ 5254, sksc_feature_bit_output_layer },         // ShaderViewportIndexLayerEXT
+		{ 2,    sksc_feature_bit_geometry },             // Geometry (fragment reads of Layer)
+	};
+	// capabilities every Vulkan 1.1 runtime satisfies — no bit, never unknown
+	static const uint32_t baseline[] = { 1, 50, 43, 44, 40, 51 };
+	// Shader, ImageQuery, Sampled1D, Image1D, InputAttachment, DerivativeControl
+	// bit 0xFF = the extension is known but sets no bit itself: its capabilities
+	// carry the precise per-op bits (image processing splits into three)
+	static const struct { const char *name; uint8_t bit; } ext_bits[] = {
+		// Reflection-only decorations from glslang's HLSL front end; every
+		// driver ignores them, so they gate nothing
+		{ "SPV_GOOGLE_hlsl_functionality1",      0xFF },
+		{ "SPV_GOOGLE_user_type",                0xFF },
+		{ "SPV_GOOGLE_decorate_string",          0xFF },
+		{ "SPV_KHR_8bit_storage",                sksc_feature_bit_storage8 },
+		{ "SPV_EXT_demote_to_helper_invocation", sksc_feature_bit_demote },
+		{ "SPV_EXT_shader_tile_image",           sksc_feature_bit_tile_image },
+		{ "SPV_EXT_shader_atomic_float_add",     sksc_feature_bit_float_atomics },
+		{ "SPV_EXT_shader_atomic_float_min_max", sksc_feature_bit_float_atomics },
+		{ "SPV_QCOM_image_processing",           0xFF },
+		{ "SPV_QCOM_image_processing2",          sksc_feature_bit_qcom_image_proc2 },
+		{ "SPV_QCOM_tile_shading",               sksc_feature_bit_qcom_tile_shading },
+		{ "SPV_EXT_shader_viewport_index_layer", sksc_feature_bit_output_layer },
+	};
+
+	uint64_t bits = 0;
+	for (uint32_t i = 5; i < word_count; ) {
+		uint32_t count  = words[i] >> 16;
+		uint32_t opcode = words[i] & 0xFFFF;
+		if (count == 0) break;
+
+		if (opcode == 17) { // OpCapability
+			uint32_t cap   = words[i + 1];
+			bool     known = false;
+			for (size_t k = 0; k < sizeof(cap_bits) / sizeof(cap_bits[0]); k++)
+				if (cap_bits[k].cap == cap) { bits |= 1ull << cap_bits[k].bit; known = true; }
+			for (size_t k = 0; k < sizeof(baseline) / sizeof(baseline[0]); k++)
+				if (baseline[k] == cap) known = true;
+			if (!known) bits |= 1ull << sksc_feature_bit_unknown;
+		} else if (opcode == 10) { // OpExtension
+			const char *name  = (const char *)&words[i + 1];
+			bool        known = false;
+			for (size_t k = 0; k < sizeof(ext_bits) / sizeof(ext_bits[0]); k++)
+				if (strncmp(name, ext_bits[k].name, (size_t)(count - 1) * 4) == 0) {
+					if (ext_bits[k].bit != 0xFF) bits |= 1ull << ext_bits[k].bit;
+					known = true;
+				}
+			if (!known) bits |= 1ull << sksc_feature_bit_unknown;
+		} else if (opcode == 60) { // OpImageTexelPointer: image atomic access
+			bits |= 1ull << sksc_feature_bit_image_atomics;
+		}
+		i += count;
+	}
+	return bits;
+}
+
+///////////////////////////////////////////
+
+void sksc_build_file(const sksc_shader_file_t *file, bool keep_debug_names, void **out_data, uint32_t *out_size) {
 	file_data_t data = {};
 
 	const char tag[8] = {'S','K','S','H','A','D','E','R'};
-	uint16_t version = 7;
+	uint16_t version = SKSC_FILE_VERSION;
 	data.write(tag);
 	data.write(version);
+
+	uint64_t features = 0;
+	for (uint32_t i = 0; i < file->stage_count; i++)
+		if (file->stages[i].language == skr_shader_lang_spirv && file->stages[i].code_size >= 20)
+			features |= sksc_spirv_features((const uint32_t *)file->stages[i].code,
+			                                file->stages[i].code_size / 4);
+	if (file->meta.wave_size > 0)
+		features |= 1ull << sksc_feature_bit_wave_size;
+	uint64_t features_reserved = 0;
 
 	data.write(file->stage_count);
 	data.write_fixed_str(file->meta.name, sizeof(file->meta.name));
 	data.write(file->meta.buffer_count);
 	data.write(file->meta.resource_count);
 	data.write(file->meta.vertex_input_count);
+	data.write(file->meta.spec_constant_count);
+	data.write(file->meta.sampler_count); // v12
+	data.write(features);
+	data.write(features_reserved);
 
 	data.write(file->meta.ops_vertex.total);
 	data.write(file->meta.ops_vertex.tex_read);
@@ -401,6 +758,8 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 	data.write(file->meta.ops_pixel.tex_read);
 	data.write(file->meta.ops_pixel.dynamic_flow);
 	data.write(file->meta.wave_size);
+	data.write(file->meta.tile_apron[0]); // v11: //--apron (QCOM tile shading)
+	data.write(file->meta.tile_apron[1]);
 
 	for (uint32_t i = 0; i < file->meta.buffer_count; i++) {
 		sksc_shader_buffer_t *buff = &file->meta.buffers[i];
@@ -435,6 +794,7 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write(com->count);
 		data.write(com->semantic);
 		data.write(com->semantic_slot);
+		data.write(com->location);
 	}
 
 	for (uint32_t i = 0; i < file->meta.resource_count; i++) {
@@ -444,14 +804,93 @@ void sksc_build_file(const sksc_shader_file_t *file, void **out_data, uint32_t *
 		data.write_fixed_str(res->tags,  sizeof(res->tags));
 		data.write(res->bind);
 		data.write(res->element_size);
+		uint16_t reserved = 0;
+		data.write(res->shape);
+		data.write(res->image_format);
+		data.write(reserved);
+	}
+
+	for (uint32_t i = 0; i < file->meta.spec_constant_count; i++) {
+		sksc_shader_spec_constant_t *spec = &file->meta.spec_constants[i];
+		data.write_fixed_str(spec->name, sizeof(spec->name));
+		data.write(spec->constant_id);
+		data.write(spec->default_value);
+		data.write(spec->type);
+		data.write(spec->stage_bits);
+	}
+
+	for (uint32_t i = 0; i < file->meta.sampler_count; i++) { // v12
+		sksc_shader_sampler_t *sampler = &file->meta.samplers[i];
+		data.write_fixed_str(sampler->name, sizeof(sampler->name));
+		data.write(sampler->slot);
+		data.write(sampler->stage_bits);
+		data.write(sampler->paired_slot);
 	}
 
 	for (uint32_t i = 0; i < file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &file->stages[i];
+
+		// SMOL-V encode SPIR-V stages, which the loader decodes from the blob's
+		// own magic. Text stages have nothing to gain and are stored as-is.
+		//
+		// Nothing at runtime reads OpName/OpMemberName, since reflection comes
+		// from the meta section, so they only serve RenderDoc and validation.
+		//
+		// Whatever gets stored is decoded and checked first, since a stage that
+		// doesn't round-trip would only surface as a broken shader on device.
+		const uint32_t smolv_flags = keep_debug_names ? smolv_encode_none : smolv_encode_strip_debug_info;
+
+		void    *code       = stage->code;
+		uint32_t code_size  = stage->code_size;
+		uint8_t *smolv_code = nullptr;
+		if (stage->language == skr_shader_lang_spirv && stage->code_size > 0) {
+			size_t bound      = smolv_encode_bound(stage->code_size);
+			size_t smolv_size = 0;
+			bool   ok         = false;
+
+			smolv_code = (uint8_t *)malloc(bound);
+			if (smolv_code != nullptr && smolv_encode(stage->code, stage->code_size, smolv_code, bound, &smolv_size, smolv_flags)) {
+				size_t   decoded_size = smolv_decoded_size(smolv_code, smolv_size);
+				uint8_t *decoded      = decoded_size > 0 ? (uint8_t *)malloc(decoded_size) : nullptr;
+				if (decoded != nullptr && smolv_decode(smolv_code, smolv_size, decoded, decoded_size)) {
+					if (keep_debug_names) {
+						// Nothing was dropped, so the decode has to be the input
+						ok = decoded_size == stage->code_size && memcmp(decoded, stage->code, decoded_size) == 0;
+					} else {
+						// Stripping means the decode isn't the input any more, so
+						// check for a fixed point instead: the stripped module has
+						// no debug info left to drop, so re-encoding it has to
+						// reproduce these exact bytes.
+						size_t   again_bound = smolv_encode_bound(decoded_size);
+						size_t   again_size  = 0;
+						uint8_t *again       = (uint8_t *)malloc(again_bound);
+						ok = again != nullptr
+						  && smolv_encode(decoded, decoded_size, again, again_bound, &again_size, smolv_flags)
+						  && again_size == smolv_size
+						  && memcmp(again, smolv_code, smolv_size) == 0;
+						free(again);
+					}
+				}
+				free(decoded);
+			}
+
+			if (ok) {
+				code      = smolv_code;
+				code_size = (uint32_t)smolv_size;
+			} else {
+				sksc_log(sksc_log_level_warn, "SMOL-V encoding didn't round-trip, storing this stage as plain SPIR-V");
+				free(smolv_code);
+				smolv_code = nullptr;
+			}
+		}
+
 		data.write(stage->language);
 		data.write(stage->stage);
-		data.write(stage->code_size);
-		data.write(stage->code, stage->code_size);
+		uint32_t stage_wave = stage->stage == skr_stage_compute ? file->meta.wave_size : 0;
+		data.write(stage_wave);
+		data.write(code_size);
+		data.write(code, code_size);
+		free(smolv_code);
 	}
 
 	*out_data = data.data.data;

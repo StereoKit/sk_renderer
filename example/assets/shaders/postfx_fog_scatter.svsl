@@ -1,0 +1,50 @@
+//--name = postfx_fog_scatter
+//--fog_color:color = 0.15,0.2,0.25,1
+//--scatter_max     = 4
+
+// Stage 2 of the fog + scatter pair (see postfx_fog_density.svsl): the density
+// prepass output (scene rgb + fog density in alpha) is filtered through a
+// BoxFilterQCOM kernel that grows with density, so distant geometry blurs out
+// into the fog instead of staying crisp behind a color fade. Density arrives
+// in the alpha channel, so unlike a depth-reading blit this pass costs no
+// depth store — the prepass computed it while depth was still on-tile.
+// Requires VK_QCOM_image_processing — gate this shader on
+// skr_shader_check_support() before building materials from it.
+// Declaration order matters for slot pairing: scene_box(t0) fuses with
+// box_smp(s0) — an image-processing sampler is exclusive, so the fused pair
+// keeps BoxFilterQCOM and plain reads from ever sharing a sampler.
+
+Texture2D    scene_box;  // t0, only ever box-filtered (IMAGE_PROCESSING sampler)
+Texture2D    scene_tex;  // t1, same image, plain read for the center density
+SamplerState box_smp;    // s0, fuses with scene_box
+SamplerState tex_smp;    // s1, fuses with scene_tex
+
+float4 fog_color;
+float  scatter_max;  // widest blur kernel, in texels
+float2 source_size;  // prepass target dimensions, for pixel → uv
+
+struct psIn {
+	float4 pos : SV_POSITION;
+};
+
+psIn vs(uint id : SV_VertexID) {
+	psIn o;
+	float2 uv = float2(id & 2, (id << 1) & 2);
+	o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+
+float4 ps(psIn input) : SV_TARGET {
+	// The prepass target can be larger than the active viewport, so uvs come
+	// from pixel position over the full texture size, not [0,1] across the blit.
+	float2 uv      = input.pos.xy / source_size;
+	float  density = scene_tex.Sample(tex_smp, uv).a;
+
+	// Scatter: the box kernel grows from 1 texel to scatter_max with density
+	float  radius  = 1.0 + density * scatter_max;
+	float4 scatter = scene_box.BoxFilterQCOM(box_smp, uv, float2(radius, radius));
+
+	// scatter.a is the box-filtered density — using it for the final lerp gives
+	// the fog itself a softened edge.
+	return float4(lerp(scatter.rgb, fog_color.rgb, scatter.a), 1);
+}

@@ -33,9 +33,10 @@ typedef struct {
 	void        (*render_ui)  (scene_t* scene);  // Optional - scene-specific ImGui controls
 } scene_vtable_t;
 
-// Base scene structure - just holds size for "inheritance" pattern
+// Base scene structure for the "inheritance" pattern
 struct scene_t {
 	size_t size;
+	float  refresh_hz;  // display refresh, written by the app before update; 0 when unknown
 };
 
 // Scene registry - add new scenes here
@@ -58,6 +59,8 @@ extern const scene_vtable_t scene_stars_vtable;
 extern const scene_vtable_t scene_yuv_test_vtable;
 extern const scene_vtable_t scene_gi_vtable;
 extern const scene_vtable_t scene_pbr_vtable;
+extern const scene_vtable_t scene_frame_pacing_vtable;
+extern const scene_vtable_t scene_desc_stress_vtable;
 #ifdef SKR_HAS_VIDEO
 extern const scene_vtable_t scene_video_vtable;
 #endif

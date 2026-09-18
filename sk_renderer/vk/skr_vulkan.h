@@ -6,6 +6,7 @@
 #pragma once
 
 #include <volk.h>
+#include "../skr_present.h"
 
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 #define SKR_MAX_SURFACES 2  // Maximum surfaces for VR stereo rendering
@@ -28,9 +29,25 @@ typedef struct skr_future_t {
 typedef struct skr_tex_readback_t {
 	void*        data;      // CPU-accessible data pointer (valid after future completes)
 	uint32_t     size;      // Data size in bytes
-	skr_future_t future;    // Poll with skr_future_check(), block with skr_future_wait()
+	skr_future_t future;    // Poll with skr_future_check(); see future notes in sk_renderer.h
 	void*        _internal; // Internal state (staging buffer/memory) - do not access directly
 } skr_tex_readback_t;
+
+// Async GPU->CPU snapshot of a storage-type buffer (the only type both
+// backends can copy out of). `data` is memory the readback owns, unaffected
+// by later writes to the buffer. The future covers work recorded on the
+// calling thread so far: dispatch first, then read back, never inside an open
+// pass. A skr_buffer_set between the dispatch and the readback snapshots the
+// newly set contents instead of the dispatch results. Creation may submit the
+// thread's pending commands (WebGPU always does; mapAsync must follow submit).
+// Create, poll, and destroy on one thread; destroying mid-flight is safe and
+// never blocks.
+typedef struct skr_buffer_readback_t {
+	void*        data;      // CPU-accessible data pointer (valid after future completes)
+	uint32_t     size;      // Data size in bytes
+	skr_future_t future;    // Poll with skr_future_check(); see future notes in sk_renderer.h
+	void*        _internal; // Internal state (staging buffer/memory) - do not access directly
+} skr_buffer_readback_t;
 
 typedef struct skr_buffer_t {
 	VkBuffer            buffer;  // Current buffer for binding (= _ring[_ring_index] if ring active)
@@ -78,11 +95,14 @@ typedef struct skr_tex_t {
 	VkImage                image;
 	VkDeviceMemory         memory;
 	VkImageView            view;
-	VkFramebuffer          framebuffer;            // Cached framebuffer (color only, no depth)
-	VkFramebuffer          framebuffer_depth;      // Cached framebuffer (color + depth, if last used with depth)
-	VkRenderPass           framebuffer_pass;       // Render pass the color-only framebuffer was created for
-	VkRenderPass           framebuffer_depth_pass; // Render pass the depth framebuffer was created for
-	skr_tex_t*             fdm;                    // Foveation density map attached to this render target (not owned). NULL = no foveation.
+	VkFramebuffer          framebuffer;             // Cached framebuffer (color only, no depth)
+	VkFramebuffer          framebuffer_depth;       // Cached framebuffer (color + depth, if last used with depth)
+	VkRenderPass           framebuffer_pass;        // Render pass the color-only framebuffer was created for
+	VkRenderPass           framebuffer_depth_pass;  // Render pass the depth framebuffer was created for
+	uint64_t               framebuffer_views;       // Fingerprint of the views the cached framebuffer was built
+	uint64_t               framebuffer_depth_views; // from — other attachments can be destroyed while the cache
+	                                                // target survives, so the render pass alone under-keys the cache
+	skr_tex_t*             fdm;                     // Foveation density map attached to this render target (not owned). NULL = no foveation.
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;
@@ -92,6 +112,7 @@ typedef struct skr_tex_t {
 	uint32_t               mip_levels;       // Number of mip levels
 	uint32_t               layer_count;      // Number of array layers (1 for regular, N for arrays, 6 for cubemaps)
 	VkImageAspectFlags     aspect_mask;      // Depth bit for depth textures, color bit for color textures
+	VkImageUsageFlags      usage;            // Adopted images carry only the bits their flags promise
 
 	// Automatic layout transition tracking. current_layout is the actual GPU
 	// layout right now — used as oldLayout for the next barrier and to skip
@@ -102,6 +123,7 @@ typedef struct skr_tex_t {
 	bool                   first_use;            // True until first transition (allows UNDEFINED optimization)
 	bool                   is_transient_discard; // True for non-readable depth/MSAA (always use UNDEFINED)
 	bool                   is_external;          // True if image/memory are externally owned (don't destroy)
+	bool                   external_prior_use;   // Last touched outside our queue timeline, see _tex_to_src_stage
 
 	// YCbCr conversion (Vulkan 1.1) for opaque YUV textures (e.g. AHB video frames)
 	VkSamplerYcbcrConversion ycbcr_conversion;   // VK_NULL_HANDLE if unused
@@ -179,6 +201,7 @@ typedef struct skr_tex_external_ahb_info_t {
 typedef struct skr_surface_t {
 	VkSurfaceKHR   surface;
 	VkSwapchainKHR swapchain;
+	VkFence        present_fence[SKR_MAX_FRAMES_IN_FLIGHT]; // Signals when that slot's present retires; all null without maintenance1
 	skr_tex_t*     images;
 	uint32_t       image_count;
 	uint32_t       current_image;
@@ -187,6 +210,23 @@ typedef struct skr_surface_t {
 	VkSemaphore    semaphore_acquire[SKR_MAX_FRAMES_IN_FLIGHT];
 	VkSemaphore*   semaphore_submit;
 	skr_vec2i_t    size;
+
+	skr_present_ring_t ring;
+	uint64_t           slot_present_id[SKR_MAX_FRAMES_IN_FLIGHT]; // The present each frame slot fed, for the wait fallback
+	uint64_t*          image_present_id;    // Per image, the id it was last presented with; 0 = never
+	uint64_t           swapchain_first_id;  // First present id issued on the current swapchain
+	uint32_t           present_mode_mask;   // 1 << skr_present_mode_ the surface offers
+	skr_present_mode_  present_mode;        // What the swapchain was created with (never default)
+	skr_present_mode_  present_mode_request; // From skr_surface_info_t, resolved against the mask at every rebuild
+	bool               present_id2;         // Swapchain created with the present_id2/present_wait2 bits
+	// VK_EXT_present_timing, all zero when the swapchain doesn't have it
+	bool               timing;
+	uint32_t           timing_stages;       // VkPresentStageFlagsEXT this surface can query
+	uint64_t           timing_domain_id;
+	uint32_t           timing_domain;       // VkTimeDomainKHR behind timing_domain_id
+	int64_t            timing_stage_offset_ns[4]; // host ns = stamp + offset, per present stage bit; stage-local domains give every stage its own clock
+	uint64_t           timing_seq_id;       // Next id for in-order results when no present ids are chained
+	uint32_t           timing_frames;       // Frames since the refresh duration was last read
 } skr_surface_t;
 
 typedef struct skr_shader_stage_t {
@@ -195,7 +235,8 @@ typedef struct skr_shader_stage_t {
 } skr_shader_stage_t;
 
 typedef struct skr_shader_t {
-	sksc_shader_meta_t   meta;
+	sksc_shader_meta_t  meta;
+	sksc_pass_inputs_t  pass_inputs; // "color"/"depth" convention, resolved at creation
 	skr_shader_stage_t  vertex_stage;
 	skr_shader_stage_t  pixel_stage;
 	skr_shader_stage_t  compute_stage;
@@ -209,6 +250,10 @@ typedef struct  {
 	skr_bind_t bind;
 	uint32_t   buffer_offset; // Offset within buffer (for bump-allocated buffers)
 	uint32_t   buffer_range;  // Range to bind (0 = use buffer->size)
+	// The shader samples this texture with QCOM image-processing ops
+	// (BoxFilterQCOM etc., meta shape bit 6) — descriptor writes must bind
+	// _skr_vk.sampler_image_proc instead of the texture's own sampler.
+	bool       image_proc_sampler;
 } skr_material_bind_t;
 
 // Internal key struct for pipeline-affecting material parameters only.
@@ -220,6 +265,7 @@ typedef struct  {
 // memcmp-based dedup in _skr_pipeline_register_material is byte-deterministic
 // regardless of compiler or C standard version.
 #define SKR_MAX_IMMUTABLE_SAMPLERS 2
+#define SKR_MAX_SPEC_CONSTANTS     4
 typedef struct {
 	// 8-byte aligned block
 	const skr_shader_t*  shader;                                              // @0   (8)
@@ -236,22 +282,23 @@ typedef struct {
 	skr_compare_         depth_test;                                          // @112 (4)
 	int32_t              immutable_sampler_count;                             // @116 (4)  Number of active immutable samplers
 	int32_t              immutable_sampler_slots[SKR_MAX_IMMUTABLE_SAMPLERS]; // @120 (8)  Descriptor binding slots (sorted by slot for deterministic memcmp)
+	uint32_t             spec_constant_values[SKR_MAX_SPEC_CONSTANTS];        // @128 (16) Bit patterns for the shader's spec constants, in shader meta order (defaults where not overridden)
 
 	// 1-byte fields packed at the end with explicit padding to fill the
 	// alignment tail. _pad0/_pad1 must remain zero — initializer rules above
 	// keep this true without any extra code at the call sites.
-	bool                 alpha_to_coverage;                                   // @128 (1)
-	bool                 depth_clamp;                                         // @129 (1)
-	bool                 wireframe;                                           // @130 (1)
-	uint8_t              _pad0;                                               // @131 (1)  must be 0
-	uint32_t             _pad1;                                               // @132 (4)  must be 0
+	bool                 alpha_to_coverage;                                   // @144 (1)
+	bool                 depth_clamp;                                         // @145 (1)
+	bool                 wireframe;                                           // @146 (1)
+	uint8_t              _pad0;                                               // @147 (1)  must be 0
+	uint32_t             _pad1;                                               // @148 (4)  must be 0
 } _skr_pipeline_material_key_t;
 
 #ifdef __cplusplus
-static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
+static_assert(sizeof(_skr_pipeline_material_key_t) == 152,
 	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
 #else
-_Static_assert(sizeof(_skr_pipeline_material_key_t) == 136,
+_Static_assert(sizeof(_skr_pipeline_material_key_t) == 152,
 	"_skr_pipeline_material_key_t layout drifted; explicit padding and memcmp dedup may be broken");
 #endif
 
@@ -283,7 +330,7 @@ typedef struct skr_compute_t {
 	VkDescriptorSetLayout  descriptor_layout;
 	VkPipeline             pipeline;
 
-	skr_material_bind_t*   binds;
+	int32_t                bind_start;  // Index into the bind pool, shared with materials
 	uint32_t               bind_count;
 
 	// CPU-side parameter staging

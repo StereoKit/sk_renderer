@@ -95,7 +95,7 @@ int32_t sksc_log_count() {
 ///////////////////////////////////////////
 
 sksc_log_item_t sksc_log_get(int32_t index) {
-	if (index < 0 || index >= sksc_log_list.count)
+	if (index < 0 || (size_t)index >= sksc_log_list.count)
 		return {};
 	return sksc_log_list[index];
 }

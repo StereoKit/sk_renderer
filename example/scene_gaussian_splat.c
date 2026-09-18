@@ -42,7 +42,7 @@ typedef struct {
 
 // Half-float conversion (IEEE 754 binary16)
 static inline uint16_t f32_to_f16(float f) {
-	uint32_t x = *(uint32_t*)&f;
+	uint32_t x; memcpy(&x, &f, sizeof(x));
 	uint32_t sign = (x >> 16) & 0x8000;
 	int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
 	uint32_t mant = (x >> 13) & 0x3FF;
@@ -508,10 +508,10 @@ static scene_t* _scene_gaussian_splat_create(void) {
 
 	if (sort_shaders_valid) {
 		// Create compute pipelines
-		skr_compute_create(&scene->sort_init_shader, &scene->sort_init);
-		skr_compute_create(&scene->sort_upsweep_shader, &scene->sort_upsweep);
-		skr_compute_create(&scene->sort_scan_shader, &scene->sort_scan);
-		skr_compute_create(&scene->sort_downsweep_shader, &scene->sort_downsweep);
+		skr_compute_create(&scene->sort_init_shader, (skr_compute_info_t){0}, &scene->sort_init);
+		skr_compute_create(&scene->sort_upsweep_shader, (skr_compute_info_t){0}, &scene->sort_upsweep);
+		skr_compute_create(&scene->sort_scan_shader, (skr_compute_info_t){0}, &scene->sort_scan);
+		skr_compute_create(&scene->sort_downsweep_shader, (skr_compute_info_t){0}, &scene->sort_downsweep);
 
 		// Bind all buffers to all shaders (even if not all used, they're declared)
 		// Init kernel buffers
@@ -669,15 +669,19 @@ static void _run_gpu_sort(scene_gaussian_splat_t* scene, float3 cam_pos) {
 		skr_compute_set_param(&scene->sort_scan,      "e_radixShift", sksc_shader_var_uint, 1, &radix_shift);
 		skr_compute_set_param(&scene->sort_downsweep, "e_radixShift", sksc_shader_var_uint, 1, &radix_shift);
 
-		// Set buffer bindings for ping-pong
+		// Set buffer bindings for ping-pong. Upsweep only reads b_sort, but its
+		// b_alt still has to swap along — WebGPU rejects the same buffer bound
+		// at two writable bindings, even unused ones.
 		if (is_even) {
 			skr_compute_set_buffer(&scene->sort_upsweep,   "b_sort",        &scene->sort_keys_a);
+			skr_compute_set_buffer(&scene->sort_upsweep,   "b_alt",         &scene->sort_keys_b);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sort",        &scene->sort_keys_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_alt",         &scene->sort_keys_b);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sortPayload", &scene->sort_payload_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_altPayload",  &scene->sort_payload_b);
 		} else {
 			skr_compute_set_buffer(&scene->sort_upsweep,   "b_sort",        &scene->sort_keys_b);
+			skr_compute_set_buffer(&scene->sort_upsweep,   "b_alt",         &scene->sort_keys_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sort",        &scene->sort_keys_b);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_alt",         &scene->sort_keys_a);
 			skr_compute_set_buffer(&scene->sort_downsweep, "b_sortPayload", &scene->sort_payload_b);
@@ -766,7 +770,7 @@ static bool _scene_gaussian_splat_get_camera(scene_t* base, scene_camera_t* out_
 	const float max_distance       = 100.0f;
 	const float move_speed         = 5.0f;
 
-	ImGuiIO* io = igGetIO();
+	ImGuiIO* io = igGetIO_Nil();
 
 	float cos_pitch = cosf(scene->cam_pitch);
 	float sin_pitch = sinf(scene->cam_pitch);

@@ -48,8 +48,8 @@ psIn vs(uint id : SV_VertexID) {
 	psIn output;
 
 	// Generate fullscreen triangle
-	output.uv  = float2((id << 1) & 2, id & 2);
-	output.pos = float4(output.uv * 2.0 - 1.0, 0, 1);
+	output.uv  = float2(id & 2, (id << 1) & 2);
+	output.pos = float4(output.uv * float2(2, -2) + float2(-1, 1), 0, 1);
 
 	return output;
 }

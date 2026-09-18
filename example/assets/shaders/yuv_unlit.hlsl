@@ -24,9 +24,7 @@ struct psIn {
 // OpTypeSampledImage in SPIRV, rather than separate OpTypeImage + OpTypeSampler.
 // This is required for VkSamplerYcbcrConversion immutable samplers to work
 // correctly on some drivers.
-[[vk::combinedImageSampler]]
 Texture2D    tex         : register(t3);
-[[vk::combinedImageSampler]]
 SamplerState tex_sampler : register(s3);
 float4       tex_trans;
 

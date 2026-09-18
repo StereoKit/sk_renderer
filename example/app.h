@@ -6,6 +6,7 @@
 #pragma once
 
 #include <sk_renderer.h>
+#include "tools/pacer.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -30,9 +31,24 @@ void    app_set_scene  (app_t* app, int32_t scene_index);
 int32_t app_scene_index(app_t* app);
 int32_t app_scene_count(app_t* app);
 
+// Rendering configuration
+void    app_set_resolve_mode  (app_t* app, int32_t mode);     // enum resolve_mode_ index, see resolve_mode_names
+int32_t app_resolve_mode_count(void);                         // resolve_mode_max, the exclusive upper bound
+void    app_set_msaa          (app_t* app, int32_t samples);  // 1 = MSAA off; call before the first frame
+
 // Input handling
 void app_key_press     (app_t* app, app_key_ key);
 void app_set_frame_time(app_t* app, float frame_time_ms);
+void app_set_refresh_rate(app_t* app, float refresh_hz);  // 0 when the platform can't report it
+
+// Frame pacing. The app owns the choices and the overlay; the platform loop
+// owns the window and surface and applies them through the pacer.
+void              app_set_run_ahead    (app_t* app, pacer_run_ahead_ run_ahead);
+pacer_run_ahead_  app_run_ahead        (app_t* app);
+void              app_set_fullscreen   (app_t* app, bool fullscreen);
+bool              app_fullscreen       (app_t* app);
+void              app_set_present_mode (app_t* app, skr_present_mode_ active);  // what the surface is doing, for the panel
+void              app_add_timing       (app_t* app, const skr_frame_timing_t* opt_frame, const skr_present_info_t* presents, int32_t count);  // this frame's timing and the drained present history, for the overlay
 
 // Per-frame functions
 void app_update        (app_t* app, float delta_time);

@@ -6,6 +6,7 @@
 #include "_sk_renderer.h"
 #include "skr_conversions.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -141,6 +142,52 @@ skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t s
 			vkCmdCopyBuffer(ctx.cmd, staging_buffer, out_buffer->buffer, 1, &(VkBufferCopy){
 				.size = out_buffer->size,
 			});
+
+			// The copy carries no implicit dependency with later reads. Those reads
+			// may land in this same command buffer (_skr_cmd_acquire hands back the
+			// active one, so creation can nest inside an open context), or in a
+			// later submission on this queue — submissions overlap freely. Either
+			// way the barrier below is what orders them.
+			VkAccessFlags        dst_access = 0;
+			VkPipelineStageFlags dst_stage  = 0;
+			if (type & skr_buffer_type_vertex) {
+				dst_access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+			}
+			if (type & skr_buffer_type_index) {
+				dst_access |= VK_ACCESS_INDEX_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+			}
+			if (type & skr_buffer_type_constant) {
+				dst_access |= VK_ACCESS_UNIFORM_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+			}
+			if (type & skr_buffer_type_storage) {
+				// SHADER_WRITE covers the WAW against a compute pass that writes the
+				// buffer on its first dispatch. Storage buffers also double as
+				// indirect args (skr_compute_execute_indirect), so cover that read.
+				dst_access |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+			}
+			if (dst_stage == 0) {
+				// A skr_buffer_type_ with no mapping above. Fail loud in debug, and
+				// stay conservative in release — dropping the barrier here would
+				// surface as intermittent corruption, not a clean failure.
+				assert(false && "skr_buffer_type_ has no barrier mapping, add one above");
+				dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+				dst_stage  = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			}
+			VkBufferMemoryBarrier buffer_barrier = {
+				.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+				.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+				.dstAccessMask       = dst_access,
+				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				.buffer              = out_buffer->buffer,
+				.offset              = 0,
+				.size                = out_buffer->size,
+			};
+			vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, NULL, 1, &buffer_barrier, 0, NULL);
 
 			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
 			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
@@ -278,6 +325,123 @@ uint32_t skr_buffer_get_size(const skr_buffer_t* buffer) {
 	return buffer ? buffer->size : 0;
 }
 
+// Internal state for readback: the host-visible staging snapshot
+typedef struct _skr_buffer_readback_internal_t {
+	VkBuffer       staging_buffer;
+	VkDeviceMemory staging_memory;
+} _skr_buffer_readback_internal_t;
+
+skr_err_ skr_buffer_readback(const skr_buffer_t* buffer, skr_buffer_readback_t* out_readback) {
+	if (!buffer || !out_readback) return skr_err_invalid_parameter;
+	memset(out_readback, 0, sizeof(*out_readback));
+
+	// Storage is the only type both backends can copy out of; see the header
+	if (!(buffer->type & skr_buffer_type_storage)) {
+		skr_log(skr_log_critical, "skr_buffer_readback needs a storage-type buffer");
+		return skr_err_unsupported;
+	}
+
+	VkBuffer staging_buffer;
+	VkResult vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
+		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size        = buffer->size,
+		.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	}, NULL, &staging_buffer);
+	SKR_VK_CHECK_RET(vr, "vkCreateBuffer", skr_err_device_error);
+
+	VkMemoryRequirements mem_requirements;
+	vkGetBufferMemoryRequirements(_skr_vk.device, staging_buffer, &mem_requirements);
+
+	VkDeviceMemory staging_memory;
+	vr = vkAllocateMemory(_skr_vk.device, &(VkMemoryAllocateInfo){
+		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize  = mem_requirements.size,
+		.memoryTypeIndex = _skr_find_memory_type(_skr_vk.physical_device, mem_requirements.memoryTypeBits,
+		                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+	}, NULL, &staging_memory);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkAllocateMemory");
+		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		return skr_err_out_of_memory;
+	}
+	vr = vkBindBufferMemory(_skr_vk.device, staging_buffer, staging_memory, 0);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkBindBufferMemory");
+		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
+		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		return skr_err_device_error;
+	}
+
+	void* mapped;
+	vr = vkMapMemory(_skr_vk.device, staging_memory, 0, buffer->size, 0, &mapped);
+	if (vr != VK_SUCCESS) {
+		SKR_VK_CHECK_NRET(vr, "vkMapMemory");
+		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
+		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		return skr_err_device_error;
+	}
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+
+	VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+	// Order the copy after shader writes and the initial-data upload
+	vkCmdPipelineBarrier(ctx.cmd, shader_stages | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &(VkBufferMemoryBarrier){
+		.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.buffer              = buffer->buffer,
+		.offset              = 0,
+		.size                = buffer->size,
+	}, 0, NULL);
+
+	vkCmdCopyBuffer(ctx.cmd, buffer->buffer, staging_buffer, 1, &(VkBufferCopy){ .size = buffer->size });
+
+	// And later shader writes after the copy (WAR with the next dispatch)
+	vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, shader_stages, 0, 0, NULL, 1, &(VkBufferMemoryBarrier){
+		.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask       = VK_ACCESS_TRANSFER_READ_BIT,
+		.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.buffer              = buffer->buffer,
+		.offset              = 0,
+		.size                = buffer->size,
+	}, 0, NULL);
+
+	// Future before release, matching skr_tex_readback: release submits this
+	// command buffer when the readback isn't nested inside a larger batch
+	skr_future_t future = skr_future_get();
+	_skr_cmd_release(ctx.cmd);
+
+	_skr_buffer_readback_internal_t* internal = (_skr_buffer_readback_internal_t*)_skr_malloc(sizeof(_skr_buffer_readback_internal_t));
+	internal->staging_buffer = staging_buffer;
+	internal->staging_memory = staging_memory;
+
+	out_readback->data      = mapped;
+	out_readback->size      = buffer->size;
+	out_readback->future    = future;
+	out_readback->_internal = internal;
+	return skr_err_success;
+}
+
+void skr_buffer_readback_destroy(skr_buffer_readback_t* ref_readback) {
+	if (!ref_readback || !ref_readback->_internal) return;
+	_skr_buffer_readback_internal_t* internal = (_skr_buffer_readback_internal_t*)ref_readback->_internal;
+
+	// No wait: the copy may sit in a command buffer this thread has yet to
+	// submit, and blocking on that here deadlocks. Deferred destruction
+	// releases the staging once the GPU is done with it (LIFO: memory first).
+	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
+	_skr_cmd_destroy_memory(NULL, internal->staging_memory);
+	_skr_cmd_destroy_buffer(NULL, internal->staging_buffer);
+	_skr_free(internal);
+
+	*ref_readback = (skr_buffer_readback_t){0};
+}
+
 void skr_buffer_set_name(skr_buffer_t* ref_buffer, const char* name) {
 	if (!ref_buffer || ref_buffer->buffer == VK_NULL_HANDLE) return;
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_BUFFER, (uint64_t)ref_buffer->buffer, name);
@@ -310,130 +474,110 @@ void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Bump Allocator
-///////////////////////////////////////////////////////////////////////////////
+// Bump ring, see _skr_bump_ring_t
 
-void _skr_bump_alloc_init(skr_bump_alloc_t* ref_alloc, skr_buffer_type_ type, uint32_t alignment) {
-	*ref_alloc = (skr_bump_alloc_t){
-		.buffer_type    = type,
-		.alignment      = alignment > 0 ? alignment : 1,
-		.high_water_mark = 0,
+#define _SKR_BUMP_RING_MIN        (64 * 1024)
+#define _SKR_BUMP_RING_WINDOW_MIN 4096
+
+void _skr_bump_ring_init(_skr_bump_ring_t* out_ring, skr_buffer_type_ type, uint32_t alignment, const _skr_cmd_ring_slot_t* slots) {
+	*out_ring = (_skr_bump_ring_t){
+		.buffer_type = type,
+		.alignment   = alignment > 0 ? alignment : 1,
+		.slots       = slots,
 	};
 }
 
-void _skr_bump_alloc_destroy(skr_bump_alloc_t* ref_alloc) {
-	if (!ref_alloc) return;
-
-	// Destroy main buffer
-	if (ref_alloc->main_valid) {
-		skr_buffer_destroy(&ref_alloc->main_buffer);
-	}
-
-	// Destroy all overflow buffers (individually allocated)
-	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		skr_buffer_destroy(ref_alloc->overflow[i]);
-		_skr_free(ref_alloc->overflow[i]);
-	}
-	_skr_free(ref_alloc->overflow);
-
-	*ref_alloc = (skr_bump_alloc_t){0};
+void _skr_bump_ring_destroy(_skr_bump_ring_t* ref_ring) {
+	skr_buffer_destroy(&ref_ring->buffer);
+	*ref_ring = (_skr_bump_ring_t){0};
 }
 
-void _skr_bump_alloc_reset(skr_bump_alloc_t* ref_alloc) {
-	if (!ref_alloc) return;
-
-	// Resize main buffer if high-water mark exceeds current capacity
-	uint32_t main_capacity = ref_alloc->main_valid ? ref_alloc->main_buffer.size : 0;
-	if (ref_alloc->high_water_mark > main_capacity) {
-		// Destroy old main buffer
-		if (ref_alloc->main_valid) {
-			skr_buffer_destroy(&ref_alloc->main_buffer);
-			ref_alloc->main_valid = false;
-		}
-
-		// Create new buffer sized to high-water mark (with some headroom)
-		uint32_t new_size = ref_alloc->high_water_mark + (ref_alloc->high_water_mark / 4);  // +25% headroom
-		if (new_size < 4096) new_size = 4096;  // Minimum 4KB
-
-		skr_buffer_create(NULL, new_size, 1, ref_alloc->buffer_type, skr_use_dynamic, &ref_alloc->main_buffer);
-		ref_alloc->main_valid = true;
-	}
-
-	// Reset main buffer offset
-	ref_alloc->main_used = 0;
-
-	// Destroy overflow buffers from previous frame (GPU is done with them now)
-	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		skr_buffer_destroy(ref_alloc->overflow[i]);
-		_skr_free(ref_alloc->overflow[i]);
-	}
-	ref_alloc->overflow_count = 0;
-
-	// Reset high-water mark for this frame
-	ref_alloc->high_water_mark = 0;
+// Widens the range every offset must be able to reach, for callers that bind
+// a fixed window from a varying offset.
+uint32_t _skr_bump_ring_reserve_window(_skr_bump_ring_t* ref_ring, uint32_t bytes) {
+	while (ref_ring->window < bytes)
+		ref_ring->window = ref_ring->window == 0 ? _SKR_BUMP_RING_WINDOW_MIN : ref_ring->window * 2;
+	return ref_ring->window;
 }
 
-skr_bump_result_t _skr_bump_alloc_write(skr_bump_alloc_t* ref_alloc, const void* data, uint32_t size) {
-	skr_bump_result_t result = { .buffer = NULL, .offset = 0 };
-	if (!ref_alloc || !data || size == 0) return result;
+void _skr_bump_ring_slot_begin(_skr_bump_ring_t* ref_ring, uint32_t slot) {
+	ref_ring->slot        = slot;
+	ref_ring->start[slot] = ref_ring->head;
+	ref_ring->end  [slot] = ref_ring->head;
+}
 
-	// Align the allocation
-	uint32_t aligned_offset = (ref_alloc->main_used + ref_alloc->alignment - 1) & ~(ref_alloc->alignment - 1);
-	uint32_t main_capacity = ref_alloc->main_valid ? ref_alloc->main_buffer.size : 0;
+// Oldest position any slot still reads, or head when nothing is live
+static uint64_t _skr_bump_ring_tail(const _skr_bump_ring_t* ring) {
+	uint64_t tail = ring->head;
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++)
+		if (ring->start[i] != ring->end[i] && ring->start[i] < tail) tail = ring->start[i];
+	return tail;
+}
 
-	// Try to allocate from main buffer
-	if (ref_alloc->main_valid && aligned_offset + size <= main_capacity) {
-		// Write to main buffer
-		memcpy((uint8_t*)ref_alloc->main_buffer.mapped + aligned_offset, data, size);
-		ref_alloc->main_used = aligned_offset + size;
+// A slot whose fence has signaled no longer reads its range. Only worth the
+// driver calls when the ring is full.
+static void _skr_bump_ring_poll(_skr_bump_ring_t* ref_ring) {
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++) {
+		if (i == ref_ring->slot || ref_ring->start[i] == ref_ring->end[i]) continue;
+		if (vkGetFenceStatus(_skr_vk.device, ref_ring->slots[i].fence) == VK_SUCCESS)
+			ref_ring->end[i] = ref_ring->start[i];
+	}
+}
 
-		// Track high-water mark
-		if (ref_alloc->main_used > ref_alloc->high_water_mark) {
-			ref_alloc->high_water_mark = ref_alloc->main_used;
+// In-flight slots and descriptors written earlier still read the old buffer;
+// skr_buffer_destroy defers it behind this slot's fence, which orders after
+// every earlier submission.
+static bool _skr_bump_ring_grow(_skr_bump_ring_t* ref_ring, uint32_t min_capacity) {
+	uint32_t capacity = ref_ring->capacity == 0 ? _SKR_BUMP_RING_MIN : ref_ring->capacity;
+	while (capacity < min_capacity && capacity != 0) capacity *= 2;
+	if (capacity == 0) {
+		skr_log(skr_log_critical, "Bump ring can't hold a %u byte write", min_capacity);
+		return false;
+	}
+	// Create first, so a failed grow keeps the old buffer instead of none
+	skr_buffer_t grown = {0};
+	skr_err_ err = skr_buffer_create(NULL, capacity, 1, ref_ring->buffer_type, skr_use_dynamic, &grown);
+	if (err != skr_err_success) {
+		skr_log(skr_log_critical, "Bump ring couldn't grow to %u bytes: %d", capacity, err);
+		return false;
+	}
+	skr_buffer_destroy(&ref_ring->buffer);
+	ref_ring->buffer   = grown;
+	ref_ring->capacity = capacity;
+	ref_ring->head     = 0;
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++) {
+		ref_ring->start[i] = 0;
+		ref_ring->end  [i] = 0;
+	}
+	return true;
+}
+
+skr_bump_result_t _skr_bump_ring_write(_skr_bump_ring_t* ref_ring, const void* data, uint32_t size) {
+	skr_bump_result_t result = {0};
+	if (size == 0) return result;
+
+	// Every offset must be able to reach `window` bytes without running off
+	// the end, since dynamic descriptors bind that range from any offset
+	uint32_t reach = size > ref_ring->window ? size : ref_ring->window;
+	if (ref_ring->capacity < reach && !_skr_bump_ring_grow(ref_ring, reach)) return result;
+
+	for (int32_t attempt = 0; ; attempt++) {
+		uint64_t pos    = (ref_ring->head + ref_ring->alignment - 1) & ~(uint64_t)(ref_ring->alignment - 1);
+		uint32_t offset = (uint32_t)(pos % ref_ring->capacity);
+		if (offset + reach > ref_ring->capacity) { // never straddle the end
+			pos   += ref_ring->capacity - offset;
+			offset = 0;
 		}
-
-		result.buffer = &ref_alloc->main_buffer;
-		result.offset = aligned_offset;
-		return result;
-	}
-
-	// Main buffer is full or doesn't exist - create overflow buffer
-	// Grow pointer array if needed (only the pointer array can realloc,
-	// individual buffers are stable so previous results stay valid)
-	if (ref_alloc->overflow_count >= ref_alloc->overflow_capacity) {
-		uint32_t new_cap = ref_alloc->overflow_capacity == 0 ? 4 : ref_alloc->overflow_capacity * 2;
-		skr_buffer_t** new_overflow = _skr_realloc(ref_alloc->overflow, new_cap * sizeof(skr_buffer_t*));
-		if (!new_overflow) {
-			skr_log(skr_log_critical, "Failed to grow bump allocator overflow array");
-			return result;
+		uint64_t end = pos + size;
+		if (end - _skr_bump_ring_tail(ref_ring) <= ref_ring->capacity) {
+			memcpy((uint8_t*)ref_ring->buffer.mapped + offset, data, size);
+			uint32_t slot = ref_ring->slot;
+			if (ref_ring->start[slot] == ref_ring->end[slot]) ref_ring->start[slot] = pos;
+			ref_ring->end[slot] = end;
+			ref_ring->head      = end;
+			return (skr_bump_result_t){ .buffer = ref_ring->buffer.buffer, .offset = offset };
 		}
-		ref_alloc->overflow = new_overflow;
-		ref_alloc->overflow_capacity = new_cap;
+		if (attempt == 0) { _skr_bump_ring_poll(ref_ring); continue; }
+		if (!_skr_bump_ring_grow(ref_ring, ref_ring->capacity * 2)) return result;
 	}
-
-	// Allocate individual overflow buffer (stable address, never moved by realloc)
-	skr_buffer_t* overflow = _skr_malloc(sizeof(skr_buffer_t));
-	if (!overflow) {
-		skr_log(skr_log_critical, "Failed to allocate bump overflow buffer");
-		return result;
-	}
-	*overflow = (skr_buffer_t){0};
-
-	skr_buffer_create(data, size, 1, ref_alloc->buffer_type, skr_use_dynamic, overflow);
-	ref_alloc->overflow[ref_alloc->overflow_count] = overflow;
-	ref_alloc->overflow_count++;
-
-	// Track total usage in high-water mark (main + all overflow buffers)
-	uint32_t overflow_total = 0;
-	for (uint32_t i = 0; i < ref_alloc->overflow_count; i++) {
-		overflow_total += ref_alloc->overflow[i]->size;
-	}
-	uint32_t total_used = ref_alloc->main_used + overflow_total;
-	if (total_used > ref_alloc->high_water_mark) {
-		ref_alloc->high_water_mark = total_used;
-	}
-
-	result.buffer = overflow;
-	result.offset = 0;
-	return result;
 }

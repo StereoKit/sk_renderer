@@ -3,7 +3,6 @@
 #define ENABLE_HLSL
 
 #include <glslang/Public/ShaderLang.h>
-#include "StandAlone/DirStackFileIncluder.h"
 #include "SPIRV/GlslangToSpv.h"
 
 #include <spirv-tools/optimizer.hpp>
@@ -25,13 +24,32 @@ void sksc_glslang_shutdown() {
 // HLSL to SPIR-V                        //
 ///////////////////////////////////////////
 
-class SkscIncluder : public DirStackFileIncluder {
+// glslang hands us an empty includer name for the top level string, hence source_file
+class SkscIncluder : public glslang::TShader::Includer {
 public:
-	virtual IncludeResult* includeSystem(const char* header_name, const char* includer_name, size_t inclusion_depth) override {
-		recordLocalPath(includer_name, inclusion_depth);
-		IncludeResult* result = readLocalPath(header_name);
-		if (result) return result;
-		return readSystemPath(header_name);
+	const char            *source_file;
+	const sksc_settings_t *settings;
+
+	IncludeResult* include(const char* header_name, const char* includer_name) {
+		const char *requester = includer_name && includer_name[0] != '\0' ? includer_name : source_file;
+		char        full[SKSC_PATH_MAX];
+		if (!sksc_include_resolve(header_name, requester, settings, full, sizeof(full)))
+			return nullptr;
+
+		int32_t len;
+		char   *text = sksc_file_read(full, &len);
+		if (!text) return nullptr;
+
+		return new IncludeResult(full, text, len, text);
+	}
+
+	virtual IncludeResult* includeLocal (const char* header_name, const char* includer_name, size_t) override { return include(header_name, includer_name); }
+	virtual IncludeResult* includeSystem(const char* header_name, const char* includer_name, size_t) override { return include(header_name, includer_name); }
+
+	virtual void releaseInclude(IncludeResult* result) override {
+		if (!result) return;
+		free(result->userData);
+		delete result;
 	}
 };
 
@@ -72,8 +90,8 @@ const char* parse_glslang_error(const char* at) {
 	else if (parse_startswith(at, "WARNING: ")) { level = sksc_log_level_warn; curr += 9;}
 
 	bool has_line = false;
-	int32_t line;
-	int32_t col;
+	int32_t line = 0;
+	int32_t col  = 0; // '(line)' format errors carry no column
 
 	const char* numbers = curr;
 	// Check for 'col:line:' format line numbers
@@ -113,16 +131,17 @@ void log_shader_msgs(glslang::TShader *shader) {
 
 ///////////////////////////////////////////
 
-compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, const char** defines, int32_t define_count, sksc_shader_file_stage_t *out_stage) {
+compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const sksc_settings_t *settings, skr_stage_ type, sksc_shader_file_stage_t *out_stage) {
 	TBuiltInResource default_resource = {};
 	EShMessages      messages         = EShMsgDefault;
 	EShMessages      messages_link    = (EShMessages)(EShMsgSpvRules | EShMsgVulkanRules | EShMsgDebugInfo);
-	EShLanguage      stage;
+	EShLanguage      stage = EShLangVertex;
 	const char*      entry = "na";
 	switch(type) {
 		case skr_stage_vertex:  stage = EShLangVertex;   entry = settings->vs_entrypoint; break;
 		case skr_stage_pixel:   stage = EShLangFragment; entry = settings->ps_entrypoint; break;
 		case skr_stage_compute: stage = EShLangCompute;  entry = settings->cs_entrypoint; break;
+		default: sksc_log(sksc_log_level_err, "Unknown shader stage %d", (int)type); return compile_result_fail;
 	}
 
 	// Create the shader and set options
@@ -135,7 +154,11 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	shader.setEnvTarget       (glslang::EShTargetSpv,         glslang::EShTargetSpv_1_3);
 	shader.setEnvTargetHlslFunctionality1();
 	shader.setTextureSamplerTransformMode(EShTexSampTransUpgradeTextureRemoveSampler);
-	if (settings->debug) {
+	// RWTextures get SPIR-V format Unknown instead of one inferred from the
+	// template (float4 to Rgba32f), like DXC; needs the WithoutFormat features.
+	shader.setNoStorageFormat(true);
+	bool debug = settings->debug;
+	if (debug) {
 		shader.setDebugInfo (true);
 		shader.setSourceFile(filename);
 		shader.addSourceText(hlsl, strlen(hlsl));
@@ -149,20 +172,10 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 
 	shader.setStrings         (shader_strings, 1);
 
-	std::string preamble;
-	if (define_count > 0) {
-		for (int32_t i = 0; i < define_count; i++) {
-			preamble += "#define " + std::string(defines[i]) + "\n";
-		}
-		shader.setPreamble(preamble.c_str());
-	}
-
 	// Setup includer
-	SkscIncluder includer;
-	includer.pushExternalDirectory(settings->folder);
-	for (int32_t i = 0; i < settings->include_folder_ct; i++) {
-		includer.pushExternalDirectory(settings->include_folders[i]);
-	}
+	SkscIncluder includer = {};
+	includer.source_file  = filename;
+	includer.settings     = settings;
 
 	std::string preprocessed_glsl;
 	if (!shader.preprocess(
@@ -214,12 +227,12 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	std::vector<unsigned int> spirv;
 	spv::SpvBuildLogger logger;
 	glslang::SpvOptions spvOptions;
-	spvOptions.generateDebugInfo                = settings->debug;
-	spvOptions.emitNonSemanticShaderDebugInfo   = settings->debug;
-	spvOptions.emitNonSemanticShaderDebugSource = settings->debug;
+	spvOptions.generateDebugInfo                = debug;
+	spvOptions.emitNonSemanticShaderDebugInfo   = debug;
+	spvOptions.emitNonSemanticShaderDebugSource = debug;
 	// Enable glslang's built-in SPIRV optimizer which includes HLSL-specific
 	// legalization passes (FixStorageClass, InterpolateFixup, CFGCleanup, etc.)
-	spvOptions.disableOptimizer                 = settings->debug || settings->optimize == 0;
+	spvOptions.disableOptimizer                 = debug || settings->optimize == 0;
 	spvOptions.optimizeSize                     = settings->optimize == 1;
 	glslang::GlslangToSpv(*intermediate, spirv, &logger, &spvOptions);
 
@@ -260,33 +273,40 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 				new_binding = old_binding + 0;
 				break;
 				
-			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLER:
+				// s registers - merged into textures (+100)
+				new_binding = old_binding + SKSC_SLOT_TEXTURE;
+				break;
+
+			case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-				// t/s registers - shift by 100
-				new_binding = old_binding + 100;
+				// t registers
+				new_binding = old_binding + SKSC_SLOT_TEXTURE;
 				break;
 
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:
 				// Check if it's read-only (StructuredBuffer) or read-write (RWStructuredBuffer)
 				if (binding->resource_type == SPV_REFLECT_RESOURCE_FLAG_SRV) {
 					// StructuredBuffer - t register
-					new_binding = old_binding + 100;
+					new_binding = old_binding + SKSC_SLOT_TEXTURE;
 				} else {
 					// RWStructuredBuffer - u register
-					new_binding = old_binding + 200;
+					new_binding = old_binding + SKSC_SLOT_READWRITE;
 				}
 				break;
 				
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:
 			case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-				// u registers - shift by 200
-				new_binding = old_binding + 200;
+				// u registers
+				new_binding = old_binding + SKSC_SLOT_READWRITE;
 				break;
 
 			case SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-				// input attachments - shift by 300
-				new_binding = old_binding + 300;
+				// input attachments - slot 300 + the declared
+				// [[vk::input_attachment_index(N)]]. glslang's auto-mapper can
+				// give several unregistered SubpassInputs the same binding, so
+				// the attachment index is the only collision-free identity.
+				new_binding = SKSC_SLOT_INPUT_ATT + binding->input_attachment_index;
 				break;
 			default:break;
 		}
@@ -322,7 +342,7 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	// Run additional SPIRV optimization passes after binding remaps.
 	// glslang's optimizer handles HLSL-specific legalization, but we can
 	// squeeze out a bit more with the full performance/size passes.
-	if (settings->debug == false && settings->optimize > 0) {
+	if (!debug && settings->optimize > 0) {
 		spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_1);
 		optimizer.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char* m) {
 			printf("SPIRV optimization error: %s\n", m);

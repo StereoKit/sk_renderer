@@ -492,10 +492,16 @@ skr_shader_t su_shader_load(const char* filename, const char* opt_name) {
 	skr_shader_t shader = {0};
 
 	if (su_file_read(filename, &shader_data, &shader_size)) {
-		skr_shader_create(shader_data, (uint32_t)shader_size, &shader);
+		skr_err_ err = skr_shader_create(shader_data, (uint32_t)shader_size, &shader);
 		free(shader_data);
 
-		if (opt_name && skr_shader_is_valid(&shader)) {
+		// Unsupported is a platform gap the shader compiler already warned
+		// about at build time, not a broken asset
+		if (err == skr_err_unsupported) {
+			su_log(su_log_warning, "Shader '%s' isn't supported on this device", filename);
+		} else if (!skr_shader_is_valid(&shader)) {
+			su_log(su_log_critical, "Failed to create shader from '%s'", filename);
+		} else if (opt_name) {
 			skr_shader_set_name(&shader, opt_name);
 		}
 	}
@@ -686,6 +692,7 @@ typedef struct _su_load_request_t {
 
 typedef struct {
 	thrd_t thread;
+	bool   thread_ok; // false where threads don't exist (web) — loads run synchronously
 	mtx_t  queue_mutex;
 	bool   running;
 
@@ -698,6 +705,8 @@ static _su_asset_loader_t _su_loader = {0};
 
 // Forward declarations
 static void _su_gltf_load_sync(su_gltf_t* gltf);
+static void _su_gltf_mark_loader_done(su_gltf_t* gltf);
+static void _su_load_request_run(_su_load_request_t request);
 
 static int32_t _su_loader_thread(void* arg) {
 	(void)arg;
@@ -721,11 +730,10 @@ static int32_t _su_loader_thread(void* arg) {
 		mtx_unlock(&_su_loader.queue_mutex);
 
 		if (has_request) {
-			switch (request.type) {
-			case _su_load_type_gltf:
-				_su_gltf_load_sync((su_gltf_t*)request.asset);
-				break;
-			}
+			// Completion publishing (after every write to the asset, so
+			// su_gltf_destroy can safely free it) happens inside the runner,
+			// covering the load function's early failure returns too.
+			_su_load_request_run(request);
 		} else {
 			// Sleep briefly to avoid busy-waiting
 			thrd_sleep(&(struct timespec){.tv_nsec = 10000000}, NULL);  // 10ms
@@ -737,7 +745,23 @@ static int32_t _su_loader_thread(void* arg) {
 	return 0;
 }
 
+static void _su_load_request_run(_su_load_request_t request) {
+	switch (request.type) {
+	case _su_load_type_gltf:
+		_su_gltf_load_sync((su_gltf_t*)request.asset);
+		_su_gltf_mark_loader_done((su_gltf_t*)request.asset);
+		break;
+	}
+}
+
 static void _su_loader_enqueue(_su_load_type_ type, void* asset) {
+	// No loader thread (single-threaded web build): load right here. A frame
+	// hitch, but assets still arrive.
+	if (!_su_loader.thread_ok) {
+		_su_load_request_run((_su_load_request_t){ .type = type, .asset = asset });
+		return;
+	}
+
 	mtx_lock(&_su_loader.queue_mutex);
 
 	int32_t next_head = (_su_loader.request_head + 1) % SU_MAX_PENDING_LOADS;
@@ -762,12 +786,15 @@ void su_initialize(su_file_read_fn file_read_callback, void* user_data) {
 	// Initialize vertex types
 	_su_vertex_types_init();
 
-	// Start asset loading thread
+	// Start asset loading thread. Threadless builds (the web) fall back to
+	// synchronous loading at enqueue time.
 	mtx_init(&_su_loader.queue_mutex, mtx_plain);
 	_su_loader.running      = true;
 	_su_loader.request_head = 0;
 	_su_loader.request_tail = 0;
-	thrd_create(&_su_loader.thread, _su_loader_thread, NULL);
+	_su_loader.thread_ok    = thrd_create(&_su_loader.thread, _su_loader_thread, NULL) == thrd_success;
+	if (!_su_loader.thread_ok)
+		su_log(su_log_info, "Asset loader thread unavailable; assets will load synchronously");
 
 	su_log(su_log_info, "Scene utilities initialized");
 }
@@ -775,7 +802,7 @@ void su_initialize(su_file_read_fn file_read_callback, void* user_data) {
 void su_shutdown(void) {
 	// Stop loading thread
 	_su_loader.running = false;
-	thrd_join(_su_loader.thread, NULL);
+	if (_su_loader.thread_ok) thrd_join(_su_loader.thread, NULL);
 	mtx_destroy(&_su_loader.queue_mutex);
 
 	su_log(su_log_info, "Scene utilities shut down");
@@ -812,6 +839,12 @@ typedef struct {
 
 struct su_gltf_t {
 	su_gltf_state_      state;
+	// Set true by the loader thread once it has completely finished (or failed)
+	// this asset. `state` flips to ready before the textures finish loading, so
+	// it can't gate teardown; su_gltf_destroy waits on this instead. Written and
+	// read under _su_loader.queue_mutex so all the loader's writes to this gltf
+	// are visible before it may be freed.
+	bool                loader_done;
 	char                filepath[256];
 	skr_material_info_t shader_infos[SU_GLTF_MAX_SHADER_SETS];
 	int32_t             shader_count;
@@ -1290,11 +1323,33 @@ su_gltf_t* su_gltf_load(const char* filename, skr_shader_t* shader) {
 	return su_gltf_load_ex(filename, &info, 1);
 }
 
+// Loader-thread side of the su_gltf_destroy handshake: flag this asset as fully
+// loaded. Under queue_mutex so the loader's writes to the gltf are visible to a
+// destroyer that reads the flag under the same lock.
+static void _su_gltf_mark_loader_done(su_gltf_t* gltf) {
+	mtx_lock(&_su_loader.queue_mutex);
+	gltf->loader_done = true;
+	mtx_unlock(&_su_loader.queue_mutex);
+}
+
 void su_gltf_destroy(su_gltf_t* gltf) {
 	if (!gltf) return;
 
-	// TODO: If still loading, need to wait for loader thread to finish with this asset
-	// For now, sk_renderer's deferred destruction handles in-flight resources
+	// The loader thread creates this gltf's meshes and textures asynchronously
+	// and flips `state` to ready BEFORE the textures finish, so `state` can't
+	// tell us the loader is done. Freeing now would pull the struct out from
+	// under an in-flight skr_tex_create on the loader thread — a use-after-free
+	// that surfaces as dstImage=0x0 in vkCmdCopyBufferToImage. Block until the
+	// loader signals it is completely finished with this asset. The loader is
+	// always alive here (scenes are destroyed before su_shutdown joins it); the
+	// running check is a safety net so a post-shutdown destroy can't spin.
+	for (;;) {
+		mtx_lock(&_su_loader.queue_mutex);
+		bool done = gltf->loader_done;
+		mtx_unlock(&_su_loader.queue_mutex);
+		if (done || !_su_loader.running) break;
+		thrd_sleep(&(struct timespec){.tv_nsec = 500000}, NULL);  // 0.5ms
+	}
 
 	for (int32_t i = 0; i < gltf->mesh_count; i++) {
 		skr_mesh_destroy(&gltf->meshes[i]);

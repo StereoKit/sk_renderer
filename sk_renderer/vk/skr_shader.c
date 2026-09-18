@@ -13,7 +13,7 @@
 // Shader stage creation
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_data, uint32_t shader_size, skr_stage_ type) {
+static skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_data, uint32_t shader_size, skr_stage_ type) {
 	skr_shader_stage_t stage = {0};
 	stage.type               = type;
 
@@ -29,7 +29,7 @@ skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* shader_
 	return stage;
 }
 
-void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
+static void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 	if (!ref_stage) return;
 
 	_skr_cmd_destroy_shader_module(NULL, ref_stage->shader);
@@ -38,6 +38,7 @@ void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 
 static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const sksc_shader_file_t* file, skr_stage_ stage_type) {
 	for (uint32_t i = 0; i < file->stage_count; i++) {
+		if (file->stages[i].language != skr_shader_lang_spirv) continue;
 		if (file->stages[i].stage == stage_type && file->stages[i].code_size > 0)
 			return _skr_shader_stage_create(device, file->stages[i].code, file->stages[i].code_size, stage_type);
 	}
@@ -49,16 +50,19 @@ static skr_shader_stage_t _skr_shader_file_create_stage(VkDevice device, const s
 // Shader creation
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, skr_shader_stage_t v_shader,
+static skr_shader_t _skr_shader_create_manual(const sksc_shader_meta_t* meta, skr_shader_stage_t v_shader,
                                        skr_shader_stage_t p_shader, skr_shader_stage_t c_shader) {
 	skr_shader_t shader  = {0};
 	if (meta) shader.meta = *meta;
+	shader.pass_inputs   = sksc_shader_meta_pass_inputs(&shader.meta);
 	shader.vertex_stage  = v_shader;
 	shader.pixel_stage   = p_shader;
 	shader.compute_stage = c_shader;
 
 	return shader;
 }
+
+static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta);
 
 skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shader_t* out_shader) {
 	if (!out_shader) return skr_err_invalid_parameter;
@@ -87,6 +91,29 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 		return err;
 	}
 
+	// A container carries one language, so a file built for another backend has
+	// nothing this device can run; without this its stages would reach
+	// vkCreateShaderModule as text.
+	bool has_spirv = false;
+	for (uint32_t i = 0; i < file.stage_count; i++)
+		if (file.stages[i].language == skr_shader_lang_spirv) has_spirv = true;
+	if (!has_spirv) {
+		skr_log(skr_log_critical, "Shader '%s' has no SPIR-V stages, compile it with skshaderc '-t s'", file.meta.name);
+		sksc_shader_file_destroy(&file);
+		return skr_err_unsupported;
+	}
+
+	// Device-support gate, before any VkShaderModule exists: a shader whose
+	// declared requirements (meta features, pinned subgroup size) this device
+	// didn't enable can never reach a working pipeline, and its SPIR-V may not
+	// even be a legal module here (e.g. SPIR-V 1.4 without VK_KHR_spirv_1_4).
+	// Nothing can fix this at runtime, so it simply comes back as an invalid
+	// shader — the warnings below are the whole diagnostic.
+	if (!_skr_shader_meta_supported(&file.meta)) {
+		sksc_shader_file_destroy(&file);
+		return skr_err_unsupported;
+	}
+
 	// Create shader stages from the file
 	skr_shader_stage_t v_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_vertex);
 	skr_shader_stage_t p_stage = _skr_shader_file_create_stage(_skr_vk.device, &file, skr_stage_pixel);
@@ -103,6 +130,61 @@ skr_err_ skr_shader_create(const void* shader_data, uint32_t data_size, skr_shad
 	return skr_err_success;
 }
 
+// Human-readable name for a sksc_feature_bit_, used only for diagnostic logging
+// when a shader fails the support gate in skr_shader_create.
+static const char* _skr_feature_bit_name(int32_t bit) {
+	switch (bit) {
+		case sksc_feature_bit_float16:           return "shaderFloat16";
+		case sksc_feature_bit_storage16:         return "16-bit storage";
+		case sksc_feature_bit_storage8:          return "8-bit storage";
+		case sksc_feature_bit_extended_formats:  return "shaderStorageImageExtendedFormats";
+		case sksc_feature_bit_image_atomics:     return "storage image atomics";
+		case sksc_feature_bit_subgroups:         return "subgroup operations";
+		case sksc_feature_bit_wave_size:         return "subgroup size control";
+		case sksc_feature_bit_multiview:         return "multiview";
+		case sksc_feature_bit_demote:            return "demote to helper invocation";
+		case sksc_feature_bit_int64:             return "shaderInt64";
+		case sksc_feature_bit_float64:           return "shaderFloat64";
+		case sksc_feature_bit_int16:             return "shaderInt16";
+		case sksc_feature_bit_int8:              return "shaderInt8";
+		case sksc_feature_bit_formatless:        return "formatless storage image read/write";
+		case sksc_feature_bit_tile_image:        return "shader tile image";
+		case sksc_feature_bit_float_atomics:     return "float atomics";
+		case sksc_feature_bit_scalar_layout:     return "scalar block layout";
+		case sksc_feature_bit_qcom_sample_weighted: return "textureSampleWeighted (VK_QCOM_image_processing)";
+		case sksc_feature_bit_qcom_box_filter:      return "textureBoxFilter (VK_QCOM_image_processing)";
+		case sksc_feature_bit_qcom_block_match:     return "textureBlockMatch (VK_QCOM_image_processing)";
+		case sksc_feature_bit_qcom_image_proc2:     return "VK_QCOM_image_processing2";
+		case sksc_feature_bit_qcom_tile_shading:    return "VK_QCOM_tile_shading";
+		case sksc_feature_bit_output_layer:         return "shaderOutputLayer (VK_EXT_shader_viewport_index_layer)";
+		case sksc_feature_bit_geometry:             return "geometryShader (fragment reads of the layer index)";
+		case sksc_feature_bit_unknown:           return "an unrecognized capability";
+		default:                                 return "an unknown feature";
+	}
+}
+
+// Returns true if the device can run this shader. Gates only on known feature
+// bits the device didn't enable. The `unknown` bit is masked out: "unrecognized"
+// isn't "unsupported" (the app may have enabled the extension via skr_vk_ext_*,
+// or the compiler is simply older than this runtime), so it falls through to
+// pipeline creation. `wave_size` is masked too because a pin is a hint, not a
+// requirement: pipeline creation falls back to the implementation default when
+// the device can't honor it. A false result means the shader comes back invalid.
+static bool _skr_shader_meta_supported(const sksc_shader_meta_t* meta) {
+	bool     supported = true;
+	uint64_t missing   = sksc_shader_meta_missing_features(meta, _skr_vk.enabled_features)
+	                     & ~((uint64_t)1 << sksc_feature_bit_unknown)
+	                     & ~((uint64_t)1 << sksc_feature_bit_wave_size);
+	if (missing != 0) {
+		supported = false;
+		for (int32_t bit = 0; bit < 64; bit++) {
+			if (missing & ((uint64_t)1 << bit))
+				skr_log(skr_log_warning, "Shader '%s' requires unsupported feature: %s", meta->name, _skr_feature_bit_name(bit));
+		}
+	}
+	return supported;
+}
+
 bool skr_shader_is_valid(const skr_shader_t* shader) {
 	if (!shader) return false;
 	return
@@ -113,6 +195,8 @@ bool skr_shader_is_valid(const skr_shader_t* shader) {
 
 void skr_shader_destroy(skr_shader_t* ref_shader) {
 	if (!ref_shader) return;
+
+	_skr_mipgen_material_release(ref_shader);
 
 	_skr_shader_stage_destroy(&ref_shader->vertex_stage);
 	_skr_shader_stage_destroy(&ref_shader->pixel_stage);
@@ -184,6 +268,62 @@ void skr_shader_set_name(skr_shader_t* ref_shader, const char* name) {
 	}
 }
 
+// Shader defaults with user overrides applied by name. out_values is indexed
+// by meta order, matching the map entries built at pipeline creation.
+void _skr_shader_resolve_spec_constants(const sksc_shader_meta_t* meta, const skr_spec_constant_t* specs, uint32_t spec_count, uint32_t out_values[SKR_MAX_SPEC_CONSTANTS]) {
+	memset(out_values, 0, sizeof(uint32_t) * SKR_MAX_SPEC_CONSTANTS);
+
+	uint32_t count = meta->spec_constant_count;
+	if (count > SKR_MAX_SPEC_CONSTANTS) {
+		skr_log(skr_log_warning, "Shader '%s' has %u spec constants, max is %d; extras keep their defaults", meta->name, count, SKR_MAX_SPEC_CONSTANTS);
+		count = SKR_MAX_SPEC_CONSTANTS;
+	}
+	for (uint32_t i = 0; i < count; i++)
+		out_values[i] = meta->spec_constants[i].default_value;
+
+	for (uint32_t s = 0; s < spec_count; s++) {
+		if (!specs[s].name) continue;
+
+		uint64_t hash  = skr_hash(specs[s].name);
+		int32_t  found = -1;
+		for (uint32_t i = 0; i < count; i++) {
+			if (meta->spec_constants[i].name_hash == hash) { found = (int32_t)i; break; }
+		}
+		if (found < 0) {
+			skr_log(skr_log_warning, "Spec constant '%s' not found in shader '%s'", specs[s].name, meta->name);
+			continue;
+		}
+
+		switch (meta->spec_constants[found].type) {
+			case sksc_shader_var_uint:  { uint32_t v = (uint32_t)specs[s].value; memcpy(&out_values[found], &v, sizeof(v)); } break;
+			case sksc_shader_var_float: { float    v = (float   )specs[s].value; memcpy(&out_values[found], &v, sizeof(v)); } break;
+			default:                    { int32_t  v = (int32_t )specs[s].value; memcpy(&out_values[found], &v, sizeof(v)); } break;
+		}
+	}
+}
+
+const VkSpecializationInfo* _skr_shader_make_spec_info(const sksc_shader_meta_t* meta, const uint32_t* spec_values, VkSpecializationMapEntry out_entries[SKR_MAX_SPEC_CONSTANTS], VkSpecializationInfo* out_info) {
+	uint32_t spec_count = meta->spec_constant_count < SKR_MAX_SPEC_CONSTANTS ? meta->spec_constant_count : SKR_MAX_SPEC_CONSTANTS;
+	if (spec_count == 0) return NULL;
+
+	// Each 32-bit value is packed contiguously; offset i*4 matches the layout
+	// _skr_shader_resolve_spec_constants writes into spec_values.
+	for (uint32_t i = 0; i < spec_count; i++) {
+		out_entries[i] = (VkSpecializationMapEntry){
+			.constantID = meta->spec_constants[i].constant_id,
+			.offset     = i * (uint32_t)sizeof(uint32_t),
+			.size       = sizeof(uint32_t),
+		};
+	}
+	*out_info = (VkSpecializationInfo){
+		.mapEntryCount = spec_count,
+		.pMapEntries   = out_entries,
+		.dataSize      = spec_count * sizeof(uint32_t),
+		.pData         = spec_values,
+	};
+	return out_info;
+}
+
 // Returns pointer to the immutable sampler for a given binding slot, or NULL if none.
 // The returned pointer is stable (points into the caller's array) for use in pImmutableSamplers.
 static const VkSampler* _skr_find_immutable_sampler(int32_t slot, const VkSampler* samplers, const int32_t* slots, int32_t count) {
@@ -193,6 +333,39 @@ static const VkSampler* _skr_find_immutable_sampler(int32_t slot, const VkSample
 	return NULL;
 }
 
+// Must see the same meta, mask and push flag as _skr_shader_make_layout, or the
+// bindings named here won't be the ones the layout made dynamic.
+uint32_t _skr_shader_dyn_bindings(const sksc_shader_meta_t* meta, skr_stage_ stage_mask, bool has_push_descriptors, uint32_t out_bindings[3]) {
+	if (has_push_descriptors) return 0; // push descriptor sets can't hold dynamic descriptors
+
+	uint32_t material = SKR_BIND_SHIFT_BUFFER  + (uint32_t)_skr_vk.bind_settings.material_slot;
+	uint32_t system   = SKR_BIND_SHIFT_BUFFER  + (uint32_t)_skr_vk.bind_settings.system_slot;
+	uint32_t instance = SKR_BIND_SHIFT_TEXTURE + (uint32_t)_skr_vk.bind_settings.instance_slot;
+	uint32_t count    = 0;
+	for (uint32_t i = 0; i < meta->buffer_count && count < 3; i++) {
+		skr_bind_t bind = meta->buffers[i].bind;
+		if ((bind.stage_bits & stage_mask) && bind.register_type == skr_register_constant && (bind.slot == material || bind.slot == system))
+			out_bindings[count++] = bind.slot;
+	}
+	for (uint32_t i = 0; i < meta->resource_count && count < 3; i++) {
+		skr_bind_t bind = meta->resources[i].bind;
+		if ((bind.stage_bits & stage_mask) && bind.register_type == skr_register_read_buffer && bind.slot == instance)
+			out_bindings[count++] = bind.slot;
+	}
+	// Dynamic offsets are consumed in binding order
+	for (uint32_t i = 1; i < count; i++)
+		for (uint32_t j = i; j > 0 && out_bindings[j-1] > out_bindings[j]; j--) {
+			uint32_t t = out_bindings[j]; out_bindings[j] = out_bindings[j-1]; out_bindings[j-1] = t;
+		}
+	return count;
+}
+
+static bool _skr_is_dyn_binding(uint32_t slot, const uint32_t* bindings, uint32_t count) {
+	for (uint32_t i = 0; i < count; i++)
+		if (bindings[i] == slot) return true;
+	return false;
+}
+
 VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_descriptors, const sksc_shader_meta_t* meta, skr_stage_ stage_mask, const VkSampler* immutable_samplers, const int32_t* immutable_sampler_slots, int32_t immutable_sampler_count) {
 	if (meta->buffer_count == 0 && meta->resource_count == 0) {
 		return VK_NULL_HANDLE;
@@ -200,6 +373,11 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 
 	VkDescriptorSetLayoutBinding bindings[32];
 	uint32_t                     binding_count = 0;
+
+	// Without push descriptors the bump-buffer slots are dynamic, so a cached
+	// set survives across frames and the draw supplies the offsets
+	uint32_t dyn_bindings[3];
+	uint32_t dyn_count = _skr_shader_dyn_bindings(meta, stage_mask, has_push_descriptors, dyn_bindings);
 
 	// Add buffer bindings
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
@@ -216,13 +394,24 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 			case skr_register_readwrite:        desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
 			case skr_register_readwrite_tex:    desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
 			case skr_register_input_attachment: desc_type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;       break; // (SubpassInput)
+			// VK_QCOM_image_processing / VK_QCOM_tile_shading (SKS v11)
+			case skr_register_sample_weight:    desc_type = VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM; break;
+			case skr_register_block_match:      desc_type = VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM;   break;
+			case skr_register_tile_sampled:     desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   break; // tile attachment, sampled
+			case skr_register_tile_storage:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            break; // tile attachment, storage
 			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
+
+		if (desc_type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && _skr_is_dyn_binding(bind.slot, dyn_bindings, dyn_count))
+			desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 
 		VkShaderStageFlags stages = 0;
 		if (bind.stage_bits & skr_stage_vertex ) stages |= VK_SHADER_STAGE_VERTEX_BIT;
 		if (bind.stage_bits & skr_stage_pixel  ) stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
 		if (bind.stage_bits & skr_stage_compute) stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+		// Vulkan allows only fragment (or nothing) on an input attachment
+		// binding, whatever stages reflection found it in
+		if (desc_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) stages &= VK_SHADER_STAGE_FRAGMENT_BIT;
 
 		bindings[binding_count++] = (VkDescriptorSetLayoutBinding){
 			.binding            = bind.slot,
@@ -248,13 +437,24 @@ VkDescriptorSetLayout _skr_shader_make_layout(VkDevice device, bool has_push_des
 			case skr_register_readwrite:        desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;         break; // (RWStructuredBuffer)
 			case skr_register_readwrite_tex:    desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          break; // (RWTexture)
 			case skr_register_input_attachment: desc_type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;       break; // (SubpassInput)
+			// VK_QCOM_image_processing / VK_QCOM_tile_shading (SKS v11)
+			case skr_register_sample_weight:    desc_type = VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM; break;
+			case skr_register_block_match:      desc_type = VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM;   break;
+			case skr_register_tile_sampled:     desc_type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;   break; // tile attachment, sampled
+			case skr_register_tile_storage:     desc_type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            break; // tile attachment, storage
 			default:                            desc_type = VK_DESCRIPTOR_TYPE_MAX_ENUM;               break;
 		}
+
+		if (desc_type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && _skr_is_dyn_binding(bind.slot, dyn_bindings, dyn_count))
+			desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
 
 		VkShaderStageFlags stages = 0;
 		if (bind.stage_bits & skr_stage_vertex ) stages |= VK_SHADER_STAGE_VERTEX_BIT;
 		if (bind.stage_bits & skr_stage_pixel  ) stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
 		if (bind.stage_bits & skr_stage_compute) stages |= VK_SHADER_STAGE_COMPUTE_BIT;
+		// Vulkan allows only fragment (or nothing) on an input attachment
+		// binding, whatever stages reflection found it in
+		if (desc_type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) stages &= VK_SHADER_STAGE_FRAGMENT_BIT;
 
 		const VkSampler* found_sampler = _skr_find_immutable_sampler(bind.slot, immutable_samplers, immutable_sampler_slots, immutable_sampler_count);
 		bindings[binding_count++] = (VkDescriptorSetLayoutBinding){

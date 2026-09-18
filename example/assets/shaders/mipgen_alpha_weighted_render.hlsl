@@ -19,10 +19,9 @@ struct vs_out {
 // Vertex shader - fullscreen triangle
 vs_out vs(uint id : SV_VertexID) {
 	vs_out output;
-	// Generate fullscreen triangle: vertices at (-1,-1), (3,-1), (-1,3)
-	// UVs should go from (0,0) at top-left to (1,1) at bottom-right
-	output.uv  = float2((id << 1) & 2, id & 2);
-	output.pos = float4(output.uv * 2.0 - 1.0, 0, 1);
+	// Generate fullscreen triangle, uv (0,0) at top-left
+	output.uv  = float2(id & 2, (id << 1) & 2);
+	output.pos = float4(output.uv * float2(2, -2) + float2(-1, 1), 0, 1);
 	return output;
 }
 

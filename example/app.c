@@ -21,18 +21,41 @@
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include <cimgui.h>
 
+// WebGPU render passes resolve only into same-sized targets, so render
+// targets can't round away from the surface size there; Vulkan keeps the
+// even rounding it has always used.
+#ifdef SKR_WEBGPU
+	#define APP_SIZE_ROUND(x) (x)
+#else
+	#define APP_SIZE_ROUND(x) ((x) & ~1)
+#endif
+
 const bool enable_offscreen       = false;
 const bool enable_bloom           = false;
 const bool enable_stereo          = true;
 enum resolve_mode_ {
 	resolve_mode_normal,         // No postfx, auto resolve
 	resolve_mode_auto_postfx,    // Auto resolve + postfx invert
+	resolve_mode_chain_postfx,   // Auto resolve + postfx invert x2 (chained, pooled intermediate)
 	resolve_mode_manual_postfx,  // Manual resolve + integral invert
 	resolve_mode_wide_kernel,    // Wide-kernel resolve (Texture2DMS, separate pass)
 	resolve_mode_oled_subpixel,  // OLED subpixel-aware resolve (Texture2DMS, separate pass)
+	resolve_mode_depth_fog,      // Postfx reads depth as input attachment (on-tile resolved under MSAA)
+	resolve_mode_depth_fog_ms,   // Same fog, but depth is SubpassInputMS, so the pass skips the depth
+	                             // resolve entirely. MSAA only, the shader can't run in a 1x pass
+	resolve_mode_fog_scatter,    // Depth fog + light scatter: on-tile density prepass (postfx, depth
+	                             // never stored), then a VK_QCOM_image_processing box-filter blit
+	                             // whose kernel widens with the density packed in alpha
+	resolve_mode_fog_tile,       // Same effect entirely on-tile: VK_QCOM_tile_shading postfx reads
+	                             // color as a tile attachment with a 4px apron (kernel capped there)
+	resolve_mode_halation,       // Film halation: a blit that convolves the scene's clipped highlights
+	                             // with a derived per-wavelength PSF. No extensions.
 	resolve_mode_max,
 };
-const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve" };
+const char* resolve_mode_names[] = { "Normal", "Auto Resolve + Invert", "Auto Resolve + Invert x2", "Manual Resolve + Invert", "Wide Kernel Resolve", "OLED Subpixel Resolve", "Depth Fog PostFX", "Depth Fog PostFX (MS depth)", "Depth Fog + Scatter (QCOM)", "Fog Scatter On-Tile (QCOM)", "Halation Blit" };
+// The mode combo walks this array to resolve_mode_max, so a missing name is an
+// out of bounds read rather than a blank entry.
+_Static_assert(sizeof(resolve_mode_names) / sizeof(resolve_mode_names[0]) == resolve_mode_max, "resolve_mode_names needs an entry per resolve_mode_");
 
 // Application state
 struct app_t {
@@ -58,7 +81,8 @@ struct app_t {
 	skr_tex_t color_msaa;
 	skr_tex_t depth_buffer;
 	skr_tex_t scene_color;
-	skr_tex_t upscale_target;  // Readable postfx output when upscale + postfx both active
+	skr_tex_t upscale_target;      // Readable postfx output when upscale + postfx both active
+	skr_tex_t fog_scatter_target;  // Readable density prepass output (rgb + density alpha) the scatter blit box-filters
 	int32_t   current_width;
 	int32_t   current_height;
 
@@ -68,6 +92,36 @@ struct app_t {
 	// PostFX
 	skr_shader_t   postfx_shader;
 	skr_material_t postfx_mat;
+	skr_material_t postfx_mat2;  // Second invert for the chained mode — two inverts ≈ identity
+	skr_shader_t   depth_fog_shader;
+	skr_material_t depth_fog_mat;
+	skr_shader_t   depth_fog_ms_shader; // Same shader with SubpassInputMS depth, MSAA passes only
+	skr_material_t depth_fog_ms_mat;
+	// Fog + scatter pair: density prepass (postfx subpass, keeps depth on-tile)
+	// + a scatter blit. The blit prefers the VK_QCOM_image_processing box
+	// filter and falls back to plain 9-tap sampling when the device lacks it.
+	skr_shader_t   fog_density_shader;
+	skr_material_t fog_density_mat;
+	skr_shader_t   fog_scatter_shader;
+	skr_material_t fog_scatter_mat;
+	bool           fog_scatter_qcom;    // Blit uses BoxFilterQCOM rather than the tap fallback
+	// Fog on-tile: same effect as a tile-shading postfx subpass (apron reads).
+	skr_shader_t   fog_tile_shader;
+	skr_material_t fog_tile_mat;
+	// Halation: a blit that convolves the scene with the film-base point
+	// spread function. Reads scene_color, which this mode makes readable.
+	skr_shader_t   halation_shader;
+	skr_material_t halation_mat;
+	// Live tuning values for it. Seeded from the shader's own defaults when the
+	// material is created, so postfx_halation.svsl stays the one place those
+	// numbers live, then driven from the ImGui panel each frame.
+	float          hal_coupling;
+	float          hal_irradiation;
+	float          hal_thickness;
+	float          hal_irr_radius;
+	float          hal_clip_knee;
+	float          hal_clip_range;
+	float          hal_dye[4];
 
 	// Manual MSAA resolve
 	skr_shader_t   resolve_shader;
@@ -85,21 +139,29 @@ struct app_t {
 
 	// Performance tracking
 	float   frame_time_ms;
+	float   refresh_hz;
 	float   gpu_time_total_ms;
 	float   gpu_time_min_ms;
 	float   gpu_time_max_ms;
 	int32_t gpu_time_samples;
 
-	// Frame time history for graphs (circular buffer)
-	#define FRAME_HISTORY_SIZE 512
-	float   frame_time_history[512];
-	float   gpu_time_history[512];
-	float   cpu_time_history[512];
-	int32_t history_index;
 	float   frame_ema;
 	float   gpu_ema;
 	float   cpu_ema;
+
+	// Presentation timeline for the overlay, both rings indexed by present id
+	#define PRESENT_HISTORY 512
+	skr_present_info_t presents[PRESENT_HISTORY];
+	skr_frame_timing_t frames  [PRESENT_HISTORY];  // by the present each frame fed
+	uint64_t           newest_present_id;          // newest drained present, 0 = none yet
+	bool               timeline_frozen;            // overlay keeps drawing from frozen_head
+	uint64_t           frozen_head;
+	pacer_run_ahead_   run_ahead;
+	bool               fullscreen;
+	skr_present_mode_  present_mode;               // what the surface is doing
 };
+
+static const char* run_ahead_names[pacer_run_ahead_max] = { "Swapchain depth", "Two frames", "One frame" };
 
 static const char* _tex_fmt_name(skr_tex_fmt_ fmt) {
 	switch (fmt) {
@@ -145,8 +207,8 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	skr_tex_sampler_t linear_clamp = { .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp };
 
 	// Apply render scale. Even dimensions required for MSAA.
-	int32_t render_w = (int32_t)(width  * app->render_scale) & ~1;
-	int32_t render_h = (int32_t)(height * app->render_scale) & ~1;
+	int32_t render_w = APP_SIZE_ROUND((int32_t)(width  * app->render_scale));
+	int32_t render_h = APP_SIZE_ROUND((int32_t)(height * app->render_scale));
 	if (render_w < 2) render_w = 2;
 	if (render_h < 2) render_h = 2;
 
@@ -160,13 +222,24 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 	bool wide_kernel     = (app->resolve_mode == resolve_mode_wide_kernel);
 	bool oled_subpixel   = (app->resolve_mode == resolve_mode_oled_subpixel);
 	bool manual_resolve  = (app->resolve_mode == resolve_mode_manual_postfx);
+	bool fog_scatter     = (app->resolve_mode == resolve_mode_fog_scatter);
+	bool fog_tile        = (app->resolve_mode == resolve_mode_fog_tile);
+	bool halation        = (app->resolve_mode == resolve_mode_halation);
 	bool separate_pass   = wide_kernel || oled_subpixel;
 	skr_tex_flags_ msaa_flags = skr_tex_flags_writeable
 		| (manual_resolve ? skr_tex_flags_input_attachment : 0)
 		| (separate_pass  ? skr_tex_flags_readable         : 0);
 	skr_tex_create(msaa_format,       msaa_flags, separate_pass ? linear_clamp : no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->color_msaa);
-	skr_tex_flags_ depth_flags = skr_tex_flags_writeable | ((app->msaa > 1) ? skr_tex_flags_input_attachment : 0);
-	skr_tex_create(app->depth_format, depth_flags, no_sampler, (skr_vec3i_t){render_w, render_h, 1}, app->msaa, 1, NULL, &app->depth_buffer);
+	// input_attachment covers both the MSAA tile path and postfx depth reads.
+	// Depth is sized unrounded: at 1x MSAA geometry renders straight to the
+	// (odd-sized) swapchain image, and attachments may be larger than the
+	// framebuffer but never smaller.
+	int32_t depth_w = (int32_t)(width  * app->render_scale);
+	int32_t depth_h = (int32_t)(height * app->render_scale);
+	if (depth_w < 2) depth_w = 2;
+	if (depth_h < 2) depth_h = 2;
+	skr_tex_flags_ depth_flags = skr_tex_flags_writeable | skr_tex_flags_input_attachment;
+	skr_tex_create(app->depth_format, depth_flags, no_sampler, (skr_vec3i_t){depth_w, depth_h, 1}, app->msaa, 1, NULL, &app->depth_buffer);
 
 	if (enable_offscreen || needs_upscale) {
 		// Offscreen target at render scale. Readable so the upscale blit can sample it.
@@ -184,13 +257,43 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 				linear_clamp,
 				(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->upscale_target);
 		}
-	} else if (app->msaa > 1) {
-		// Intermediate color target for auto-resolve + postfx mode.
-		// Data stays in tile memory (transient) — postfx reads as input, writes to render_target.
+	} else if (halation) {
+		// Halation blits from this with a wide tap kernel, so the scene has to
+		// land in a sampleable target rather than staying transient. Geometry
+		// writes it at 1x, the MSAA resolve lands in it otherwise — which is
+		// why it takes render_target's format and not offscreen_format: a
+		// resolve attachment has to match the format of its color attachment,
+		// and color_msaa follows the render target here.
+		skr_tex_create(render_target->format,
+			skr_tex_flags_readable | skr_tex_flags_writeable,
+			linear_clamp,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
+	} else if (fog_tile) {
+		// On-tile fog reads this as a sampled tile attachment: SAMPLED usage
+		// rules out the transient flag, but the render pass still never stores
+		// it — the data lives and dies in tile memory.
+		skr_tex_create(render_target->format,
+			skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_input_attachment,
+			linear_clamp,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
+	} else {
+		// Intermediate color target for the postfx modes (geometry target at 1x,
+		// resolve target under MSAA). Data stays in tile memory (transient) —
+		// postfx reads as input, writes to render_target.
 		skr_tex_create(render_target->format,
 			skr_tex_flags_writeable | skr_tex_flags_input_attachment | skr_tex_flags_in_tile_msaa,
 			no_sampler,
 			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
+	}
+
+	// Fog scatter: the density prepass writes scene rgb + density alpha here,
+	// and the scatter blit reads it back with BoxFilterQCOM — so unlike the
+	// other postfx outputs, this one must be readable.
+	if (fog_scatter) {
+		skr_tex_create(app->offscreen_format,
+			skr_tex_flags_readable | skr_tex_flags_writeable,
+			linear_clamp,
+			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->fog_scatter_target);
 	}
 
 	app->current_width  = width;
@@ -205,10 +308,8 @@ static void _destroy_render_targets(app_t* app) {
 	skr_tex_destroy(&app->color_msaa);
 	skr_tex_destroy(&app->depth_buffer);
 	skr_tex_destroy(&app->upscale_target);
-	bool needs_upscale = (app->render_scale < 1.0f) || (app->viewport_scale < 1.0f);
-	if (enable_offscreen || needs_upscale || app->msaa > 1) {
-		skr_tex_destroy(&app->scene_color);
-	}
+	skr_tex_destroy(&app->fog_scatter_target);
+	skr_tex_destroy(&app->scene_color);
 }
 
 static void _switch_scene(app_t* app, int32_t new_index) {
@@ -271,15 +372,79 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->postfx_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->postfx_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->postfx_mat);
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->postfx_shader,
+			.depth_test = skr_compare_always,
+		}, &app->postfx_mat2);
+	}
+	app->depth_fog_shader = su_shader_load("shaders/postfx_depth_fog.hlsl.sks", "postfx_depth_fog");
+	if (skr_shader_is_valid(&app->depth_fog_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->depth_fog_shader,
+			.depth_test = skr_compare_always,
+		}, &app->depth_fog_mat);
+	}
+	app->depth_fog_ms_shader = su_shader_load("shaders/postfx_depth_fog_ms.hlsl.sks", "postfx_depth_fog_ms");
+	if (skr_shader_is_valid(&app->depth_fog_ms_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->depth_fog_ms_shader,
+			.depth_test = skr_compare_always,
+		}, &app->depth_fog_ms_mat);
+	}
+	// Fog + scatter: the density prepass is an ordinary postfx; the scatter
+	// blit prefers BoxFilterQCOM. skr_shader_create refuses shaders the device
+	// can't run (VK_QCOM_image_processing here), so an invalid result routes
+	// to the extension-free tap fallback and the mode works everywhere.
+	app->fog_density_shader = su_shader_load("shaders/postfx_fog_density.svsl.sks", "postfx_fog_density");
+	app->fog_scatter_shader = su_shader_load("shaders/postfx_fog_scatter.svsl.sks", "postfx_fog_scatter");
+	app->fog_scatter_qcom   = skr_shader_is_valid(&app->fog_scatter_shader);
+	if (!app->fog_scatter_qcom)
+		app->fog_scatter_shader = su_shader_load("shaders/postfx_fog_scatter_taps.svsl.sks", "postfx_fog_scatter_taps");
+	if (skr_shader_is_valid(&app->fog_density_shader) && skr_shader_is_valid(&app->fog_scatter_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->fog_density_shader,
+			.depth_test = skr_compare_always,
+		}, &app->fog_density_mat);
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->fog_scatter_shader,
+			.depth_test = skr_compare_always,
+		}, &app->fog_scatter_mat);
+	}
+	// Fog on-tile needs VK_QCOM_tile_shading; no fallback — the scatter mode
+	// above already is the non-tile version of this effect.
+	app->fog_tile_shader = su_shader_load("shaders/postfx_fog_tile.svsl.sks", "postfx_fog_tile");
+	if (skr_shader_is_valid(&app->fog_tile_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->fog_tile_shader,
+			.depth_test = skr_compare_always,
+		}, &app->fog_tile_mat);
+	}
+	// Halation: PSF convolution blit. Plain bilinear taps, so unlike the fog
+	// scatter pair there's no device gate and no fallback shader — the mode is
+	// available everywhere.
+	app->halation_shader = su_shader_load("shaders/postfx_halation.svsl.sks", "postfx_halation");
+	if (skr_shader_is_valid(&app->halation_shader)) {
+		skr_material_create((skr_material_info_t){
+			.shader     = &app->halation_shader,
+			.depth_test = skr_compare_always,
+		}, &app->halation_mat);
+		// Pull the tuning values straight out of the freshly created material,
+		// which carries the shader's declared defaults — no second copy of them
+		// here to drift out of sync.
+		skr_material_get_param(&app->halation_mat, "coupling",       sksc_shader_var_float, 1, &app->hal_coupling);
+		skr_material_get_param(&app->halation_mat, "irradiation",    sksc_shader_var_float, 1, &app->hal_irradiation);
+		skr_material_get_param(&app->halation_mat, "base_thickness", sksc_shader_var_float, 1, &app->hal_thickness);
+		skr_material_get_param(&app->halation_mat, "irr_radius",     sksc_shader_var_float, 1, &app->hal_irr_radius);
+		skr_material_get_param(&app->halation_mat, "clip_knee",      sksc_shader_var_float, 1, &app->hal_clip_knee);
+		skr_material_get_param(&app->halation_mat, "clip_range",     sksc_shader_var_float, 1, &app->hal_clip_range);
+		skr_material_get_param(&app->halation_mat, "dye_absorb",     sksc_shader_var_float, 4,  app->hal_dye);
 	}
 	app->resolve_shader = su_shader_load("shaders/msaa_resolve.hlsl.sks", "msaa_resolve");
 	if (skr_shader_is_valid(&app->resolve_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->resolve_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->resolve_mat);
 	}
@@ -287,7 +452,6 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->wide_resolve_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->wide_resolve_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->wide_resolve_mat);
 	}
@@ -295,7 +459,6 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->oled_resolve_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->oled_resolve_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->oled_resolve_mat);
 	}
@@ -303,7 +466,6 @@ app_t* app_create(int32_t start_scene) {
 	if (skr_shader_is_valid(&app->upscale_shader)) {
 		skr_material_create((skr_material_info_t){
 			.shader     = &app->upscale_shader,
-			.cull       = skr_cull_none,
 			.depth_test = skr_compare_always,
 		}, &app->upscale_mat);
 	}
@@ -328,7 +490,9 @@ app_t* app_create(int32_t start_scene) {
 	app->scene_types[16] = &scene_yuv_test_vtable;
 	app->scene_types[17] = &scene_gi_vtable;
 	app->scene_types[18] = &scene_pbr_vtable;
-	app->scene_count = 19;
+	app->scene_types[19] = &scene_frame_pacing_vtable;
+	app->scene_types[20] = &scene_desc_stress_vtable;
+	app->scene_count = 21;
 #ifdef SKR_HAS_VIDEO
 	app->scene_types[app->scene_count++] = &scene_video_vtable;
 #endif
@@ -336,8 +500,6 @@ app_t* app_create(int32_t start_scene) {
 	su_log(su_log_info, "Application created successfully!");
 	su_log(su_log_info, "Available scenes: %d (use arrow keys to switch)", app->scene_count);
 
-	//start_scene = 17;
-	
 	// Start with the requested scene (default to 0 if out of range or -1)
 	app->scene_index = -1;
 	int32_t initial_scene = (start_scene >= 0 && start_scene < app->scene_count) ? start_scene : 0;
@@ -370,8 +532,28 @@ void app_destroy(app_t* app) {
 	skr_render_list_destroy(&app->render_list);
 
 	// Destroy postfx (always destroy if created, regardless of runtime toggle)
+	if (skr_shader_is_valid(&app->depth_fog_shader)) {
+		skr_material_destroy(&app->depth_fog_mat);
+		skr_shader_destroy(&app->depth_fog_shader);
+	}
+	if (skr_shader_is_valid(&app->depth_fog_ms_shader)) {
+		skr_material_destroy(&app->depth_fog_ms_mat);
+		skr_shader_destroy(&app->depth_fog_ms_shader);
+	}
+	// The fog materials only exist when their shaders passed the device gate
+	if (skr_material_is_valid(&app->fog_density_mat))  skr_material_destroy(&app->fog_density_mat);
+	if (skr_material_is_valid(&app->fog_scatter_mat))  skr_material_destroy(&app->fog_scatter_mat);
+	if (skr_material_is_valid(&app->fog_tile_mat))     skr_material_destroy(&app->fog_tile_mat);
+	if (skr_shader_is_valid(&app->fog_density_shader)) skr_shader_destroy(&app->fog_density_shader);
+	if (skr_shader_is_valid(&app->fog_scatter_shader)) skr_shader_destroy(&app->fog_scatter_shader);
+	if (skr_shader_is_valid(&app->fog_tile_shader))    skr_shader_destroy(&app->fog_tile_shader);
+	if (skr_shader_is_valid(&app->halation_shader)) {
+		skr_material_destroy(&app->halation_mat);
+		skr_shader_destroy(&app->halation_shader);
+	}
 	if (skr_shader_is_valid(&app->postfx_shader)) {
 		skr_material_destroy(&app->postfx_mat);
+		skr_material_destroy(&app->postfx_mat2);
 		skr_shader_destroy(&app->postfx_shader);
 	}
 	if (skr_shader_is_valid(&app->resolve_shader)) {
@@ -418,6 +600,20 @@ int32_t app_scene_count(app_t* app) {
 	return app ? app->scene_count : 0;
 }
 
+void app_set_resolve_mode(app_t* app, int32_t mode) {
+	if (!app || mode < 0 || mode >= resolve_mode_max) return;
+	app->resolve_mode = mode;
+}
+
+int32_t app_resolve_mode_count(void) {
+	return resolve_mode_max;
+}
+
+void app_set_msaa(app_t* app, int32_t samples) {
+	if (!app || samples < 1 || samples > skr_get_max_msaa_samples()) return;
+	app->msaa = samples;
+}
+
 void app_key_press(app_t* app, app_key_ key) {
 	if (!app) return;
 
@@ -431,7 +627,7 @@ void app_key_press(app_t* app, app_key_ key) {
 	}
 }
 
-void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_target) {
+static void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_target) {
 	if (!app) return;
 
 	// Destroy old render targets
@@ -448,11 +644,31 @@ void app_resize(app_t* app, int32_t width, int32_t height, skr_tex_t* render_tar
 
 void app_update(app_t* app, float delta_time) {
 	if (!app || !app->scene_current) return;
+	app->scene_current->refresh_hz = app->refresh_hz;
 	scene_update(app->scene_types[app->scene_index], app->scene_current, delta_time);
 }
 
 void app_set_frame_time(app_t* app, float frame_time_ms) {
 	if (app) app->frame_time_ms = frame_time_ms;
+}
+
+void app_set_refresh_rate(app_t* app, float refresh_hz) {
+	if (app) app->refresh_hz = refresh_hz;
+}
+
+void              app_set_run_ahead   (app_t* app, pacer_run_ahead_ run_ahead) { app->run_ahead = run_ahead; }
+pacer_run_ahead_  app_run_ahead       (app_t* app)                             { return app->run_ahead; }
+void              app_set_fullscreen  (app_t* app, bool fullscreen)            { app->fullscreen = fullscreen; }
+bool              app_fullscreen      (app_t* app)                             { return app->fullscreen; }
+void              app_set_present_mode(app_t* app, skr_present_mode_ active)   { app->present_mode = active; }
+
+void app_add_timing(app_t* app, const skr_frame_timing_t* opt_frame, const skr_present_info_t* presents, int32_t count) {
+	if (opt_frame && opt_frame->present_id != 0)
+		app->frames[opt_frame->present_id % PRESENT_HISTORY] = *opt_frame;
+	for (int32_t i = 0; i < count; i++) {
+		app->presents[presents[i].id % PRESENT_HISTORY] = presents[i];
+		if (presents[i].id > app->newest_present_id) app->newest_present_id = presents[i].id;
+	}
 }
 
 void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t height) {
@@ -539,10 +755,24 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// manual_resolve    | color_msaa      | final_output    | NULL
 	// wide_kernel       | color_msaa      | NULL            | NULL (separate pass)
 	// oled_subpixel     | color_msaa      | NULL            | NULL (separate pass)
+	// fog_scatter       | as auto_postfx  | as auto_postfx  | fog_scatter_target (+scatter blit)
+	// halation          | scene_color     | scene_color     | NULL (readable scene + halation blit)
 	//
 	// *render_target = scene_color when enable_offscreen or needs_upscale
 	// final_output   = render_target when !needs_upscale, else upscale_src
-	bool use_postfx         = (app->resolve_mode == resolve_mode_auto_postfx)   && skr_material_is_valid(&app->postfx_mat);
+	bool use_chain_postfx   = (app->resolve_mode == resolve_mode_chain_postfx)  && skr_material_is_valid(&app->postfx_mat) && skr_material_is_valid(&app->postfx_mat2);
+	bool use_depth_fog      = (app->resolve_mode == resolve_mode_depth_fog)     && skr_material_is_valid(&app->depth_fog_mat);
+	// SubpassInputMS has no 1x form, so this mode is only offered under MSAA
+	bool use_depth_fog_ms   = (app->resolve_mode == resolve_mode_depth_fog_ms)  && app->msaa > 1 && skr_material_is_valid(&app->depth_fog_ms_mat);
+	// Gate on the support flag, not just material validity — the material is
+	// never created on devices without VK_QCOM_image_processing, and the mode
+	// must fall back to plain rendering there.
+	bool use_fog_scatter    = (app->resolve_mode == resolve_mode_fog_scatter)   && skr_material_is_valid(&app->fog_density_mat) && skr_material_is_valid(&app->fog_scatter_mat);
+	bool use_fog_tile       = (app->resolve_mode == resolve_mode_fog_tile)      && skr_material_is_valid(&app->fog_tile_mat);
+	// Halation is not a postfx: it needs neighbours, so it reads the finished
+	// scene as a texture in a blit rather than a pixel-local subpass.
+	bool use_halation       = (app->resolve_mode == resolve_mode_halation)      && skr_material_is_valid(&app->halation_mat);
+	bool use_postfx         = ((app->resolve_mode == resolve_mode_auto_postfx)  && skr_material_is_valid(&app->postfx_mat)) || use_chain_postfx || use_depth_fog || use_depth_fog_ms || use_fog_scatter || use_fog_tile;
 	bool use_manual_resolve = (app->resolve_mode == resolve_mode_manual_postfx) && app->msaa > 1 && skr_material_is_valid(&app->resolve_mat);
 	bool use_wide_kernel    = (app->resolve_mode == resolve_mode_wide_kernel)   && app->msaa > 1 && skr_material_is_valid(&app->wide_resolve_mat);
 	bool use_oled_subpixel  = (app->resolve_mode == resolve_mode_oled_subpixel) && app->msaa > 1 && skr_material_is_valid(&app->oled_resolve_mat);
@@ -552,7 +782,9 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// goes to upscale_target (a separate readable texture) to avoid aliasing in the framebuffer.
 	skr_tex_t* upscale_src = NULL;  // What the upscale blit reads from (NULL = no upscale)
 	if (needs_upscale)
-		upscale_src = (use_postfx && app->msaa > 1) ? &app->upscale_target : &app->scene_color;
+		// Fog scatter and halation always blit into upscale_target: their blit
+		// source is scene_color / the prepass, which it must not write back to.
+		upscale_src = ((use_postfx && app->msaa > 1) || use_fog_scatter || use_halation) ? &app->upscale_target : &app->scene_color;
 
 	skr_tex_t* final_output = needs_upscale ? upscale_src : render_target;
 
@@ -573,12 +805,18 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	} else if (use_postfx) {
 		// Auto postfx: geometry writes to scene_color (or resolves there for MSAA),
 		// postfx reads as input attachment (tile-local), writes to final_output.
+		// Fog scatter diverts the postfx (density prepass) to a readable target
+		// instead — the scatter blit box-filters it into final_output afterwards.
 		color_target   = (app->msaa > 1) ? &app->color_msaa : &app->scene_color;
 		resolve_target = (app->msaa > 1) ? &app->scene_color : NULL;
-		postfx_output  = final_output;
+		postfx_output  = use_fog_scatter ? &app->fog_scatter_target : final_output;
 	} else {
-		color_target   = (app->msaa > 1) ? &app->color_msaa : ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target);
-		resolve_target = (app->msaa > 1) ? ((enable_offscreen || needs_upscale) ? &app->scene_color : render_target) : NULL;
+		// Halation renders the scene into scene_color like the offscreen path
+		// does, then blits it to final_output — it samples neighbours, so the
+		// scene has to be a texture by the time it runs.
+		bool to_scene_color = enable_offscreen || needs_upscale || use_halation;
+		color_target   = (app->msaa > 1) ? &app->color_msaa : (to_scene_color ? &app->scene_color : render_target);
+		resolve_target = (app->msaa > 1) ? (to_scene_color ? &app->scene_color : render_target) : NULL;
 	}
 
 	// Scene geometry via deferred pass (handles multi-view transparently)
@@ -598,8 +836,23 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	if (use_manual_resolve)
 		skr_pass_add_resolve(&pass, &app->resolve_mat);
-	if (use_postfx)
+	if (use_fog_tile) {
+		// The pass auto-binds "color" (tile attachment) and "depth" (input
+		// attachment); only the pixel→uv scale needs setting here. The clip
+		// planes come from the projection in the system buffer, in-shader.
+		float source_size[2] = { (float)render_w, (float)render_h };
+		skr_material_set_param(&app->fog_tile_mat, "source_size", sksc_shader_var_float, 2, source_size);
+		skr_pass_add_postfx(&pass, &app->fog_tile_mat);
+	} else if (use_fog_scatter)
+		skr_pass_add_postfx(&pass, &app->fog_density_mat);
+	else if (use_depth_fog)
+		skr_pass_add_postfx(&pass, &app->depth_fog_mat);
+	else if (use_depth_fog_ms)
+		skr_pass_add_postfx(&pass, &app->depth_fog_ms_mat);
+	else if (use_postfx)
 		skr_pass_add_postfx(&pass, &app->postfx_mat);
+	if (use_chain_postfx)
+		skr_pass_add_postfx(&pass, &app->postfx_mat2);
 	skr_pass_submit(&pass);
 	skr_render_list_clear(&app->render_list);
 
@@ -612,6 +865,33 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	if (use_oled_subpixel) {
 		skr_material_set_tex(&app->oled_resolve_mat, "msaa_color", &app->color_msaa);
 		skr_renderer_blit(&app->oled_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+	}
+	// Fog scatter: box-filter the density prepass output, kernel width driven
+	// by the fog density each pixel packed into alpha (VK_QCOM_image_processing)
+	if (use_fog_scatter) {
+		float source_size[2] = { (float)render_w, (float)render_h };
+		skr_material_set_param(&app->fog_scatter_mat, "source_size", sksc_shader_var_float, 2, source_size);
+		// The QCOM shader binds the prepass twice — box-filtered and plain —
+		// while the tap fallback only has the plain binding.
+		if (app->fog_scatter_qcom)
+			skr_material_set_tex(&app->fog_scatter_mat, "scene_box", &app->fog_scatter_target);
+		skr_material_set_tex  (&app->fog_scatter_mat, "scene_tex", &app->fog_scatter_target);
+		skr_renderer_blit(&app->fog_scatter_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+	}
+	// Halation: convolve the scene's clipped highlights with the film-base PSF
+	// and add the halo back over it. 33 bilinear taps, no extensions needed.
+	if (use_halation) {
+		float source_size[2] = { (float)render_w, (float)render_h };
+		skr_material_set_param(&app->halation_mat, "source_size",    sksc_shader_var_float, 2, source_size);
+		skr_material_set_param(&app->halation_mat, "coupling",       sksc_shader_var_float, 1, &app->hal_coupling);
+		skr_material_set_param(&app->halation_mat, "irradiation",    sksc_shader_var_float, 1, &app->hal_irradiation);
+		skr_material_set_param(&app->halation_mat, "base_thickness", sksc_shader_var_float, 1, &app->hal_thickness);
+		skr_material_set_param(&app->halation_mat, "irr_radius",     sksc_shader_var_float, 1, &app->hal_irr_radius);
+		skr_material_set_param(&app->halation_mat, "clip_knee",      sksc_shader_var_float, 1, &app->hal_clip_knee);
+		skr_material_set_param(&app->halation_mat, "clip_range",     sksc_shader_var_float, 1, &app->hal_clip_range);
+		skr_material_set_param(&app->halation_mat, "dye_absorb",     sksc_shader_var_float, 4,  app->hal_dye);
+		skr_material_set_tex  (&app->halation_mat, "src_tex", &app->scene_color);
+		skr_renderer_blit(&app->halation_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
 	}
 
 	// Post-processing (operates at render resolution, before upscale)
@@ -629,13 +909,134 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 
 	// ImGui: always renders to swapchain at native resolution (sharp UI)
 	skr_tex_t* imgui_target = upscale_src ? render_target
-		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel) ? render_target
+		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel || use_halation) ? render_target
 		: (resolve_target ? resolve_target : color_target);
 	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1, 0);
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
 	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
 	ImGui_ImplSkRenderer_RenderDrawData(width, height);
 	skr_renderer_end_pass();
+}
+
+static ImU32 _rgba(float r, float g, float b, float a) {
+	return igGetColorU32_Vec4((ImVec4){r, g, b, a});
+}
+
+static void _rect(ImDrawList* dl, float x0, float y0, float x1, float y1, ImU32 col) {
+	ImDrawList_AddRectFilled(dl, (ImVec2){x0, y0}, (ImVec2){x1, y1}, col, 0.0f, 0);
+}
+
+// How many refreshes an image stayed on screen, 0 when either side is unknown
+static float _present_refreshes(const app_t* app, uint64_t id, float refresh_ms) {
+	if (id < 2) return 0.0f;
+	const skr_present_info_t* pi   = &app->presents[ id      % PRESENT_HISTORY];
+	const skr_present_info_t* prev = &app->presents[(id - 1) % PRESENT_HISTORY];
+	if (pi->id != id || prev->id != id - 1 || pi->display_ns == 0 || prev->display_ns == 0 || pi->display_ns <= prev->display_ns) return 0.0f;
+	return (float)(pi->display_ns - prev->display_ns) / (refresh_ms * 1000000.0f);
+}
+
+// The bottom half of the graph is 0 to 1 refresh, where frames normally live;
+// the top half is 1 to 4.5, where the misses and the queue depth are
+static float _axis(float refreshes) {
+	return refreshes <= 1.0f ? refreshes * 0.5f : 0.5f + (refreshes - 1.0f) / 3.5f * 0.5f;
+}
+
+// Newest at the right. The top row is one square per present, colored by how
+// many refreshes the image stayed on screen: what a capture card would see.
+// Below it CPU, GPU and present-to-display latency run as lines over a grid
+// in refresh periods.
+static void _draw_timeline(app_t* app, float width) {
+	const float   pitch   = 3.0f;  // pixels per present
+	const float   gap     = 8.0f;
+	const float   graph_h = 100.0f;
+	int32_t cols = (int32_t)(width / pitch);
+	if (cols > PRESENT_HISTORY) cols = PRESENT_HISTORY;
+	ImDrawList* dl = igGetWindowDrawList();
+	ImVec2      p  = igGetCursorScreenPos();
+	igDummy((ImVec2){width, pitch + gap + graph_h});
+	uint64_t head = app->timeline_frozen ? app->frozen_head : app->newest_present_id;
+	if (cols < 1 || head == 0) return;
+
+	float refresh_ms = 1000.0f / (app->refresh_hz > 0.0f ? app->refresh_hz : 60.0f);
+	float gx1        = p.x + cols * pitch;
+	float gy0        = p.y + pitch + gap;
+	float gy1        = gy0 + graph_h;
+	_rect(dl, p.x, gy0, gx1, gy1, _rgba(0.08f, 0.08f, 0.10f, 1.0f));
+	static const float grid[] = { 0.25f, 0.5f, 0.75f, 1.0f, 2.0f, 3.0f, 4.0f };
+	for (int32_t g = 0; g < (int32_t)(sizeof(grid) / sizeof(grid[0])); g++) {
+		float y = gy1 - graph_h * _axis(grid[g]);
+		ImDrawList_AddLine(dl, (ImVec2){p.x, y}, (ImVec2){gx1, y}, _rgba(1.0f, 1.0f, 1.0f, grid[g] == 1.0f ? 0.4f : 0.15f), 1.0f);
+		if (grid[g] < 1.0f) continue;
+		char label[4];
+		snprintf(label, sizeof(label), "%d", (int32_t)grid[g]);
+		ImDrawList_AddText_Vec2(dl, (ImVec2){gx1 - 10.0f, y - 15.0f}, _rgba(1.0f, 1.0f, 1.0f, 0.5f), label, NULL);
+	}
+
+	const ImU32 blue   = _rgba(0.30f, 0.55f, 1.0f, 1.0f);
+	const ImU32 orange = _rgba(1.0f,  0.60f, 0.15f, 1.0f);
+	ImVec2 prev_cpu = {0}, prev_gpu = {0}, prev_lat = {0};
+	bool   has_prev_frame = false, has_prev_lat = false;
+	for (int32_t i = 0; i < cols; i++) {
+		uint64_t back = (uint64_t)(cols - 1 - i);
+		if (back >= head) continue;
+		uint64_t id = head - back;
+		float    x0 = p.x + i * pitch;
+		float    cx = x0 + pitch * 0.5f;
+
+		const skr_present_info_t* pi        = &app->presents[id % PRESENT_HISTORY];
+		float                     refreshes = _present_refreshes(app, id, refresh_ms);
+		ImU32                     col       = _rgba(0.35f, 0.35f, 0.35f, 1.0f);
+		if (refreshes > 0.0f) {
+			int32_t n = (int32_t)(refreshes + 0.5f);
+			float   a = pi->source >= skr_timing_source_vblank ? 1.0f : 0.5f;
+			col = n <= 1 ? _rgba(0.25f, 0.85f, 0.35f, a) : n == 2 ? _rgba(1.0f, 0.75f, 0.2f, a) : _rgba(1.0f, 0.25f, 0.2f, a);
+		}
+		_rect(dl, x0, p.y, x0 + pitch, p.y + pitch, col);
+
+		const skr_frame_timing_t* ft = &app->frames[id % PRESENT_HISTORY];
+		if (ft->present_id == id) {
+			uint64_t total  = ft->cpu_end_ns > ft->cpu_begin_ns ? ft->cpu_end_ns - ft->cpu_begin_ns : 0;
+			uint64_t wait   = ft->cpu_wait_ns < total ? ft->cpu_wait_ns : total;
+			ImVec2   cpu    = { cx, gy1 - graph_h * _axis((float)(total - wait)  / 1000000.0f / refresh_ms) };
+			ImVec2   gpu    = { cx, gy1 - graph_h * _axis((float)ft->gpu_time_ns / 1000000.0f / refresh_ms) };
+			if (cpu.y < gy0) cpu.y = gy0;
+			if (gpu.y < gy0) gpu.y = gy0;
+			if (has_prev_frame) {
+				ImDrawList_AddLine(dl, prev_cpu, cpu, blue,   1.5f);
+				ImDrawList_AddLine(dl, prev_gpu, gpu, orange, 1.5f);
+			}
+			prev_cpu = cpu; prev_gpu = gpu; has_prev_frame = true;
+		} else has_prev_frame = false;
+
+		if (pi->id == id && pi->display_ns > pi->cpu_present_ns) {
+			ImVec2 lat = { cx, gy1 - graph_h * _axis((float)(pi->display_ns - pi->cpu_present_ns) / 1000000.0f / refresh_ms) };
+			if (lat.y < gy0) lat.y = gy0;
+			if (has_prev_lat) ImDrawList_AddLine(dl, prev_lat, lat, _rgba(1.0f, 1.0f, 1.0f, pi->source >= skr_timing_source_vblank ? 0.9f : 0.4f), 1.5f);
+			prev_lat = lat; has_prev_lat = true;
+		} else has_prev_lat = false;
+	}
+
+	// Stats over everything still in the ring, not just the squares
+	int32_t counted = 0, doubled = 0;
+	float   worst   = 0.0f;
+	for (uint64_t back = 0; back < PRESENT_HISTORY && back < head; back++) {
+		float refreshes = _present_refreshes(app, head - back, refresh_ms);
+		if (refreshes <= 0.0f) continue;
+		counted++;
+		if (refreshes >= 1.5f)  doubled++;
+		if (refreshes > worst)  worst = refreshes;
+	}
+
+	const skr_present_info_t* newest = &app->presents[head % PRESENT_HISTORY];
+	float lat_ms = newest->display_ns > newest->cpu_present_ns ? (float)(newest->display_ns - newest->cpu_present_ns) / 1000000.0f : 0.0f;
+	const char* source = pacer_source_names[newest->source];
+	igTextColored((ImVec4){0.30f, 0.55f, 1.0f, 1.0f}, "CPU %.2f ms", app->cpu_ema);
+	igSameLine(0.0f, 12.0f);
+	igTextColored((ImVec4){1.0f, 0.60f, 0.15f, 1.0f}, "GPU %.2f ms", app->gpu_ema);
+	igText("Lag %05.2f ms (%.1f refr)", lat_ms, lat_ms / refresh_ms);
+	igSameLine(0.0f, 12.0f);
+	if (igCheckbox("Freeze", &app->timeline_frozen) && app->timeline_frozen) app->frozen_head = app->newest_present_id;
+	igText("Last %d: %d doubled, worst %.1f, %s", counted, doubled, worst, source);
 }
 
 void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32_t height) {
@@ -669,6 +1070,8 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 
 	// Show render info and controls
 	igText("Window: %d x %d", width, height);
+	igSameLine(0.0f, 12.0f);
+	igCheckbox("Fullscreen", &app->fullscreen);
 	{
 		float rs = app->render_scale   * 100.0f;
 		float vs = app->viewport_scale * 100.0f;
@@ -676,8 +1079,8 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 		if (igSliderFloat("Viewport Scale", &vs, 25.0f, 100.0f, "%.0f%%", 0)) app->viewport_scale = vs / 100.0f;
 	}
 	{
-		int32_t rw = (int32_t)(width  * app->render_scale) & ~1;
-		int32_t rh = (int32_t)(height * app->render_scale) & ~1;
+		int32_t rw = APP_SIZE_ROUND((int32_t)(width  * app->render_scale));
+		int32_t rh = APP_SIZE_ROUND((int32_t)(height * app->render_scale));
 		int32_t vw = (int32_t)(rw * app->viewport_scale) & ~1;
 		int32_t vh = (int32_t)(rh * app->viewport_scale) & ~1;
 		igText("Render: %d x %d, Viewport: %d x %d", rw, rh, vw, vh);
@@ -685,6 +1088,34 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 	igText("MSAA: %dx", app->msaa);
 	if (app->msaa > 1)
 		igCombo_Str_arr("Resolve Mode", &app->resolve_mode, resolve_mode_names, resolve_mode_max, 0);
+
+	// Presentation. Present mode is only reachable from the command line;
+	// vsync'd FIFO is the only mode worth pacing.
+	{
+		int32_t run_ahead = (int32_t)app->run_ahead;
+		if (igCombo_Str_arr("Run ahead", &run_ahead, run_ahead_names, pacer_run_ahead_max, 0)) app->run_ahead = (pacer_run_ahead_)run_ahead;
+		igText("%s, refresh %.2f Hz", pacer_present_mode_names[app->present_mode], app->refresh_hz);
+	}
+	if (app->resolve_mode == resolve_mode_fog_scatter && !app->fog_scatter_qcom)
+		igText("Scatter: 9-tap fallback\n(no VK_QCOM_image_processing)");
+	if (app->resolve_mode == resolve_mode_fog_tile && !skr_material_is_valid(&app->fog_tile_mat))
+		igTextColored((ImVec4){1.0f, 0.45f, 0.35f, 1.0f}, "Needs VK_QCOM_tile_shading\n(renders without postfx here)");
+	if (app->resolve_mode == resolve_mode_halation && skr_material_is_valid(&app->halation_mat)) {
+		igSeparator();
+		igText("Halation");
+		// Both radii are fractions of the source height, so the on-screen size
+		// moves with the render target — show the pixel figures alongside, since
+		// that is what you are actually judging.
+		int32_t rh = APP_SIZE_ROUND((int32_t)(height * app->render_scale));
+		igText("halo reaches %.0f px, glow %.0f px", app->hal_thickness * rh * 4.0f, app->hal_irr_radius * rh);
+		igSliderFloat ("Strength",    &app->hal_coupling,    0.0f, 1.0f,   "%.2f", 0);
+		igSliderFloat ("Glow / Halo", &app->hal_irradiation, 0.0f, 1.0f,   "%.2f", 0);
+		igSliderFloat ("Halo Radius", &app->hal_thickness,   0.0f, 0.03f,  "%.4f", 0);
+		igSliderFloat ("Glow Radius", &app->hal_irr_radius,  0.0f, 0.01f,  "%.4f", 0);
+		igSliderFloat ("Clip Knee",   &app->hal_clip_knee,   0.0f, 1.0f,   "%.2f", 0);
+		igSliderFloat ("Clip Range",  &app->hal_clip_range,  1.0f, 24.0f,  "%.1f", 0);
+		igSliderFloat3("Dye Absorb",  app->hal_dye,          0.0f, 3.0f,   "%.2f", 0);
+	}
 
 	float gpu_ms   = skr_renderer_get_gpu_time_us() / 1000.0f;
 	float cpu_ms   = skr_renderer_get_cpu_time_us() / 1000.0f;
@@ -698,49 +1129,16 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 		if (gpu_ms > app->gpu_time_max_ms) app->gpu_time_max_ms = gpu_ms;
 	}
 
-	// Store history in circular buffer
-	app->frame_time_history[app->history_index] = frame_ms;
-	app->gpu_time_history  [app->history_index] = gpu_ms > 0.0f ? gpu_ms : app->gpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE];
-	app->cpu_time_history  [app->history_index] = cpu_ms > 0.0f ? cpu_ms : app->cpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE];
-	app->history_index = (app->history_index + 1) % FRAME_HISTORY_SIZE;
-
-	// Exponential moving average for readable display (smoothing factor ~0.1)
+	// Exponential moving average for readable display
 	const float ema_a = 0.02f;
 	app->frame_ema = app->frame_ema > 0.0f ? app->frame_ema + ema_a * (frame_ms - app->frame_ema) : frame_ms;
-	app->gpu_ema   = app->gpu_ema   > 0.0f ? app->gpu_ema   + ema_a * (app->gpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE] - app->gpu_ema) : gpu_ms;
-	app->cpu_ema   = app->cpu_ema   > 0.0f ? app->cpu_ema   + ema_a * (app->cpu_time_history[(app->history_index + FRAME_HISTORY_SIZE - 1) % FRAME_HISTORY_SIZE] - app->cpu_ema) : cpu_ms;
+	if (gpu_ms > 0.0f) app->gpu_ema = app->gpu_ema > 0.0f ? app->gpu_ema + ema_a * (gpu_ms - app->gpu_ema) : gpu_ms;
+	if (cpu_ms > 0.0f) app->cpu_ema = app->cpu_ema > 0.0f ? app->cpu_ema + ema_a * (cpu_ms - app->cpu_ema) : cpu_ms;
 
-	igText("Frame Time: %.3f ms (%.1f FPS)", app->frame_ema, 1000.0f / app->frame_ema);
-	igText("CPU Time: %.3f ms", app->cpu_ema);
-	igText("GPU Time: %.3f ms", app->gpu_ema);
+	igText("Frame Time: %05.2f ms (%5.1f FPS)", app->frame_ema, 1000.0f / app->frame_ema);
 
-	// Graph display ranges
-	const float frame_graph_min = 6.0f;
-	const float frame_graph_max = 10.0f;
-	const float cpu_graph_min   = 0.0f;
-	const float cpu_graph_max   = 3.0f;
-	const float gpu_graph_min   = 0.0f;
-	const float gpu_graph_max   = 3.0f;
-
-	// Get available width for full-width plots
-	ImVec2 content_region;
-	igGetContentRegionAvail(&content_region);
-	float plot_width = content_region.x;
-
-	char frame_overlay[32], cpu_overlay[32], gpu_overlay[32];
-	snprintf(frame_overlay, sizeof(frame_overlay), "Frame: %.1f ms", app->frame_ema);
-	snprintf(cpu_overlay,   sizeof(cpu_overlay),   "CPU: %.1f ms",   app->cpu_ema);
-	snprintf(gpu_overlay,   sizeof(gpu_overlay),   "GPU: %.1f ms",   app->gpu_ema);
-
-	// Plot frame time - using values_offset for circular buffer
-	igPlotLines_FloatPtr("##frame_graph", app->frame_time_history, FRAME_HISTORY_SIZE,
-		app->history_index, frame_overlay, frame_graph_min, frame_graph_max, (ImVec2){plot_width, 60}, sizeof(float));
-
-	igPlotLines_FloatPtr("##cpu_graph", app->cpu_time_history, FRAME_HISTORY_SIZE,
-		app->history_index, cpu_overlay, cpu_graph_min, cpu_graph_max, (ImVec2){plot_width, 60}, sizeof(float));
-
-	igPlotLines_FloatPtr("##gpu_graph", app->gpu_time_history, FRAME_HISTORY_SIZE,
-		app->history_index, gpu_overlay, gpu_graph_min, gpu_graph_max, (ImVec2){plot_width, 60}, sizeof(float));
+	ImVec2 content_region = igGetContentRegionAvail();
+	_draw_timeline(app, content_region.x);
 
 	igEnd();
 }

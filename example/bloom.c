@@ -59,8 +59,8 @@ void bloom_create(int32_t width, int32_t height, int32_t mip_count) {
 		.depth_test   = skr_compare_always,
 	}, &g_bloom.bloom_composite_mat);
 	for (int32_t i = 0; i < mip_count; i++) {
-		skr_compute_create(&g_bloom.bloom_downsample_shader, &g_bloom.bloom_downsample_comp[i]);
-		skr_compute_create(&g_bloom.bloom_upsample_shader, &g_bloom.bloom_upsample_comp[i]);
+		skr_compute_create(&g_bloom.bloom_downsample_shader, (skr_compute_info_t){0}, &g_bloom.bloom_downsample_comp[i]);
+		skr_compute_create(&g_bloom.bloom_upsample_shader, (skr_compute_info_t){0}, &g_bloom.bloom_upsample_comp[i]);
 	}
 
 	// Create fullscreen quad mesh

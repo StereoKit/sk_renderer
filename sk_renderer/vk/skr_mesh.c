@@ -29,6 +29,19 @@ skr_err_ skr_vert_type_create(const skr_vert_component_t* items, int32_t item_co
 		return skr_err_invalid_parameter;
 	}
 
+	// Semantic + slot is the key the pipeline remap matches on, so a duplicate
+	// pair would be ambiguous — reject it up front rather than silently binding
+	// whichever component the match loop happens to hit first.
+	for (int32_t i = 0; i < item_count; i++) {
+		for (int32_t j = i + 1; j < item_count; j++) {
+			if (items[i].semantic      == items[j].semantic &&
+			    items[i].semantic_slot == items[j].semantic_slot) {
+				skr_log(skr_log_warning, "Cannot create vertex type with duplicate semantic + slot components");
+				return skr_err_invalid_parameter;
+			}
+		}
+	}
+
 	// Allocate storage
 	out_type->component_count = item_count;
 	out_type->components      = _skr_malloc(sizeof(skr_vert_component_t) * item_count);
@@ -84,6 +97,10 @@ skr_err_ skr_vert_type_create(const skr_vert_component_t* items, int32_t item_co
 		uint8_t  binding        = items[i].binding;
 		uint32_t component_size = _skr_vert_fmt_to_size(items[i].format) * items[i].count;
 
+		// location is a placeholder only: the real per-shader location is
+		// resolved at pipeline creation by matching semantics (see
+		// _skr_pipeline_create). format/binding/offset here are authoritative
+		// and reused by that remap.
 		out_type->attributes[i] = (VkVertexInputAttributeDescription){
 			.location = i,
 			.binding  = binding,
@@ -213,6 +230,23 @@ void skr_mesh_set_name(skr_mesh_t* ref_mesh, const char* name) {
 // Mesh data update
 ///////////////////////////////////////////////////////////////////////////////
 
+// A render list may still carry the old count and read the handle mid-call,
+// so never shrink, and publish the new buffer before releasing the old one.
+static skr_err_ _skr_mesh_buffer_replace(skr_buffer_t* ref_buffer, skr_buffer_type_ type, const void* data, uint32_t count, uint32_t stride) {
+	uint32_t capacity = ref_buffer->size / stride;
+	if (capacity < count) capacity = count;
+
+	skr_buffer_t new_buffer;
+	skr_err_ err = skr_buffer_create(NULL, capacity, stride, type, skr_use_dynamic, &new_buffer);
+	if (err != skr_err_success) return err;
+	memcpy(new_buffer.mapped, data, count * stride);
+
+	skr_buffer_t old_buffer = *ref_buffer;
+	*ref_buffer = new_buffer;
+	skr_buffer_destroy(&old_buffer);
+	return skr_err_success;
+}
+
 skr_err_ skr_mesh_set_verts(skr_mesh_t* ref_mesh, const void* vert_data, uint32_t vert_count) {
 	if (!ref_mesh) {
 		return skr_err_invalid_parameter;
@@ -252,10 +286,7 @@ skr_err_ skr_mesh_set_verts(skr_mesh_t* ref_mesh, const void* vert_data, uint32_
 		bool is_static    = ref_mesh->vertex_buffers[0].use & skr_use_static;
 
 		if (is_static || needs_resize) {
-			// Either static (convert to dynamic) or too small (resize)
-			skr_buffer_destroy(&ref_mesh->vertex_buffers[0]);
-
-			skr_err_ err = skr_buffer_create(vert_data, vert_count, vert_stride, skr_buffer_type_vertex, skr_use_dynamic, &ref_mesh->vertex_buffers[0]);
+			skr_err_ err = _skr_mesh_buffer_replace(&ref_mesh->vertex_buffers[0], skr_buffer_type_vertex, vert_data, vert_count, vert_stride);
 			if (err != skr_err_success) {
 				skr_log(skr_log_critical, "Failed to create dynamic vertex buffer for mesh");
 				return err;
@@ -302,10 +333,7 @@ skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, const void* ind_data, uint32_t 
 		bool is_static    = ref_mesh->index_buffer.use & skr_use_static;
 
 		if (is_static || needs_resize) {
-			// Either static (convert to dynamic) or too small (resize)
-			skr_buffer_destroy(&ref_mesh->index_buffer);
-
-			skr_err_ err = skr_buffer_create(ind_data, ind_count, ind_stride, skr_buffer_type_index, skr_use_dynamic, &ref_mesh->index_buffer);
+			skr_err_ err = _skr_mesh_buffer_replace(&ref_mesh->index_buffer, skr_buffer_type_index, ind_data, ind_count, ind_stride);
 			if (err != skr_err_success) {
 				skr_log(skr_log_critical, "Failed to create dynamic index buffer for mesh");
 				return err;

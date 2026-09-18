@@ -15,7 +15,7 @@
 
 void sksc_line_col (const char *from_text, const char *at, int32_t *out_line, int32_t *out_column);
 int  strcmp_nocase (char const *a, char const *b);
-void parse_semantic(const char* str, char* out_str, int32_t* out_idx);
+void parse_semantic(const char* str, char* out_str, size_t out_size, int32_t* out_idx);
 
 ///////////////////////////////////////////
 // HLSL Source Initializer Parser        //
@@ -220,7 +220,6 @@ array_t<sksc_ast_default_t> sksc_hlsl_find_initializers(const char *hlsl_text) {
 		}
 
 		// We found a type, now parse: type name = initializer;
-		const char *type_start = c;
 		c += type_len;
 		// Skip dimension suffixes like 2, 3, 4, 2x2, 3x3, 4x4
 		while (*c && ((*c >= '0' && *c <= '9') || *c == 'x')) c++;
@@ -293,6 +292,132 @@ array_t<sksc_ast_default_t> sksc_hlsl_find_initializers(const char *hlsl_text) {
 }
 
 ///////////////////////////////////////////
+// SPIRV Specialization Constant Scanner  //
+///////////////////////////////////////////
+
+// SPIRV-Reflect doesn't expose spec constant types or defaults, so walk the
+// words directly. Valid SPIRV puts OpName/OpDecorate before the constants
+// section, so a single forward pass sees everything it needs.
+static void _sksc_spirv_scan_spec_constants(const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *ref_meta) {
+	const uint32_t *words      = (const uint32_t *)spirv_stage->code;
+	size_t          word_count = spirv_stage->code_size / sizeof(uint32_t);
+	const size_t    SPIRV_HEADER_SIZE = 5;
+	if (word_count <= SPIRV_HEADER_SIZE) return;
+
+	// Per-id lookup tables, sized from the module's id bound (header word 3)
+	uint32_t id_bound = words[3];
+	if (id_bound == 0 || id_bound > 0x400000) return;
+
+	enum type_kind_ { type_kind_none, type_kind_bool, type_kind_int, type_kind_uint, type_kind_float };
+	uint8_t     *type_kinds = (uint8_t    *)calloc(id_bound, sizeof(uint8_t));
+	int64_t     *spec_ids   = (int64_t    *)malloc(id_bound * sizeof(int64_t)); // -1 = not decorated with SpecId
+	const char **names      = (const char**)calloc(id_bound, sizeof(const char*));
+	for (uint32_t i = 0; i < id_bound; i++) spec_ids[i] = -1;
+
+	array_t<sksc_shader_spec_constant_t> spec_list = {};
+	spec_list.data     = ref_meta->spec_constants;
+	spec_list.capacity = ref_meta->spec_constant_count;
+	spec_list.count    = ref_meta->spec_constant_count;
+
+	for (size_t i = SPIRV_HEADER_SIZE; i < word_count; ) {
+		uint32_t op_words = words[i] >> 16;
+		uint32_t opcode   = words[i] & 0xFFFF;
+		if (op_words == 0 || i + op_words > word_count) break; // Malformed SPIRV
+
+		switch (opcode) {
+			case 5: // OpName: [target id, literal string...]
+				if (op_words >= 3 && words[i+1] < id_bound)
+					names[words[i+1]] = (const char *)&words[i+2];
+				break;
+			case 71: // OpDecorate: [target id, decoration, extra...] — SpecId is decoration 1
+				if (op_words >= 4 && words[i+2] == 1 && words[i+1] < id_bound)
+					spec_ids[words[i+1]] = (int64_t)words[i+3];
+				break;
+			case 20: // OpTypeBool: [result id]
+				if (op_words >= 2 && words[i+1] < id_bound)
+					type_kinds[words[i+1]] = type_kind_bool;
+				break;
+			case 21: // OpTypeInt: [result id, width, signedness] — only 32-bit supported
+				if (op_words >= 4 && words[i+1] < id_bound && words[i+2] == 32)
+					type_kinds[words[i+1]] = words[i+3] ? type_kind_int : type_kind_uint;
+				break;
+			case 22: // OpTypeFloat: [result id, width] — only 32-bit supported
+				if (op_words >= 3 && words[i+1] < id_bound && words[i+2] == 32)
+					type_kinds[words[i+1]] = type_kind_float;
+				break;
+			case 48:   // OpSpecConstantTrue:  [result type, result id]
+			case 49:   // OpSpecConstantFalse: [result type, result id]
+			case 50: { // OpSpecConstant:      [result type, result id, value literal...]
+				if (op_words < 3) break;
+				uint32_t type_id   = words[i+1];
+				uint32_t result_id = words[i+2];
+				if (type_id >= id_bound || result_id >= id_bound)  break;
+				if (spec_ids  [result_id] < 0)                     break; // Not user-specializable (no SpecId)
+				if (type_kinds[type_id  ] == type_kind_none)       break; // Unsupported (non-32-bit) type
+
+				sksc_shader_spec_constant_t spec = {};
+				spec.constant_id = (uint32_t)spec_ids[result_id];
+				switch (opcode) {
+					case 48: spec.default_value = 1;          break;
+					case 49: spec.default_value = 0;          break;
+					case 50: spec.default_value = words[i+3]; break;
+				}
+				switch (type_kinds[type_id]) {
+					case type_kind_bool:  spec.type = sksc_shader_var_int;   break; // VkBool32
+					case type_kind_int:   spec.type = sksc_shader_var_int;   break;
+					case type_kind_uint:  spec.type = sksc_shader_var_uint;  break;
+					case type_kind_float: spec.type = sksc_shader_var_float; break;
+				}
+				spec.stage_bits = spirv_stage->stage;
+				if (names[result_id]) strncpy(spec.name, names[result_id], sizeof(spec.name) - 1);
+				else                  snprintf(spec.name, sizeof(spec.name), "spec%u", spec.constant_id);
+
+				// Merge with the same constant across other stages
+				int64_t existing = spec_list.index_where([](const sksc_shader_spec_constant_t &s, void *data) {
+					return s.constant_id == *(uint32_t *)data;
+				}, &spec.constant_id);
+				if (existing >= 0) {
+					sksc_shader_spec_constant_t *prev = &spec_list[existing];
+					if (prev->type != spec.type || strcmp(prev->name, spec.name) != 0) {
+						sksc_log(sksc_log_level_warn, "Specialization constant id %u is declared differently across stages ('%s' vs '%s')", spec.constant_id, prev->name, spec.name);
+					}
+					prev->stage_bits |= spec.stage_bits;
+				} else {
+					spec_list.add(spec);
+				}
+			} break;
+			default: break;
+		}
+
+		i += op_words;
+	}
+
+	ref_meta->spec_constants      = spec_list.data;
+	ref_meta->spec_constant_count = (uint32_t)spec_list.count;
+
+	free(type_kinds);
+	free(spec_ids);
+	free((void*)names);
+}
+
+///////////////////////////////////////////
+
+// Encode spirv-reflect image traits into sksc_shader_resource_t.shape:
+// bits 0-2 dimension (1 = 2D, 2 = 3D, 3 = cube, 4 = 1D), bit 3 arrayed,
+// bit 4 multisampled, bit 5 depth-comparison
+static uint8_t _sksc_image_shape(const SpvReflectImageTraits *image) {
+	uint8_t shape;
+	switch (image->dim) {
+		case SpvDim1D:   shape = 4; break;
+		case SpvDim3D:   shape = 2; break;
+		case SpvDimCube: shape = 3; break;
+		default:         shape = 1; break; // 2D, SubpassData, Rect
+	}
+	if (image->arrayed)    shape |= SKSC_SHAPE_ARRAYED;
+	if (image->ms)         shape |= SKSC_SHAPE_MS;
+	if (image->depth == 1) shape |= SKSC_SHAPE_COMPARISON;
+	return shape;
+}
 
 bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader_meta_t *ref_meta) {
 	// Create reflection data
@@ -362,7 +487,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			buff->var_count          = count;
 			buff->vars               = (sksc_shader_var_t*)malloc(count * sizeof(sksc_shader_var_t));
 			memset(buff->vars, 0, count * sizeof(sksc_shader_var_t));
-			strncpy(buff->name, buffer_name, sizeof(buff->name));
+			strncpy(buff->name, buffer_name, sizeof(buff->name) - 1);
 
 			for (uint32_t m = 0; m < count; m++) {
 				SpvReflectBlockVariable* member = &binding->block.members[m];
@@ -374,7 +499,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 				}
 				
 				const char* member_name = member->name ? member->name : "";
-				strncpy(buff->vars[m].name, member_name, sizeof(buff->vars[m].name));
+				strncpy(buff->vars[m].name, member_name, sizeof(buff->vars[m].name) - 1);
 				buff->vars[m].offset     = member->offset;
 				buff->vars[m].size       = member->size;
 
@@ -391,7 +516,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 				// Build type name - use SPIRV type_name for structs, construct for primitives
 				const char* type_name = member->type_description->type_name;
 				if (type_name) {
-					strncpy(buff->vars[m].type_name, type_name, sizeof(buff->vars[m].type_name));
+					strncpy(buff->vars[m].type_name, type_name, sizeof(buff->vars[m].type_name) - 1);
 				} else {
 					// Construct type name for primitive types
 					const char* base_type = "unknown";
@@ -417,7 +542,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 					} else if (vec_size > 1) {
 						snprintf(buff->vars[m].type_name, sizeof(buff->vars[m].type_name), "%s%u", base_type, vec_size);
 					} else {
-						strncpy(buff->vars[m].type_name, base_type, sizeof(buff->vars[m].type_name));
+						strncpy(buff->vars[m].type_name, base_type, sizeof(buff->vars[m].type_name) - 1);
 					}
 				}
 
@@ -467,7 +592,8 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			tex->bind.slot          = binding->binding;
 			tex->bind.stage_bits   |= spirv_stage->stage;
 			tex->bind.register_type = skr_register_texture;
-			strncpy(tex->name, name, sizeof(tex->name));
+			tex->shape             |= _sksc_image_shape(&binding->image);
+			strncpy(tex->name, name, sizeof(tex->name) - 1);
 		}
 	}
 
@@ -487,7 +613,9 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			tex->bind.slot          = binding->binding;
 			tex->bind.stage_bits   |= spirv_stage->stage;
 			tex->bind.register_type = skr_register_readwrite_tex;
-			strncpy(tex->name, name, sizeof(tex->name));
+			tex->shape             |= _sksc_image_shape(&binding->image);
+			tex->image_format       = (uint8_t)binding->image.image_format;
+			strncpy(tex->name, name, sizeof(tex->name) - 1);
 		}
 	}
 
@@ -537,7 +665,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			}
 			tex->element_size = element_size;
 
-			strncpy(tex->name, name, sizeof(tex->name));
+			strncpy(tex->name, name, sizeof(tex->name) - 1);
 		}
 	}
 
@@ -557,7 +685,8 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			res->bind.slot          = binding->binding;
 			res->bind.stage_bits   |= spirv_stage->stage;
 			res->bind.register_type = skr_register_input_attachment;
-			strncpy(res->name, name, sizeof(res->name));
+			res->shape             |= _sksc_image_shape(&binding->image);
+			strncpy(res->name, name, sizeof(res->name) - 1);
 		}
 	}
 
@@ -595,7 +724,7 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			
 			char    semantic[64];
 			int32_t semantic_idx = 0;
-			parse_semantic(semantic_str, semantic, &semantic_idx);
+			parse_semantic(semantic_str, semantic, sizeof(semantic), &semantic_idx);
 
 			if (strlen(semantic) > 3 &&
 				tolower(semantic[0]) == 's' &&
@@ -607,6 +736,11 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 			}
 
 			ref_meta->vertex_inputs[curr].semantic_slot = semantic_idx;
+			// SPIR-V input location this attribute is decorated with. Read it
+			// straight from reflection rather than inferring from array index:
+			// enumeration order is not guaranteed to match location order, and
+			// skipped built-ins/SV_ inputs would break any index-based scheme.
+			ref_meta->vertex_inputs[curr].location = (uint8_t)input->location;
 			if      (strcmp_nocase(semantic, "sv_position" ) == 0) { ref_meta->vertex_inputs[curr].semantic = skr_semantic_position;     }
 			else if (strcmp_nocase(semantic, "binormal"    ) == 0) { ref_meta->vertex_inputs[curr].semantic = skr_semantic_binormal;     }
 			else if (strcmp_nocase(semantic, "blendindices") == 0) { ref_meta->vertex_inputs[curr].semantic = skr_semantic_blendindices; }
@@ -692,21 +826,24 @@ bool sksc_spirv_to_meta(const sksc_shader_file_stage_t *spirv_stage, sksc_shader
 		ref_meta->ops_pixel = ops;
 	}
 
+	_sksc_spirv_scan_spec_constants(spirv_stage, ref_meta);
+
 	spvReflectDestroyShaderModule(&module);
 	return true;
 }
 
 ///////////////////////////////////////////
 
-void parse_semantic(const char* str, char* out_str, int32_t* out_idx) {
+void parse_semantic(const char* str, char* out_str, size_t out_size, int32_t* out_idx) {
 	const char *curr  = str;
 	char*       write = out_str;
+	char*       end   = out_str + out_size - 1;
 	int         idx   = 0;
 	while (*curr != 0) {
 		if (*curr>='0' && *curr<='9') {
 			idx  = idx * 10;
 			idx += (*curr) - '0';
-		} else {
+		} else if (write < end) {
 			*write = *curr;
 			write++;
 		}
@@ -845,9 +982,9 @@ array_t<sksc_meta_item_t> sksc_meta_find_defaults(const char *hlsl_text) {
 
 			sksc_meta_item_t item = {};
 			sksc_line_col(hlsl_text, comment, &item.row, &item.col);
-			strncpy(item.name,  name,  sizeof(item.name));
-			strncpy(item.tag,   tag,   sizeof(item.tag));
-			strncpy(item.value, value, sizeof(item.value));
+			snprintf(item.name,  sizeof(item.name),  "%s", name);
+			snprintf(item.tag,   sizeof(item.tag),   "%s", tag);
+			snprintf(item.value, sizeof(item.value), "%s", value);
 			items.add(item);
 
 			if (tag[0] == '\0' && value[0] == '\0') {
@@ -922,7 +1059,7 @@ void sksc_meta_assign_defaults(array_t<sksc_ast_default_t> ast_defaults, array_t
 			if (strcmp(buff->vars[v].name, item->name) != 0) continue;
 
 			found += 1;
-			strncpy(buff->vars[v].extra, item->tag, sizeof(buff->vars[v].extra));
+			strncpy(buff->vars[v].extra, item->tag, sizeof(buff->vars[v].extra) - 1);
 
 			// If no value specified, keep the AST default (if any)
 			if (item->value[0] == '\0') break;
@@ -963,14 +1100,14 @@ void sksc_meta_assign_defaults(array_t<sksc_ast_default_t> ast_defaults, array_t
 			if (strcmp(ref_meta->resources[r].name, item->name) != 0) continue;
 			found += 1;
 
-			strncpy(ref_meta->resources[r].tags,  item->tag,   sizeof(ref_meta->resources[r].tags ));
-			strncpy(ref_meta->resources[r].value, item->value, sizeof(ref_meta->resources[r].value));
+			strncpy(ref_meta->resources[r].tags,  item->tag,   sizeof(ref_meta->resources[r].tags ) - 1);
+			strncpy(ref_meta->resources[r].value, item->value, sizeof(ref_meta->resources[r].value) - 1);
 			break;
 		}
 
 		if (strcmp(item->name, "name") == 0) {
 			found += 1;
-			strncpy(ref_meta->name, item->value, sizeof(ref_meta->name));
+			strncpy(ref_meta->name, item->value, sizeof(ref_meta->name) - 1);
 		}
 
 		if (strcmp(item->name, "wave_size") == 0) {

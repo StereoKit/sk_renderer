@@ -35,13 +35,13 @@ typedef struct sksc_settings_t {
 	bool        silent_err;
 	bool        silent_warn;
 	int32_t     optimize;       // 0=none, 1=size, 2+=performance
-	char        folder[512];
 	char        vs_entrypoint[64];
 	char        ps_entrypoint[64];
 	char        cs_entrypoint[64];
 	char**      include_folders;
 	int32_t     include_folder_ct;
-	bool        target_langs[5];
+	bool        target_langs[6]; // Indexed by skr_shader_lang_
+	bool        use_svsl;        // compile with the SVSL backend instead of glslang
 } sksc_settings_t;
 
 typedef struct sksc_log_item_t {
@@ -62,8 +62,11 @@ typedef enum sksc_log_level_ {
 
 SKSC_API void            sksc_init            (void);
 SKSC_API void            sksc_shutdown        (void);
+SKSC_API bool            sksc_include_walk    (const char *filename, const sksc_settings_t *settings, void (*on_dep)(void *user, const char *path), void *user);
 SKSC_API bool            sksc_compile         (const char *filename, const char *hlsl_text, sksc_settings_t *settings, sksc_shader_file_t *out_file);
-SKSC_API void            sksc_build_file      (const sksc_shader_file_t *file, void **out_data, uint32_t *out_size);
+// SPIR-V stages are stored SMOL-V encoded (smolv.h) and decoded by the loader.
+// keep_debug_names keeps OpName/OpMemberName, ~8% of a module, for debug builds.
+SKSC_API void            sksc_build_file      (const sksc_shader_file_t *file, bool keep_debug_names, void **out_data, uint32_t *out_size);
 SKSC_API char*           sksc_shader_file_info(const sksc_shader_file_t *file); // Returns malloc'd string, caller must free
 
 SKSC_API void            sksc_log        (sksc_log_level_ level, const char* text, ...);

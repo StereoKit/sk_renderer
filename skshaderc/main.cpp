@@ -26,13 +26,18 @@
 #include <dirent.h>
 #include <libgen.h>
 #include <ctype.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #define SKSC_IMPL
 #include "sksc.h"
 
 #include "miniz.h"
+#ifdef SKSC_HAS_SPIRV_TOOLS
 #include <spirv-tools/libspirv.hpp>
+#endif
 
 ///////////////////////////////////////////
 
@@ -49,6 +54,11 @@ typedef struct compiler_settings_t {
 	sksc_settings_t shaderc;
 } compiler_settings_t;
 
+typedef struct include_age_t {
+	uint64_t output_time; // oldest enabled output
+	bool     stale;       // a dependency is at least as new as that
+} include_age_t;
+
 ///////////////////////////////////////////
 
 uint64_t exe_file_time = 0;
@@ -56,17 +66,18 @@ const int32_t path_size = 2048;
 
 ///////////////////////////////////////////
 
-bool                read_file     (const char *filename, char **out_text, size_t *out_size);
+char               *read_file     (const char *filename); // malloc'd, NUL terminated
 bool                write_file    (const char *filename, void *file_data, size_t file_size);
 bool                write_file_txt(const char *filename, void *file_data, size_t file_size);
 bool                write_header  (const char *filename, void *file_data, size_t file_size, bool zipped, const sksc_shader_file_t *shader_file);
 bool                write_skcs    (const char *filename, void *file_data, size_t file_size, const char* original_name, sksc_shader_file_t *file);
-bool                write_stages  (const sksc_shader_file_t *file, const char *folder, bool trailing_slash, const char *name_ext);
+bool                write_stages  (const sksc_shader_file_t *file, const char *folder, const char *trailing_slash, const char *name_ext);
 void                compile_file  (const char *filename, compiler_settings_t *settings);
 void                iterate_dir   (const char *directory_path, void *callback_data, void (*on_item)(void *callback_data, const char *name, bool file));
 compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit); 
 void                show_usage    ();
 uint64_t            file_time     (const char *file);
+void                exe_path      (const char *argv0, char *out_path, size_t path_size);
 void                file_name     (const char *file, char *out_name, size_t name_size);
 void                file_name_ext (const char *file, char *out_name, size_t name_size);
 void                file_dir      (const char *file, char *out_path, size_t path_size);
@@ -78,6 +89,7 @@ bool                recurse_mkdir (const char *dirname);
 
 ///////////////////////////////////////////
 
+int32_t file_count     = 0; // handed to compile_file, up-to-date ones included
 int32_t compiled_count = 0;
 int32_t failed_count   = 0;
 
@@ -91,13 +103,15 @@ int main(int argc, const char **argv) {
 	compiler_settings_t settings = check_settings(argc, argv, &exit);
 	if (exit) return 0;
 
-	exe_file_time = file_time(argv[0]);
+	char exe[path_size];
+	exe_path(argv[0], exe, sizeof(exe));
+	exe_file_time = file_time(exe);
 
 	sksc_init();
 
 	
 #if defined(_WIN32)
-	for (size_t i = 1; i < argc; i++) {
+	for (int32_t i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 ||
 			strcmp(argv[i], "-i") == 0) { // Skip trying to compile paths
 			i++;
@@ -107,17 +121,17 @@ int main(int argc, const char **argv) {
 		const char *path = argv[i];
 		if (file_exists(path)) {
 			compile_file(path, &settings);
-			compiled_count++;
+			file_count++;
 		} else if (path_is_file(path) && path_is_wild(path)) {
 			iterate_dir(path, &settings, [](void *callback_data, const char *src_filename, bool file) {
 				if (!file) return;
 				compile_file(src_filename, (compiler_settings_t*)callback_data);
-				compiled_count++;
+				file_count++;
 			});
 		}
 	}
 #else
-	for (size_t i = 1; i < argc; i++) {
+	for (int32_t i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 ||
 			strcmp(argv[i], "-i") == 0) { // Skip trying to compile paths
 			i++;
@@ -126,11 +140,13 @@ int main(int argc, const char **argv) {
 
 		if (file_exists(argv[i])) {
 			compile_file(argv[i], &settings);
-			compiled_count++;
+			file_count++;
 		}
 	}
 #endif
-	if (settings.shaderc.silent_info == false || compiled_count == 0) {
+	// file_count, not compiled_count: an all-up-to-date run compiles nothing and
+	// has nothing to say, but a run that matched no files at all does.
+	if (settings.shaderc.silent_info == false || file_count == 0) {
 		printf("Compiled %d %s", compiled_count, compiled_count == 1 ? "shader" : "shaders");
 		if (failed_count > 0) {
 			printf(", %d failed", failed_count);
@@ -169,8 +185,18 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 	result.shaderc.silent_info   = false;
 	result.shaderc.silent_warn   = false;
 
-	// Get the inlcude folder
-	file_dir(argv[argc-1], result.shaderc.folder, sizeof(result.shaderc.folder));
+	// The option loop below stops at argc-1 to leave the shader file, so help
+	// needs its own pass or a lone '--help' is read as a filename.
+	for (int32_t i=1; i<argc; i++) {
+		if (strcmp(argv[i], "-help") == 0 ||
+			strcmp(argv[i], "-?"   ) == 0 ||
+			strcmp(argv[i], "--help") == 0 ||
+			strcmp(argv[i], "/?"   ) == 0) {
+			*exit = true;
+			show_usage();
+			return result;
+		}
+	}
 
 	bool set_targets = false;
 	for (int32_t i=1; i<argc-1; i++) {
@@ -182,6 +208,7 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		else if (strcmp(argv[i], "-raw")== 0) result.output_raw_shaders    = true;
 		else if (strcmp(argv[i], "-e" ) == 0) result.replace_ext           = false;
 		else if (strcmp(argv[i], "-f" ) == 0) result.only_if_changed       = false;
+		else if (strcmp(argv[i], "-svsl")== 0) result.shaderc.use_svsl     = true;
 		else if (strcmp(argv[i], "-d" ) == 0) result.shaderc.debug         = true;
 		else if (strcmp(argv[i], "-si") == 0) result.shaderc.silent_info   = true;
 		else if (strcmp(argv[i], "-sw") == 0) { result.shaderc.silent_info = true; result.shaderc.silent_warn = true; }
@@ -194,17 +221,13 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 		         strcmp(argv[i], "-O2") == 0) result.shaderc.optimize = 2;
 		else if (strcmp(argv[i], "-o3") == 0 ||
 		         strcmp(argv[i], "-O3") == 0) result.shaderc.optimize = 3;
-		else if (strcmp(argv[i], "-help" ) == 0 ||
-		         strcmp(argv[i], "-?" ) == 0 ||
-		         strcmp(argv[i], "--help" ) == 0 ||
-		         strcmp(argv[i], "/?" ) == 0 ) *exit = true;
-		else if (strcmp(argv[i], "-cs") == 0 && i<argc-1) { strncpy(result.shaderc.cs_entrypoint, argv[i+1], sizeof(result.shaderc.cs_entrypoint)); i++; }
-		else if (strcmp(argv[i], "-vs") == 0 && i<argc-1) { strncpy(result.shaderc.vs_entrypoint, argv[i+1], sizeof(result.shaderc.vs_entrypoint)); i++; }
-		else if (strcmp(argv[i], "-ps") == 0 && i<argc-1) { strncpy(result.shaderc.ps_entrypoint, argv[i+1], sizeof(result.shaderc.ps_entrypoint)); i++; }
+		else if (strcmp(argv[i], "-cs") == 0 && i<argc-1){ strncpy(result.shaderc.cs_entrypoint, argv[i+1], sizeof(result.shaderc.cs_entrypoint) - 1); i++; }
+		else if (strcmp(argv[i], "-vs") == 0 && i<argc-1) { strncpy(result.shaderc.vs_entrypoint, argv[i+1], sizeof(result.shaderc.vs_entrypoint) - 1); i++; }
+		else if (strcmp(argv[i], "-ps") == 0 && i<argc-1) { strncpy(result.shaderc.ps_entrypoint, argv[i+1], sizeof(result.shaderc.ps_entrypoint) - 1); i++; }
 		else if (strcmp(argv[i], "-i" ) == 0 && i<argc-1) {
 			size_t len = strlen(argv[i + 1]) + 1;
 			result.shaderc.include_folder_ct += 1;
-			result.shaderc.include_folders    = (char**)realloc(result.shaderc.include_folders, sizeof(result.shaderc.include_folder_ct * sizeof(char *)));
+			result.shaderc.include_folders    = (char**)realloc(result.shaderc.include_folders, result.shaderc.include_folder_ct * sizeof(char *));
 			result.shaderc.include_folders[result.shaderc.include_folder_ct-1] = (char*)malloc(len);
 			strncpy(result.shaderc.include_folders[result.shaderc.include_folder_ct-1], argv[i+1], len); 
 			i++; }
@@ -218,7 +241,8 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			const char *targets = argv[i + 1];
 			size_t      len     = strlen(targets);
 			for (size_t i = 0; i < len; i++) {
-				if (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				if      (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				else if (targets[i] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
 				else { printf("Unrecognized shader language target '%c'\n", targets[i]); *exit = true; }
 			}
 			i++;
@@ -234,9 +258,9 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 
 	// If no entrypoints were provided, then these are the defaults!
 	if (result.shaderc.ps_entrypoint[0] == 0 && result.shaderc.vs_entrypoint[0] == 0 && result.shaderc.cs_entrypoint[0] == 0) {
-		strncpy(result.shaderc.ps_entrypoint, "ps", sizeof(result.shaderc.ps_entrypoint));
-		strncpy(result.shaderc.vs_entrypoint, "vs", sizeof(result.shaderc.vs_entrypoint));
-		strncpy(result.shaderc.cs_entrypoint, "cs", sizeof(result.shaderc.cs_entrypoint));
+		strncpy(result.shaderc.ps_entrypoint, "ps", sizeof(result.shaderc.ps_entrypoint) - 1);
+		strncpy(result.shaderc.vs_entrypoint, "vs", sizeof(result.shaderc.vs_entrypoint) - 1);
+		strncpy(result.shaderc.cs_entrypoint, "cs", sizeof(result.shaderc.cs_entrypoint) - 1);
 	}
 
 	if (*exit) {
@@ -253,7 +277,9 @@ Usage: skshaderc [options] target_file
 
 Options:
 	-h		Output a C header file with a byte array instead of a binary file.
-	-z		Zips and compresses output data with miniz
+	-z		Zips and compresses output data with miniz. SPIR-V stages are
+			always stored in the more compressible SMOL-V form, which
+			makes this a much bigger win than it is on raw SPIR-V.
 	-raw		Outputs the raw shader stage data as additional files in the same
 			directory. Useful for debugging shader transpilation.
 	-sk		This outputs a StereoKit compatible C# file for the shader, and
@@ -266,8 +292,12 @@ Options:
 			shaders.
 	-sw		No info or warnings are printed when compiling shaders.
 	-si		No info is printed when compiling shaders.
-	-f		Force the shader to recompile, even if the timestamp on the
-			matching .sks file is newer.
+	-f		Force the shader to recompile. Without it, a shader is skipped
+			when every output is newer than the source, every file it
+			#includes, and skshaderc itself.
+	-svsl		Compile the shader with the SVSL backend instead of the glslang
+			pipeline. Files ending in .svsl use SVSL automatically. Only
+			available when skshaderc was built with SKSHADERC_ENABLE_SVSL.
 
 	-d		Compile shaders with debug info embedded. Enabling this will
 			disable shader optimizations.
@@ -287,13 +317,17 @@ Options:
 			names from vertex and pixel shader stages. Default is 'vs'.
 
 	-i folder	Adds a folder to the include path when searching for #include
-			files.
+			files. An #include is looked for next to the file that requested
+			it, then in each -i folder in the order given.
 	-o path	Sets the output folder for compiled shaders. Default will
 			leave them in the same folder as the original file. Can also be a
 			specific filename.
 	-t targets	Sets a list of shader language targets to generate. This is a
 			string of characters, where each character represents a language.
-			's' is d3d12 and vulkan spir-v. Default value is 's'.
+			's' is d3d12 and vulkan spir-v. 'w' is WebGPU WGSL, emitted
+			natively by the SVSL backend (the glslang pipeline refuses it).
+			'sw' emits both; 'w' alone makes a web-slim .sks with no SPIR-V
+			blobs. Default value is 's'.
 
 	target_file	This can be any filename, and can use the wildcard '*' to 
 			compile multiple files in the same call.
@@ -332,7 +366,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		snprintf(new_filename_cs,  sizeof(new_filename_cs ), "%s", settings->out_folder);
 	}
 
-	// Skip this file if it hasn't changed 
+	// Skip this file if it hasn't changed
 	uint64_t src_file_time          = file_time(src_filename);
 	uint64_t compiled_file_time_sks = make_sks                     ? file_time(new_filename_sks) : UINT64_MAX;
 	uint64_t compiled_file_time_h   = settings->output_header      ? file_time(new_filename_h)   : UINT64_MAX;
@@ -345,28 +379,43 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		oldest_time = compiled_file_time_cs;
 	if (oldest_time > compiled_file_time_raw)
 		oldest_time = compiled_file_time_raw;
+	// Walking includes costs file reads, so it only runs once the cheap checks
+	// have found no reason to compile
 	if (settings->only_if_changed && src_file_time < oldest_time && exe_file_time < oldest_time) {
-		if (!settings->shaderc.silent_info) {
-			printf("File '%s' is already up-to-date, skipping...\n", src_filename);
+		include_age_t deps = { oldest_time, false };
+		// An unresolved #include is a change too: the header moved or was
+		// deleted, and the compile needs to run to report it.
+		if (!sksc_include_walk(src_filename, &settings->shaderc, [](void *user, const char *path) {
+			include_age_t *age  = (include_age_t*)user;
+			uint64_t       time = file_time(path);
+			if (time >= age->output_time)
+				age->stale = true;
+		}, &deps))
+			deps.stale = true;
+
+		if (!deps.stale) {
+			if (!settings->shaderc.silent_info) {
+				printf("File '%s' is already up-to-date, skipping...\n", src_filename);
+			}
+			return;
 		}
-		return;
 	}
 
-	char  *file_text;
-	size_t file_size;
-	if (read_file(src_filename, &file_text, &file_size) == false) {
+	char *file_text = read_file(src_filename);
+	if (file_text == nullptr) {
 		printf("Couldn't read file '%s'!\n", src_filename);
 		return;
 	}
 	
 	sksc_shader_file_t file;
+	compiled_count++;
 	sksc_log(sksc_log_level_info, "Compiling %s..", src_filename);
 	if (sksc_compile(src_filename, file_text, &settings->shaderc, &file)) {
 
 		// Turn the shader data into a binary file
 		void*    sks_data;
 		uint32_t sks_size;
-		sksc_build_file(&file, &sks_data, &sks_size);
+		sksc_build_file(&file, settings->shaderc.debug, &sks_data, &sks_size);
 		
 		// Zip data
 		bool err = false;
@@ -407,7 +456,6 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 				else         sksc_log(sksc_log_level_err,  "Failed to write file! %s", abs_file);
 			}
 			if (settings->output_raw_shaders) {
-				char* abs_file = path_absolute(new_filename_cs);
 				bool  success  = write_stages(&file, dest_folder, trailing_slash, name_ext);
 
 				if (success) sksc_log(sksc_log_level_info, "Compiled raw files successfully to %s", dest_folder);
@@ -436,11 +484,13 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 
 ///////////////////////////////////////////
 
-bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trailing_slash, const char *name_ext) {
+bool write_stages(const sksc_shader_file_t *file, const char *folder, const char *trailing_slash, const char *name_ext) {
 	bool result = true;
 
+#ifdef SKSC_HAS_SPIRV_TOOLS
 	// Create SPIRV-Tools context for disassembly
 	spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_1);
+#endif
 
 	for (uint32_t i = 0; i < file->stage_count; i++) {
 		sksc_shader_file_stage_t *stage = &file->stages[i];
@@ -453,16 +503,23 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 			case skr_shader_lang_glsl_es:  lang = "glsl.es";  break;
 			case skr_shader_lang_glsl_web: lang = "glsl.web"; break;
 			case skr_shader_lang_hlsl:     lang = "hlsl";     break;
+			case skr_shader_lang_wgsl:     lang = "wgsl";     break;
+			// Without the SPIRV-Tools disassembler we emit the raw binary module.
+#ifdef SKSC_HAS_SPIRV_TOOLS
 			case skr_shader_lang_spirv:    lang = "spvasm";   break;
+#else
+			case skr_shader_lang_spirv:    lang = "spv";      break;
+#endif
 		}
 		switch(stage->stage){
 			case skr_stage_compute: stage_name = "compute"; break;
 			case skr_stage_pixel:   stage_name = "pixel";   break;
 			case skr_stage_vertex:  stage_name = "vertex";  break;
 		}
-		snprintf(sub_filename, sizeof(sub_filename), "%s%s%s.%s.%s", folder, trailing_slash ? "":"/", name_ext, stage_name, lang);
+		snprintf(sub_filename, sizeof(sub_filename), "%s%s%s.%s.%s", folder, trailing_slash, name_ext, stage_name, lang);
 
 		if (stage->language == skr_shader_lang_spirv) {
+#ifdef SKSC_HAS_SPIRV_TOOLS
 			// Disassemble SPIRV to text
 			std::string disassembly;
 			const uint32_t *spirv_data = (const uint32_t *)stage->code;
@@ -473,6 +530,10 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 				sksc_log(sksc_log_level_err, "Failed to disassemble SPIRV");
 				result = false;
 			}
+#else
+			// No disassembler in this build: write the raw SPIR-V binary.
+			result = write_file(sub_filename, stage->code, stage->code_size) && result;
+#endif
 		} else {
 			result = write_file_txt(sub_filename, stage->code, stage->code_size - 1) && result;
 		}
@@ -482,26 +543,21 @@ bool write_stages(const sksc_shader_file_t *file, const char *folder, bool trail
 
 ///////////////////////////////////////////
 
-bool read_file(const char *filename, char **out_text, size_t *out_size) {
-	*out_text = nullptr;
-	*out_size = 0;
-
+char *read_file(const char *filename) {
 	FILE *fp = fopen(filename, "rb");
-	if (fp == nullptr) {
-		return false;
-	}
-
-	fseek(fp, 0L, SEEK_END);
-	*out_size = ftell(fp);
-	rewind(fp);
-
-	*out_text = (char*)malloc(*out_size+1);
-	if (*out_text == nullptr) { *out_size = 0; fclose(fp); return false; }
-	if (fread(*out_text, 1, *out_size, fp) == 0) return false;
+	if (!fp) return nullptr;
+	fseek(fp, 0, SEEK_END);
+	long size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	// ftell returns -1 for an unseekable stream, so reject a bad size before it
+	// wraps to a huge malloc/fread.
+	if (size < 0) { fclose(fp); return nullptr; }
+	char *data = (char*)malloc((size_t)size + 1);
+	if (!data) { fclose(fp); return nullptr; }
+	size_t got = fread(data, 1, (size_t)size, fp);
 	fclose(fp);
-
-	(*out_text)[*out_size] = 0;
-	return true;
+	data[got] = '\0';
+	return data;
 }
 
 ///////////////////////////////////////////
@@ -672,7 +728,9 @@ bool write_header(const char *filename, void *file_data, size_t file_size, bool 
 		free(info);
 	}
 
-	// Write SPIRV disassembly as comments
+	// Write SPIRV disassembly as comments (skipped when this build has no
+	// SPIRV-Tools disassembler; the embedded container below is unaffected)
+#ifdef SKSC_HAS_SPIRV_TOOLS
 	if (shader_file) {
 		spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_1);
 		for (uint32_t i = 0; i < shader_file->stage_count; i++) {
@@ -706,6 +764,7 @@ bool write_header(const char *filename, void *file_data, size_t file_size, bool 
 			}
 		}
 	}
+#endif
 
 	// Write byte array
 	int32_t ct = fprintf(fp, "const unsigned char sks_%s%s[%zu] = {", name, zipped ? "_zip" : "", file_size);
@@ -859,14 +918,17 @@ class Material%s : Material
 
 uint64_t file_time(const char *file) {
 #if defined(_WIN32)
-	HANDLE   handle = CreateFileA(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-	FILETIME write_time;
-
-	if (!GetFileTime(handle, nullptr, nullptr, &write_time))
+	HANDLE handle = CreateFileA(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (handle == INVALID_HANDLE_VALUE)
 		return 0;
+
+	FILETIME write_time;
+	bool     ok = GetFileTime(handle, nullptr, nullptr, &write_time) != 0;
 	CloseHandle(handle);
+	if (!ok) return 0;
+
 	return (static_cast<uint64_t>(write_time.dwHighDateTime) << 32) | write_time.dwLowDateTime;
-#elif defined(__linux__) || __APPLE__
+#elif defined(__linux__) || defined(__APPLE__)
 	struct stat result;
 	if(stat(file, &result)==0)
 		return result.st_mtime;
@@ -874,6 +936,29 @@ uint64_t file_time(const char *file) {
 #else
 	#error "Platform unsupported"
 #endif
+}
+
+///////////////////////////////////////////
+
+// argv[0] doesn't resolve when we're launched off PATH, and file_time's 0 then
+// silently disables the compiler half of the up-to-date check.
+void exe_path(const char *argv0, char *out_path, size_t path_size) {
+#if defined(_WIN32)
+	DWORD len = GetModuleFileNameA(NULL, out_path, (DWORD)path_size);
+	if (len > 0 && len < path_size)
+		return;
+#elif defined(__linux__)
+	ssize_t len = readlink("/proc/self/exe", out_path, path_size - 1);
+	if (len > 0) {
+		out_path[len] = '\0'; // readlink doesn't terminate
+		return;
+	}
+#elif defined(__APPLE__)
+	uint32_t size = (uint32_t)path_size;
+	if (_NSGetExecutablePath(out_path, &size) == 0) // may contain symlinks or '..', stat follows both
+		return;
+#endif
+	snprintf(out_path, path_size, "%s", argv0);
 }
 
 ///////////////////////////////////////////
@@ -889,7 +974,7 @@ void file_name(const char *file, char *out_name, size_t name_size) {
 	while (*end != '.' && end != start) end--;
 	if    (end == start) end = file + len;
 
-	for (int32_t i=0; start+i != end && i<name_size; i++) {
+	for (size_t i=0; start+i != end && i<name_size; i++) {
 		out_name[i] = start[i];
 	}
 	size_t last = end - start;
@@ -907,7 +992,7 @@ void file_name_ext(const char *file, char *out_name, size_t name_size) {
 	while (*start != '\\' && *start != '/' && start != file) start--;
 	if    (*start == '\\' || *start == '/') start++;
 
-	for (int32_t i=0; start+i != end && i<name_size; i++) {
+	for (size_t i=0; start+i != end && i<name_size; i++) {
 		out_name[i] = start[i];
 	}
 	size_t last = end - start;
@@ -923,7 +1008,14 @@ void file_dir(const char *file, char *out_path, size_t path_size) {
 
 	while (*end != '\\' && *end != '/' && end != file) end--;
 
-	for (int32_t i=0; file+i <= end && i<path_size; i++) {
+	// No separator means a bare filename, its folder is the cwd. Without this
+	// the copy below emits the name's first character as a phantom folder.
+	if (end == file && *end != '\\' && *end != '/') {
+		snprintf(out_path, path_size, "./");
+		return;
+	}
+
+	for (size_t i=0; file+i <= end && i<path_size; i++) {
 		out_path[i] = file[i];
 	}
 	size_t last = (end - file)+1;

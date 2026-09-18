@@ -17,15 +17,15 @@ thread_local int32_t _skr_thread_idx = -1;
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool _skr_cmd_init() {
+bool _skr_cmd_init(void) {
 	memset(_skr_vk.thread_pools, 0, sizeof(_skr_vk.thread_pools));
 	return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void _skr_cmd_shutdown() {
-	vkDeviceWaitIdle(_skr_vk.device);
+void _skr_cmd_shutdown(void) {
+	_skr_device_wait_idle();
 
 	// Destroy thread command pools and per-thread command ring fences
 	mtx_lock(&_skr_vk.thread_pool_mutex);
@@ -41,15 +41,12 @@ void _skr_cmd_shutdown() {
 			_skr_destroy_list_execute(&thread->cmd_ring[c].destroy_list);
 			_skr_destroy_list_free   (&thread->cmd_ring[c].destroy_list);
 
-			// Destroy bump allocators
-			_skr_bump_alloc_destroy(&thread->cmd_ring[c].const_bump);
-			_skr_bump_alloc_destroy(&thread->cmd_ring[c].storage_bump);
-
 			if (thread->cmd_ring[c].fence != VK_NULL_HANDLE)
 				vkDestroyFence(_skr_vk.device, thread->cmd_ring[c].fence, NULL);
-			if (thread->cmd_ring[c].descriptor_pool != VK_NULL_HANDLE)
-				vkDestroyDescriptorPool(_skr_vk.device, thread->cmd_ring[c].descriptor_pool, NULL);
 		}
+		_skr_bump_ring_destroy(&thread->const_ring);
+		_skr_bump_ring_destroy(&thread->storage_ring);
+		_skr_desc_cache_destroy(&thread->desc_cache);
 
 		if (thread->cmd_pool != VK_NULL_HANDLE)
 			vkDestroyCommandPool(_skr_vk.device, thread->cmd_pool, NULL);
@@ -57,11 +54,15 @@ void _skr_cmd_shutdown() {
 		*thread = (_skr_vk_thread_t){0};
 	}
 	mtx_unlock(&_skr_vk.thread_pool_mutex);
+
+	// Each thread's pool index is a thread_local this loop can't reach. Reset
+	// the calling thread's so a later skr_init can re-register it.
+	_skr_thread_idx = -1;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-_skr_vk_thread_t* _skr_cmd_get_thread() {
+_skr_vk_thread_t* _skr_cmd_get_thread(void) {
 	if (_skr_thread_idx >= 0) {
 		return &_skr_vk.thread_pools[_skr_thread_idx];
 	}
@@ -70,7 +71,7 @@ _skr_vk_thread_t* _skr_cmd_get_thread() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_thread_init() {
+void skr_thread_init(void) {
 	// Already initialized for this thread
 	if (_skr_thread_idx >= 0) {
 		skr_log(skr_log_critical, "Thread already initialized with index %d", _skr_thread_idx);
@@ -111,6 +112,9 @@ void skr_thread_init() {
 	_skr_thread_idx                  = thread_idx;
 	thread.thread_idx                = thread_idx;
 	_skr_vk.thread_pools[thread_idx] = thread;
+	_skr_vk_thread_t* pool = &_skr_vk.thread_pools[thread_idx];
+	_skr_bump_ring_init(&pool->const_ring,   skr_buffer_type_constant, _skr_vk.min_ubo_offset_align,  pool->cmd_ring);
+	_skr_bump_ring_init(&pool->storage_ring, skr_buffer_type_storage,  _skr_vk.min_ssbo_offset_align, pool->cmd_ring);
 
 	mtx_unlock(&_skr_vk.thread_pool_mutex);
 
@@ -123,13 +127,13 @@ void skr_thread_init() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool skr_thread_is_initialized() {
+bool skr_thread_is_initialized(void) {
 	return _skr_thread_idx >= 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_thread_shutdown() {
+void skr_thread_shutdown(void) {
 	if (_skr_thread_idx < 0) {
 		skr_log(skr_log_warning, "Thread not initialized, nothing to shutdown");
 		return;
@@ -152,15 +156,12 @@ void skr_thread_shutdown() {
 		_skr_destroy_list_execute(&thread->cmd_ring[c].destroy_list);
 		_skr_destroy_list_free   (&thread->cmd_ring[c].destroy_list);
 
-		// Destroy bump allocators
-		_skr_bump_alloc_destroy(&thread->cmd_ring[c].const_bump);
-		_skr_bump_alloc_destroy(&thread->cmd_ring[c].storage_bump);
-
 		if (thread->cmd_ring[c].fence != VK_NULL_HANDLE)
 			vkDestroyFence(_skr_vk.device, thread->cmd_ring[c].fence, NULL);
-		if (thread->cmd_ring[c].descriptor_pool != VK_NULL_HANDLE)
-			vkDestroyDescriptorPool(_skr_vk.device, thread->cmd_ring[c].descriptor_pool, NULL);
 	}
+	_skr_bump_ring_destroy(&thread->const_ring);
+	_skr_bump_ring_destroy(&thread->storage_ring);
+	_skr_desc_cache_destroy(&thread->desc_cache);
 
 	// Destroy command pool
 	if (thread->cmd_pool != VK_NULL_HANDLE)
@@ -223,31 +224,15 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 			.commandPool        = ref_pool->cmd_pool,
 			.commandBufferCount = 1,
 		}, &slot->cmd);
+		VkExportFenceCreateInfo export_fence_info = {
+			.sType       = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+			.handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
 		vkCreateFence(_skr_vk.device, &(VkFenceCreateInfo){
 			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+			.pNext = _skr_vk.has_external_fence_fd ? &export_fence_info : NULL,
 		}, NULL, &slot->fence);
 		slot->destroy_list = _skr_destroy_list_create();
-		_skr_bump_alloc_init(&slot->const_bump,   skr_buffer_type_constant, _skr_vk.min_ubo_offset_align);
-		_skr_bump_alloc_init(&slot->storage_bump, skr_buffer_type_storage,  _skr_vk.min_ssbo_offset_align);
-
-		// Create descriptor pool for non-push-descriptor fallback
-		if (!_skr_vk.has_push_descriptors) {
-			VkDescriptorPoolSize pool_sizes[] = {
-				{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         .descriptorCount = 1000 },
-				{ .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          .descriptorCount = 1000 },
-				{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1000 },
-				{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         .descriptorCount = 1000 },
-			};
-			VkDescriptorPoolCreateInfo pool_info = {
-				.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-				.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-				.maxSets       = 2000,
-				.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
-				.pPoolSizes    = pool_sizes,
-			};
-			VkResult vr = vkCreateDescriptorPool(_skr_vk.device, &pool_info, NULL, &slot->descriptor_pool);
-			SKR_VK_CHECK_NRET(vr, "vkCreateDescriptorPool");
-		}
 
 		char name[64];
 		snprintf(name,sizeof(name), "CommandBuffer_thr%u_%u", ref_pool->thread_idx, idx);
@@ -255,22 +240,14 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 
 		snprintf(name,sizeof(name), "Command_Fence_thr%u_%u", ref_pool->thread_idx, idx);
 		_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_FENCE, (uint64_t)slot->fence, name);
-
-		if (slot->descriptor_pool != VK_NULL_HANDLE) {
-			snprintf(name,sizeof(name), "DescriptorPool_thr%u_%u", ref_pool->thread_idx, idx);
-			_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_DESCRIPTOR_POOL, (uint64_t)slot->descriptor_pool, name);
-		}
 	} else {
 		vkResetCommandBuffer(slot->cmd, 0);
 		vkResetFences       (_skr_vk.device, 1, &slot->fence);
-		// Reset descriptor pool when reusing command buffer slot
-		if (slot->descriptor_pool != VK_NULL_HANDLE) {
-			vkResetDescriptorPool(_skr_vk.device, slot->descriptor_pool, 0);
-		}
-		// Reset bump allocators - resizes main buffer if needed, clears overflow
-		_skr_bump_alloc_reset(&slot->const_bump);
-		_skr_bump_alloc_reset(&slot->storage_bump);
+		// The GPU is done with this slot, so the sets it retired can free
+		_skr_desc_cache_retire(&ref_pool->desc_cache, idx);
 	}
+	_skr_bump_ring_slot_begin(&ref_pool->const_ring,   idx);
+	_skr_bump_ring_slot_begin(&ref_pool->storage_ring, idx);
 
 	vkBeginCommandBuffer(slot->cmd, &(VkCommandBufferBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -281,39 +258,254 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Descriptor writes
 
-// Helper to bind descriptors (handles push descriptors vs descriptor set allocation)
-void _skr_bind_descriptors(VkCommandBuffer cmd, VkDescriptorPool pool, VkPipelineBindPoint bind_point, 
-                            VkPipelineLayout layout, VkDescriptorSetLayout desc_layout, 
-                            VkWriteDescriptorSet* writes, uint32_t write_count) {
-	if (write_count == 0) return;
+void _skr_desc_writes_begin(_skr_desc_writes_t* out_writes, int32_t material_idx) {
+	out_writes->write_ct  = 0;
+	out_writes->buffer_ct = 0;
+	out_writes->image_ct  = 0;
+	out_writes->dyn       = (_skr_dyn_offsets_t){0};
+	out_writes->dyn.count = _skr_pipeline_get_dyn_bindings(material_idx, out_writes->dyn.bindings);
+}
 
-	if (_skr_vk.has_push_descriptors) {
-		vkCmdPushDescriptorSetKHR(cmd, bind_point, layout, 0, write_count, writes);
-	} else {
-		// Fallback: allocate and bind descriptor set from command buffer's pool
-		VkDescriptorSetAllocateInfo alloc_info = {
-			.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-			.descriptorPool     = pool,
-			.descriptorSetCount = 1,
-			.pSetLayouts        = &desc_layout,
-		};
-		VkDescriptorSet desc_set;
-		VkResult vr = vkAllocateDescriptorSets(_skr_vk.device, &alloc_info, &desc_set);
-		if (vr == VK_SUCCESS) {
-			for (uint32_t i = 0; i < write_count; i++) {
-				writes[i].dstSet = desc_set;
-			}
-			vkUpdateDescriptorSets(_skr_vk.device, write_count, writes, 0, NULL);
-			vkCmdBindDescriptorSets(cmd, bind_point, layout, 0, 1, &desc_set, 0, NULL);
+// Every buffer descriptor goes through here, so the layout's choice of dynamic
+// vs plain is honored no matter which caller supplies the buffer
+void _skr_write_buffer(_skr_desc_writes_t* ref_writes, uint32_t binding, bool storage, VkBuffer buffer, uint32_t offset, uint32_t range) {
+	if (ref_writes->write_ct >= _SKR_DESC_WRITES_MAX || ref_writes->buffer_ct >= _SKR_DESC_INFOS_MAX) return;
+
+	// A dynamic binding keeps the buffer at offset 0 in the set and takes the
+	// draw's offset at bind time, so the set stays valid across frames
+	bool dynamic = false;
+	for (uint32_t i = 0; i < ref_writes->dyn.count; i++) {
+		if (ref_writes->dyn.bindings[i] != binding) continue;
+		ref_writes->dyn.offsets[i] = offset;
+		dynamic = true;
+	}
+	VkDescriptorType type = storage
+		? (dynamic ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+		: (dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+	ref_writes->buffer_infos[ref_writes->buffer_ct] = (VkDescriptorBufferInfo){
+		.buffer = buffer,
+		.offset = dynamic ? 0 : offset,
+		.range  = range == UINT32_MAX ? VK_WHOLE_SIZE : range,
+	};
+	ref_writes->writes[ref_writes->write_ct] = (VkWriteDescriptorSet){
+		.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstBinding      = binding,
+		.descriptorCount = 1,
+		.descriptorType  = type,
+		.pBufferInfo     = &ref_writes->buffer_infos[ref_writes->buffer_ct],
+	};
+	ref_writes->buffer_ct++;
+	ref_writes->write_ct++;
+}
+
+void _skr_write_image(_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescriptorType type, VkSampler sampler, VkImageView view, VkImageLayout layout) {
+	if (ref_writes->write_ct >= _SKR_DESC_WRITES_MAX || ref_writes->image_ct >= _SKR_DESC_INFOS_MAX) return;
+
+	ref_writes->image_infos[ref_writes->image_ct] = (VkDescriptorImageInfo){
+		.sampler     = sampler,
+		.imageView   = view,
+		.imageLayout = layout,
+	};
+	ref_writes->writes[ref_writes->write_ct] = (VkWriteDescriptorSet){
+		.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstBinding      = binding,
+		.descriptorCount = 1,
+		.descriptorType  = type,
+		.pImageInfo      = &ref_writes->image_infos[ref_writes->image_ct],
+	};
+	ref_writes->image_ct++;
+	ref_writes->write_ct++;
+}
+
+static inline uint64_t _skr_hash_word(uint64_t hash, uint64_t word) {
+	hash ^= word;
+	hash *= 0x9E3779B97F4A7C15ull;
+	return hash ^ (hash >> 29);
+}
+
+// Fingerprint of a set's contents: the layout it targets and every handle,
+// offset and range it would be written with. Never returns 0.
+static uint64_t _skr_hash_writes(VkDescriptorSetLayout layout, const VkWriteDescriptorSet* writes, uint32_t write_count) {
+	uint64_t hash = _skr_hash_word(0x9E3779B97F4A7C15ull, (uint64_t)layout);
+	for (uint32_t i = 0; i < write_count; i++) {
+		hash = _skr_hash_word(hash, ((uint64_t)writes[i].dstBinding << 32) | (uint32_t)writes[i].descriptorType);
+		if (writes[i].pBufferInfo) {
+			const VkDescriptorBufferInfo* info = writes[i].pBufferInfo;
+			hash = _skr_hash_word(hash, (uint64_t)info->buffer);
+			hash = _skr_hash_word(hash, info->offset);
+			hash = _skr_hash_word(hash, info->range);
+		} else if (writes[i].pImageInfo) {
+			const VkDescriptorImageInfo* info = writes[i].pImageInfo;
+			hash = _skr_hash_word(hash, (uint64_t)info->sampler);
+			hash = _skr_hash_word(hash, (uint64_t)info->imageView);
+			hash = _skr_hash_word(hash, (uint64_t)info->imageLayout);
 		}
 	}
+	return hash ? hash : 1;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Descriptor set cache, see _skr_desc_cache_t
+
+#define _SKR_DESC_TYPE_COUNT 9
+static const VkDescriptorType _skr_desc_types[_SKR_DESC_TYPE_COUNT] = {
+	VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+	VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+	VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+	VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+	VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+	VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM,
+	VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM,
+};
+#define _SKR_DESC_QCOM_FIRST    7 // index of the first type that needs VK_QCOM_image_processing
+#define _SKR_DESC_POOL_SETS     512
+#define _SKR_DESC_POOL_PER_TYPE 2048
+
+static VkDescriptorPool _skr_desc_pool_create(void) {
+	VkDescriptorPoolSize sizes[_SKR_DESC_TYPE_COUNT];
+	uint32_t             size_ct = 0;
+	for (int32_t i = 0; i < _SKR_DESC_TYPE_COUNT; i++) {
+		if (i >= _SKR_DESC_QCOM_FIRST && !_skr_vk.has_qcom_image_proc) continue;
+		sizes[size_ct++] = (VkDescriptorPoolSize){ .type = _skr_desc_types[i], .descriptorCount = _SKR_DESC_POOL_PER_TYPE };
+	}
+	VkDescriptorPool pool = VK_NULL_HANDLE;
+	VkResult vr = vkCreateDescriptorPool(_skr_vk.device, &(VkDescriptorPoolCreateInfo){
+		.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+		.maxSets       = _SKR_DESC_POOL_SETS,
+		.poolSizeCount = size_ct,
+		.pPoolSizes    = sizes,
+	}, NULL, &pool);
+	if (vr != VK_SUCCESS) skr_log(skr_log_critical, "vkCreateDescriptorPool failed: %d", vr);
+	return pool;
+}
+
+static _skr_desc_cache_entry_t* _skr_desc_cache_entry(_skr_desc_cache_t* ref_cache, int32_t bind_start) {
+	uint32_t chunk_idx = (uint32_t)bind_start >> _SKR_DESC_CACHE_SHIFT;
+	if (bind_start < 0 || chunk_idx >= _SKR_DESC_CACHE_MAX_CHUNKS) return NULL;
+	if (ref_cache->chunks[chunk_idx] == NULL)
+		ref_cache->chunks[chunk_idx] = _skr_calloc(_SKR_DESC_CACHE_CHUNK, sizeof(_skr_desc_cache_entry_t));
+	return &ref_cache->chunks[chunk_idx][(uint32_t)bind_start & (_SKR_DESC_CACHE_CHUNK - 1)];
+}
+
+static bool _skr_desc_cache_alloc(_skr_desc_cache_t* ref_cache, VkDescriptorSetLayout layout, VkDescriptorSet* out_set, uint8_t* out_pool) {
+	VkDescriptorSetAllocateInfo info = {
+		.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorSetCount = 1,
+		.pSetLayouts        = &layout,
+	};
+	// Freed sets go back to the pool they came from, so any pool may have room.
+	// One that fails with sets left has run out of a descriptor type, not sets.
+	for (uint32_t i = 0; i < ref_cache->pool_count; i++) {
+		if (ref_cache->pool_used[i] >= _SKR_DESC_POOL_SETS || ref_cache->pool_no_room[i]) continue;
+		info.descriptorPool = ref_cache->pools[i];
+		if (vkAllocateDescriptorSets(_skr_vk.device, &info, out_set) != VK_SUCCESS) {
+			ref_cache->pool_no_room[i] = true;
+			continue;
+		}
+		ref_cache->pool_used[i]++;
+		*out_pool = (uint8_t)i;
+		return true;
+	}
+	if (ref_cache->pool_count >= 255) {
+		skr_log(skr_log_critical, "Descriptor set cache is out of pools");
+		return false;
+	}
+	VkDescriptorPool pool = _skr_desc_pool_create();
+	if (pool == VK_NULL_HANDLE) return false;
+	if (ref_cache->pool_count == ref_cache->pool_capacity) {
+		ref_cache->pool_capacity = ref_cache->pool_capacity == 0 ? 4 : ref_cache->pool_capacity * 2;
+		ref_cache->pools         = _skr_realloc(ref_cache->pools,        ref_cache->pool_capacity * sizeof(VkDescriptorPool));
+		ref_cache->pool_used     = _skr_realloc(ref_cache->pool_used,    ref_cache->pool_capacity * sizeof(uint16_t));
+		ref_cache->pool_no_room  = _skr_realloc(ref_cache->pool_no_room, ref_cache->pool_capacity * sizeof(bool));
+	}
+	uint32_t idx = ref_cache->pool_count++;
+	ref_cache->pools       [idx] = pool;
+	ref_cache->pool_used   [idx] = 0;
+	ref_cache->pool_no_room[idx] = false;
+	info.descriptorPool = pool;
+	if (vkAllocateDescriptorSets(_skr_vk.device, &info, out_set) != VK_SUCCESS) {
+		skr_log(skr_log_critical, "vkAllocateDescriptorSets failed on a fresh cache pool");
+		return false;
+	}
+	ref_cache->pool_used[idx] = 1;
+	*out_pool = (uint8_t)idx;
+	return true;
+}
+
+bool _skr_bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, int32_t bind_start, VkPipelineLayout layout, VkDescriptorSetLayout desc_layout, _skr_desc_writes_t* ref_writes) {
+	if (ref_writes->write_ct == 0) return true;
+
+	if (_skr_vk.has_push_descriptors) {
+		vkCmdPushDescriptorSetKHR(cmd, bind_point, layout, 0, ref_writes->write_ct, ref_writes->writes);
+		return true;
+	}
+
+	// One entry per bind slice, so a caller that varies its writes within one
+	// material (mipgen's per-mip views) misses every time and churns a set per call
+	_skr_vk_thread_t*        thread = _skr_cmd_get_thread();
+	uint32_t                 slot   = (uint32_t)(thread->active_cmd - thread->cmd_ring);
+	_skr_desc_cache_t*       cache  = &thread->desc_cache;
+	_skr_desc_cache_entry_t* entry  = _skr_desc_cache_entry(cache, bind_start);
+	if (entry == NULL) {
+		skr_log(skr_log_critical, "Descriptor bind without a bind slice");
+		return false;
+	}
+
+	uint64_t hash = _skr_hash_writes(desc_layout, ref_writes->writes, ref_writes->write_ct);
+	if (entry->hash != hash) {
+		if (entry->set != VK_NULL_HANDLE) {
+			if (cache->retired_count[slot] == cache->retired_capacity[slot]) {
+				cache->retired_capacity[slot] = cache->retired_capacity[slot] == 0 ? 16 : cache->retired_capacity[slot] * 2;
+				cache->retired[slot]          = _skr_realloc(cache->retired[slot], cache->retired_capacity[slot] * sizeof(_skr_desc_retired_t));
+			}
+			cache->retired[slot][cache->retired_count[slot]++] = (_skr_desc_retired_t){ .set = entry->set, .pool = entry->pool };
+		}
+		entry->set  = VK_NULL_HANDLE;
+		entry->hash = 0;
+		if (!_skr_desc_cache_alloc(cache, desc_layout, &entry->set, &entry->pool))
+			return false;
+		for (uint32_t i = 0; i < ref_writes->write_ct; i++)
+			ref_writes->writes[i].dstSet = entry->set;
+		vkUpdateDescriptorSets(_skr_vk.device, ref_writes->write_ct, ref_writes->writes, 0, NULL);
+		entry->hash = hash;
+	}
+	vkCmdBindDescriptorSets(cmd, bind_point, layout, 0, 1, &entry->set, ref_writes->dyn.count, ref_writes->dyn.offsets);
+	return true;
+}
+
+void _skr_desc_cache_retire(_skr_desc_cache_t* ref_cache, uint32_t slot) {
+	for (uint32_t i = 0; i < ref_cache->retired_count[slot]; i++) {
+		_skr_desc_retired_t retired = ref_cache->retired[slot][i];
+		vkFreeDescriptorSets(_skr_vk.device, ref_cache->pools[retired.pool], 1, &retired.set);
+		ref_cache->pool_used   [retired.pool]--;
+		ref_cache->pool_no_room[retired.pool] = false;
+	}
+	ref_cache->retired_count[slot] = 0;
+}
+
+void _skr_desc_cache_destroy(_skr_desc_cache_t* ref_cache) {
+	for (uint32_t i = 0; i < _SKR_DESC_CACHE_MAX_CHUNKS; i++)
+		_skr_free(ref_cache->chunks[i]);
+	for (uint32_t i = 0; i < skr_MAX_COMMAND_RING; i++)
+		_skr_free(ref_cache->retired[i]);
+	for (uint32_t i = 0; i < ref_cache->pool_count; i++)
+		vkDestroyDescriptorPool(_skr_vk.device, ref_cache->pools[i], NULL);
+	_skr_free(ref_cache->pools);
+	_skr_free(ref_cache->pool_used);
+	_skr_free(ref_cache->pool_no_room);
+	*ref_cache = (_skr_desc_cache_t){0};
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
-_skr_cmd_ctx_t _skr_cmd_begin() {
+_skr_cmd_ctx_t _skr_cmd_begin(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
+	(void)pool; // only read by the asserts below
 	assert(pool);
 	assert(pool->ref_count == 0 && "Ref count should be 0 at batch start");
 
@@ -331,10 +523,9 @@ bool _skr_cmd_try_get_active(_skr_cmd_ctx_t* out_ctx) {
 	if (pool->active_cmd) {
 		*out_ctx = (_skr_cmd_ctx_t){
 			.cmd             = pool->active_cmd->cmd,
-			.descriptor_pool = pool->active_cmd->descriptor_pool,
 			.destroy_list    = &pool->active_cmd->destroy_list,
-			.const_bump      = &pool->active_cmd->const_bump,
-			.storage_bump    = &pool->active_cmd->storage_bump,
+			.const_ring      = &pool->const_ring,
+			.storage_ring    = &pool->storage_ring,
 		};
 		return true;
 	}
@@ -343,7 +534,7 @@ bool _skr_cmd_try_get_active(_skr_cmd_ctx_t* out_ctx) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-_skr_cmd_ctx_t _skr_cmd_acquire() {
+_skr_cmd_ctx_t _skr_cmd_acquire(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
 
@@ -353,10 +544,9 @@ _skr_cmd_ctx_t _skr_cmd_acquire() {
 	pool->ref_count++;
 	return (_skr_cmd_ctx_t){
 		.cmd             = pool->active_cmd->cmd,
-		.descriptor_pool = pool->active_cmd->descriptor_pool,
 		.destroy_list    = &pool->active_cmd->destroy_list,
-		.const_bump      = &pool->active_cmd->const_bump,
-		.storage_bump    = &pool->active_cmd->storage_bump,
+		.const_ring      = &pool->const_ring,
+		.storage_ring    = &pool->storage_ring,
 	};
 }
 
@@ -391,7 +581,7 @@ void _skr_cmd_release(VkCommandBuffer buffer) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-VkCommandBuffer _skr_cmd_end() {
+VkCommandBuffer _skr_cmd_end(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
 
@@ -422,7 +612,7 @@ skr_future_t _skr_cmd_end_submit(const VkSemaphore* wait_semaphores, uint32_t wa
 
 	VkPipelineStageFlags wait_stages[SKR_MAX_SURFACES];
 	for (uint32_t i = 0; i < wait_count; i++) {
-		wait_stages[i] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		wait_stages[i] = _SKR_ACQUIRE_WAIT_STAGE;
 	}
 
 	// Submit with command buffer's fence
@@ -458,7 +648,7 @@ skr_future_t _skr_cmd_end_submit(const VkSemaphore* wait_semaphores, uint32_t wa
 // Future API - for GPU/CPU synchronization
 ///////////////////////////////////////////////////////////////////////////////
 
-skr_future_t skr_future_get() {
+skr_future_t skr_future_get(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 
 	// Invalid future if not on an initialized thread
@@ -478,6 +668,27 @@ skr_future_t skr_future_get() {
 		.slot       = target,
 		.generation = target->generation,
 	};
+}
+
+int32_t skr_renderer_frame_fence_fd(void) {
+	if (!_skr_vk.has_external_fence_fd) return -1;
+
+	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
+	if (!pool || !pool->alive) return -1;
+
+	_skr_cmd_ring_slot_t* slot = pool->last_submitted;
+	if (!slot || slot->fence == VK_NULL_HANDLE) return -1;
+
+	VkFenceGetFdInfoKHR fd_info = {
+		.sType      = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+		.fence      = slot->fence,
+		.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	int fd = -1;
+	if (vkGetFenceFdKHR(_skr_vk.device, &fd_info, &fd) != VK_SUCCESS) {
+		return -1;
+	}
+	return fd;
 }
 
 bool skr_future_check(const skr_future_t* future) {
@@ -517,11 +728,11 @@ void skr_future_wait(const skr_future_t* future) {
 // Command Batching API - for grouping multiple GPU operations
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_cmd_begin() {
+void skr_cmd_begin(void) {
 	_skr_cmd_acquire();
 }
 
-skr_future_t skr_cmd_end() {
+skr_future_t skr_cmd_end(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool && pool->ref_count > 0 && "Unbalanced skr_cmd_begin/end");
 
@@ -538,12 +749,12 @@ skr_future_t skr_cmd_end() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-bool skr_cmd_is_active() {
+bool skr_cmd_is_active(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	return pool && pool->ref_count > 0;
 }
 
-skr_future_t skr_cmd_flush() {
+skr_future_t skr_cmd_flush(void) {
 	_skr_vk_thread_t* pool = _skr_cmd_get_thread();
 	assert(pool);
 
