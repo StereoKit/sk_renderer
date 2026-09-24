@@ -130,6 +130,24 @@ void astc_write_weight_2bit(inout uint4 block, uint weight_index, uint weight_va
 	astc_block_write_bits(block, pos, 2u, astc_reverse2(weight_value));
 }
 
+// ASTC stores the weight stream bit-reversed from the top of the block, so a
+// stream packed LSB-first lands with three reversebits. Put fields with a
+// constant bit offset (e.g. from an [unroll] loop) so the word select folds.
+void astc_stream_put(inout uint3 stream, uint bit, uint value) {
+	uint shift = bit & 31u;
+	uint lo    = value << shift;
+	uint hi    = shift != 0u ? value >> (32u - shift) : 0u;
+	if      (bit < 32u) { stream.x |= lo; stream.y |= hi; }
+	else if (bit < 64u) { stream.y |= lo; stream.z |= hi; }
+	else                { stream.z |= lo; }
+}
+
+void astc_write_weight_stream(inout uint4 block, uint3 stream) {
+	block.w |= reversebits(stream.x);
+	block.z |= reversebits(stream.y);
+	block.y |= reversebits(stream.z);
+}
+
 // 2-bit weight unquant levels (0, 21, 43, 64) / 64 and midpoint thresholds.
 float astc_unq_r4(uint w) { return float(w * 21u + (w >> 1)) / 64.0; }
 static const float UNQ_R4_T0  = 21.0 / 128.0;  // ≈ 0.164

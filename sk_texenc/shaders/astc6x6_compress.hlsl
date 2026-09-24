@@ -98,10 +98,10 @@ void encode_mode_3x3_rgba(
 	static const float wcoord[3] = { 0.0, 2.5, 5.0 };
 	uint weights[9];
 	if (faxis_len_sq < 1e-6) {
-		[loop] for (uint i = 0; i < 9; i++) weights[i] = 0;
+		[unroll] for (uint i = 0; i < 9; i++) weights[i] = 0;
 	} else {
-		[loop] for (uint wy = 0; wy < 3; wy++) {
-			[loop] for (uint wx = 0; wx < 3; wx++) {
+		[unroll] for (uint wy = 0; wy < 3; wy++) {
+			[unroll] for (uint wx = 0; wx < 3; wx++) {
 				float fx = wcoord[wx], fy = wcoord[wy];
 				int   ix0 = int(fx),   iy0 = int(fy);
 				int   ix1 = min(ix0 + 1, 5);
@@ -119,6 +119,9 @@ void encode_mode_3x3_rgba(
 			}
 		}
 	}
+	// Endpoint swaps mirror every weight; applied as an XOR where weights are
+	// read, so the array is never rewritten at a runtime index.
+	uint flip = 0u;
 
 	// LS refine RGB endpoints — alpha LS would require a separate axis since
 	// CEM 12 single-plane shares one weight per pixel for all four channels.
@@ -126,7 +129,7 @@ void encode_mode_3x3_rgba(
 	// stay at bbox; alpha precision then comes from the 8-bit endpoint range.
 	if (faxis_len_sq >= 1e-6) {
 		float gw[9];
-		[loop] for (uint i = 0; i < 9; i++) gw[i] = astc_unq_r8(weights[i]);
+		[unroll] for (uint i = 0; i < 9; i++) gw[i] = astc_unq_r8(weights[i]);
 
 		float  A = 0, B = 0, C = 0;
 		float3 D = float3(0, 0, 0), E = float3(0, 0, 0);
@@ -160,7 +163,7 @@ void encode_mode_3x3_rgba(
 			if (n0.r + n0.g + n0.b > n1.r + n1.g + n1.b) {
 				uint3 tmp = n0; n0 = n1; n1 = tmp;
 				uint  at  = a0; a0 = a1; a1 = at;
-				[loop] for (uint i = 0; i < 9; i++) weights[i] = 7u - weights[i];
+				flip = 7u;
 			}
 			e0 = n0; e1 = n1;
 		}
@@ -169,16 +172,16 @@ void encode_mode_3x3_rgba(
 	uint4 block = uint4(0, 0, 0, 0);
 	astc_write_header_3x3_rgba(block);
 	astc_write_endpoints_rgba8(block, e0, e1, a0, a1);
-	[loop] for (uint wi = 0; wi < 9; wi++) {
-		astc_write_weight_3bit(block, wi, weights[wi]);
-	}
+	uint3 stream = uint3(0, 0, 0);
+	[unroll] for (uint i = 0; i < 9; i++) astc_stream_put(stream, 3u * i, weights[i] ^ flip);
+	astc_write_weight_stream(block, stream);
 	out_block = block;
 
 	// SSE — full RGBA reconstruction with bilinear weight upsampling.
 	float4 e0_f = float4(float3(e0) / 255.0, float(a0) / 255.0);
 	float4 e1_f = float4(float3(e1) / 255.0, float(a1) / 255.0);
 	float  gw2[9];
-	[loop] for (uint i = 0; i < 9; i++) gw2[i] = astc_unq_r8(weights[i]);
+	[unroll] for (uint i = 0; i < 9; i++) gw2[i] = astc_unq_r8(weights[i] ^ flip);
 	float sse = 0.0;
 	[unroll] for (uint py = 0; py < 6; py++) {
 		[unroll] for (uint px = 0; px < 6; px++) {
@@ -228,10 +231,10 @@ void encode_mode_5x5_rgba(
 	static const float wcoord[5] = { 0.0, 1.25, 2.5, 3.75, 5.0 };
 	uint weights[25];
 	if (faxis_len_sq < 1e-6) {
-		[loop] for (uint i = 0; i < 25; i++) weights[i] = 0;
+		[unroll] for (uint i = 0; i < 25; i++) weights[i] = 0;
 	} else {
-		[loop] for (uint wy = 0; wy < 5; wy++) {
-			[loop] for (uint wx = 0; wx < 5; wx++) {
+		[unroll] for (uint wy = 0; wy < 5; wy++) {
+			[unroll] for (uint wx = 0; wx < 5; wx++) {
 				float fx = wcoord[wx], fy = wcoord[wy];
 				int   ix0 = int(fx),   iy0 = int(fy);
 				int   ix1 = min(ix0 + 1, 5);
@@ -247,10 +250,13 @@ void encode_mode_5x5_rgba(
 			}
 		}
 	}
+	// Endpoint swaps mirror every weight; applied as an XOR where weights are
+	// read, so the array is never rewritten at a runtime index.
+	uint flip = 0u;
 
 	if (faxis_len_sq >= 1e-6) {
 		float gw[25];
-		[loop] for (uint i = 0; i < 25; i++) gw[i] = astc_unq_r4(weights[i]);
+		[unroll] for (uint i = 0; i < 25; i++) gw[i] = astc_unq_r4(weights[i]);
 
 		float  A = 0, B = 0, C = 0;
 		float3 D = float3(0, 0, 0), E = float3(0, 0, 0);
@@ -284,7 +290,7 @@ void encode_mode_5x5_rgba(
 			if (n0.r + n0.g + n0.b > n1.r + n1.g + n1.b) {
 				uint3 tmp = n0; n0 = n1; n1 = tmp;
 				uint  at  = a0; a0 = a1; a1 = at;
-				[loop] for (uint i = 0; i < 25; i++) weights[i] = 3u - weights[i];
+				flip ^= 3u;
 			}
 			e0 = n0; e1 = n1;
 		}
@@ -304,16 +310,16 @@ void encode_mode_5x5_rgba(
 		if (s0 > s1) {
 			uint3 tmp = e0; e0 = e1; e1 = tmp;
 			uint  at  = a0; a0 = a1; a1 = at;
-			[loop] for (uint i = 0; i < 25; i++) weights[i] = 3u - weights[i];
+			flip ^= 3u;
 		}
 	}
 
 	uint4 block = uint4(0, 0, 0, 0);
 	astc_write_header_5x5_rgba(block);
 	astc_write_endpoints_rgba6trit(block, e0, e1, a0, a1);
-	[loop] for (uint wi = 0; wi < 25; wi++) {
-		astc_write_weight_2bit(block, wi, weights[wi]);
-	}
+	uint3 stream = uint3(0, 0, 0);
+	[unroll] for (uint i = 0; i < 25; i++) astc_stream_put(stream, 2u * i, weights[i] ^ flip);
+	astc_write_weight_stream(block, stream);
 	out_block = block;
 
 	// SSE with range-192 dequantized endpoints (mirrors the decoder).
@@ -337,7 +343,7 @@ void encode_mode_5x5_rgba(
 		astc_dequant_r192(v_a1)) / 255.0;
 
 	float gw2[25];
-	[loop] for (uint i = 0; i < 25; i++) gw2[i] = astc_unq_r4(weights[i]);
+	[unroll] for (uint i = 0; i < 25; i++) gw2[i] = astc_unq_r4(weights[i] ^ flip);
 	float sse = 0.0;
 	[unroll] for (uint py = 0; py < 6; py++) {
 		[unroll] for (uint px = 0; px < 6; px++) {
@@ -423,33 +429,34 @@ void encode_mode_4x4_rgb_only(
 		pproj[pi] = dot(pixels[pi].rgb, faxis);
 	}
 
+	// Grid points sit at fixed pixel positions, so the bilinear resample runs
+	// across rows then down columns, all at static indices.
 	static const float wcoord[4] = { 0.0, 5.0/3.0, 10.0/3.0, 5.0 };
-	uint weights[16];
-	if (faxis_len_sq < 1e-6) {
-		[loop] for (uint i = 0; i < 16; i++) weights[i] = 0;
-	} else {
-		float inv_axis_len_sq = 1.0 / faxis_len_sq;
-		[loop] for (uint wy = 0; wy < 4; wy++) {
-			[loop] for (uint wx = 0; wx < 4; wx++) {
-				float fx = wcoord[wx], fy = wcoord[wy];
-				int   ix0 = int(fx),   iy0 = int(fy);
-				int   ix1 = min(ix0 + 1, 5);
-				int   iy1 = min(iy0 + 1, 5);
-				float tx = fx - float(ix0), ty = fy - float(iy0);
-				float p00 = pproj[iy0 * 6 + ix0];
-				float p10 = pproj[iy0 * 6 + ix1];
-				float p01 = pproj[iy1 * 6 + ix0];
-				float p11 = pproj[iy1 * 6 + ix1];
-				float p   = lerp(lerp(p00, p10, tx), lerp(p01, p11, tx), ty);
-				float target = saturate((p - fc0_proj) * inv_axis_len_sq);
-				weights[wy * 4 + wx] = astc_quantize_weight_trit_2bit(target);
-			}
+	float rows[6][4];
+	[unroll] for (uint ry = 0; ry < 6; ry++) {
+		[unroll] for (uint wx = 0; wx < 4; wx++) {
+			int   ix0 = int(wcoord[wx]);
+			int   ix1 = min(ix0 + 1, 5);
+			float tx  = wcoord[wx] - float(ix0);
+			rows[ry][wx] = lerp(pproj[ry * 6 + ix0], pproj[ry * 6 + ix1], tx);
+		}
+	}
+	uint  weights[16];
+	float inv_axis_len_sq = faxis_len_sq < 1e-6 ? 0.0 : 1.0 / faxis_len_sq;
+	[unroll] for (uint wy = 0; wy < 4; wy++) {
+		int   iy0 = int(wcoord[wy]);
+		int   iy1 = min(iy0 + 1, 5);
+		float ty  = wcoord[wy] - float(iy0);
+		[unroll] for (uint wx = 0; wx < 4; wx++) {
+			float p      = lerp(rows[iy0][wx], rows[iy1][wx], ty);
+			float target = saturate((p - fc0_proj) * inv_axis_len_sq);
+			weights[wy * 4 + wx] = faxis_len_sq < 1e-6 ? 0u : astc_quantize_weight_trit_2bit(target);
 		}
 	}
 
 	if (faxis_len_sq >= 1e-6) {
 		float gw[16];
-		[loop] for (uint i = 0; i < 16; i++) gw[i] = astc_unq_r12(weights[i]);
+		[unroll] for (uint i = 0; i < 16; i++) gw[i] = astc_unq_r12(weights[i]);
 
 		float  A = 0, B = 0, C = 0;
 		float3 D = float3(0, 0, 0), E = float3(0, 0, 0);
@@ -482,7 +489,7 @@ void encode_mode_4x4_rgb_only(
 			uint3  n1      = uint3(e1_ref * 255.0 + 0.5);
 			if (n0.r + n0.g + n0.b > n1.r + n1.g + n1.b) {
 				uint3 tmp = n0; n0 = n1; n1 = tmp;
-				[loop] for (uint i = 0; i < 16; i++) weights[i] = weights[i] ^ 1u;
+				[unroll] for (uint i = 0; i < 16; i++) weights[i] = weights[i] ^ 1u;
 			}
 			e0 = n0; e1 = n1;
 		}
@@ -502,7 +509,7 @@ void encode_mode_4x4_rgb_only(
 	float3 e0_f = float3(e0) / 255.0;
 	float3 e1_f = float3(e1) / 255.0;
 	float  gw2[16];
-	[loop] for (uint i = 0; i < 16; i++) gw2[i] = astc_unq_r12(weights[i]);
+	[unroll] for (uint i = 0; i < 16; i++) gw2[i] = astc_unq_r12(weights[i]);
 	float sse = 0.0;
 	[unroll] for (uint py = 0; py < 6; py++) {
 		[unroll] for (uint px = 0; px < 6; px++) {
@@ -546,15 +553,14 @@ void encode_mode_6x6pp_rgb_only(
 	T[2] = faxis_len_sq * UNQ_R4_T2 + fc0_proj;
 
 	uint weights[36];
-	if (faxis_len_sq < 1e-6) {
-		[loop] for (uint i = 0; i < 36; i++) weights[i] = 0;
-	} else {
-		[unroll] for (uint i = 0; i < 36; i++) {
-			float p = pproj[i];
-			uint  q = uint(p >= T[0]) + uint(p >= T[1]) + uint(p >= T[2]);
-			weights[i] = q;
-		}
+	[unroll] for (uint i = 0; i < 36; i++) {
+		float p = pproj[i];
+		uint  q = uint(p >= T[0]) + uint(p >= T[1]) + uint(p >= T[2]);
+		weights[i] = faxis_len_sq < 1e-6 ? 0u : q;
 	}
+	// Endpoint swaps mirror every weight (3 - w == w ^ 3); applied where
+	// weights are read, so the array is never rewritten at a runtime index.
+	uint flip = 0u;
 
 	if (faxis_len_sq >= 1e-6) {
 		float  A = 0, B = 0, C = 0;
@@ -576,7 +582,7 @@ void encode_mode_6x6pp_rgb_only(
 			uint3  n1      = uint3(e1_ref * 255.0 + 0.5);
 			if (n0.r + n0.g + n0.b > n1.r + n1.g + n1.b) {
 				uint3 tmp = n0; n0 = n1; n1 = tmp;
-				[loop] for (uint i = 0; i < 36; i++) weights[i] = 3u - weights[i];
+				flip ^= 3u;
 			}
 			e0 = n0; e1 = n1;
 		}
@@ -596,16 +602,16 @@ void encode_mode_6x6pp_rgb_only(
 		        + astc_dequant_r80(astc_quantize_to_r80(e1.b));
 		if (s0 > s1) {
 			uint3 tmp = e0; e0 = e1; e1 = tmp;
-			[loop] for (uint i = 0; i < 36; i++) weights[i] = 3u - weights[i];
+			flip ^= 3u;
 		}
 	}
 
 	uint4 block = uint4(0, 0, 0, 0);
 	astc_write_header_6x6_rgb(block);
 	astc_write_endpoints_rgb6(block, e0, e1);
-	[loop] for (uint wi = 0; wi < 36; wi++) {
-		astc_write_weight_2bit(block, wi, weights[wi]);
-	}
+	uint3 stream = uint3(0, 0, 0);
+	[unroll] for (uint i = 0; i < 36; i++) astc_stream_put(stream, 2u * i, weights[i] ^ flip);
+	astc_write_weight_stream(block, stream);
 	out_block = block;
 
 	// SSE: same range-80 dequant pattern as the standalone 6x6pp shader,
@@ -624,7 +630,7 @@ void encode_mode_6x6pp_rgb_only(
 	                     astc_dequant_r80(q1.b)) / 255.0;
 	float sse = 0.0;
 	[unroll] for (uint i = 0; i < 36; i++) {
-		float  w     = astc_unq_r4(weights[i]);
+		float  w     = astc_unq_r4(weights[i] ^ flip);
 		float3 recon = lerp(e0_f, e1_f, w);
 		float4 d     = float4(pixels[i].rgb - recon, pixels[i].a - 1.0);
 		sse += dot(d, d);
@@ -679,10 +685,10 @@ void encode_mode_dual_3x3_rgba(
 	uint weights_sec[9];
 
 	if (faxis_len_sq < 1e-6) {
-		[loop] for (uint i = 0; i < 9; i++) weights_pri[i] = 0;
+		[unroll] for (uint i = 0; i < 9; i++) weights_pri[i] = 0;
 	} else {
-		[loop] for (uint wy = 0; wy < 3; wy++) {
-			[loop] for (uint wx = 0; wx < 3; wx++) {
+		[unroll] for (uint wy = 0; wy < 3; wy++) {
+			[unroll] for (uint wx = 0; wx < 3; wx++) {
 				float fx = wcoord[wx], fy = wcoord[wy];
 				int   ix0 = int(fx),   iy0 = int(fy);
 				int   ix1 = min(ix0 + 1, 5);
@@ -700,7 +706,7 @@ void encode_mode_dual_3x3_rgba(
 	}
 
 	if (alpha_degenerate) {
-		[loop] for (uint i = 0; i < 9; i++) weights_sec[i] = 0;
+		[unroll] for (uint i = 0; i < 9; i++) weights_sec[i] = 0;
 	} else {
 		// Bilinear-downsample per-pixel alpha-t (in [0,1]) to the 9 grid
 		// points, then quantize to 4 levels via the same midpoint thresholds.
@@ -709,8 +715,8 @@ void encode_mode_dual_3x3_rgba(
 		[unroll] for (uint i = 0; i < 36; i++) {
 			a_t[i] = (pixels[i].a * 255.0 - float(amin)) * inv_arange;
 		}
-		[loop] for (uint wy = 0; wy < 3; wy++) {
-			[loop] for (uint wx = 0; wx < 3; wx++) {
+		[unroll] for (uint wy = 0; wy < 3; wy++) {
+			[unroll] for (uint wx = 0; wx < 3; wx++) {
 				float fx = wcoord[wx], fy = wcoord[wy];
 				int   ix0 = int(fx),   iy0 = int(fy);
 				int   ix1 = min(ix0 + 1, 5);
@@ -727,11 +733,15 @@ void encode_mode_dual_3x3_rgba(
 		}
 	}
 
+	// Endpoint swaps mirror every primary weight; applied as an XOR where
+	// weights are read, so the array is never rewritten at a runtime index.
+	uint flip = 0u;
+
 	// LS refine RGB endpoints using primary weights (same pattern as
 	// encode_mode_3x3_rgba). Skip alpha LS — keep a0/a1 at bbox.
 	if (faxis_len_sq >= 1e-6) {
 		float gw[9];
-		[loop] for (uint i = 0; i < 9; i++) gw[i] = astc_unq_r4(weights_pri[i]);
+		[unroll] for (uint i = 0; i < 9; i++) gw[i] = astc_unq_r4(weights_pri[i]);
 
 		float  A = 0, B = 0, C = 0;
 		float3 D = float3(0, 0, 0), E = float3(0, 0, 0);
@@ -766,7 +776,7 @@ void encode_mode_dual_3x3_rgba(
 			// are not affected by an RGB swap (independent plane).
 			if (n0.r + n0.g + n0.b > n1.r + n1.g + n1.b) {
 				uint3 tmp = n0; n0 = n1; n1 = tmp;
-				[loop] for (uint i = 0; i < 9; i++) weights_pri[i] = 3u - weights_pri[i];
+				flip = 3u;
 			}
 			e0 = n0; e1 = n1;
 		}
@@ -776,9 +786,13 @@ void encode_mode_dual_3x3_rgba(
 	astc_write_header_3x3_rgba_dual(block);
 	astc_write_endpoints_rgba8(block, e0, e1, a0, a1);
 	astc_write_ccs(block, 90u, ASTC_CCS_ALPHA);
-	[loop] for (uint wi = 0; wi < 9; wi++) {
-		astc_write_dual_weight_2bit(block, wi, weights_pri[wi], weights_sec[wi]);
+	// Dual plane interleaves each grid point's primary and secondary weight
+	uint3 stream = uint3(0, 0, 0);
+	[unroll] for (uint i = 0; i < 9; i++) {
+		astc_stream_put(stream, 4u * i,      weights_pri[i] ^ flip);
+		astc_stream_put(stream, 4u * i + 2u, weights_sec[i]);
 	}
+	astc_write_weight_stream(block, stream);
 	out_block = block;
 
 	// SSE: RGB uses primary weight, alpha uses secondary weight — both
@@ -788,8 +802,8 @@ void encode_mode_dual_3x3_rgba(
 	float  a0_f     = float(a0) / 255.0;
 	float  a1_f     = float(a1) / 255.0;
 	float gw_pri[9], gw_sec[9];
-	[loop] for (uint i = 0; i < 9; i++) {
-		gw_pri[i] = astc_unq_r4(weights_pri[i]);
+	[unroll] for (uint i = 0; i < 9; i++) {
+		gw_pri[i] = astc_unq_r4(weights_pri[i] ^ flip);
 		gw_sec[i] = astc_unq_r4(weights_sec[i]);
 	}
 	float sse = 0.0;
@@ -873,11 +887,6 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	float faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b) / 255.0;
 	float fc0_proj     = dot(float3(imin_rgb) / 255.0, faxis);
 
-	float pproj[36];
-	[unroll] for (uint i = 0; i < 36; i++) {
-		pproj[i] = dot(pixels[i].rgb, faxis);
-	}
-
 	// Per-block early-out: pick the mode set that can possibly win based on
 	// the alpha content. Skipping unwinnable modes is safe because their
 	// SSE would be strictly higher than at least one mode we still run.
@@ -898,9 +907,14 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		// at no quality benefit (alpha=1.0 either way).
 		encode_mode_4x4_rgb_only  (pixels, imin_rgb, imax_rgb, b, s);
 		best = b; best_sse = s;
+		// Mode A projects onto its own axis, so pproj isn't live across it
+		float pproj[36];
+		[unroll] for (uint i = 0; i < 36; i++) pproj[i] = dot(pixels[i].rgb, faxis);
 		encode_mode_6x6pp_rgb_only(pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, b, s);
 		if (s < best_sse) { best = b; best_sse = s; }
 	} else {
+		float pproj[36];
+		[unroll] for (uint i = 0; i < 36; i++) pproj[i] = dot(pixels[i].rgb, faxis);
 		encode_mode_3x3_rgba(pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, a0, a1, b, s);
 		best = b; best_sse = s;
 		encode_mode_5x5_rgba(pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, a0, a1, b, s);
