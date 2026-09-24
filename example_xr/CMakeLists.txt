@@ -143,6 +143,7 @@ target_sources(sk_renderer_xr_test PRIVATE
 
 target_link_libraries(sk_renderer_xr_test PRIVATE
 	sk_renderer
+	sk_texenc
 	${SKR_XR_IMPL}
 )
 

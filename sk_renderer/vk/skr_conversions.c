@@ -77,9 +77,9 @@ uint32_t skr_tex_fmt_to_native(skr_tex_fmt_ format) {
 		case skr_tex_fmt_astc4x4_rgba:       return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 		case skr_tex_fmt_astc6x6_rgba_srgb:  return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
 		case skr_tex_fmt_astc6x6_rgba:       return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
-		// HDR rides on the regular UNORM 8x8 format — the decoder picks
-		// LDR vs HDR per-block from the encoded CEM.
-		case skr_tex_fmt_astc8x8_rgba_hdr:   return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+		// UNORM ASTC decodes with the LDR profile, where HDR blocks become the
+		// error color, so HDR content needs the SFLOAT format.
+		case skr_tex_fmt_astc8x8_rgba_hdr:   return VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK;
 		case skr_tex_fmt_atc_rgb:            return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		case skr_tex_fmt_atc_rgba:           return VK_FORMAT_UNDEFINED; // No Vulkan equivalent
 		// YUV / multi-plane formats
@@ -158,9 +158,7 @@ skr_tex_fmt_ skr_tex_fmt_from_native(uint32_t format) {
 		case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:       return skr_tex_fmt_astc4x4_rgba;
 		case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:        return skr_tex_fmt_astc6x6_rgba_srgb;
 		case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:       return skr_tex_fmt_astc6x6_rgba;
-		// LDR 8x8 has no skr enum of its own; the HDR profile shares the
-		// Vulkan format (HDR is signalled per-block via CEM), so map to it.
-		case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:       return skr_tex_fmt_astc8x8_rgba_hdr;
+		case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:      return skr_tex_fmt_astc8x8_rgba_hdr;
 		// YUV / multi-plane formats
 		case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:                       return skr_tex_fmt_nv12;
 		case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:     return skr_tex_fmt_p010;

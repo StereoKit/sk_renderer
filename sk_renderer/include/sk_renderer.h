@@ -848,6 +848,15 @@ SKR_API bool              skr_shader_get_param_info        (const skr_shader_t* 
 SKR_API bool              skr_shader_get_tex_info          (const skr_shader_t*     shader, const char* tex_name,   skr_shader_tex_info_t*   opt_out_info);
 SKR_API void              skr_shader_set_name              (      skr_shader_t* ref_shader, const char* name);
 
+// One resource for skr_compute_dispatch. Resolve `bind` once with
+// skr_compute_get_bind, and fill whichever of tex/buffer the slot takes; the
+// other is ignored.
+typedef struct skr_compute_bind_t {
+	skr_bind_t    bind;
+	skr_tex_t*    tex;
+	skr_buffer_t* buffer;
+} skr_compute_bind_t;
+
 SKR_API skr_err_          skr_compute_create               (const skr_shader_t* shader, skr_compute_info_t info, skr_compute_t* out_compute);
 SKR_API void              skr_compute_set_pipeline         (      skr_compute_t* ref_compute, skr_compute_info_t info);
 SKR_API bool              skr_compute_is_valid             (const skr_compute_t*     compute);
@@ -855,6 +864,7 @@ SKR_API void              skr_compute_destroy              (      skr_compute_t*
 SKR_API skr_bind_t        skr_compute_get_bind             (const skr_compute_t*     compute, const char* bind_name);
 SKR_API void              skr_compute_execute              (      skr_compute_t* ref_compute, uint32_t x, uint32_t y, uint32_t z);
 SKR_API void              skr_compute_execute_indirect     (      skr_compute_t* ref_compute, skr_buffer_t* indirect_args);
+SKR_API void              skr_compute_dispatch             (const skr_compute_t*     compute, const skr_compute_bind_t* binds, uint32_t bind_count, const void* opt_params, uint32_t params_size, uint32_t x, uint32_t y, uint32_t z); // Stateless execute: binds and $Global params come from the arguments, so threads can share one compute. Params shorter than $Global keep the shader's defaults past params_size
 SKR_API void              skr_compute_set_tex              (      skr_compute_t* ref_compute, const char* name, skr_tex_t*    texture);
 SKR_API void              skr_compute_set_buffer           (      skr_compute_t* ref_compute, const char* name, skr_buffer_t* buffer);
 SKR_API void              skr_compute_set_params           (      skr_compute_t* ref_compute, const void* data, uint32_t size);

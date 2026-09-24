@@ -224,7 +224,7 @@ static void _skr_flush_texture_transitions(VkCommandBuffer cmd) {
 // Flush deferred compute→graphics barrier. Called before render passes and blits
 // to ensure compute writes are visible to vertex/fragment stages.
 static void _skr_flush_pending_compute_barrier(VkCommandBuffer cmd) {
-	if (!_skr_vk.pending_compute_barrier) return;
+	if (!_skr_exchange_u32(&_skr_vk.pending_compute_barrier, 0)) return;
 	vkCmdPipelineBarrier(cmd,
 		VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
@@ -233,7 +233,6 @@ static void _skr_flush_pending_compute_barrier(VkCommandBuffer cmd) {
 			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
 		}, 0, NULL, 0, NULL);
-	_skr_vk.pending_compute_barrier = false;
 }
 
 void skr_renderer_frame_begin(void) {

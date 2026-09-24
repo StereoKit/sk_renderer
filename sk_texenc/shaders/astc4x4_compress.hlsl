@@ -25,6 +25,12 @@
 Texture2D<float4>         source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
+// Gamma-encode linear-light sources (float or sRGB-view textures) so the
+// endpoints quantize in the space a *_srgb output format decodes from.
+[[vk::constant_id(0)]] const bool SRGB_ENCODE = false;
+// Non-color data: weigh channels evenly rather than perceptually.
+[[vk::constant_id(1)]] const bool LINEAR_DATA = false;
+
 uint mip_level;
 uint image_width;
 uint image_height;
@@ -37,7 +43,7 @@ uint buffer_offset;
 // index). For trit+Bbit encoding the decoder's unquantize(v) is not monotonic
 // in v — it produces pairs that mirror across 0.5, which is why LS-refine
 // endpoint swap can use `v ^ 1` as the weight mirror. (The trit+2bit table,
-// UNQ_R12_V, lives in astc_common.hlsli.)
+// astc_unq_r12, lives in astc_common.hlsli.)
 
 // trit+1bit (6 lvl): v → unquantized weight in [0, 1]. Raw values
 // (0,63,12,51,25,38) with the decoder's "> 32 → +1" bump, over 64.
@@ -80,10 +86,10 @@ uint4 encode_mode_4x4_rgb(in float3 pixels[16]) {
 	}
 
 	float3 faxis = float3(
-		float(int(e1.r) - int(e0.r)) * 2.0,
-		float(int(e1.g) - int(e0.g)) * 4.0,
+		float(int(e1.r) - int(e0.r)) * PW_R,
+		float(int(e1.g) - int(e0.g)) * PW_G,
 		float(int(e1.b) - int(e0.b)));
-	float faxis_len_sq = (faxis.r * faxis.r * 0.5 + faxis.g * faxis.g * 0.25 + faxis.b * faxis.b) / 255.0;
+	float faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b) / 255.0;
 	float fc0_proj     = dot(float3(e0) / 255.0, faxis);
 
 	// Quantize pixel projections to trit+2bit weight (12 levels). weights[]
@@ -102,13 +108,13 @@ uint4 encode_mode_4x4_rgb(in float3 pixels[16]) {
 	}
 
 	// LS refine (same 2x2 normal-equation solve as before, indexed through
-	// UNQ_R12_V since weights are encoded-v values).
+	// astc_unq_r12 since weights are encoded-v values).
 	if (faxis_len_sq >= 1e-6) {
 		float  A = 0, B = 0, C = 0;
 		float3 D = float3(0, 0, 0);
 		float3 E = float3(0, 0, 0);
 		[unroll] for (uint i = 0; i < 16; i++) {
-			float  w  = UNQ_R12_V[weights[i]];
+			float  w  = astc_unq_r12(weights[i]);
 			float3 p  = pixels[i];
 			float  iw = 1.0 - w;
 			A += iw * iw; B +=  w * iw; C +=  w *  w;
@@ -133,10 +139,10 @@ uint4 encode_mode_4x4_rgb(in float3 pixels[16]) {
 			// endpoints are exact 8-bit values, so this axis is exactly the
 			// decoder's — closing the fit-against-stale-axis gap.
 			faxis = float3(
-				float(int(e1.r) - int(e0.r)) * 2.0,
-				float(int(e1.g) - int(e0.g)) * 4.0,
+				float(int(e1.r) - int(e0.r)) * PW_R,
+				float(int(e1.g) - int(e0.g)) * PW_G,
 				float(int(e1.b) - int(e0.b)));
-			faxis_len_sq = (faxis.r * faxis.r * 0.5 + faxis.g * faxis.g * 0.25 + faxis.b * faxis.b) / 255.0;
+			faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b) / 255.0;
 			if (faxis_len_sq >= 1e-6) {
 				fc0_proj = dot(float3(e0) / 255.0, faxis);
 				float inv_len = 1.0 / faxis_len_sq;
@@ -196,11 +202,11 @@ uint4 encode_mode_4x4_rgba(in float4 pixels[16]) {
 	// every pixel to the same weight and the gradient collapses to constant
 	// alpha. Alpha gets red's perceptual weight (2).
 	float4 faxis = float4(
-		float(int(e1.r) - int(e0.r)) * 2.0,
-		float(int(e1.g) - int(e0.g)) * 4.0,
+		float(int(e1.r) - int(e0.r)) * PW_R,
+		float(int(e1.g) - int(e0.g)) * PW_G,
 		float(int(e1.b) - int(e0.b)),
-		float(int(a1)   - int(a0))   * 2.0);
-	float faxis_len_sq = (faxis.r * faxis.r * 0.5 + faxis.g * faxis.g * 0.25 + faxis.b * faxis.b + faxis.a * faxis.a * 0.5) / 255.0;
+		float(int(a1)   - int(a0))   * PW_A);
+	float faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b + faxis.a * faxis.a * PW_A_INV) / 255.0;
 	float fc0_proj     = dot(float4(float3(e0), float(a0)) / 255.0, faxis);
 
 	// Quantize to trit+1bit weight (6 levels); weights[] holds encoded v.
@@ -250,11 +256,11 @@ uint4 encode_mode_4x4_rgba(in float4 pixels[16]) {
 			// Re-derive weights against the refined endpoints (exact 8-bit,
 			// so decoder-exact).
 			faxis = float4(
-				float(int(e1.r) - int(e0.r)) * 2.0,
-				float(int(e1.g) - int(e0.g)) * 4.0,
+				float(int(e1.r) - int(e0.r)) * PW_R,
+				float(int(e1.g) - int(e0.g)) * PW_G,
 				float(int(e1.b) - int(e0.b)),
-				float(int(a1)   - int(a0))   * 2.0);
-			faxis_len_sq = (faxis.r * faxis.r * 0.5 + faxis.g * faxis.g * 0.25 + faxis.b * faxis.b + faxis.a * faxis.a * 0.5) / 255.0;
+				float(int(a1)   - int(a0))   * PW_A);
+			faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b + faxis.a * faxis.a * PW_A_INV) / 255.0;
 			if (faxis_len_sq >= 1e-6) {
 				fc0_proj = dot(float4(float3(e0), float(a0)) / 255.0, faxis);
 				float inv_len = 1.0 / faxis_len_sq;
@@ -298,6 +304,8 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			uint sx = min(bx * 4u + px, image_width  - 1u);
 			uint sy = min(by * 4u + py, image_height - 1u);
 			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			if (SRGB_ENCODE)
+				texel.rgb = linear_to_srgb(texel.rgb);
 			pixels[py * 4u + px] = texel;
 			amin = min(amin, texel.a);
 			amax = max(amax, texel.a);

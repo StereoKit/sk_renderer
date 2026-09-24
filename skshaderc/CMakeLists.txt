@@ -23,6 +23,8 @@
 # Both take an optional trailing INCLUDES list of .hlsli files.
 # cmake can't see through an #include, so anything a shader pulls
 # in has to be named there for an edit to it to trigger a rebuild.
+# skshaderc_compile_headers also takes an OPTIMIZED flag, which keeps
+# Debug builds from compiling those shaders unoptimized.
 #
 # If you wish to design your own shader compiling function,
 # this file also exports SKSHADERC_EXE_PATH, which is a
@@ -359,7 +361,7 @@ if(SKSHADERC_ENABLE_SVSL)
 	message(STATUS "Fetching SVSL...")
 	FetchContent_Declare( SVSL
 		GIT_REPOSITORY https://github.com/maluoi/SVSL.git
-		GIT_TAG        v2026.8.11
+		GIT_TAG        v2026.9.23
 		GIT_SHALLOW    TRUE
 		GIT_PROGRESS   TRUE
 	)
@@ -507,8 +509,12 @@ function(SKSHADERC_COMPILE_ASSETS TARGET OUT_PATH COMMAND_STRING OUT_LIST)
 endfunction()
 
 function(SKSHADERC_COMPILE_HEADERS ADD_TARGET OUTPUT_FOLDER COMMAND_STRING)
-	cmake_parse_arguments(PARSE_ARGV 3 SKSC "" "" "INCLUDES")
-	set(SKSHADERC_COMPILE_COMMANDS "-h $<$<CONFIG:Debug>:-d> -o ${OUTPUT_FOLDER} ${COMMAND_STRING}")
+	cmake_parse_arguments(PARSE_ARGV 3 SKSC "OPTIMIZED" "" "INCLUDES")
+	if(SKSC_OPTIMIZED)
+		set(SKSHADERC_COMPILE_COMMANDS "-h -o ${OUTPUT_FOLDER} ${COMMAND_STRING}")
+	else()
+		set(SKSHADERC_COMPILE_COMMANDS "-h $<$<CONFIG:Debug>:-d> -o ${OUTPUT_FOLDER} ${COMMAND_STRING}")
+	endif()
 	message(STATUS "sk_renderer compiling shader headers with args 'skshaderc ${SKSHADERC_COMPILE_COMMANDS} [shaders]'")
 	separate_arguments(SKSHADERC_COMPILE_COMMANDS)
 

@@ -44,7 +44,7 @@ uint buffer_offset;
 // Mode A: 6x5 grid, 2-bit weights — Voronoi assignment + bilinear interp.
 ///////////////////////////////////////////////////////////////////////////////
 
-// 2-bit weight unquant levels (UNQ_R4) and midpoint thresholds (UNQ_R4_T0..T2)
+// 2-bit weight unquant levels (astc_unq_r4) and midpoint thresholds (UNQ_R4_T0..T2)
 // come from astc_common.hlsli.
 
 // Voronoi assignment for 6x5 grid: 6 X grid points, 5 Y. X cell counts
@@ -69,7 +69,7 @@ static const uint A_BL_WY[8] = { 0u, 9u, 2u, 11u, 5u, 14u, 7u, 0u };
 // Mode B: 4x4 grid, trit+2bit (12 lvl) BISE weights.
 ///////////////////////////////////////////////////////////////////////////////
 
-// trit+2bit unquant indexed by ENCODED v ∈ [0, 11] is UNQ_R12_V from
+// trit+2bit unquant indexed by ENCODED v ∈ [0, 11] is astc_unq_r12 from
 // astc_common.hlsli. Trit-encoded unquant is non-monotonic in v, pairs as
 // (v, v^1) mirror across 0.5 — so the LS-style endpoint-swap would use v^1
 // to flip weights if needed (we don't LS in HDR but use this for SSE lookup
@@ -174,10 +174,10 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				uint  jy  = A_BL_JY[sy]; uint jy1 = min(jy + 1u, 4u);
 				float fx  = float(A_BL_WX[sx]) * (1.0 / 16.0);
 				float fy  = float(A_BL_WY[sy]) * (1.0 / 16.0);
-				float w00 = UNQ_R4[weights_A[jy  * 6u + jx ]];
-				float w10 = UNQ_R4[weights_A[jy  * 6u + jx1]];
-				float w01 = UNQ_R4[weights_A[jy1 * 6u + jx ]];
-				float w11 = UNQ_R4[weights_A[jy1 * 6u + jx1]];
+				float w00 = astc_unq_r4(weights_A[jy  * 6u + jx ]);
+				float w10 = astc_unq_r4(weights_A[jy  * 6u + jx1]);
+				float w01 = astc_unq_r4(weights_A[jy1 * 6u + jx ]);
+				float w11 = astc_unq_r4(weights_A[jy1 * 6u + jx1]);
 				float w_i = lerp(lerp(w00, w10, fx), lerp(w01, w11, fx), fy);
 				float p_n = (pixel_proj[sy * 8u + sx] - c0_proj) * inv_axis_len_sq;
 				float err = p_n - w_i;
@@ -201,7 +201,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			}
 		}
 		// Quantize cell-mean projections to trit+2bit (12 lvl) weights. Output
-		// is ENCODED v ∈ [0, 11]; UNQ_R12_V[v] is the dequantized value.
+		// is ENCODED v ∈ [0, 11]; astc_unq_r12(v) is the dequantized value.
 		[unroll] for (uint gi = 0; gi < 16; gi++) {
 			float p     = grid_proj[gi] * 0.25;
 			float norm  = (p - c0_proj) * inv_axis_len_sq;
@@ -214,10 +214,10 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				uint  jy  = B_BL_J[sy]; uint jy1 = min(jy + 1u, 3u);
 				float fx  = float(B_BL_W[sx]) * (1.0 / 16.0);
 				float fy  = float(B_BL_W[sy]) * (1.0 / 16.0);
-				float w00 = UNQ_R12_V[weights_B[jy  * 4u + jx ]];
-				float w10 = UNQ_R12_V[weights_B[jy  * 4u + jx1]];
-				float w01 = UNQ_R12_V[weights_B[jy1 * 4u + jx ]];
-				float w11 = UNQ_R12_V[weights_B[jy1 * 4u + jx1]];
+				float w00 = astc_unq_r12(weights_B[jy  * 4u + jx ]);
+				float w10 = astc_unq_r12(weights_B[jy  * 4u + jx1]);
+				float w01 = astc_unq_r12(weights_B[jy1 * 4u + jx ]);
+				float w11 = astc_unq_r12(weights_B[jy1 * 4u + jx1]);
 				float w_i = lerp(lerp(w00, w10, fx), lerp(w01, w11, fx), fy);
 				float p_n = (pixel_proj[sy * 8u + sx] - c0_proj) * inv_axis_len_sq;
 				float err = p_n - w_i;

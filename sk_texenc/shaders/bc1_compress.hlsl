@@ -18,6 +18,8 @@ RWStructuredBuffer<uint2> output_blocks : register(u1);
 // in the darks if fed linear values; quantizing in sRGB space matches how the
 // hardware decodes a *_srgb output format back to linear at sample time.
 [[vk::constant_id(1)]] const bool SRGB_ENCODE = false;
+// Non-color data: weigh channels evenly rather than perceptually.
+[[vk::constant_id(2)]] const bool LINEAR_DATA = false;
 
 #include "bc_common.hlsli"
 
@@ -150,13 +152,13 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		// Perceptually weighted axis in float space: avoids per-pixel float->uint
 		// conversion and replaces 4-cycle v_mul_lo_u32 with 1-cycle v_fma_f32.
 		float3 faxis = float3(
-			float(int(color1.r) - int(color0.r)) * 2.0,
-			float(int(color1.g) - int(color0.g)) * 4.0,
+			float(int(color1.r) - int(color0.r)) * PW_R,
+			float(int(color1.g) - int(color0.g)) * PW_G,
 			float(int(color1.b) - int(color0.b)));
 
 		// axis_len_sq with matching weights, scaled by 1/255 to match [0,1] pixel space.
 		// Projection gives proj_int/255, so thresholds must also be /255.
-		float faxis_len_sq = (faxis.r * faxis.r * 0.5 + faxis.g * faxis.g * 0.25 + faxis.b * faxis.b) / 255.0;
+		float faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b) / 255.0;
 		float fc0_proj     = dot(float3(color0) / 255.0, faxis);
 
 		indices = 0;

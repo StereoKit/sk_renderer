@@ -24,10 +24,14 @@
 		#define _skr_load_acquire(p)  (*(p)) // x86/x64 loads carry acquire already
 	#endif
 	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
+	#define _skr_store_u32(p, v)      _InterlockedExchange((volatile long*)(p), (long)(v))
+	#define _skr_exchange_u32(p, v)   ((uint32_t)_InterlockedExchange((volatile long*)(p), (long)(v)))
 #else
 	#define _skr_atomic(T)            T
 	#define _skr_load_acquire(p)      __atomic_load_n ((p),      __ATOMIC_ACQUIRE)
 	#define _skr_store_release(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+	#define _skr_store_u32(p, v)      __atomic_store_n   ((p), (v), __ATOMIC_RELAXED)
+	#define _skr_exchange_u32(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_RELAXED)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -267,6 +271,8 @@ typedef struct {
 	VkDebugUtilsMessengerEXT debug_messenger;
 	bool                     validation_enabled;
 	bool                     has_push_descriptors;        // VK_KHR_push_descriptor support
+	bool                     has_astc_decode_mode;        // VK_EXT_astc_decode_mode, linear LDR ASTC views decode to UNORM8
+	bool                     has_astc_hdr;                // VK_EXT_texture_compression_astc_hdr, the SFLOAT ASTC formats
 	bool                     has_depth_clamp;             // VkPhysicalDeviceFeatures::depthClamp support
 	bool                     has_fill_mode_non_solid;     // VkPhysicalDeviceFeatures::fillModeNonSolid support
 	bool                     has_external_memory_fd;      // VK_KHR_external_memory_fd
@@ -366,7 +372,7 @@ typedef struct {
 	skr_tex_t*               global_textures[16];
 
 	// Deferred compute→graphics barrier (flushed before next render pass)
-	bool                     pending_compute_barrier;
+	_skr_atomic(uint32_t)    pending_compute_barrier; // set from any recording thread
 
 	// Deferred texture transition tracking (to avoid in-renderpass barriers)
 	skr_tex_t**              pending_transitions;

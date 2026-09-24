@@ -55,6 +55,8 @@
 //   For wt_range=4 (4 levels, 2 bits), A=0 (wt_w=6), B=0 (wt_h=6):
 //     bits → 0 0 1 0 0 0 0 1 0 0 0  =  0x108
 
+#include "texenc_common.hlsli"
+
 static const uint ASTC_BLOCK_MODE_3x3_R3      = 0x1BFu; // 3x3 grid, 3-bit weights
 static const uint ASTC_BLOCK_MODE_4x4_R2      = 0x042u; // 4x4 grid, 2-bit weights
 static const uint ASTC_BLOCK_MODE_4x4_R3      = 0x053u; // 4x4 grid, 3-bit weights
@@ -91,11 +93,13 @@ void astc_block_write_bits(inout uint4 block, uint pos, uint count, uint value) 
 	uint mask  = (count >= 32u) ? 0xFFFFFFFFu : ((1u << count) - 1u);
 	value &= mask;
 
-	block[word] |= value << shift;
-	// Straddle into the next word when the field crosses a 32-bit boundary
-	if (shift + count > 32u) {
-		block[word + 1u] |= value >> (32u - shift);
-	}
+	// Selects instead of block[word] keep the block out of local memory
+	uint lo = value << shift;
+	uint hi = (shift + count > 32u) ? value >> (32u - shift) : 0u;
+	block |= uint4(word == 0u ? lo : 0u,
+	               word == 1u ? lo : (word == 0u ? hi : 0u),
+	               word == 2u ? lo : (word == 1u ? hi : 0u),
+	               word == 3u ? lo : (word == 2u ? hi : 0u));
 }
 
 // Reverse the low 3 bits: abc → cba. Used for 3-bit weight placement.
@@ -126,8 +130,8 @@ void astc_write_weight_2bit(inout uint4 block, uint weight_index, uint weight_va
 	astc_block_write_bits(block, pos, 2u, astc_reverse2(weight_value));
 }
 
-// 2-bit weight unquant levels (UNQ_R4) and midpoint thresholds.
-static const float UNQ_R4[4]  = { 0.0, 21.0/64.0, 43.0/64.0, 1.0 };
+// 2-bit weight unquant levels (0, 21, 43, 64) / 64 and midpoint thresholds.
+float astc_unq_r4(uint w) { return float(w * 21u + (w >> 1)) / 64.0; }
 static const float UNQ_R4_T0  = 21.0 / 128.0;  // ≈ 0.164
 static const float UNQ_R4_T1  = 0.5;
 static const float UNQ_R4_T2  = 107.0 / 128.0; // ≈ 0.836
@@ -238,32 +242,15 @@ uint astc_dequant_r80(uint v) {
 	return ((v & 1u) * 0x80u) | (T >> 2);
 }
 
-// Inverse quant LUT for range 80 (quint + 4 bit). 256 entries: target 8-bit
-// channel value → closest 7-bit encoded value that dequantizes to it.
-// Precomputed offline (Python) by running mesa's dequant formula for all 80
-// valid encoded values and picking the best v for each target. Replaces what
-// would otherwise be an 80-iteration search per endpoint value per block.
-static const uint astc_r80_quant_lut[256] = {
-	 0u,  0u, 16u, 16u, 16u, 32u, 32u, 32u, 48u, 48u, 48u, 48u, 64u, 64u, 64u,  2u,
-	 2u,  2u, 18u, 18u, 18u, 34u, 34u, 34u, 50u, 50u, 50u, 50u, 66u, 66u, 66u,  4u,
-	 4u,  4u, 20u, 20u, 20u, 36u, 36u, 36u, 36u, 52u, 52u, 52u, 68u, 68u, 68u,  6u,
-	 6u,  6u, 22u, 22u, 22u, 38u, 38u, 38u, 38u, 54u, 54u, 54u, 70u, 70u, 70u,  8u,
-	 8u,  8u, 24u, 24u, 24u, 24u, 40u, 40u, 40u, 56u, 56u, 56u, 72u, 72u, 72u, 10u,
-	10u, 10u, 26u, 26u, 26u, 26u, 42u, 42u, 42u, 58u, 58u, 58u, 74u, 74u, 74u, 12u,
-	12u, 12u, 12u, 28u, 28u, 28u, 44u, 44u, 44u, 60u, 60u, 60u, 76u, 76u, 76u, 14u,
-	14u, 14u, 14u, 30u, 30u, 30u, 46u, 46u, 46u, 62u, 62u, 62u, 78u, 78u, 78u, 78u,
-	79u, 79u, 79u, 79u, 63u, 63u, 63u, 47u, 47u, 47u, 31u, 31u, 31u, 15u, 15u, 15u,
-	15u, 77u, 77u, 77u, 61u, 61u, 61u, 45u, 45u, 45u, 29u, 29u, 29u, 13u, 13u, 13u,
-	13u, 75u, 75u, 75u, 59u, 59u, 59u, 43u, 43u, 43u, 27u, 27u, 27u, 27u, 11u, 11u,
-	11u, 73u, 73u, 73u, 57u, 57u, 57u, 41u, 41u, 41u, 25u, 25u, 25u, 25u,  9u,  9u,
-	 9u, 71u, 71u, 71u, 55u, 55u, 55u, 39u, 39u, 39u, 39u, 23u, 23u, 23u,  7u,  7u,
-	 7u, 69u, 69u, 69u, 53u, 53u, 53u, 37u, 37u, 37u, 37u, 21u, 21u, 21u,  5u,  5u,
-	 5u, 67u, 67u, 67u, 51u, 51u, 51u, 51u, 35u, 35u, 35u, 19u, 19u, 19u,  3u,  3u,
-	 3u, 65u, 65u, 65u, 49u, 49u, 49u, 49u, 33u, 33u, 33u, 17u, 17u, 17u,  1u,  1u
-};
-
+// Closest range-80 (quint + 4 bit) encoded value for an 8-bit target. The
+// upper half mirrors the lower with bit 0 set; level L of the lower 40 is
+// quint L%5 and binary L/5. Matches an exhaustive search over mesa's dequant.
 uint astc_quantize_to_r80(uint target) {
-	return astc_r80_quant_lut[min(target, 255u)];
+	target = min(target, 255u);
+	uint m = target >> 7;
+	uint t = m != 0u ? 255u - target : target;
+	uint L = (t * 159u + 280u) >> 9;
+	return (16u * (L % 5u) + 2u * (L / 5u)) ^ m;
 }
 
 // Pack endpoints for single-partition CEM 8 at range 80 (1 quint + 4 bits
@@ -380,10 +367,9 @@ static const float ASTC_5X5_AXIS_POS[6] = { 0.0, 13.0/16.0, 26.0/16.0, 38.0/16.0
 // fits, so we have to encode that way regardless of intent.
 //
 // 192 valid encoded values map non-monotonically to 0-255 (alternating low/
-// high halves), so we need a 256-entry inverse-quant LUT and a separate
-// dequantize formula for the SSE side. Trits pack 5-at-a-time into 8 bits;
-// for 8 values we use one full 5-trit group (38 bits) and one partial 3-trit
-// group (23 bits) for a total of 61 bits.
+// high halves), so quantizing and dequantizing each need their own formula.
+// Trits pack 5-at-a-time into 8 bits; for 8 values we use one full 5-trit
+// group (38 bits) and one partial 3-trit group (23 bits) for a total of 61 bits.
 ///////////////////////////////////////////////////////////////////////////////
 
 uint astc_dequant_r192(uint v) {
@@ -395,49 +381,26 @@ uint astc_dequant_r192(uint v) {
 	return ((v & 1u) * 0x80u) | (T >> 2);
 }
 
-// 256 → range-192 inverse quant LUT (8-bit target → encoded value 0..191).
-// Generated offline by enumerating astc_dequant_r192(v) for v in [0, 191] and
-// picking, for each target, the v with smallest absolute error.
-static const uint astc_r192_quant_lut[256] = {
-	  0u,  64u, 128u,   2u,   2u,  66u, 130u,   4u,   4u,  68u, 132u,   6u,   6u,  70u, 134u,   8u,
-	  8u,  72u, 136u,  10u,  10u,  74u, 138u,  12u,  12u,  76u, 140u,  14u,  14u,  78u, 142u,  16u,
-	 16u,  80u, 144u,  18u,  18u,  82u, 146u,  20u,  20u,  84u, 148u,  22u,  22u,  86u, 150u,  24u,
-	 24u,  88u, 152u,  26u,  26u,  90u, 154u,  28u,  28u,  92u, 156u,  30u,  30u,  94u, 158u,  32u,
-	 32u,  96u, 160u,  34u,  34u,  98u, 162u,  36u,  36u, 100u, 164u,  38u,  38u, 102u, 166u,  40u,
-	 40u, 104u, 168u,  42u,  42u, 106u, 170u,  44u,  44u, 108u, 172u,  46u,  46u, 110u, 174u,  48u,
-	 48u, 112u, 176u,  50u,  50u, 114u, 178u,  52u,  52u, 116u, 180u,  54u,  54u, 118u, 182u,  56u,
-	 56u, 120u, 184u,  58u,  58u, 122u, 186u,  60u,  60u, 124u, 188u,  62u,  62u, 126u, 190u, 190u,
-	191u, 191u, 127u,  63u,  63u, 189u, 125u,  61u,  61u, 187u, 123u,  59u,  59u, 185u, 121u,  57u,
-	 57u, 183u, 119u,  55u,  55u, 181u, 117u,  53u,  53u, 179u, 115u,  51u,  51u, 177u, 113u,  49u,
-	 49u, 175u, 111u,  47u,  47u, 173u, 109u,  45u,  45u, 171u, 107u,  43u,  43u, 169u, 105u,  41u,
-	 41u, 167u, 103u,  39u,  39u, 165u, 101u,  37u,  37u, 163u,  99u,  35u,  35u, 161u,  97u,  33u,
-	 33u, 159u,  95u,  31u,  31u, 157u,  93u,  29u,  29u, 155u,  91u,  27u,  27u, 153u,  89u,  25u,
-	 25u, 151u,  87u,  23u,  23u, 149u,  85u,  21u,  21u, 147u,  83u,  19u,  19u, 145u,  81u,  17u,
-	 17u, 143u,  79u,  15u,  15u, 141u,  77u,  13u,  13u, 139u,  75u,  11u,  11u, 137u,  73u,   9u,
-	  9u, 135u,  71u,   7u,   7u, 133u,  69u,   5u,   5u, 131u,  67u,   3u,   3u, 129u,  65u,   1u
-};
+// Closest range-192 (trit + 6 bit) encoded value for an 8-bit target. Same
+// mirrored halves as range 80, with level L of the lower 96 being trit L%3
+// and binary L/3. Matches an exhaustive search over astc_dequant_r192.
+uint astc_quantize_to_r192(uint target) {
+	target = min(target, 255u);
+	uint m = target >> 7;
+	uint t = m != 0u ? 255u - target : target;
+	uint L = min(t - (t >> 2), 95u);
+	return (64u * (L % 3u) + 2u * (L / 3u)) ^ m;
+}
 
-// Trit BISE pack LUT: 5 trit digits → 8-bit T pattern that mesa's
-// unpack_trit_block decodes back to those digits. Index = t0 + 3*t1 + 9*t2 +
-// 27*t3 + 81*t4. Generated offline by brute-force inverse search.
-static const uint astc_trit_pack_lut[243] = {
-	0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x10, 0x11, 0x12, 0x14, 0x15, 0x16, 0x18,
-	0x19, 0x1A, 0x03, 0x07, 0x0B, 0x13, 0x17, 0x1B, 0x0C, 0x0D, 0x0E, 0x20, 0x21, 0x22, 0x24, 0x25,
-	0x26, 0x28, 0x29, 0x2A, 0x30, 0x31, 0x32, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3A, 0x23, 0x27, 0x2B,
-	0x33, 0x37, 0x3B, 0x2C, 0x2D, 0x2E, 0x40, 0x41, 0x42, 0x44, 0x45, 0x46, 0x48, 0x49, 0x4A, 0x50,
-	0x51, 0x52, 0x54, 0x55, 0x56, 0x58, 0x59, 0x5A, 0x43, 0x47, 0x4B, 0x53, 0x57, 0x5B, 0x4C, 0x4D,
-	0x4E, 0x80, 0x81, 0x82, 0x84, 0x85, 0x86, 0x88, 0x89, 0x8A, 0x90, 0x91, 0x92, 0x94, 0x95, 0x96,
-	0x98, 0x99, 0x9A, 0x83, 0x87, 0x8B, 0x93, 0x97, 0x9B, 0x8C, 0x8D, 0x8E, 0xA0, 0xA1, 0xA2, 0xA4,
-	0xA5, 0xA6, 0xA8, 0xA9, 0xAA, 0xB0, 0xB1, 0xB2, 0xB4, 0xB5, 0xB6, 0xB8, 0xB9, 0xBA, 0xA3, 0xA7,
-	0xAB, 0xB3, 0xB7, 0xBB, 0xAC, 0xAD, 0xAE, 0xC0, 0xC1, 0xC2, 0xC4, 0xC5, 0xC6, 0xC8, 0xC9, 0xCA,
-	0xD0, 0xD1, 0xD2, 0xD4, 0xD5, 0xD6, 0xD8, 0xD9, 0xDA, 0xC3, 0xC7, 0xCB, 0xD3, 0xD7, 0xDB, 0xCC,
-	0xCD, 0xCE, 0x60, 0x61, 0x62, 0x64, 0x65, 0x66, 0x68, 0x69, 0x6A, 0x70, 0x71, 0x72, 0x74, 0x75,
-	0x76, 0x78, 0x79, 0x7A, 0x63, 0x67, 0x6B, 0x73, 0x77, 0x7B, 0x6C, 0x6D, 0x6E, 0xE0, 0xE1, 0xE2,
-	0xE4, 0xE5, 0xE6, 0xE8, 0xE9, 0xEA, 0xF0, 0xF1, 0xF2, 0xF4, 0xF5, 0xF6, 0xF8, 0xF9, 0xFA, 0xE3,
-	0xE7, 0xEB, 0xF3, 0xF7, 0xFB, 0xEC, 0xED, 0xEE, 0x1C, 0x1D, 0x1E, 0x3C, 0x3D, 0x3E, 0x5C, 0x5D,
-	0x5E, 0x9C, 0x9D, 0x9E, 0xBC, 0xBD, 0xBE, 0xDC, 0xDD, 0xDE, 0x1F, 0x3F, 0x5F, 0x9F, 0xBF, 0xDF,
-	0x7C, 0x7D, 0x7E
-};
+// Inverse of the spec's trit block decode: 5 trit digits to the 8-bit T pattern.
+uint astc_trit_pack(uint t0, uint t1, uint t2, uint t3, uint t4) {
+	uint C = t2 != 2u ? t2 * 16u + t1 * 4u + t0
+	       : t1 == 2u ? 12u + t0
+	       :            t1 * 16u + t0 * 4u + 3u;
+	if (t3 == 2u && t4 == 2u) return ((C >> 2) << 5) | 0x1Cu | (C & 3u);
+	if (t4 == 2u)             return C | (3u << 5) | (t3 << 7);
+	return C | (t3 << 5) | (t4 << 7);
+}
 
 // Pack a full 5-trit group (5 binary 6-bit values + 8 T-bits scattered
 // across the trit positions). Total 38 bits; T bits are NOT contiguous, so
@@ -461,10 +424,9 @@ void astc_write_trit_group_full(inout uint4 block, uint base_bit, uint T_pattern
 
 // Pack a partial 3-trit group (3 binary + 5 lower T-bits, total 23 bits).
 // T5, T6, T7 sit at offsets 29, 30, 37 within a full group — outside the
-// partial group's 23-bit window. We rely on the LUT lookup using the partial
-// indexing (idx in 0..26) which always returns T patterns with bits 5, 6, 7
-// equal to 0, so we don't need to write them. Decoder reads them as 0 from
-// past the partial group's data anyway.
+// partial group's 23-bit window. With t3 = t4 = 0, astc_trit_pack always
+// leaves bits 5, 6, 7 at 0, so we don't need to write them. Decoder reads
+// them as 0 from past the partial group's data anyway.
 void astc_write_trit_group_partial3(inout uint4 block, uint base_bit, uint T_pattern,
                                     uint m0, uint m1, uint m2) {
 	astc_block_write_bits(block, base_bit +  0u, 6u, m0);
@@ -481,17 +443,17 @@ void astc_write_trit_group_partial3(inout uint4 block, uint base_bit, uint T_pat
 // the configuration the decoder selects when 5x5 weight grid + 2-bit weights
 // leaves 61 endpoint bits. Same value order as RGBA8: (R0, R1, G0, G1, B0,
 // B1, A0, A1). Each 8-bit endpoint is mapped to its closest range-192
-// encoded form via astc_r192_quant_lut, then packed as one full 5-trit group
+// encoded form via astc_quantize_to_r192, then packed as one full 5-trit group
 // (38 bits at bit 17) plus one partial 3-trit group (23 bits at bit 55).
 void astc_write_endpoints_rgba6trit(inout uint4 block, uint3 e0_rgb, uint3 e1_rgb, uint a0, uint a1) {
-	uint v0 = astc_r192_quant_lut[min(e0_rgb.r, 255u)];
-	uint v1 = astc_r192_quant_lut[min(e1_rgb.r, 255u)];
-	uint v2 = astc_r192_quant_lut[min(e0_rgb.g, 255u)];
-	uint v3 = astc_r192_quant_lut[min(e1_rgb.g, 255u)];
-	uint v4 = astc_r192_quant_lut[min(e0_rgb.b, 255u)];
-	uint v5 = astc_r192_quant_lut[min(e1_rgb.b, 255u)];
-	uint v6 = astc_r192_quant_lut[min(a0, 255u)];
-	uint v7 = astc_r192_quant_lut[min(a1, 255u)];
+	uint v0 = astc_quantize_to_r192(e0_rgb.r);
+	uint v1 = astc_quantize_to_r192(e1_rgb.r);
+	uint v2 = astc_quantize_to_r192(e0_rgb.g);
+	uint v3 = astc_quantize_to_r192(e1_rgb.g);
+	uint v4 = astc_quantize_to_r192(e0_rgb.b);
+	uint v5 = astc_quantize_to_r192(e1_rgb.b);
+	uint v6 = astc_quantize_to_r192(a0);
+	uint v7 = astc_quantize_to_r192(a1);
 
 	// Each value = (trit_digit << 6) | binary_6bit.
 	uint t0 = v0 >> 6, t1 = v1 >> 6, t2 = v2 >> 6, t3 = v3 >> 6;
@@ -500,13 +462,12 @@ void astc_write_endpoints_rgba6trit(inout uint4 block, uint3 e0_rgb, uint3 e1_rg
 	uint m4 = v4 & 63u, m5 = v5 & 63u, m6 = v6 & 63u, m7 = v7 & 63u;
 
 	// Group 0: 5 values (R0, R1, G0, G1, B0).
-	uint T_full = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
+	uint T_full = astc_trit_pack(t0, t1, t2, t3, t4);
 	astc_write_trit_group_full(block, 17u, T_full, m0, m1, m2, m3, m4);
 
-	// Group 1 (partial): 3 values (B1, A0, A1). LUT index uses only the
-	// first three trits — t3, t4 are implicitly 0 in this lookup, which
-	// guarantees the returned T pattern has bits 5, 6, 7 equal to 0.
-	uint T_part = astc_trit_pack_lut[t5 + 3u*t6 + 9u*t7];
+	// Group 1 (partial): 3 values (B1, A0, A1). Zero t3, t4 keep T bits
+	// 5, 6, 7 at 0.
+	uint T_part = astc_trit_pack(t5, t6, t7, 0u, 0u);
 	astc_write_trit_group_partial3(block, 55u, T_part, m5, m6, m7);
 }
 
@@ -834,8 +795,8 @@ uint astc_quantize_weight_trit_2bit(float target) {
 		uint(target >= 49.5 / 64.0) +
 		uint(target >= 56.0 / 64.0) +
 		uint(target >= 61.5 / 64.0);
-	static const uint LEVEL_TO_V[12] = { 0u, 4u, 8u, 2u, 6u, 10u, 11u, 7u, 3u, 9u, 5u, 1u };
-	return LEVEL_TO_V[level];
+	// LEVEL_TO_V = { 0, 4, 8, 2, 6, 10, 11, 7, 3, 9, 5, 1 }, packed as nibbles
+	return ((level < 8u ? 0x7ba62840u : 0x1593u) >> (4u * (level & 7u))) & 15u;
 }
 
 // trit+2bit (12 lvl) weight unquant, indexed by the ENCODED v value (not
@@ -847,17 +808,16 @@ uint astc_quantize_weight_trit_2bit(float target) {
 // v: 0,      1,  2,     3,     4,    5,     6,     7,     8,     9,     10,    11
 // w: 0/64, 64/64, 18/64, 46/64, 5/64, 59/64, 24/64, 40/64, 11/64, 53/64, 30/64, 34/64
 // Note every v^1 pair still sums to exactly 1 — the endpoint-swap weight
-// mirror stays valid.
-static const float UNQ_R12_V[12] = {
-	 0.0/64.0,  1.0,       18.0/64.0, 46.0/64.0,
-	 5.0/64.0, 59.0/64.0,  24.0/64.0, 40.0/64.0,
-	11.0/64.0, 53.0/64.0,  30.0/64.0, 34.0/64.0,
-};
+// mirror stays valid. Raw values are packed four bytes to a uint.
+float astc_unq_r12(uint v) {
+	uint packed = v < 4u ? 0x2e124000u : v < 8u ? 0x28183b05u : 0x221e350bu;
+	return float((packed >> (8u * (v & 3u))) & 0xFFu) / 64.0;
+}
 
 // Full 5-weight trit+1bit group (13 bits total: 5·1 binary + 8 T-bits)
 // written at weight-stream natural offset `base`. `T_pattern` comes from
-// astc_trit_pack_lut indexed by (t0 + 3·t1 + 9·t2 + 27·t3 + 81·t4); m0..m4
-// are the 1-bit binary parts (value bit 0 of each encoded weight).
+// astc_trit_pack(t0, t1, t2, t3, t4); m0..m4 are the 1-bit binary parts
+// (value bit 0 of each encoded weight).
 void astc_write_weight_trit_1bit_full(inout uint4 block, uint base, uint T_pattern,
                                       uint m0, uint m1, uint m2, uint m3, uint m4) {
 	// Layout (natural offsets from `base`):
@@ -880,7 +840,7 @@ void astc_write_weight_trit_1bit_full(inout uint4 block, uint base, uint T_patte
 
 // Partial 1-weight trit+1bit group (3 bits: m0 + T0 + T1) at natural offset
 // `base`. Used for the 16th weight in a 16-weight grid after 3 full groups.
-// LUT indexed by (t0) gives T pattern with bits 2-7 == 0, so only T0/T1
+// astc_trit_pack(t0, 0, 0, 0, 0) leaves T bits 2-7 at 0, so only T0/T1
 // matter for reconstruction.
 void astc_write_weight_trit_1bit_partial1(inout uint4 block, uint base, uint T_pattern, uint m0) {
 	astc_block_write_bits(block, 127u - base - 0u, 1u, m0 & 1u);
@@ -937,13 +897,13 @@ void astc_write_weights16_trit_2bit(inout uint4 block, in uint weights[16]) {
 		uint t2 = v2 >> 2, m2 = v2 & 3u;
 		uint t3 = v3 >> 2, m3 = v3 & 3u;
 		uint t4 = v4 >> 2, m4 = v4 & 3u;
-		uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
+		uint T  = astc_trit_pack(t0, t1, t2, t3, t4);
 		astc_write_weight_trit_2bit_full(block, base, T, m0, m1, m2, m3, m4);
 		base += 18u;
 	}
 	// Partial-1 for weight 15.
 	uint v15 = weights[15];
-	uint T_p = astc_trit_pack_lut[v15 >> 2];
+	uint T_p = astc_trit_pack(v15 >> 2, 0u, 0u, 0u, 0u);
 	astc_write_weight_trit_2bit_partial1(block, base, T_p, v15 & 3u);
 }
 
@@ -963,12 +923,12 @@ void astc_write_weights16_trit_1bit(inout uint4 block, in uint weights[16]) {
 		uint t2 = v2 >> 1, m2 = v2 & 1u;
 		uint t3 = v3 >> 1, m3 = v3 & 1u;
 		uint t4 = v4 >> 1, m4 = v4 & 1u;
-		uint T  = astc_trit_pack_lut[t0 + 3u*t1 + 9u*t2 + 27u*t3 + 81u*t4];
+		uint T  = astc_trit_pack(t0, t1, t2, t3, t4);
 		astc_write_weight_trit_1bit_full(block, base, T, m0, m1, m2, m3, m4);
 		base += 13u;
 	}
 	// Partial-1 for weight 15.
 	uint v15 = weights[15];
-	uint T_p = astc_trit_pack_lut[v15 >> 1];
+	uint T_p = astc_trit_pack(v15 >> 1, 0u, 0u, 0u, 0u);
 	astc_write_weight_trit_1bit_partial1(block, base, T_p, v15 & 1u);
 }

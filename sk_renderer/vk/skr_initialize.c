@@ -534,6 +534,26 @@ static void _skr_register_internal_requests(void) {
 			{ &float_atomic2_features, sizeof(float_atomic2_features) } },
 		.feature_count          = 2,
 	});
+
+	// UNORM8 decode for linear LDR ASTC views needs only the extension; the
+	// feature bit it carries is for the shared exponent mode.
+	skr_vk_request(&(skr_vk_request_t){
+		.name                   = "astc_decode_mode",
+		.device_extensions      = (const char*[]){ VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME },
+		.device_extension_count = 1,
+	});
+
+	static const VkPhysicalDeviceTextureCompressionASTCHDRFeaturesEXT astc_hdr_features = {
+		.sType                      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES_EXT,
+		.textureCompressionASTC_HDR = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                   = "astc_hdr",
+		.device_extensions      = (const char*[]){ VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &astc_hdr_features, sizeof(astc_hdr_features) } },
+		.feature_count          = 1,
+	});
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1390,6 +1410,8 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_present_fence           = skr_vk_request_enabled("swapchain_maintenance1");
 	_skr_vk.has_present_timing          = skr_vk_request_enabled("present_timing");
 	_skr_vk.has_present_wait2           = skr_vk_request_enabled("present_wait2");
+	_skr_vk.has_astc_decode_mode        = skr_vk_request_enabled("astc_decode_mode");
+	_skr_vk.has_astc_hdr                = skr_vk_request_enabled("astc_hdr");
 	_skr_vk.has_present_wait            = skr_vk_request_enabled("present_wait");
 	_skr_vk.has_display_timing_google   = skr_vk_request_enabled(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
 #ifdef _WIN32

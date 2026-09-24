@@ -69,7 +69,7 @@ const int32_t path_size = 2048;
 char               *read_file     (const char *filename); // malloc'd, NUL terminated
 bool                write_file    (const char *filename, void *file_data, size_t file_size);
 bool                write_file_txt(const char *filename, void *file_data, size_t file_size);
-bool                write_header  (const char *filename, void *file_data, size_t file_size, bool zipped, const sksc_shader_file_t *shader_file);
+bool                write_header  (const char *filename, void *file_data, size_t file_size, size_t unzipped_size, const sksc_shader_file_t *shader_file);
 bool                write_skcs    (const char *filename, void *file_data, size_t file_size, const char* original_name, sksc_shader_file_t *file);
 bool                write_stages  (const sksc_shader_file_t *file, const char *folder, const char *trailing_slash, const char *name_ext);
 void                compile_file  (const char *filename, compiler_settings_t *settings);
@@ -279,7 +279,8 @@ Options:
 	-h		Output a C header file with a byte array instead of a binary file.
 	-z		Zips and compresses output data with miniz. SPIR-V stages are
 			always stored in the more compressible SMOL-V form, which
-			makes this a much bigger win than it is on raw SPIR-V.
+			makes this a much bigger win than it is on raw SPIR-V. With -h,
+			the header also gets sks_<name>_unzipped_size.
 	-raw		Outputs the raw shader stage data as additional files in the same
 			directory. Useful for debugging shader transpilation.
 	-sk		This outputs a StereoKit compatible C# file for the shader, and
@@ -416,6 +417,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 		void*    sks_data;
 		uint32_t sks_size;
 		sksc_build_file(&file, settings->shaderc.debug, &sks_data, &sks_size);
+		uint32_t unzipped_size = settings->output_zipped ? sks_size : 0;
 		
 		// Zip data
 		bool err = false;
@@ -450,7 +452,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 			}
 			if (settings->output_header) {
 				char* abs_file = path_absolute(new_filename_h);
-				bool  success  = write_header(abs_file, sks_data, sks_size, settings->output_zipped, &file);
+				bool  success  = write_header(abs_file, sks_data, sks_size, unzipped_size, &file);
 
 				if (success) sksc_log(sksc_log_level_info, "Compiled successfully to %s", abs_file);
 				else         sksc_log(sksc_log_level_err,  "Failed to write file! %s", abs_file);
@@ -705,7 +707,8 @@ bool write_file_txt(const char *filename, void *file_data, size_t file_size) {
 
 ///////////////////////////////////////////
 
-bool write_header(const char *filename, void *file_data, size_t file_size, bool zipped, const sksc_shader_file_t *shader_file) {
+// unzipped_size is 0 for data that isn't zipped
+bool write_header(const char *filename, void *file_data, size_t file_size, size_t unzipped_size, const sksc_shader_file_t *shader_file) {
 	char name[path_size];
 	file_name(filename, name, sizeof(name));
 
@@ -767,7 +770,11 @@ bool write_header(const char *filename, void *file_data, size_t file_size, bool 
 #endif
 
 	// Write byte array
-	int32_t ct = fprintf(fp, "const unsigned char sks_%s%s[%zu] = {", name, zipped ? "_zip" : "", file_size);
+	// zlib streams don't record their inflated size, so it rides alongside. An
+	// enum stays a constant expression in C, where a const variable isn't.
+	if (unzipped_size > 0)
+		fprintf(fp, "enum { sks_%s_unzipped_size = %zu };\n", name, unzipped_size);
+	int32_t ct = fprintf(fp, "const unsigned char sks_%s%s[%zu] = {", name, unzipped_size > 0 ? "_zip" : "", file_size);
 	for (size_t i = 0; i < file_size; i++) {
 		unsigned char byte = ((unsigned char *)file_data)[i];
 		ct += fprintf(fp, "%d,", byte);

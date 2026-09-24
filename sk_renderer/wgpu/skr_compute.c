@@ -96,58 +96,84 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static WGPUBindGroup _skr_compute_bind_group(skr_compute_t* compute, uint32_t* out_dyn_offsets, uint32_t* out_dyn_count) {
+// Everything per-dispatch arrives as arguments, so this never writes to the
+// compute. Shared by execute, execute_indirect, and dispatch.
+static void _skr_compute_record(const skr_compute_t* compute, const skr_material_bind_t* binds, uint32_t bind_count, const void* opt_params, uint32_t params_size, uint32_t x, uint32_t y, uint32_t z, const skr_buffer_t* opt_indirect) {
 	_skr_draw_buffers_t db = {0};
-	if (compute->param_buffer && compute->param_buffer_size > 0) {
-		_skr_bump_uniform_write(compute->param_buffer, compute->param_buffer_size, &db.material_offset);
-		db.material_size = compute->param_buffer_size;
+	if (opt_params && params_size > 0) {
+		_skr_bump_uniform_write(opt_params, params_size, &db.material_offset);
+		db.material_size = params_size;
 	}
-	*out_dyn_count = _skr_dynamic_offsets(&compute->shader->meta, (uint8_t)skr_stage_compute, &db, out_dyn_offsets);
-	return _skr_build_bind_group_meta(&compute->shader->meta, compute->bind_group_layout, compute->binds, compute->bind_count);
+	uint32_t      dyn_offsets[3];
+	uint32_t      dyn_count  = _skr_dynamic_offsets(&compute->shader->meta, (uint8_t)skr_stage_compute, &db, dyn_offsets);
+	WGPUBindGroup bind_group = _skr_build_bind_group_meta(&compute->shader->meta, compute->bind_group_layout, binds, bind_count);
+	if (bind_group == NULL) {
+		skr_log(skr_log_critical, "Compute dispatch missing bindings in shader '%s'", compute->shader->meta.name);
+		return;
+	}
+
+	WGPUComputePassDescriptor pass_desc = {0};
+	WGPUPassTimestampWrites   ts;
+	pass_desc.timestampWrites = _skr_timer_pass_writes(&ts);
+	WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(_skr_cmd_get(), &pass_desc);
+	wgpuComputePassEncoderSetPipeline (pass, compute->pipeline);
+	wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, dyn_count, dyn_offsets);
+	if (opt_indirect) wgpuComputePassEncoderDispatchWorkgroupsIndirect(pass, opt_indirect->buffer, 0);
+	else              wgpuComputePassEncoderDispatchWorkgroups        (pass, x, y, z);
+	wgpuComputePassEncoderEnd(pass);
+	wgpuComputePassEncoderRelease(pass);
+	wgpuBindGroupRelease(bind_group);
 }
 
 void skr_compute_execute(skr_compute_t* ref_compute, uint32_t x, uint32_t y, uint32_t z) {
 	if (!skr_compute_is_valid(ref_compute)) return;
-
-	uint32_t dyn_offsets[3], dyn_count = 0;
-	WGPUBindGroup bind_group = _skr_compute_bind_group(ref_compute, dyn_offsets, &dyn_count);
-	if (bind_group == NULL) {
-		skr_log(skr_log_critical, "Compute dispatch missing bindings in shader '%s'", ref_compute->shader->meta.name);
-		return;
-	}
-
-	WGPUComputePassDescriptor pass_desc = {0};
-	WGPUPassTimestampWrites   ts;
-	pass_desc.timestampWrites = _skr_timer_pass_writes(&ts);
-	WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(_skr_cmd_get(), &pass_desc);
-	wgpuComputePassEncoderSetPipeline (pass, ref_compute->pipeline);
-	wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, dyn_count, dyn_offsets);
-	wgpuComputePassEncoderDispatchWorkgroups(pass, x, y, z);
-	wgpuComputePassEncoderEnd(pass);
-	wgpuComputePassEncoderRelease(pass);
-	wgpuBindGroupRelease(bind_group);
+	_skr_compute_record(ref_compute, ref_compute->binds, ref_compute->bind_count, ref_compute->param_buffer, ref_compute->param_buffer_size, x, y, z, NULL);
 }
 
 void skr_compute_execute_indirect(skr_compute_t* ref_compute, skr_buffer_t* indirect_args) {
 	if (!skr_compute_is_valid(ref_compute) || indirect_args == NULL || indirect_args->buffer == NULL) return;
+	_skr_compute_record(ref_compute, ref_compute->binds, ref_compute->bind_count, ref_compute->param_buffer, ref_compute->param_buffer_size, 0, 0, 0, indirect_args);
+}
 
-	uint32_t dyn_offsets[3], dyn_count = 0;
-	WGPUBindGroup bind_group = _skr_compute_bind_group(ref_compute, dyn_offsets, &dyn_count);
-	if (bind_group == NULL) {
-		skr_log(skr_log_critical, "Compute dispatch missing bindings in shader '%s'", ref_compute->shader->meta.name);
+void skr_compute_dispatch(const skr_compute_t* compute, const skr_compute_bind_t* binds, uint32_t bind_count, const void* opt_params, uint32_t params_size, uint32_t x, uint32_t y, uint32_t z) {
+	if (!skr_compute_is_valid(compute)) return;
+	const sksc_shader_meta_t* meta = &compute->shader->meta;
+
+	skr_material_bind_t slots[32] = {0};
+	if (compute->bind_count > sizeof(slots) / sizeof(slots[0])) {
+		skr_log(skr_log_critical, "skr_compute_dispatch: shader '%s' has %u binds, above the %u it supports", meta->name, compute->bind_count, (uint32_t)(sizeof(slots) / sizeof(slots[0])));
 		return;
 	}
+	for (uint32_t i = 0; i < compute->bind_count; i++) slots[i].bind = compute->binds[i].bind;
+	for (uint32_t b = 0; b < bind_count; b++) {
+		for (uint32_t i = 0; i < compute->bind_count; i++) {
+			if (slots[i].bind.slot != binds[b].bind.slot || slots[i].bind.register_type != binds[b].bind.register_type) continue;
+			// StructuredBuffers sit among the resources, so the register decides
+			uint8_t reg = binds[b].bind.register_type;
+			if (reg == skr_register_constant || reg == skr_register_read_buffer || reg == skr_register_readwrite) slots[i].buffer  = binds[b].buffer;
+			else                                                                                                  slots[i].texture = binds[b].tex;
+			break;
+		}
+	}
 
-	WGPUComputePassDescriptor pass_desc = {0};
-	WGPUPassTimestampWrites   ts;
-	pass_desc.timestampWrites = _skr_timer_pass_writes(&ts);
-	WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(_skr_cmd_get(), &pass_desc);
-	wgpuComputePassEncoderSetPipeline (pass, ref_compute->pipeline);
-	wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, dyn_count, dyn_offsets);
-	wgpuComputePassEncoderDispatchWorkgroupsIndirect(pass, indirect_args->buffer, 0);
-	wgpuComputePassEncoderEnd(pass);
-	wgpuComputePassEncoderRelease(pass);
-	wgpuBindGroupRelease(bind_group);
+	uint8_t     pad[256];
+	uint8_t*    heap   = NULL;
+	const void* params = NULL;
+	uint32_t    size   = 0;
+	if (meta->global_buffer_id >= 0) {
+		const sksc_shader_buffer_t* global = &meta->buffers[meta->global_buffer_id];
+		size   = global->size;
+		params = opt_params;
+		if (!opt_params || params_size < size) {
+			uint8_t* dst = size > sizeof(pad) ? (heap = (uint8_t*)_skr_malloc(size)) : pad;
+			if (global->defaults) memcpy(dst, global->defaults, size);
+			else                  memset(dst, 0, size);
+			if (opt_params) memcpy(dst, opt_params, params_size);
+			params = dst;
+		}
+	}
+	_skr_compute_record(compute, slots, compute->bind_count, params, size, x, y, z, NULL);
+	_skr_free(heap);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

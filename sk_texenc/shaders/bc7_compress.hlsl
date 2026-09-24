@@ -46,6 +46,8 @@ RWStructuredBuffer<uint4> output_blocks : register(u1);
 // (float or sRGB-view textures Load as linear). Same rationale as BC1's
 // variant: quantize in the space the *_srgb output format decodes from.
 [[vk::constant_id(0)]] const bool SRGB_ENCODE = false;
+// Non-color data: weigh channels evenly rather than perceptually.
+[[vk::constant_id(1)]] const bool LINEAR_DATA = false;
 
 #include "bc_common.hlsli"
 
@@ -161,7 +163,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 		// Perceptually weighted projection axis (R2 G4 B1 A2, as BC1 + the
 		// ASTC 4x4 RGBA mode); reconstruction SSE below stays unweighted.
-		float4 axis   = (e1 - e0) * float4(2.0, 4.0, 1.0, 2.0);
+		float4 axis   = (e1 - e0) * float4(PW_R, PW_G, 1.0, PW_A);
 		float  len_sq = dot(e1 - e0, axis);
 
 		if (len_sq < 1e-3) {
@@ -248,7 +250,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		float3 e1 = float3((m5_c1 << 1) | (m5_c1 >> 6));
 		float  a0 = float(m5_a0), a1 = float(m5_a1);
 
-		float3 caxis   = (e1 - e0) * float3(2.0, 4.0, 1.0);
+		float3 caxis   = (e1 - e0) * float3(PW_R, PW_G, 1.0);
 		float  clen    = dot(e1 - e0, caxis);
 		float  cproj0  = dot(e0, caxis);
 		float  inv_cl  = clen > 1e-3 ? 1.0 / clen : 0.0;
