@@ -172,7 +172,7 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 	// Same policy as scene_gltf: HDR content prefers BC6H (desktop), then
 	// ASTC 8x8 HDR (mobile); LDR content falls back to BC1 on desktop.
 	scene->skybox_is_hdr = (equirect_format == skr_tex_fmt_rg11b10uf);
-	tex_compress_init(tex_compress_load_auto);
+	tex_compress_init();
 	if (scene->skybox_is_hdr && tex_compress_available(tex_compress_fmt_bc6h)) {
 		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_bc6h);
 		scene->compressed_fmt_name = "BC6H";

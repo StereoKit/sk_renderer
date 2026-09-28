@@ -1142,6 +1142,17 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		},
 	};
 
+	// ASTC decodes to FP16 texels by default, twice the cache footprint LDR
+	// needs. sRGB formats already decode to 8 bits, and HDR isn't UNORM.
+	VkImageViewASTCDecodeModeEXT astc_decode = {
+		.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT,
+		.decodeMode = VK_FORMAT_R8G8B8A8_UNORM,
+	};
+	bool is_astc_unorm = vk_format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vk_format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK &&
+	                     (vk_format - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) % 2 == 0;
+	if (_skr_vk.has_astc_decode_mode && is_astc_unorm)
+		view_info.pNext = &astc_decode;
+
 	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "vkCreateImageView failed");
@@ -2467,6 +2478,11 @@ bool skr_tex_fmt_is_supported(skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t
 	if (vk_format == VK_FORMAT_UNDEFINED) {
 		return false;
 	}
+	// Format properties report the hardware, but sampling HDR ASTC also needs
+	// the feature enabled on the device.
+	if (vk_format == VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK && !_skr_vk.has_astc_hdr) {
+		return false;
+	}
 
 	// Check if this is a depth format
 	bool is_depth = _skr_format_is_depth(vk_format);
@@ -2569,8 +2585,7 @@ void skr_tex_fmt_block_info(skr_tex_fmt_ format, uint32_t* opt_out_block_width, 
 		case skr_tex_fmt_astc6x6_rgba_srgb:
 			block_w = 6; block_h = 6; block_bytes = 16; break;
 
-		// ASTC 8x8 (16 bytes per block; same VK format as LDR 8x8 — HDR
-		// signalled per-block via CEM, not by Vulkan format).
+		// ASTC 8x8 HDR (16 bytes per block)
 		case skr_tex_fmt_astc8x8_rgba_hdr:
 			block_w = 8; block_h = 8; block_bytes = 16; break;
 

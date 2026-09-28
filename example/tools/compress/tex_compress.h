@@ -7,25 +7,19 @@
 
 #include <sk_renderer.h>
 
-// GPU Texture Compression
-//
-// Compresses RGBA textures on the GPU with compute shaders — zero CPU
-// readback, compressed data stays on the GPU via buffer-to-image copy
-// (skr_tex_set_buffer). Encoder shaders live next to this file in
-// shaders/; see tools/compress/README.md for the toolkit layout.
+// GPU Texture Compression, the example's wrapper around sk_texenc.
 //
 // Usage:
 //   tex_compress_init();
 //
-//   skr_tex_t source = ...; // texture with mips generated
+//   skr_tex_t source     = ...; // texture with mips generated
 //   skr_tex_t compressed = tex_compress(&source, tex_compress_fmt_bc7);
 //
 //   tex_compress_shutdown();
 //
-// LDR formats expect an rgba32/rgba32_linear source; the HDR formats
-// (bc6h, astc8x8hdr) expect a float-format source (rg11b10/rgba16f/...).
-// Callers should probe output-format sampleability themselves via
-// skr_tex_fmt_is_supported — the desktop/mobile split is BC vs ASTC.
+// LDR formats take an rgba32 source: a UNORM view of gamma bytes, or an sRGB
+// view, which sk_texenc gamma-encodes after the linear Load. The HDR formats
+// (bc6h, astc8x8hdr) expect a float source (rg11b10/rgba16f/...).
 
 typedef enum tex_compress_fmt_ {
 	tex_compress_fmt_bc1,          // 4 bpp LDR RGB, opaque 4-color mode only
@@ -37,53 +31,31 @@ typedef enum tex_compress_fmt_ {
 	tex_compress_fmt_astc8x8hdr,   // 2 bpp HDR RGB (CEM 11) — float source
 } tex_compress_fmt_;
 
-typedef enum tex_compress_load_ {
-	// Load one encoder family: ASTC if this GPU can sample it, BC otherwise.
-	// One family is all a runtime needs — ASTC covers mobile, BC covers
-	// desktop — and the other family's shaders are never even loaded.
-	tex_compress_load_auto,
-	// Load every encoder regardless of sampling support. For validation:
-	// tex_compress_readback works without a sampleable output format, which
-	// is how the demo scene exercises ASTC encoders on desktop GPUs.
-	tex_compress_load_all,
-} tex_compress_load_;
-
-// The first init after a shutdown decides what's loaded; later calls no-op.
-void      tex_compress_init    (tex_compress_load_ load);
+void      tex_compress_init    (void);
 void      tex_compress_shutdown(void);
 
-// True when this format's encoder is loaded AND its output format is
-// sampleable on this GPU — i.e. tex_compress/_cube will produce a texture
-// that can actually be displayed. Use this to pick formats at runtime
-// instead of probing skr_tex_fmt_is_supported directly, which knows nothing
-// about which encoder family got loaded.
+// True when sk_texenc embeds this encoder and the GPU can sample its output.
 bool      tex_compress_available(tex_compress_fmt_ format);
 
 // Compress a 2D source texture, full mip chain. Returns an invalid texture
 // on failure (unsupported format, invalid source, allocation failure).
 skr_tex_t tex_compress         (skr_tex_t* source, tex_compress_fmt_ format);
 
-// Compress a 6-layer cubemap by running the 2D encoder on each face and
-// assembling the results (GPU-side copies, no readback). The returned
-// texture has skr_tex_flags_cubemap and the source's mip count. Cube
-// sources arrive as linear light (float and sRGB-view textures both Load
-// as linear), so the LDR formats gamma-encode into their sRGB output
-// format — quantizing in perceptual space keeps precision in the darks.
+// Compress a 6-layer cubemap, keeping the source's mip count. The result has
+// skr_tex_flags_cubemap.
 skr_tex_t tex_compress_cube    (skr_tex_t* cube_source, tex_compress_fmt_ format);
 
 ///////////////////////////////////////////////////////////////////////////////
-// Validation & profiling utilities (used by the tex-compress demo scene)
+// Validation & profiling, only when sk_texenc is built with SK_TEXENC_DEBUG
 ///////////////////////////////////////////////////////////////////////////////
 
-// Compress mip 0 into a host-visible buffer, wait for the GPU, and return
-// the raw block bytes (malloc'd; caller frees). Desktop-only — stalls the
-// GPU. This is what feeds the auto-saved .astc/.dds regression artifacts;
-// it works even when the output format isn't sampleable on this hardware,
-// since no destination texture is involved.
+#ifdef SK_TEXENC_DEBUG
+// Compress mip 0, wait for the GPU, and return the raw block bytes (malloc'd;
+// caller frees). Stalls the GPU. Works even when the output format isn't
+// sampleable, which is how ASTC gets validated on desktop GPUs.
 uint8_t*  tex_compress_readback(skr_tex_t* source, tex_compress_fmt_ format, int32_t* out_size);
 
-// Dispatch just the encoder at mip 0 into a cached throwaway buffer — no
-// texture, no readback, no per-call allocation. For per-frame profiling
-// where you want the encoder shader cost on the perf graph, not the
-// surrounding texture-upload plumbing.
+// Dispatch just the encoder at mip 0 into a cached throwaway buffer, so the
+// perf graph shows the shader's cost without the texture upload around it.
 void      tex_compress_profile (skr_tex_t* source, tex_compress_fmt_ format);
+#endif

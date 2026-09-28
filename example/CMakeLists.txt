@@ -153,7 +153,7 @@ if(APPLE)
 	target_include_directories(sk_renderer_test PRIVATE ${sk_renderer_SOURCE_DIR}/sk_renderer/threads)
 endif()
 
-target_link_libraries(sk_renderer_test PRIVATE sk_renderer sk_renderer_imgui)
+target_link_libraries(sk_renderer_test PRIVATE sk_renderer sk_renderer_imgui sk_texenc)
 skr_copy_moltenvk(sk_renderer_test)
 target_include_directories(sk_renderer_test PRIVATE
 	${stb_SOURCE_DIR}
@@ -292,23 +292,12 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/msaa_resolve_oled.hlsl
 	assets/shaders/upscale.hlsl
 	assets/shaders/tex_compare.hlsl
-	# GPU texture compression toolkit — sources live with the tool code in
-	# tools/compress/ (see tools/compress/README.md); compiled .sks output
-	# lands in generated/shaders/ alongside everything else.
-	tools/compress/shaders/bc1_compress.hlsl
-	tools/compress/shaders/bc6h_compress.hlsl
-	tools/compress/shaders/bc7_compress.hlsl
-	tools/compress/shaders/astc4x4_compress.hlsl
-	tools/compress/shaders/astc6x6_compress.hlsl
-	tools/compress/shaders/astc8x8hdr_compress.hlsl
 	tools/compress/shaders/tex_psnr.hlsl
 
 	INCLUDES
 	assets/shaders/common.hlsli
 	assets/shaders/gpu_sort_common.hlsli
 	assets/shaders/pbr.hlsli
-	tools/compress/shaders/astc_common.hlsli
-	tools/compress/shaders/bc_common.hlsli
 )
 target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)

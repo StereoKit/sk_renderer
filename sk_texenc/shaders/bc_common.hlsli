@@ -1,20 +1,7 @@
 // Shared helpers for the BC-family GPU encoders (bc1/bc6h/bc7_compress.hlsl).
 // The ASTC analog is astc_common.hlsli.
 
-///////////////////////////////////////////////////////////////////////////////
-// Color space
-///////////////////////////////////////////////////////////////////////////////
-
-// IEC 61966-2-1 transfer function. Used by the SRGB_ENCODE pipeline variants
-// to gamma-encode linear-light sources (float or sRGB-view textures, which
-// Load as linear) so endpoints quantize in the space the *_srgb output
-// format decodes from.
-float3 linear_to_srgb(float3 c) {
-	c = max(c, 0.0);
-	float3 lo = c * 12.92;
-	float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
-	return lerp(lo, hi, step(0.0031308, c));
-}
+#include "texenc_common.hlsli"
 
 ///////////////////////////////////////////////////////////////////////////////
 // 128-bit block packing (BC6H / BC7)

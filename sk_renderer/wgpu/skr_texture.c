@@ -586,7 +586,8 @@ skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t arr
 
 	WGPUTexelCopyTextureInfo from = { .texture = tex->texture, .mipLevel = mip_level, .origin = { 0, 0, array_layer } };
 	WGPUTexelCopyBufferInfo  to   = { .layout = { .offset = 0, .bytesPerRow = padded, .rowsPerImage = blocks_y }, .buffer = ctx->base.staging };
-	WGPUExtent3D extent = { (uint32_t)mip_size.x, (uint32_t)mip_size.y, 1 };
+	// Block formats copy whole blocks, even where a mip is smaller than one
+	WGPUExtent3D extent = { blocks_x * block_w, blocks_y * block_h, 1 };
 	wgpuCommandEncoderCopyTextureToBuffer(_skr_cmd_get(), &from, &to, &extent);
 
 	// Submit, then chain the map; its future is what the caller polls

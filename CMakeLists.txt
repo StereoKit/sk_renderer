@@ -40,6 +40,7 @@ include(skr_warnings)
 # Build options
 option(SKR_BUILD_SKSHADERC "Build skshaderc shader compiler" ON)
 option(SKR_BUILD_KTX2 "Build the sk_ktx2 KTX2/Basis Universal transcoder" ON)
+option(SKR_BUILD_TEXENC "Build the sk_texenc GPU texture compressor" ON)
 option(SKR_BUILD_EXAMPLES "Build sk_renderer example application" ON)
 option(SKR_BUILD_XR_EXAMPLE "Build OpenXR example application (Linux/Windows only)" OFF)
 set(SKR_SK_APP_DIR "" CACHE PATH "Local sk_app checkout for the example (empty = fetch the pinned release)")
@@ -304,6 +305,14 @@ endif()
 skshaderc_compile_headers(sk_renderer ${CMAKE_BINARY_DIR}/sk_renderer_generated/builtin_shaders "${_skr_builtin_shader_args}"
 	${_skr_builtin_shaders}
 )
+
+###############################################################################
+# sk_texenc GPU texture compression
+###############################################################################
+
+if(SKR_BUILD_TEXENC)
+	add_subdirectory(sk_texenc)
+endif()
 
 ###############################################################################
 # Dear ImGui backend

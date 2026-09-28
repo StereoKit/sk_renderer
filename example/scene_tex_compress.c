@@ -49,6 +49,7 @@ typedef struct {
 	bool           astc6x6_supported;       // Texture sampling supported (drives display)
 	bool           astc6x6_validate_only;   // Compute works but display format unsupported (AMD desktop)
 	bool           astc8x8hdr_supported;    // ASTC 8x8 HDR sampling — Adreno/Mali yes, AMD desktop no
+	bool           astc8x8hdr_validate_only;
 
 	// GPU compression source (with mips) for the compute encoders
 	skr_tex_t      texture_source;
@@ -70,6 +71,7 @@ typedef struct {
 // container for these formats, so external tools (texconv, GIMP, RenderDoc)
 // and the CPU reference decoders can all read it.
 // dxgi_format: 95 = BC6H_UF16, 99 = BC7_UNORM_SRGB.
+#if defined(SK_TEXENC_DEBUG) && !defined(__ANDROID__)
 static bool _dds_write_bc(const char* path, int32_t width, int32_t height, uint32_t dxgi_format, const void* data, size_t size) {
 	FILE* f = fopen(path, "wb");
 	if (!f) return false;
@@ -95,6 +97,7 @@ static bool _dds_write_bc(const char* path, int32_t width, int32_t height, uint3
 	fclose(f);
 	return ok;
 }
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // Image Loading
@@ -164,7 +167,7 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	} else if (scene->current_format == tex_compress_fmt_astc6x6 && (scene->astc6x6_supported || scene->astc6x6_validate_only)) {
 		tex_fmt  = skr_tex_fmt_astc6x6_rgba_srgb;
 		fmt_name = "ASTC6x6";
-	} else if (scene->current_format == tex_compress_fmt_astc8x8hdr) {
+	} else if (scene->current_format == tex_compress_fmt_astc8x8hdr && (scene->astc8x8hdr_supported || scene->astc8x8hdr_validate_only)) {
 		tex_fmt  = skr_tex_fmt_astc8x8_rgba_hdr;
 		fmt_name = "ASTC8x8 HDR";
 	} else {
@@ -229,7 +232,7 @@ static void _load_image(scene_texcomp_t* scene, const char* path) {
 	// is involved — just a host-visible compute output buffer.
 	// Desktop only; no writable CWD on Android, and the validator is
 	// desktop-only anyway.
-#if !defined(__ANDROID__)
+#if defined(SK_TEXENC_DEBUG) && !defined(__ANDROID__)
 	int32_t  astc_size  = 0;
 	uint8_t* astc_data  = NULL;
 	int32_t  astc_block = 0;
@@ -312,27 +315,21 @@ static scene_t* _scene_texcomp_create(void) {
 	scene->swipe        = 0.5f;
 	scene->brightness   = 1.0f;
 
-	// Initialize GPU compression and quality measurement
-	// load_all: this scene validates encoders via readback even when the
-	// output format isn't sampleable (ASTC on desktop) — see the format
-	// dropdown's validate-only entries.
-	tex_compress_init(tex_compress_load_all);
+	tex_compress_init();
 	tex_psnr_init();
 
-	// Check format support
-	scene->bc1_supported        = skr_tex_fmt_is_supported(skr_tex_fmt_bc1_rgba_srgb,     skr_tex_flags_readable, 1);
-	scene->bc7_supported        = skr_tex_fmt_is_supported(skr_tex_fmt_bc7_rgba_srgb,     skr_tex_flags_readable, 1);
-	scene->bc6h_supported       = skr_tex_fmt_is_supported(skr_tex_fmt_bc6h_rgbuf,        skr_tex_flags_readable, 1);
-	scene->astc6x6_supported    = skr_tex_fmt_is_supported(skr_tex_fmt_astc6x6_rgba_srgb, skr_tex_flags_readable, 1);
-	// HDR ASTC reuses the LDR 8x8 Vulkan format (HDR signalled per-block via
-	// CEM). Sampling support is the LDR 8x8 sample feature plus the optional
-	// astcHdr device feature; here we just probe sampleability of the LDR
-	// format and accept that HDR blocks may decode to garbage on some HW.
-	scene->astc8x8hdr_supported = skr_tex_fmt_is_supported(skr_tex_fmt_astc8x8_rgba_hdr,  skr_tex_flags_readable, 1);
-	// Even without texture sampling we can still run the compute shader and
-	// read the blocks back into a .astc file for offline validation against
-	// astcenc — desktop AMD GPUs hit this path.
-	scene->astc6x6_validate_only = !scene->astc6x6_supported;
+	// Supported means sk_texenc embeds the encoder and the GPU samples its output
+	scene->bc1_supported        = tex_compress_available(tex_compress_fmt_bc1_alpha);
+	scene->bc7_supported        = tex_compress_available(tex_compress_fmt_bc7);
+	scene->bc6h_supported       = tex_compress_available(tex_compress_fmt_bc6h);
+	scene->astc6x6_supported    = tex_compress_available(tex_compress_fmt_astc6x6);
+	scene->astc8x8hdr_supported = tex_compress_available(tex_compress_fmt_astc8x8hdr);
+#ifdef SK_TEXENC_DEBUG
+	// Debug builds embed every encoder, so formats the GPU can't sample can
+	// still be read back into a .astc file for validation against astcenc.
+	scene->astc6x6_validate_only    = !scene->astc6x6_supported;
+	scene->astc8x8hdr_validate_only = !scene->astc8x8hdr_supported;
+#endif
 
 	su_log(su_log_info, "TexCompress: BC1 %s, BC7 %s, BC6H %s, ASTC6x6 %s, ASTC8x8HDR %s",
 		scene->bc1_supported     ? "supported" : "not supported",
@@ -340,10 +337,10 @@ static scene_t* _scene_texcomp_create(void) {
 		scene->bc6h_supported    ? "supported" : "not supported",
 		scene->astc6x6_supported ? "supported" :
 		scene->astc6x6_validate_only ? "validate-only (no display)" : "not supported",
-		scene->astc8x8hdr_supported ? "supported" : "validate-only (no display)");
+		scene->astc8x8hdr_supported ? "supported" :
+		scene->astc8x8hdr_validate_only ? "validate-only (no display)" : "not supported");
 
-	// Default format: prefer BC1 (displayable on desktop); ASTC6x6 otherwise —
-	// it always at least runs the encoder via the validate-only path.
+	// Default format: prefer BC1 (displayable on desktop); ASTC6x6 otherwise
 	scene->current_format = scene->bc1_supported ? tex_compress_fmt_bc1_alpha : tex_compress_fmt_astc6x6;
 
 	// Default file path
@@ -402,9 +399,11 @@ static void _scene_texcomp_update(scene_t* base, float delta_time) {
 	// output buffer and do just the compute dispatch at mip 0 — no texture
 	// creation, no buffer copy, no per-frame allocation. This gives an
 	// apples-to-apples shader cost comparison on the perf graph.
+#ifdef SK_TEXENC_DEBUG
 	if (skr_tex_is_valid(&scene->texture_source)) {
 		tex_compress_profile(&scene->texture_source, scene->current_format);
 	}
+#endif
 }
 
 static void _scene_texcomp_render(scene_t* base, int32_t width, int32_t height,
@@ -481,16 +480,16 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 	igTextColored(scene->bc6h_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 0.5f, 0.5f, 1.0f},
 		"  BC6H:         %s", scene->bc6h_supported ? "Yes" : "No");
 	// ASTC 4x4 and 6x6 share one sampling probe — Vulkan's LDR ASTC feature
-	// is all-or-nothing. The encoder always runs; validate-only means the
-	// result can't be displayed, only read back.
+	// is all-or-nothing. Validate-only means the result can't be displayed,
+	// only read back.
 	igTextColored(
 		scene->astc6x6_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 1.0f, 0.5f, 1.0f},
 		"  ASTC 4x4/6x6: %s",
-		scene->astc6x6_supported ? "Yes" : "Validate only (no display)");
+		scene->astc6x6_supported ? "Yes" : scene->astc6x6_validate_only ? "Validate only (no display)" : "No");
 	igTextColored(
 		scene->astc8x8hdr_supported ? (ImVec4){0.5f, 1.0f, 0.5f, 1.0f} : (ImVec4){1.0f, 1.0f, 0.5f, 1.0f},
 		"  ASTC 8x8 HDR: %s",
-		scene->astc8x8hdr_supported ? "Yes" : "Validate only (no display)");
+		scene->astc8x8hdr_supported ? "Yes" : scene->astc8x8hdr_validate_only ? "Validate only (no display)" : "No");
 
 	igSeparator();
 
@@ -515,10 +514,9 @@ static void _scene_texcomp_render_ui(scene_t* base) {
 			labels[count] = "ASTC 4x4";       values[count++] = tex_compress_fmt_astc4x4;
 			labels[count] = "ASTC 6x6";       values[count++] = tex_compress_fmt_astc6x6;
 		}
-		// Always offer ASTC HDR: encoder runs on any GPU even when the
-		// output format isn't sampleable (validate-only path saves the .astc
-		// file, magenta on screen).
-		labels[count] = "ASTC 8x8 HDR";   values[count++] = tex_compress_fmt_astc8x8hdr;
+		if (scene->astc8x8hdr_supported || scene->astc8x8hdr_validate_only) {
+			labels[count] = "ASTC 8x8 HDR";   values[count++] = tex_compress_fmt_astc8x8hdr;
+		}
 
 		int selected = 0;
 		for (int i = 0; i < count; i++) {
