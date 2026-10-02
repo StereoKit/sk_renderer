@@ -166,9 +166,8 @@ void _skr_append_renderpass_config(char* ref_str, size_t str_size, const skr_pip
 		rp_key->depth_format == VK_FORMAT_D32_SFLOAT         ? "d32" : "?";
 
 	size_t pos = strlen(ref_str);
-	snprintf(ref_str + pos, str_size - pos, "%s_%s_x%d%s%s", color_str, depth_str, rp_key->samples,
-		(rp_key->flags & skr_rp_flag_msrtss)               ? "_msrtss" : "",
-		(rp_key->flags & skr_rp_flag_fragment_density_map) ? "_fdm"    : "");
+	snprintf(ref_str + pos, str_size - pos, "%s_%s_x%d%s", color_str, depth_str, rp_key->samples,
+		(rp_key->flags & skr_rp_flag_fragment_density_map) ? "_fdm" : "");
 }
 
 static const char* _skr_descriptor_type_name(VkDescriptorType type) {

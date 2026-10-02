@@ -262,11 +262,13 @@ static void _scene_shadows_render(scene_t* base, int32_t width, int32_t height, 
 	skr_render_list_add(&scene->shadow_list, &scene->floor_mesh, &scene->shadow_caster_material, &floor_instance, sizeof(float4x4), 1);
 
 	skr_pass_t shadow_pass = {
-		.depth       = &scene->shadow_map,
-		.clear       = skr_clear_depth,
-		.clear_depth = 1.0f,
-		.viewport    = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
-		.scissor     = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
+		.target = {
+			.depth       = &scene->shadow_map,
+			.clear       = skr_clear_depth,
+			.clear_depth = 1.0f,
+		},
+		.viewport = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
+		.scissor  = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
 	};
 	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys_buffer, sizeof(su_system_buffer_t));
 	skr_pass_submit  (&shadow_pass);

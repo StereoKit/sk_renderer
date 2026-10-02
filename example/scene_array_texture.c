@@ -230,15 +230,17 @@ static void _scene_array_texture_render(scene_t* base, int32_t width, int32_t he
 	skr_render_list_add(&scene->render_list, &scene->cube_mesh, &scene->cube_material, cube_instances, sizeof(float4x4), total_cubes);
 
 	skr_pass_t stereo_pass = {
-		.color       = &scene->array_render_target,
-		.depth       = &scene->depth_buffer,
-		.clear       = skr_clear_all,
-		.clear_color = {0, 0, 0, 0},
-		.clear_depth = 1.0f,
-		.viewport    = {0, 0, (float)w, (float)h},
-		.scissor     = {0, 0, w, h},
-		.view_count       = sys_buffer.view_count,
-		.views_correlated = true,
+		.target = {
+			.color            = &scene->array_render_target,
+			.depth            = &scene->depth_buffer,
+			.clear            = skr_clear_all,
+			.clear_color      = {0, 0, 0, 0},
+			.clear_depth      = 1.0f,
+			.view_count       = sys_buffer.view_count,
+			.views_correlated = true,
+		},
+		.viewport = {0, 0, (float)w, (float)h},
+		.scissor  = {0, 0, w, h},
 	};
 	skr_pass_add_draw(&stereo_pass, &scene->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	skr_pass_submit(&stereo_pass);

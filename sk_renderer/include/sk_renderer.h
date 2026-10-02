@@ -251,7 +251,9 @@ typedef enum skr_tex_flags_ {
 	skr_tex_flags_compute          = 1 << 7,  // For compute shader RWTexture (storage image)
 	skr_tex_flags_cubemap          = 1 << 8,  // Cubemap texture (requires 6 array layers)
 	skr_tex_flags_input_attachment = 1 << 9,  // Used as input attachment in subpass (SubpassInput)
-	skr_tex_flags_fragment_density_map = 1 << 10, // R8G8 foveation density map, read only as an FDM attachment, never sampled. See skr_tex_set_fragment_density_map.
+	skr_tex_flags_fragment_density_map = 1 << 10, // R8G8 foveation density map from the XR runtime (XR_FB_foveation_vulkan), for skr_tex_create_external_vk only. See skr_foveation_t.
+	skr_tex_flags_subsampled       = 1 << 11, // Foveated render target stored at the density map's resolution. Render only: it can't be sampled, copied, uploaded, read back, or mipmapped, and a later pass loading its contents reads undefined data on most devices. On external images, declares VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT. No-op without skr_capability_fragment_density_map.
+	skr_tex_flags_foveated         = 1 << 12, // Render target whose passes may shift their density map, see skr_foveation_t.offset_px. On the density map it opts in, and every color, depth and resolve attachment of its passes then needs it too; external images must carry VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT. No-op elsewhere.
 } skr_tex_flags_;
 
 typedef enum skr_tex_sample_ {
@@ -362,8 +364,8 @@ typedef enum skr_capability_ {
 	skr_capability_external_dma,         // DMA-BUF via VK_EXT_external_memory_dma_buf
 	skr_capability_vk_video,             // Vulkan video decode (VK_KHR_video_decode_queue)
 	skr_capability_presentation,         // Window-system presentation (VK_KHR_surface + VK_KHR_swapchain). False on headless ICDs.
-	skr_capability_fragment_density_map, // Foveated rendering via VK_EXT_fragment_density_map, see skr_tex_set_fragment_density_map. Typically tile-based GPUs only.
-	skr_capability_msrtss,               // Multisampled-render-to-single-sampled: rasterize MSAA straight into a single-sample image, resolved in-tile with no separate MSAA attachment. See skr_pass_t.multisample.
+	skr_capability_fragment_density_map, // Foveated rendering via VK_EXT_fragment_density_map, see skr_foveation_t. Typically tile-based GPUs only.
+	skr_capability_fragment_density_offset, // Density maps can be shifted per pass, see skr_foveation_t.offset_px. External attachments need VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT for it.
 	skr_capability_max                   // Must be last - array size
 } skr_capability_;
 
@@ -638,25 +640,32 @@ typedef struct skr_pass_draw_t {
 	uint32_t             system_data_size;
 } skr_pass_draw_t;
 
+// Foveated rendering for a pass or blit, typically fed from the XR runtime
+typedef struct skr_foveation_t {
+	skr_tex_t*  map;          // Density map from the runtime (XR_FB_foveation_vulkan), created with skr_tex_flags_fragment_density_map. NULL = unfoveated.
+	skr_vec2i_t offset_px[2]; // Per-view shift of the map, e.g. onto the gaze. Applies when the map and every attachment carry skr_tex_flags_foveated.
+} skr_foveation_t;
+
+// What a pass renders into, shared by skr_renderer_begin_pass and skr_pass_t
+typedef struct skr_pass_target_t {
+	skr_tex_t*      color;
+	skr_tex_t*      depth;
+	skr_tex_t*      resolve;
+	skr_clear_      clear;
+	skr_vec4_t      clear_color;
+	float           clear_depth;
+	uint32_t        clear_stencil;
+	int32_t         view_count;       // Number of views to render (1 = single, 2 = stereo, etc.)
+	bool            views_correlated; // True if views see the same geometry from different viewpoints
+	                                  // (VR stereo). False for cubemap faces or independent layers.
+	skr_foveation_t foveation;
+} skr_pass_target_t;
+
 typedef struct skr_pass_t {
-	skr_tex_t*  color;
-	skr_tex_t*  depth;
-	skr_tex_t*  resolve;
-	skr_tex_t*  postfx_output;      // Final output for postfx chain (NULL = write back to resolve/color)
-	skr_clear_  clear;
-	skr_vec4_t  clear_color;
-	float       clear_depth;
-	uint32_t    clear_stencil;
-	skr_rect_t  viewport;
-	skr_recti_t scissor;
-	int32_t     view_count;         // Number of views to render (1 = single, 2 = stereo, etc.)
-	bool        views_correlated;  // True if views see the same geometry from different viewpoints
-	                                // (VR stereo). False for cubemap faces or independent layers.
-	int32_t     multisample;       // Desired rasterization sample count. 0 = use the color attachment's
-	                                // own sample count (today's behavior). If the color attachment is
-	                                // single-sample but this is >1 and the device supports it, the pass
-	                                // is rendered multisampled-to-single-sampled (resolved in-tile, no
-	                                // separate MSAA/resolve attachment).
+	skr_pass_target_t target;
+	skr_tex_t*        postfx_output; // Final output for postfx chain (NULL = write back to resolve/color)
+	skr_rect_t        viewport;
+	skr_recti_t       scissor;
 
 	skr_pass_draw_t draws[SKR_PASS_MAX_DRAWS];
 	uint32_t        draw_count;
@@ -812,7 +821,6 @@ SKR_API skr_tex_fmt_      skr_tex_get_format               (const skr_tex_t*    
 SKR_API skr_tex_flags_    skr_tex_get_flags                (const skr_tex_t*     tex);
 SKR_API int32_t           skr_tex_get_multisample          (const skr_tex_t*     tex);
 SKR_API void              skr_tex_set_sampler              (      skr_tex_t* ref_tex, skr_tex_sampler_t sampler);
-SKR_API void              skr_tex_set_fragment_density_map (      skr_tex_t* ref_tex, skr_tex_t* fdm);
 SKR_API skr_tex_sampler_t skr_tex_get_sampler              (const skr_tex_t*     tex);
 SKR_API skr_err_          skr_tex_set_data                 (      skr_tex_t* ref_tex, const skr_tex_data_t* data);
 SKR_API skr_err_          skr_tex_set_buffer               (      skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint32_t base_mip, uint32_t mip_count);
@@ -903,13 +911,13 @@ SKR_API void              skr_renderer_frame_end           (skr_surface_t** opt_
 #ifdef SKR_VK
 SKR_API int32_t           skr_renderer_frame_fence_fd      (void);  // Sync FD for the calling thread's most recent submission; call on the frame-submitting thread to get the frame fence. Caller closes it; -1 if unsupported or nothing submitted
 #endif
-SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask, int32_t multisample);  // multisample: 0 = the color attachment's own sample count, >1 with a single-sample color = MSRTSS, see skr_pass_t.multisample
+SKR_API void              skr_renderer_begin_pass          (const skr_pass_target_t* target);
 SKR_API void              skr_renderer_end_pass            (void);
 SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);
 SKR_API void              skr_renderer_set_global_texture  (int32_t bind, const skr_tex_t* tex);
 SKR_API void              skr_renderer_set_viewport        (skr_rect_t viewport);
 SKR_API void              skr_renderer_set_scissor         (skr_recti_t scissor);
-SKR_API void              skr_renderer_blit                (skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px);
+SKR_API void              skr_renderer_blit                (skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px, const skr_foveation_t* opt_foveation);
 
 SKR_API void              skr_renderer_draw                (skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
 SKR_API void              skr_renderer_draw_mesh_immediate (skr_mesh_t* mesh, skr_material_t* material, int32_t first_index, int32_t index_count, int32_t vertex_offset, int32_t instance_count);

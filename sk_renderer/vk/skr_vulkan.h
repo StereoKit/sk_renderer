@@ -10,6 +10,7 @@
 
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 #define SKR_MAX_SURFACES 2  // Maximum surfaces for VR stereo rendering
+#define SKR_FDM_MAX_LAYERS 2 // Density map layers that can carry an offset: one per stereo view
 
 // Number of copies in a dynamic buffer's flipbook ring. This is one more than
 // the in-flight frame count: callers write the new frame's data before the
@@ -102,7 +103,6 @@ typedef struct skr_tex_t {
 	uint64_t               framebuffer_views;       // Fingerprint of the views the cached framebuffer was built
 	uint64_t               framebuffer_depth_views; // from — other attachments can be destroyed while the cache
 	                                                // target survives, so the render pass alone under-keys the cache
-	skr_tex_t*             fdm;                     // Foveation density map attached to this render target (not owned). NULL = no foveation.
 	VkSampler              sampler;          // Vulkan sampler handle
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;

@@ -821,17 +821,19 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 
 	// Scene geometry via deferred pass (handles multi-view transparently)
 	skr_pass_t pass = {
-		.color         = color_target,
-		.depth         = &app->depth_buffer,
-		.resolve       = resolve_target,
+		.target = {
+			.color            = color_target,
+			.depth            = &app->depth_buffer,
+			.resolve          = resolve_target,
+			.clear            = skr_clear_all,
+			.clear_color      = {0, 0, 0, 0},
+			.clear_depth      = 1.0f,
+			.view_count       = sys_buffer.view_count,
+			.views_correlated = true,
+		},
 		.postfx_output = postfx_output,
-		.clear         = skr_clear_all,
-		.clear_color   = {0, 0, 0, 0},
-		.clear_depth   = 1.0f,
 		.viewport      = {0, 0, (float)view_w, (float)view_h},
 		.scissor       = {0, 0, view_w, view_h},
-		.view_count       = sys_buffer.view_count,
-		.views_correlated = true,
 	};
 	skr_pass_add_draw(&pass, &app->render_list, &sys_buffer, sizeof(su_system_buffer_t));
 	if (use_manual_resolve)
@@ -859,12 +861,12 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 	// Wide-kernel resolve: separate pass reads MSAA color as Texture2DMS
 	if (use_wide_kernel) {
 		skr_material_set_tex(&app->wide_resolve_mat, "msaa_color", &app->color_msaa);
-		skr_renderer_blit(&app->wide_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+		skr_renderer_blit(&app->wide_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h}, NULL);
 	}
 	// OLED subpixel resolve: per-channel weights based on physical subpixel layout
 	if (use_oled_subpixel) {
 		skr_material_set_tex(&app->oled_resolve_mat, "msaa_color", &app->color_msaa);
-		skr_renderer_blit(&app->oled_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+		skr_renderer_blit(&app->oled_resolve_mat, final_output, (skr_recti_t){0, 0, view_w, view_h}, NULL);
 	}
 	// Fog scatter: box-filter the density prepass output, kernel width driven
 	// by the fog density each pixel packed into alpha (VK_QCOM_image_processing)
@@ -876,7 +878,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		if (app->fog_scatter_qcom)
 			skr_material_set_tex(&app->fog_scatter_mat, "scene_box", &app->fog_scatter_target);
 		skr_material_set_tex  (&app->fog_scatter_mat, "scene_tex", &app->fog_scatter_target);
-		skr_renderer_blit(&app->fog_scatter_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+		skr_renderer_blit(&app->fog_scatter_mat, final_output, (skr_recti_t){0, 0, view_w, view_h}, NULL);
 	}
 	// Halation: convolve the scene's clipped highlights with the film-base PSF
 	// and add the halo back over it. 33 bilinear taps, no extensions needed.
@@ -891,7 +893,7 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		skr_material_set_param(&app->halation_mat, "clip_range",     sksc_shader_var_float, 1, &app->hal_clip_range);
 		skr_material_set_param(&app->halation_mat, "dye_absorb",     sksc_shader_var_float, 4,  app->hal_dye);
 		skr_material_set_tex  (&app->halation_mat, "src_tex", &app->scene_color);
-		skr_renderer_blit(&app->halation_mat, final_output, (skr_recti_t){0, 0, view_w, view_h});
+		skr_renderer_blit(&app->halation_mat, final_output, (skr_recti_t){0, 0, view_w, view_h}, NULL);
 	}
 
 	// Post-processing (operates at render resolution, before upscale)
@@ -904,14 +906,14 @@ void app_render(app_t* app, skr_tex_t* render_target, int32_t width, int32_t hei
 		float uv_scale[4] = { (float)view_w / (float)render_w, (float)view_h / (float)render_h, 0, 0 };
 		skr_material_set_params(&app->upscale_mat, uv_scale, sizeof(uv_scale));
 		skr_material_set_tex   (&app->upscale_mat, "src_tex", upscale_src);
-		skr_renderer_blit(&app->upscale_mat, render_target, (skr_recti_t){0, 0, width, height});
+		skr_renderer_blit(&app->upscale_mat, render_target, (skr_recti_t){0, 0, width, height}, NULL);
 	}
 
 	// ImGui: always renders to swapchain at native resolution (sharp UI)
 	skr_tex_t* imgui_target = upscale_src ? render_target
 		: (use_postfx || use_manual_resolve || use_wide_kernel || use_oled_subpixel || use_halation) ? render_target
 		: (resolve_target ? resolve_target : color_target);
-	skr_renderer_begin_pass(imgui_target, NULL, NULL, skr_clear_none, (skr_vec4_t){0}, 1.0f, 0, 0x1, 0x1, 0);
+	skr_renderer_begin_pass(&(skr_pass_target_t){ .color = imgui_target });
 	skr_renderer_set_viewport((skr_rect_t ){0, 0, (float)width, (float)height});
 	skr_renderer_set_scissor ((skr_recti_t){0, 0, width, height});
 	ImGui_ImplSkRenderer_RenderDrawData(width, height);

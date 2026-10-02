@@ -112,18 +112,17 @@ static uint64_t _skr_view_fingerprint(const VkImageView* views, uint32_t count) 
 	return hash;
 }
 
-static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* cache_target, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, bool has_depth) {
+static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* cache_target, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, const skr_tex_t* opt_fdm, bool has_depth) {
 	VkFramebuffer* cached_fb    = has_depth ? &cache_target->framebuffer_depth       : &cache_target->framebuffer;
 	VkRenderPass*  cached_pass  = has_depth ? &cache_target->framebuffer_depth_pass  : &cache_target->framebuffer_pass;
 	uint64_t*      cached_views = has_depth ? &cache_target->framebuffer_depth_views : &cache_target->framebuffer_views;
 
 	VkImageView views[4];
 	uint32_t    view_count = 0;
-	skr_tex_t*  fdm        = _skr_framebuffer_fdm(color, opt_resolve);
 	if (color)       views[view_count++] = color->view;
 	if (depth)       views[view_count++] = depth->view;
 	if (opt_resolve) views[view_count++] = opt_resolve->view;
-	if (fdm)         views[view_count++] = fdm->view;
+	if (opt_fdm)     views[view_count++] = opt_fdm->view;
 	uint64_t fingerprint = _skr_view_fingerprint(views, view_count);
 
 	// Check if we have a cached framebuffer for this render pass + attachments
@@ -137,7 +136,7 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 	}
 
 	// Create and cache new framebuffer
-	*cached_fb    = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve);
+	*cached_fb    = _skr_create_framebuffer(device, render_pass, color, depth, opt_resolve, opt_fdm);
 	*cached_pass  = render_pass;
 	*cached_views = fingerprint;
 	return *cached_fb;
@@ -350,6 +349,73 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 	_skr_vk.flight_idx = _skr_vk.frame % SKR_MAX_FRAMES_IN_FLIGHT;
 }
 
+// A density map flagged skr_tex_flags_foveated opts its passes into shifting.
+// Every attachment must then carry the flag too, as it stands for the offset
+// image bit.
+static bool _skr_fdm_offsets_ok(const skr_tex_t* fdm, const skr_tex_t* opt_color, const skr_tex_t* opt_depth, const skr_tex_t* opt_resolve, const skr_tex_t* opt_output) {
+	if (!_skr_vk.has_fdm_offset || !(fdm->flags & skr_tex_flags_foveated) || fdm->layer_count > SKR_FDM_MAX_LAYERS) return false;
+	const skr_tex_t* texs [4] = { opt_color, opt_depth, opt_resolve, opt_output };
+	const char*      names[4] = { "color", "depth", "resolve", "output" };
+	for (int32_t i = 0; i < 4; i++) {
+		if (!texs[i] || (texs[i]->flags & skr_tex_flags_foveated)) continue;
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_warning, "Density map offsets skipped: the pass's %s lacks skr_tex_flags_foveated", names[i]);
+		warned = true;
+		return false;
+	}
+	return true;
+}
+
+// Loading a subsampled image reads undefined data unless the device resamples
+// loads (FDM2 subsampledLoads), which Adreno doesn't
+static void _skr_check_subsampled_load(const skr_tex_t* opt_tex, bool loads, const char* fn_name) {
+	if (!loads || !opt_tex || !(opt_tex->flags & skr_tex_flags_subsampled)) return;
+	if (_skr_vk.fdm_subsampled_loads || !_skr_vk.capabilities[skr_capability_fragment_density_map]) return;
+	static bool warned = false;
+	if (!warned) skr_log(skr_log_critical, "%s: loads a subsampled target's previous contents, which this device can't resample, so they're undefined. Clear or fully cover it instead", fn_name);
+	warned = true;
+}
+
+_Static_assert(sizeof(((skr_foveation_t*)0)->offset_px) / sizeof(skr_vec2i_t) == SKR_FDM_MAX_LAYERS, "skr_foveation_t.offset_px holds one offset per density map layer");
+
+// The density map a pass can use, NULL when it has none or can't attach it
+static skr_tex_t* _skr_foveation_map(const skr_foveation_t* opt_foveation) {
+	skr_tex_t* map = opt_foveation ? opt_foveation->map : NULL;
+	if (!map || !_skr_vk.capabilities[skr_capability_fragment_density_map]) return NULL;
+	// Render passes describe the map as R8G8, so anything else can't be attached
+	if (!skr_tex_is_valid(map) || map->format != skr_tex_fmt_r8g8 || !(map->flags & skr_tex_flags_fragment_density_map)) {
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_warning, "Density map must be a valid r8g8 texture created with skr_tex_flags_fragment_density_map, rendering unfoveated");
+		warned = true;
+		return NULL;
+	}
+	return map;
+}
+
+// Rounds toward zero to the device's offset granularity
+static void _skr_foveation_offsets(const skr_foveation_t* foveation, VkOffset2D out_offsets[SKR_FDM_MAX_LAYERS]) {
+	int32_t gx = (int32_t)_skr_vk.fdm_offset_granularity.width;
+	int32_t gy = (int32_t)_skr_vk.fdm_offset_granularity.height;
+	for (int32_t i = 0; i < SKR_FDM_MAX_LAYERS; i++)
+		out_offsets[i] = (VkOffset2D){ foveation->offset_px[i].x / gx * gx, foveation->offset_px[i].y / gy * gy };
+}
+
+// Ends the pass, shifting its density map. One offset per map layer under
+// multiview, else one; 0 leaves the map where it is.
+static void _skr_cmd_end_renderpass(VkCommandBuffer cmd, const VkOffset2D* offsets, uint32_t offset_count) {
+	if (offset_count == 0) {
+		vkCmdEndRenderPass(cmd);
+		return;
+	}
+	VkRenderPassFragmentDensityMapOffsetEndInfoEXT offset_info = {
+		.sType                      = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_EXT,
+		.fragmentDensityOffsetCount = offset_count,
+		.pFragmentDensityOffsets    = offsets,
+	};
+	PFN_vkCmdEndRenderPass2 end2 = vkCmdEndRenderPass2 ? vkCmdEndRenderPass2 : vkCmdEndRenderPass2KHR;
+	end2(cmd, &(VkSubpassEndInfo){ .sType = VK_STRUCTURE_TYPE_SUBPASS_END_INFO, .pNext = &offset_info });
+}
+
 // Clear wins over discard, a missing bit still means LOAD. Anything but LOAD
 // gets initialLayout=UNDEFINED, so discard also drops the pre-pass barrier.
 static VkAttachmentLoadOp _skr_color_load_op(skr_clear_ clear) {
@@ -358,29 +424,29 @@ static VkAttachmentLoadOp _skr_color_load_op(skr_clear_ clear) {
 	return VK_ATTACHMENT_LOAD_OP_LOAD;
 }
 
-void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask, int32_t multisample) {
+void skr_renderer_begin_pass(const skr_pass_target_t* target) {
+	skr_tex_t* color       = target->color;
+	skr_tex_t* depth       = target->depth;
+	skr_tex_t* opt_resolve = target->resolve;
+	skr_clear_ clear       = target->clear;
 	// Require at least one attachment (color or depth)
 	if (!color && !depth) return;
 
-	// A single-sample color attachment with a higher requested sample count
-	// renders multisampled-to-single-sampled: rasterized at `multisample` and
-	// resolved in-tile, with no separate MSAA color or resolve attachment.
-	int32_t               color_samples  = color ? (int32_t)color->samples : 1;
-	bool                  use_msrtss     = multisample > 1 && color_samples == 1 && _skr_vk.capabilities[skr_capability_msrtss];
-	VkSampleCountFlagBits raster_samples = use_msrtss
-		? (VkSampleCountFlagBits)multisample
-		: (color ? color->samples : (depth ? depth->samples : VK_SAMPLE_COUNT_1_BIT));
-	// Under MSRTSS the single-sample color is the target itself, so no resolve attachment
-	skr_tex_t* fb_resolve = use_msrtss ? NULL : opt_resolve;
+	uint32_t view_count       = target->view_count > 0 ? (uint32_t)target->view_count : 1;
+	uint32_t view_mask        = (1u << view_count) - 1;
+	uint32_t correlation_mask = target->views_correlated ? view_mask : 0;
+	if (view_count > _skr_vk.max_multiview_view_count) {
+		skr_log(skr_log_critical, "Multiview pass requires %u views, device supports %u", view_count, _skr_vk.max_multiview_view_count);
+		return;
+	}
 
-	// Validate multiview view count against device limits
-	if (view_mask) {
-		uint32_t view_count = 0;
-		for (uint32_t m = view_mask; m; m >>= 1) view_count += (m & 1);
-		if (view_count > _skr_vk.max_multiview_view_count) {
-			skr_log(skr_log_critical, "Multiview pass requires %u views, device supports %u", view_count, _skr_vk.max_multiview_view_count);
-			return;
-		}
+	// A density map needs a layer for every view the pass renders
+	skr_tex_t* pass_fdm = _skr_foveation_map(&target->foveation);
+	if (pass_fdm && view_count > pass_fdm->layer_count) {
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_critical, "Density map has %u layers but the pass renders %u views, skipping the pass", pass_fdm->layer_count, view_count);
+		warned = true;
+		return;
 	}
 
 	// Lock pipeline cache for the duration of this render pass.
@@ -398,38 +464,38 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	skr_pipeline_renderpass_key_t rp_key = {
 		.color_format    = color                                           ? skr_tex_fmt_to_native(color->format)         : VK_FORMAT_UNDEFINED,
 		.depth_format    = depth                                           ? skr_tex_fmt_to_native(depth->format)         : VK_FORMAT_UNDEFINED,
-		.resolve_format  = (!use_msrtss && opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT) ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
-		.samples         = raster_samples,
+		.resolve_format  = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT) ? skr_tex_fmt_to_native(opt_resolve->format) : VK_FORMAT_UNDEFINED,
+		.samples         = color ? color->samples : depth->samples,
 		.depth_store_op  = (depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
 		.color_load_op   = _skr_color_load_op(clear),
 		.view_mask        = view_mask,
 		.correlation_mask = correlation_mask,
 		.final_color_layout   = (color && (color->flags & skr_tex_flags_readable))
 			? _skr_tex_sample_layout(color) : 0,
-		.final_resolve_layout = (!use_msrtss && opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT && (opt_resolve->flags & skr_tex_flags_readable))
+		.final_resolve_layout = (opt_resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT && (opt_resolve->flags & skr_tex_flags_readable))
 			? _skr_tex_sample_layout(opt_resolve) : 0,
 		.final_depth_layout   = (depth && (depth->flags & skr_tex_flags_readable) && !(depth->samples > VK_SAMPLE_COUNT_1_BIT))
 			? _skr_tex_sample_layout(depth) : 0,
-		.flags = (use_msrtss ? skr_rp_flag_msrtss : 0)
-		       | (_skr_framebuffer_fdm(color, fb_resolve) ? skr_rp_flag_fragment_density_map : 0),
+		.flags            = pass_fdm ? skr_rp_flag_fragment_density_map : 0,
 	};
-	_skr_vk.current_renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
+	_skr_check_subsampled_load(color, rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD, "skr_renderer_begin_pass");
+	int32_t renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 
 	// Get render pass from pipeline system
-	VkRenderPass render_pass = _skr_pipeline_get_renderpass(_skr_vk.current_renderpass_idx);
+	VkRenderPass render_pass = _skr_pipeline_get_renderpass(renderpass_idx);
 	if (render_pass == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
 	// Determine which texture to use for framebuffer caching
 	// Priority: resolve target (for separate-attachment MSAA) > color > depth
 	skr_tex_t* fb_cache_target = color;
-	if (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
-		fb_cache_target = fb_resolve;  // Use resolve target for MSAA
+	if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
+		fb_cache_target = opt_resolve;  // Use resolve target for MSAA
 	} else if (!color) {
 		fb_cache_target = depth;  // Depth-only pass
 	}
 
 	// Get or create cached framebuffer
-	VkFramebuffer framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, fb_cache_target, render_pass, color, depth, fb_resolve, depth != NULL);
+	VkFramebuffer framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, fb_cache_target, render_pass, color, depth, opt_resolve, pass_fdm, depth != NULL);
 
 	if (framebuffer == VK_NULL_HANDLE) { _skr_pipeline_unlock(); return; }
 
@@ -467,11 +533,11 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 
 	if (color) {
 		if (clear & skr_clear_color) {
-			clear_values[clear_value_count] = (VkClearValue){ .color = {.float32 = {clear_color.x, clear_color.y, clear_color.z, clear_color.w}} };
+			clear_values[clear_value_count] = (VkClearValue){ .color = {.float32 = {target->clear_color.x, target->clear_color.y, target->clear_color.z, target->clear_color.w}} };
 		}
 		clear_value_count++; // Color attachment needs an entry
 
-		if (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
+		if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
 			// Resolve has loadOp = DONT_CARE, but still needs an entry
 			clear_value_count++;
 		}
@@ -479,7 +545,7 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 
 	if (depth) {
 		if (clear & (skr_clear_depth | skr_clear_stencil)) {
-			clear_values[clear_value_count] = (VkClearValue){ .depthStencil = {.depth = clear_depth, .stencil = clear_stencil} };
+			clear_values[clear_value_count] = (VkClearValue){ .depthStencil = {.depth = target->clear_depth, .stencil = target->clear_stencil} };
 		}
 		clear_value_count++;
 	}
@@ -504,24 +570,30 @@ void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_
 	if (color) {
 		_skr_tex_transition_notify_layout(color, _skr_tex_attachment_layout(color));
 	}
-	if (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
-		_skr_tex_transition_notify_layout(fb_resolve, _skr_tex_attachment_layout(fb_resolve));
+	if (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) {
+		_skr_tex_transition_notify_layout(opt_resolve, _skr_tex_attachment_layout(opt_resolve));
 	}
 	if (depth) {
 		_skr_tex_transition_notify_layout(depth, _skr_tex_attachment_layout(depth));
 	}
 
-	// Store current textures for end_pass layout transitions
+	// Store current textures for end_pass layout transitions. A pass index of
+	// -1 means none began, so end_pass and draws know to skip.
+	_skr_vk.current_renderpass_idx  = renderpass_idx;
 	_skr_vk.current_color_texture   = color;
 	_skr_vk.current_depth_texture   = depth;
-	_skr_vk.current_resolve_texture = (fb_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) ? fb_resolve : NULL;
+	_skr_vk.current_resolve_texture = (opt_resolve && rp_key.samples > VK_SAMPLE_COUNT_1_BIT) ? opt_resolve : NULL;
+	_skr_vk.current_fdm_layers      = pass_fdm && _skr_fdm_offsets_ok(pass_fdm, color, depth, _skr_vk.current_resolve_texture, NULL) ? pass_fdm->layer_count : 0;
+	_skr_foveation_offsets(&target->foveation, _skr_vk.current_fdm_offsets);
 
 	_skr_cmd_release(cmd);
 }
 
 void skr_renderer_end_pass(void) {
+	if (_skr_vk.current_renderpass_idx < 0) return;
 	VkCommandBuffer cmd = _skr_cmd_acquire().cmd;
-	vkCmdEndRenderPass(cmd);
+
+	_skr_cmd_end_renderpass(cmd, _skr_vk.current_fdm_offsets, _skr_vk.current_fdm_layers);
 
 	// Render pass finalLayout handles the transition to the sample layout for
 	// readable attachments (free on tilers via the subpass→EXTERNAL dependency).
@@ -546,6 +618,7 @@ void skr_renderer_end_pass(void) {
 		_skr_tex_transition_notify_layout(_skr_vk.current_resolve_texture, _skr_tex_sample_layout(_skr_vk.current_resolve_texture));
 	}
 
+	_skr_vk.current_renderpass_idx  = -1;
 	_skr_vk.current_color_texture   = NULL;
 	_skr_vk.current_depth_texture   = NULL;
 	_skr_vk.current_resolve_texture = NULL;
@@ -570,6 +643,10 @@ void skr_renderer_set_global_texture(int32_t bind, const skr_tex_t* tex) {
 		if (bind >= SKR_MAX_GLOBAL_BINDINGS) {
 			skr_log(skr_log_critical, "Global texture binding %d exceeds maximum of %d slots", bind, SKR_MAX_GLOBAL_BINDINGS);
 		}
+		return;
+	}
+	if (tex && (tex->flags & skr_tex_flags_subsampled) && _skr_vk.capabilities[skr_capability_fragment_density_map]) {
+		skr_log(skr_log_critical, "skr_renderer_set_global_texture: slot %d got a subsampled texture, which can only be rendered to, not sampled", bind);
 		return;
 	}
 	_skr_vk.global_textures[bind] = (skr_tex_t*)tex;
@@ -607,7 +684,7 @@ void skr_renderer_set_scissor(skr_recti_t scissor) {
 	_skr_cmd_release(cmd);
 }
 
-void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px) {
+void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px, const skr_foveation_t* opt_foveation) {
 	if (!material || !to) return;
 	if (!skr_material_is_valid(material) || !skr_tex_is_valid(to)) return;
 
@@ -630,6 +707,18 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	uint32_t width  = bounds_px.w > 0 ? bounds_px.w : to->size.x;
 	uint32_t height = bounds_px.h > 0 ? bounds_px.h : to->size.y;
 
+	// A subsampled target needs its density map here too, or it can't be written
+	skr_tex_t* fdm = _skr_foveation_map(opt_foveation);
+	if (fdm && fdm->layer_count < ((is_cubemap || is_array) ? layer_count : 1)) {
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_critical, "Blit density map has %u layers but the blit renders %u, skipping the blit", fdm->layer_count, layer_count);
+		warned = true;
+		return;
+	}
+	VkOffset2D fdm_offsets[SKR_FDM_MAX_LAYERS] = {0};
+	bool       fdm_shift = fdm && _skr_fdm_offsets_ok(fdm, to, NULL, NULL, NULL);
+	if (fdm_shift) _skr_foveation_offsets(opt_foveation, fdm_offsets);
+
 	// Lock pipeline cache for this blit operation
 	_skr_pipeline_lock();
 
@@ -643,7 +732,9 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		.depth_store_op     = VK_ATTACHMENT_STORE_OP_DONT_CARE,  // No depth in blit
 		.color_load_op      = is_full_blit ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
 		.final_color_layout = (to->flags & skr_tex_flags_readable) ? _skr_tex_sample_layout(to) : 0,
+		.flags              = fdm ? skr_rp_flag_fragment_density_map : 0,
 	};
+	_skr_check_subsampled_load(to, !is_full_blit, "skr_renderer_blit");
 	int32_t renderpass_idx = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	int32_t vert_idx       = _skr_pipeline_register_vertformat_unlocked((skr_vert_type_t){0});
 
@@ -745,11 +836,12 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			return;
 		}
 
+		VkImageView fb_views[2] = { temp_view, fdm ? fdm->view : VK_NULL_HANDLE };
 		vr = vkCreateFramebuffer(_skr_vk.device, &(VkFramebufferCreateInfo){
 			.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 			.renderPass      = render_pass,
-			.attachmentCount = 1,
-			.pAttachments    = &temp_view,
+			.attachmentCount = fdm ? 2 : 1,
+			.pAttachments    = fb_views,
 			.width           = width,
 			.height          = height,
 			.layers          = 1,  // Multiview: layers=1, view_mask controls layer count
@@ -781,13 +873,13 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);  // Single instance, multiview broadcasts across layers
 		}
 
-		vkCmdEndRenderPass(ctx.cmd);
+		_skr_cmd_end_renderpass(ctx.cmd, fdm_offsets, fdm_shift ? fdm->layer_count : 0);
 
 		_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
 		_skr_cmd_destroy_image_view (ctx.destroy_list, temp_view);
 	} else {
 		// Regular 2D: use cached framebuffer
-		framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, to, render_pass, to, NULL, NULL, false);
+		framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, to, render_pass, to, NULL, NULL, fdm, false);
 		if (framebuffer == VK_NULL_HANDLE) {
 			_skr_cmd_release(ctx.cmd);
 			_skr_pipeline_unlock();
@@ -813,7 +905,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 			if (bound) vkCmdDraw(ctx.cmd, 3, 1, 0, 0);
 		}
 
-		vkCmdEndRenderPass(ctx.cmd);
+		_skr_cmd_end_renderpass(ctx.cmd, fdm_offsets, fdm_shift ? 1 : 0);
 	}
 
 	// Render pass finalLayout handles the transition. Update tracking to match.
@@ -873,7 +965,7 @@ static bool _skr_list_bind_descriptors(const _skr_cmd_ctx_t* ctx, const skr_rend
 }
 
 void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_t system_data_size) {
-	if (!list || list->count == 0) return;
+	if (!list || list->count == 0 || _skr_vk.current_renderpass_idx < 0) return;
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 	VkCommandBuffer cmd = ctx.cmd;
@@ -1005,7 +1097,7 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material,
                                        int32_t first_index, int32_t index_count, int32_t vertex_offset,
                                        int32_t instance_count) {
-	if (!mesh || !material) return;
+	if (!mesh || !material || _skr_vk.current_renderpass_idx < 0) return;
 	if (instance_count < 1) instance_count = 1;
 
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
@@ -1172,23 +1264,23 @@ static int32_t _skr_build_material_descriptors(_skr_cmd_ctx_t* ctx, skr_material
 void skr_pass_submit(skr_pass_t* pass) {
 	if (!pass || pass->draw_count == 0) return;
 
-	int32_t  view_count = pass->view_count > 0 ? pass->view_count : 1;
+	int32_t  view_count = pass->target.view_count > 0 ? pass->target.view_count : 1;
 	uint32_t view_mask  = (1u << view_count) - 1;
-	uint32_t correlation = pass->views_correlated ? view_mask : 0;
+	uint32_t correlation = pass->target.views_correlated ? view_mask : 0;
 
 	// The resolve subpass reads MSAA color and writes the resolve target, so
 	// both must exist. This has to settle before the early-out below: dropping
 	// the resolve any later leaves the framebuffer mismatched against the
 	// single-subpass render pass the key then selects.
 	bool has_resolve = pass->resolve_material && skr_material_is_valid(pass->resolve_material);
-	if (has_resolve && !(pass->resolve && pass->color && pass->color->samples > VK_SAMPLE_COUNT_1_BIT)) {
+	if (has_resolve && !(pass->target.resolve && pass->target.color && pass->target.color->samples > VK_SAMPLE_COUNT_1_BIT)) {
 		skr_log(skr_log_warning, "Resolve material needs an MSAA color target and a resolve target, skipping it");
 		has_resolve = false;
 	}
 
 	// --- Single-subpass path (no postfx, no manual resolve) ---
 	if (pass->postfx_count == 0 && !has_resolve) {
-		skr_renderer_begin_pass(pass->color, pass->depth, pass->resolve, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil, view_mask, correlation, pass->multisample);
+		skr_renderer_begin_pass(&pass->target);
 		skr_renderer_set_viewport(pass->viewport);
 		skr_renderer_set_scissor (pass->scissor);
 		for (uint32_t i = 0; i < pass->draw_count; i++)
@@ -1198,9 +1290,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 	}
 
 	// --- Multi-subpass path (with postfx) ---
-	skr_tex_t* color   = pass->color;
-	skr_tex_t* depth   = pass->depth;
-	skr_tex_t* resolve = pass->resolve;
+	skr_tex_t* color   = pass->target.color;
+	skr_tex_t* depth   = pass->target.depth;
+	skr_tex_t* resolve = pass->target.resolve;
 	bool use_msaa  = resolve && color && color->samples > VK_SAMPLE_COUNT_1_BIT;
 	bool has_color = color != NULL;
 	bool has_depth = depth != NULL;
@@ -1209,6 +1301,14 @@ void skr_pass_submit(skr_pass_t* pass) {
 	skr_tex_t* final_output = pass->postfx_output;
 	if (!final_output) final_output = use_msaa ? resolve : color;
 	if (!final_output) { skr_log(skr_log_critical, "skr_pass_submit: no postfx output target"); return; }
+
+	skr_tex_t* pass_fdm = _skr_foveation_map(&pass->target.foveation);
+	if (pass_fdm && pass_fdm->layer_count < (uint32_t)view_count) {
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_critical, "Density map has %u layers but the pass renders %d views, skipping the pass", pass_fdm->layer_count, view_count);
+		warned = true;
+		return;
+	}
 
 	_skr_pipeline_lock();
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
@@ -1299,6 +1399,32 @@ void skr_pass_submit(skr_pass_t* pass) {
 		skr_log(skr_log_critical, "PostFX uses tile attachments, but this device lacks VK_QCOM_tile_shading");
 		pass_tile_shading = false;
 	}
+	// Vulkan forbids a density map in a tile shading pass. A subsampled target
+	// can't be written without its map, so that pass can't run at all.
+	bool subsampled_target = ((color   && (color  ->flags & skr_tex_flags_subsampled))
+	                       || (resolve && (resolve->flags & skr_tex_flags_subsampled))
+	                       || (final_output->flags & skr_tex_flags_subsampled));
+	if (pass_tile_shading && pass_fdm && subsampled_target) {
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_critical, "skr_pass_submit: PostFX tile shading can't render into a subsampled target, skipping the pass");
+		warned = true;
+		_skr_cmd_release(ctx.cmd);
+		_skr_pipeline_unlock();
+		return;
+	} else if (pass_tile_shading && pass_fdm) {
+		static bool warned = false;
+		if (!warned) skr_log(skr_log_warning, "PostFX tile shading and foveation can't share a pass, rendering this one unfoveated");
+		warned   = true;
+		pass_fdm = NULL;
+	}
+	// Pooled transients only pay for the offset bit in passes that shift the map
+	bool fdm_shift = pass_fdm && _skr_fdm_offsets_ok(pass_fdm, pass->target.color, pass->target.depth, use_msaa ? pass->target.resolve : NULL, final_output);
+	VkOffset2D fdm_offsets[SKR_FDM_MAX_LAYERS] = {0};
+	if (fdm_shift) _skr_foveation_offsets(&pass->target.foveation, fdm_offsets);
+	// TODO: QCOM shader resolve into a subsampled target loses the device on
+	// Quest 3 (suspected driver bug), costing the ~0.2 ms/frame subsampled color
+	// store it would skip. Retest once VK_EXT_custom_resolve ships there.
+	bool custom_resolve = has_resolve && pass->postfx_count == 0 && _skr_vk.has_custom_resolve && !(pass_fdm && subsampled_target);
 	if (pass_tile_shading && (tile_apron[0] > _skr_vk.max_tile_apron || tile_apron[1] > _skr_vk.max_tile_apron)) {
 		skr_log(skr_log_warning, "PostFX tile apron (%u, %u) exceeds device max %u — clamping; edge-of-tile reads past the clamp are undefined",
 			tile_apron[0], tile_apron[1], _skr_vk.max_tile_apron);
@@ -1317,11 +1443,11 @@ void skr_pass_submit(skr_pass_t* pass) {
 		                     | ((postfx_reads_depth || resolve_reads_depth) && postfx_depth_ms ? skr_rp_flag_postfx_depth_ms : 0)
 		                     | (pass_tile_shading                     ? skr_rp_flag_tile_shading       : 0)
 		                     | (has_resolve                           ? skr_rp_flag_resolve_subpass    : 0)
-		                     | (has_resolve && pass->postfx_count == 0 && _skr_vk.has_custom_resolve
-		                                                              ? skr_rp_flag_custom_resolve     : 0),
+		                     | (custom_resolve                        ? skr_rp_flag_custom_resolve     : 0)
+		                     | (pass_fdm                              ? skr_rp_flag_fragment_density_map : 0),
 		.tile_apron          = { (uint8_t)tile_apron[0], (uint8_t)tile_apron[1] },
 		.depth_store_op      = (has_depth && (depth->flags & skr_tex_flags_readable)) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-		.color_load_op       = _skr_color_load_op(pass->clear),
+		.color_load_op       = _skr_color_load_op(pass->target.clear),
 		.view_mask           = view_mask,
 		.correlation_mask    = correlation,
 		.subpass_index       = 0,
@@ -1336,6 +1462,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	};
 
 	// Register geometry subpass
+	_skr_check_subsampled_load(color, rp_key.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD, "skr_pass_submit");
 	int32_t rp_idx_geometry = _skr_pipeline_register_renderpass_unlocked(&rp_key);
 	VkRenderPass render_pass = _skr_pipeline_get_renderpass(rp_idx_geometry);
 	if (render_pass == VK_NULL_HANDLE) {
@@ -1384,7 +1511,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 		: (skr_recti_t){ 0, 0, (int32_t)render_width, (int32_t)render_height };
 
 	for (uint32_t i = 0; i < intermediate_count; i++) {
-		intermediates[i] = _skr_transient_acquire(intermediate_format, (int32_t)render_width, (int32_t)render_height, view_count, false);
+		intermediates[i] = _skr_transient_acquire(intermediate_format, (int32_t)render_width, (int32_t)render_height, view_count, false, fdm_shift);
 		if (!intermediates[i]) {
 			skr_log(skr_log_critical, "skr_pass_submit: failed to acquire postfx intermediate %u", i);
 			goto cleanup;
@@ -1393,7 +1520,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 	// Pooled 1x transient the geometry subpass resolves depth into for postfx
 	if ((postfx_reads_depth || resolve_reads_depth) && samples > VK_SAMPLE_COUNT_1_BIT && !postfx_depth_ms) {
-		depth_resolve_tex = _skr_transient_acquire(rp_key.depth_format, (int32_t)render_width, (int32_t)render_height, view_count, true);
+		depth_resolve_tex = _skr_transient_acquire(rp_key.depth_format, (int32_t)render_width, (int32_t)render_height, view_count, true, fdm_shift);
 		if (!depth_resolve_tex) {
 			skr_log(skr_log_critical, "skr_pass_submit: failed to acquire depth resolve target");
 			goto cleanup;
@@ -1410,7 +1537,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 	if (pass->postfx_count > 0) {
 		skr_tex_t* scene_src = use_msaa ? resolve : color;
 		if (scene_src && (scene_src == final_output || !(scene_src->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) {
-			scene_transient = _skr_transient_acquire(skr_tex_fmt_to_native(scene_src->format), (int32_t)render_width, (int32_t)render_height, view_count, false);
+			scene_transient = _skr_transient_acquire(skr_tex_fmt_to_native(scene_src->format), (int32_t)render_width, (int32_t)render_height, view_count, false, fdm_shift);
 			if (!scene_transient) {
 				skr_log(skr_log_critical, "skr_pass_submit: failed to acquire postfx scene target");
 				goto cleanup;
@@ -1435,6 +1562,8 @@ void skr_pass_submit(skr_pass_t* pass) {
 		bool resolve_is_final = has_resolve && pass->postfx_count == 0;
 		if (!resolve_is_final)
 			fb_attachments[fb_count++] = final_output->view;
+		if (pass_fdm)
+			fb_attachments[fb_count++] = pass_fdm->view;
 
 		// Cache framebuffer on final_output when no pooled transients are
 		// attached (common case) — pooled views vary between frames.
@@ -1497,14 +1626,14 @@ void skr_pass_submit(skr_pass_t* pass) {
 		memset(clear_values, 0, sizeof(clear_values));
 
 		if (has_color) {
-			if (pass->clear & skr_clear_color)
-				clear_values[clear_count] = (VkClearValue){ .color = {.float32 = {pass->clear_color.x, pass->clear_color.y, pass->clear_color.z, pass->clear_color.w}} };
+			if (pass->target.clear & skr_clear_color)
+				clear_values[clear_count] = (VkClearValue){ .color = {.float32 = {pass->target.clear_color.x, pass->target.clear_color.y, pass->target.clear_color.z, pass->target.clear_color.w}} };
 			clear_count++;
 		}
 		if (use_msaa) clear_count++; // resolve
 		if (has_depth) {
-			if (pass->clear & (skr_clear_depth | skr_clear_stencil))
-				clear_values[clear_count] = (VkClearValue){ .depthStencil = {.depth = pass->clear_depth, .stencil = pass->clear_stencil} };
+			if (pass->target.clear & (skr_clear_depth | skr_clear_stencil))
+				clear_values[clear_count] = (VkClearValue){ .depthStencil = {.depth = pass->target.clear_depth, .stencil = pass->target.clear_stencil} };
 			clear_count++;
 		}
 		if (depth_resolve_tex) clear_count++; // depth resolve (DONT_CARE load)
@@ -1664,7 +1793,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 				prev_color = intermediates[p];
 		}
 
-		vkCmdEndRenderPass(ctx.cmd);
+		_skr_cmd_end_renderpass(ctx.cmd, fdm_offsets, fdm_shift ? pass_fdm->layer_count : 0);
 
 		// Render pass finalLayout handles the transition. Just update tracking.
 		_skr_tex_transition_notify_layout(final_output, (final_output->flags & skr_tex_flags_readable)
@@ -1686,8 +1815,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 		_skr_transient_release(scene_transient);
 	}
 
-	_skr_vk.current_color_texture = NULL;
-	_skr_vk.current_depth_texture = NULL;
+	_skr_vk.current_renderpass_idx = -1;
+	_skr_vk.current_color_texture  = NULL;
+	_skr_vk.current_depth_texture  = NULL;
 	_skr_cmd_release(ctx.cmd);
 	_skr_pipeline_unlock();
 	return;

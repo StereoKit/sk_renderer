@@ -884,6 +884,17 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 	return skr_err_success;
 }
 
+static bool _skr_tex_is_subsampled(skr_tex_flags_ flags) {
+	return (flags & skr_tex_flags_subsampled) && _skr_vk.capabilities[skr_capability_fragment_density_map];
+}
+
+// Vulkan forbids transfers on subsampled images, so these refuse them by name
+static bool _skr_tex_refuse_subsampled(const skr_tex_t* tex, const char* fn_name) {
+	if (!_skr_tex_is_subsampled(tex->flags)) return false;
+	skr_log(skr_log_critical, "%s: subsampled textures can't be copied, uploaded to, read back, or mipmapped", fn_name);
+	return true;
+}
+
 skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampler_t sampler, skr_vec3i_t size, int32_t multisample, int32_t mip_count, const skr_tex_data_t* opt_data, skr_tex_t* out_tex) {
 	if (!out_tex) return skr_err_invalid_parameter;
 
@@ -903,6 +914,10 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	if (size.x <= 0 || size.y <= 0 || size.z <= 0) {
 		skr_log(skr_log_warning, "Invalid texture size");
 		return skr_err_invalid_parameter;
+	}
+	if (flags & skr_tex_flags_fragment_density_map) {
+		skr_log(skr_log_warning, "skr_tex_create: density maps come from the XR runtime, wrap them with skr_tex_create_external_vk");
+		return skr_err_unsupported;
 	}
 
 	out_tex->flags            = flags;
@@ -967,9 +982,12 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	if (out_tex->aspect_mask == 0)          { out_tex->aspect_mask   = VK_IMAGE_ASPECT_COLOR_BIT;   }
 
 
-	// For MSAA or in-tile attachments, add transient bit for tile-local optimization
-	// But only if the texture is NOT readable (transient means no memory backing)
-	bool is_transient_candidate = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT || is_in_tile) && (out_tex->flags & skr_tex_flags_writeable) && !(out_tex->flags & skr_tex_flags_readable);
+	// Attachments nobody reads back can live in tile memory alone: MSAA and
+	// in-tile color, and any non-readable depth. Single-sample depth counts
+	// too, since a render pass only ever stores depth that is readable.
+	bool is_transient_candidate = (out_tex->samples > VK_SAMPLE_COUNT_1_BIT || is_in_tile || is_depth)
+		&&  (out_tex->flags & skr_tex_flags_writeable)
+		&& !(out_tex->flags & (skr_tex_flags_readable | skr_tex_flags_compute));
 
 	if (out_tex->flags & skr_tex_flags_writeable) {
 		if (is_depth) {
@@ -1058,6 +1076,22 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		}
 	}
 
+	// Opt-in, since drivers may lay out images with this bit differently
+	bool fdm_offset_capable = (out_tex->flags & skr_tex_flags_foveated) && (out_tex->flags & skr_tex_flags_writeable)
+		&& image_type == VK_IMAGE_TYPE_2D && !(out_tex->flags & skr_tex_flags_cubemap) && _skr_vk.has_fdm_offset;
+
+	// Subsampled images are stored at the density map's resolution. They're
+	// render targets only: no transfers, no mips, and materials refuse them
+	// since sampling needs immutable subsampled samplers.
+	bool subsampled = _skr_tex_is_subsampled(out_tex->flags);
+	if (subsampled) {
+		if (out_tex->mip_levels > 1 || (opt_data && opt_data->data))
+			skr_log(skr_log_warning, "skr_tex_create: subsampled textures can't have mips or uploaded data, ignoring");
+		out_tex->mip_levels = 1;
+		opt_data = NULL;
+		usage &= ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+	}
+
 	// Create image (use normalized out_tex->size where z is always depth)
 	VkImageCreateInfo image_info = {
 		.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -1071,7 +1105,9 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		.usage         = usage,
 		.sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		.flags         = (out_tex->flags & skr_tex_flags_cubemap) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+		.flags         = ((out_tex->flags & skr_tex_flags_cubemap) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0)
+		               | (subsampled         ? VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT : 0)
+		               | (fdm_offset_capable ? VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT : 0),
 	};
 
 	VkResult vr = vkCreateImage(_skr_vk.device, &image_info, NULL, &out_tex->image);
@@ -1280,8 +1316,9 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
 	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
 
-	// Only release from sampler cache if we acquired from it (not YCbCr immutable samplers)
-	if (ref_tex->ycbcr_sampler == VK_NULL_HANDLE) {
+	// Only release from sampler cache if we acquired from it (not YCbCr immutable
+	// samplers, nor density maps, which have none)
+	if (ref_tex->sampler != VK_NULL_HANDLE && ref_tex->ycbcr_sampler == VK_NULL_HANDLE) {
 		_skr_sampler_cache_release(ref_tex->sampler_settings);
 	}
 	_skr_cmd_destroy_image_view (NULL, ref_tex->view);
@@ -1361,6 +1398,8 @@ skr_err_ skr_tex_set_data(skr_tex_t* ref_tex, const skr_tex_data_t* data) {
 	if (!ref_tex || !data || !data->data) return skr_err_invalid_parameter;
 	if (ref_tex->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
 
+	if (_skr_tex_refuse_subsampled(ref_tex, "skr_tex_set_data")) return skr_err_unsupported;
+
 	// The generic upload issues a single COLOR-aspect copy, invalid for multi-plane
 	// YUV; its pixel data must be supplied at creation instead.
 	if (_skr_tex_fmt_is_yuv(ref_tex->format)) {
@@ -1375,6 +1414,7 @@ skr_err_ skr_tex_set_buffer(skr_tex_t* ref_tex, const skr_buffer_t* buffer, uint
 	if (!ref_tex || !buffer) return skr_err_invalid_parameter;
 	if (ref_tex->image == VK_NULL_HANDLE || buffer->buffer == VK_NULL_HANDLE) return skr_err_invalid_parameter;
 	if (mip_count == 0) return skr_err_invalid_parameter;
+	if (_skr_tex_refuse_subsampled(ref_tex, "skr_tex_set_buffer")) return skr_err_unsupported;
 
 	if (base_mip + mip_count > ref_tex->mip_levels) {
 		skr_log(skr_log_warning, "skr_tex_set_buffer: mip range [%u, %u) exceeds texture mip count %u",
@@ -1479,6 +1519,7 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_filter_sh
 		skr_log(skr_log_warning, "Cannot generate mipmaps for invalid texture");
 		return;
 	}
+	if (_skr_tex_refuse_subsampled(ref_tex, "skr_tex_generate_mips")) return;
 
 	// Use the actual mip count the VkImage was created with, not the
 	// theoretical max from dimensions, to avoid accessing non-existent levels.
@@ -2773,13 +2814,6 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 	return skr_err_success;
 }
 
-void skr_tex_set_fragment_density_map(skr_tex_t* ref_tex, skr_tex_t* fdm) {
-	// Without device support the target just renders unfoveated. The cached
-	// framebuffer needs no attention: the density map's view is part of its
-	// fingerprint, and attaching one changes the render pass key.
-	ref_tex->fdm = _skr_vk.capabilities[skr_capability_fragment_density_map] ? fdm : NULL;
-}
-
 skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t update) {
 	if (!ref_tex) return skr_err_invalid_parameter;
 	if (update.image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
@@ -3531,6 +3565,7 @@ skr_err_ skr_tex_copy(const skr_tex_t* src, skr_tex_t* dst,
 	// Validate inputs
 	if (!src || !dst) return skr_err_invalid_parameter;
 	if (src->image == VK_NULL_HANDLE || dst->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+	if (_skr_tex_refuse_subsampled(src, "skr_tex_copy") || _skr_tex_refuse_subsampled(dst, "skr_tex_copy")) return skr_err_unsupported;
 	if (layer_count == 0) layer_count = 1;
 
 	// Check mip/layer bounds
@@ -3632,6 +3667,7 @@ skr_err_ skr_tex_copy(const skr_tex_t* src, skr_tex_t* dst,
 skr_err_ skr_tex_create_copy(const skr_tex_t* src, skr_tex_fmt_ format, skr_tex_flags_ flags, int32_t multisample, skr_tex_t* out_tex) {
 	if (!src || !out_tex)             return skr_err_invalid_parameter;
 	if (src->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+	if (_skr_tex_refuse_subsampled(src, "skr_tex_create_copy")) return skr_err_unsupported;
 
 	// Resolve parameters
 	skr_tex_fmt_ dst_format  = (format      == skr_tex_fmt_none) ? src->format           : format;
@@ -3732,6 +3768,7 @@ typedef struct _skr_tex_readback_internal_t {
 skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t array_layer, skr_tex_readback_t* out_readback) {
 	if (!tex || !out_readback)        return skr_err_invalid_parameter;
 	if (tex->image == VK_NULL_HANDLE) return skr_err_invalid_parameter;
+	if (_skr_tex_refuse_subsampled(tex, "skr_tex_readback")) return skr_err_unsupported;
 
 	// The COLOR-aspect copy below can't read multi-plane YUV (which is also never readable).
 	if (_skr_tex_fmt_is_yuv(tex->format)) {

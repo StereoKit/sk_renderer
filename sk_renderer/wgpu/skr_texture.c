@@ -617,10 +617,6 @@ skr_tex_fmt_   skr_tex_get_format     (const skr_tex_t* tex) { return tex ? tex-
 skr_tex_flags_ skr_tex_get_flags      (const skr_tex_t* tex) { return tex ? tex->flags : skr_tex_flags_none; }
 int32_t        skr_tex_get_multisample(const skr_tex_t* tex) { return tex ? (int32_t)tex->samples : 1; }
 
-void skr_tex_set_fragment_density_map(skr_tex_t* ref_tex, skr_tex_t* fdm) {
-	(void)ref_tex; (void)fdm; // No foveation on WebGPU, see skr_capability_fragment_density_map
-}
-
 void skr_tex_set_sampler(skr_tex_t* ref_tex, skr_tex_sampler_t sampler) {
 	if (ref_tex == NULL) return;
 	ref_tex->sampler_settings = sampler;

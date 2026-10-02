@@ -273,7 +273,7 @@ static void _load_skybox(scene_gi_t* scene, const char* path) {
 	}, &scene->equirect_convert_material);
 	skr_material_set_tex(&scene->equirect_convert_material, "equirect_tex", &scene->equirect_texture);
 
-	skr_renderer_blit(&scene->equirect_convert_material, &scene->cubemap_texture, (skr_recti_t){0, 0, cube_size, cube_size});
+	skr_renderer_blit(&scene->equirect_convert_material, &scene->cubemap_texture, (skr_recti_t){0, 0, cube_size, cube_size}, NULL);
 
 	skr_material_destroy(&scene->equirect_convert_material);
 	skr_tex_destroy(&scene->equirect_texture);
@@ -921,14 +921,16 @@ static void _gi_run_fast_voxelize(
 		}
 
 		skr_pass_t gi_pass = {
-			.color       = &scene->gi_fast_color,
-			.depth       = &scene->gi_fast_depth,
-			.clear       = skr_clear_all,
-			.clear_color = {0, 0, 0, 0},
-			.clear_depth = 1.0f,
-			.viewport    = {0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE},
-			.scissor     = {0, 0, GI_GRID_SIZE, GI_GRID_SIZE},
-			.view_count  = cap_sys.view_count,
+			.target = {
+				.color       = &scene->gi_fast_color,
+				.depth       = &scene->gi_fast_depth,
+				.clear       = skr_clear_all,
+				.clear_color = {0, 0, 0, 0},
+				.clear_depth = 1.0f,
+				.view_count  = cap_sys.view_count,
+			},
+			.viewport = {0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE},
+			.scissor  = {0, 0, GI_GRID_SIZE, GI_GRID_SIZE},
 		};
 		skr_pass_add_draw(&gi_pass, &scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t));
 		skr_pass_submit(&gi_pass);
@@ -1118,13 +1120,15 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 				}
 
 				skr_pass_t cap_pass = {
-					.color       = &scene->gi_capture_color,
-					.depth       = &scene->gi_capture_depth,
-					.clear       = skr_clear_all,
-					.clear_color = {0, 0, 0, 0},
-					.clear_depth = 1.0f,
-					.viewport    = {0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE},
-					.scissor     = {0, 0, GI_GRID_SIZE, GI_GRID_SIZE},
+					.target = {
+						.color       = &scene->gi_capture_color,
+						.depth       = &scene->gi_capture_depth,
+						.clear       = skr_clear_all,
+						.clear_color = {0, 0, 0, 0},
+						.clear_depth = 1.0f,
+					},
+					.viewport = {0, 0, (float)GI_GRID_SIZE, (float)GI_GRID_SIZE},
+					.scissor  = {0, 0, GI_GRID_SIZE, GI_GRID_SIZE},
 				};
 				skr_pass_add_draw(&cap_pass, &scene->gi_capture_list, &cap_sys, sizeof(su_system_buffer_t));
 				skr_pass_submit  (&cap_pass);
@@ -1219,11 +1223,13 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	}
 
 	skr_pass_t shadow_pass = {
-		.depth       = &scene->shadow_map,
-		.clear       = skr_clear_depth,
-		.clear_depth = 1.0f,
-		.viewport    = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
-		.scissor     = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
+		.target = {
+			.depth       = &scene->shadow_map,
+			.clear       = skr_clear_depth,
+			.clear_depth = 1.0f,
+		},
+		.viewport = {0, 0, (float)SHADOW_MAP_RESOLUTION, (float)SHADOW_MAP_RESOLUTION},
+		.scissor  = {0, 0, SHADOW_MAP_RESOLUTION, SHADOW_MAP_RESOLUTION},
 	};
 	skr_pass_add_draw(&shadow_pass, &scene->shadow_list, &shadow_sys, sizeof(su_system_buffer_t));
 	skr_pass_submit  (&shadow_pass);
@@ -1361,7 +1367,7 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	scene_gi_t* scene = (scene_gi_t*)base;
 	float delta_time  = scene->delta_time;
 
-	ImGuiIO* io = igGetIO_Nil();
+	ImGuiIO* io = igGetCurrentContext() ? igGetIO_Nil() : NULL;
 
 #ifdef __ANDROID__
 	// Arc rotation camera (touch)
@@ -1373,7 +1379,7 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	const float min_distance       = 1.0f;
 	const float max_distance       = 40.0f;
 
-	if (!io->WantCaptureMouse) {
+	if (io && !io->WantCaptureMouse) {
 		if (io->MouseDown[0] && io->MouseDownDuration[0] > 0.0f) {
 			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
 			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
@@ -1429,7 +1435,7 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	const float move_speed = 5.0f;
 	const float look_speed = 0.002f;
 
-	if (!io->WantCaptureMouse && io->MouseDown[1]) {
+	if (io && !io->WantCaptureMouse && io->MouseDown[1]) {
 		scene->cam_yaw   -= io->MouseDelta.x * look_speed;
 		scene->cam_pitch -= io->MouseDelta.y * look_speed;
 
@@ -1448,7 +1454,7 @@ static bool _scene_gi_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	float3 up      = {  0.0f,  1.0f,  0.0f  };
 
 	float speed = move_speed * delta_time;
-	if (!io->WantCaptureKeyboard) {
+	if (io && !io->WantCaptureKeyboard) {
 		if (igIsKeyDown_Nil(ImGuiKey_W)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(forward,  speed)); }
 		if (igIsKeyDown_Nil(ImGuiKey_S)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(forward, -speed)); }
 		if (igIsKeyDown_Nil(ImGuiKey_D)) { scene->cam_pos = float3_add(scene->cam_pos, float3_mul_s(right,    speed)); }

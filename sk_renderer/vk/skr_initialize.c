@@ -285,24 +285,31 @@ static void _skr_register_internal_requests(void) {
 		.features               = (skr_vk_feature_t[]){ { &fdm_non_subsampled_features, sizeof(fdm_non_subsampled_features) } },
 		.feature_count          = 1,
 	});
-#endif
 
-	// Multisampled-render-to-single-sampled: rasterize MSAA straight into a
-	// single-sample image and resolve in-tile. The foundation for foveation +
-	// MSAA, since the foveated image must be the color attachment itself.
-	static const VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT msrtss_features = {
-		.sType                             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT,
-		.multisampledRenderToSingleSampled = VK_TRUE,
+	// Shifts the density map per pass, per layer, without rewriting it: how a
+	// runtime's fixed foveation pattern follows the gaze.
+	static const VkPhysicalDeviceFragmentDensityMapOffsetFeaturesEXT fdm_offset_features = {
+		.sType                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_EXT,
+		.fragmentDensityMapOffset = VK_TRUE,
 	};
 	skr_vk_request(&(skr_vk_request_t){
-		.name                   = "msrtss",
-		.device_extensions      = (const char*[]){ VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME,
-		                                           VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
-		                                           VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME },
-		.device_extension_count = 3,
-		.features               = (skr_vk_feature_t[]){ { &msrtss_features, sizeof(msrtss_features) } },
+		.name                   = "fdm_offset",
+		.device_extensions      = (const char*[]){ VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME,
+		                                           VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME },
+		.device_extension_count = 2,
+		.features               = (skr_vk_feature_t[]){ { &fdm_offset_features, sizeof(fdm_offset_features) } },
 		.feature_count          = 1,
 	});
+
+	// Quest's compositor only reads subsampled swapchain images correctly when
+	// the app's device has this enabled, even with no FDM2 feature in use
+	skr_vk_request(&(skr_vk_request_t){
+		.name                   = "fdm2",
+		.device_extensions      = (const char*[]){ VK_EXT_FRAGMENT_DENSITY_MAP_2_EXTENSION_NAME,
+		                                           VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME },
+		.device_extension_count = 2,
+	});
+#endif
 
 	// Multiview is required for stereo/XR rendering. It's core 1.1 but still a
 	// feature flag, so a 1.1 device can report it unsupported.
@@ -1456,7 +1463,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_depth_stencil_resolve   = skr_vk_request_enabled("depth_stencil_resolve");
 	_skr_vk.has_fragment_density_map    = skr_vk_request_enabled("fragment_density_map");
 	_skr_vk.has_fdm_non_subsampled      = skr_vk_request_enabled("fdm_non_subsampled");
-	_skr_vk.has_msrtss                  = skr_vk_request_enabled("msrtss");
+	_skr_vk.has_fdm_offset              = skr_vk_request_enabled("fdm_offset");
 	_skr_vk.has_present_fence           = skr_vk_request_enabled("swapchain_maintenance1");
 	_skr_vk.has_present_timing          = skr_vk_request_enabled("present_timing");
 	_skr_vk.has_present_wait2           = skr_vk_request_enabled("present_wait2");
@@ -1471,9 +1478,12 @@ bool skr_init(skr_settings_t settings) {
 #endif
 	// Calibration is only useful if the device can pair its own clock with the
 	// one skr_time_now_ns reads
+	// Pick the spelling whose extension is actually enabled: the loader hands
+	// out a KHR trampoline even when only the EXT one is, and it jumps to NULL
 	_skr_vk.has_calibrated_timestamps = false;
-	if (skr_vk_request_enabled(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) || skr_vk_request_enabled(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
-		PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_domains = vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+	bool calibrated_khr = skr_vk_request_enabled(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+	if (calibrated_khr || skr_vk_request_enabled(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+		PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_domains = calibrated_khr
 			? vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
 			: vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
 		uint32_t        domain_count = 0;
@@ -1489,7 +1499,7 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.has_calibrated_timestamps = has_device && has_host;
 	}
 	if (_skr_vk.has_calibrated_timestamps)
-		_skr_vk.get_calibrated_timestamps = vkGetCalibratedTimestampsKHR ? vkGetCalibratedTimestampsKHR : vkGetCalibratedTimestampsEXT;
+		_skr_vk.get_calibrated_timestamps = calibrated_khr ? vkGetCalibratedTimestampsKHR : vkGetCalibratedTimestampsEXT;
 	_skr_vk.has_subpass_merge_feedback  = skr_vk_request_enabled("subpass_merge_feedback");
 	_skr_vk.has_subgroup_size_control   = skr_vk_request_enabled("subgroup_size_control");
 	_skr_vk.has_ycbcr_conversion        = skr_vk_request_enabled("ycbcr_conversion");
@@ -1565,8 +1575,25 @@ bool skr_init(skr_settings_t settings) {
 		tile_shading_props.pNext = props2.pNext;
 		props2.pNext             = &tile_shading_props;
 	}
+	VkPhysicalDeviceFragmentDensityMapOffsetPropertiesEXT fdm_offset_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_PROPERTIES_EXT,
+	};
+	if (_skr_vk.has_fdm_offset) {
+		fdm_offset_props.pNext = props2.pNext;
+		props2.pNext           = &fdm_offset_props;
+	}
+	bool has_fdm2 = skr_vk_request_enabled("fdm2");
+	VkPhysicalDeviceFragmentDensityMap2PropertiesEXT fdm2_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_2_PROPERTIES_EXT,
+	};
+	if (has_fdm2) {
+		fdm2_props.pNext = props2.pNext;
+		props2.pNext     = &fdm2_props;
+	}
 	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
 	_skr_vk.max_tile_apron = _skr_vk.has_qcom_tile_shading ? tile_shading_props.maxApronSize : 0;
+	_skr_vk.fdm_offset_granularity = _skr_vk.has_fdm_offset ? fdm_offset_props.fragmentDensityOffsetGranularity : (VkExtent2D){ 1, 1 };
+	_skr_vk.fdm_subsampled_loads   = has_fdm2 && fdm2_props.subsampledLoads;
 	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
 	if (_skr_vk.has_subgroup_size_control) {
 		_skr_vk.min_subgroup_size             = subgroup_props.minSubgroupSize;
@@ -1746,13 +1773,12 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.capabilities[skr_capability_external_dma] = _skr_vk.has_external_memory_dma_buf && _skr_vk.has_drm_format_modifier && has_image_format_list;
 	_skr_vk.capabilities[skr_capability_vk_video    ] = _skr_vk.has_video_decode && _skr_vk.has_ycbcr_conversion;
 	_skr_vk.capabilities[skr_capability_presentation] = has_surface && has_swapchain;
-	// Foveation needs MSRTSS (the foveated image must be the color attachment,
-	// not a resolve target) and non-subsampled images, since FDM passes use
-	// ordinary attachments until subsampled images land.
-	_skr_vk.capabilities[skr_capability_msrtss              ] = _skr_vk.has_msrtss;
-	_skr_vk.capabilities[skr_capability_fragment_density_map] = _skr_vk.has_fragment_density_map && _skr_vk.has_fdm_non_subsampled && _skr_vk.has_msrtss;
+	// The render pass builders attach the density map through renderpass2, and
+	// attachments are ordinary images, so non-subsampled support is required
+	_skr_vk.capabilities[skr_capability_fragment_density_map] = _skr_vk.has_fragment_density_map && _skr_vk.has_fdm_non_subsampled && _skr_vk.has_create_renderpass2;
+	_skr_vk.capabilities[skr_capability_fragment_density_offset] = _skr_vk.capabilities[skr_capability_fragment_density_map] && _skr_vk.has_fdm_offset;
 	if (_skr_vk.has_fragment_density_map && !_skr_vk.capabilities[skr_capability_fragment_density_map])
-		skr_log(skr_log_info, "Fragment density map present but missing MSRTSS or non-subsampled images, foveation disabled");
+		skr_log(skr_log_info, "Fragment density map present but missing non-subsampled images or renderpass2, foveation disabled");
 
 	// Build the shader-support mask: one bit per sksc_feature_bit_ that this
 	// device actually enabled above, so skr_shader_check_support can reject a

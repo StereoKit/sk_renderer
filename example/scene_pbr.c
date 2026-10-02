@@ -160,7 +160,7 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 	}, &scene->equirect_convert_material);
 	skr_material_set_tex(&scene->equirect_convert_material, "equirect_tex", &scene->equirect_texture);
 
-	skr_renderer_blit(&scene->equirect_convert_material, &scene->cubemap_texture, (skr_recti_t){0, 0, cube_size, cube_size});
+	skr_renderer_blit(&scene->equirect_convert_material, &scene->cubemap_texture, (skr_recti_t){0, 0, cube_size, cube_size}, NULL);
 
 	skr_material_destroy(&scene->equirect_convert_material);
 	skr_tex_destroy     (&scene->equirect_texture);
@@ -339,9 +339,10 @@ static bool _scene_pbr_get_camera(scene_t* base, scene_camera_t* out_camera) {
 	const float min_distance       = 1.0f;
 	const float max_distance       = 40.0f;
 
-	ImGuiIO* io = igGetIO_Nil();
+	// No ImGui context in the XR example, so no mouse orbit there
+	ImGuiIO* io = igGetCurrentContext() ? igGetIO_Nil() : NULL;
 
-	if (!io->WantCaptureMouse) {
+	if (io && !io->WantCaptureMouse) {
 		if (io->MouseDown[0]) {
 			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
 			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;

@@ -61,8 +61,6 @@ typedef enum {
 	skr_rp_flag_resolve_reads_depth= 1 << 5, // Tracked apart from the postfx flag so a depth-free resolve
 	                                         // releases depth from tile memory after the geometry subpass
 	skr_rp_flag_fragment_density_map = 1 << 6, // A fragment density map attachment drives foveation (VK_EXT_fragment_density_map)
-	skr_rp_flag_msrtss             = 1 << 7, // Attachments are single-sample but rasterized at `samples` and
-	                                         // resolved in-tile on store (VK_EXT_multisampled_render_to_single_sampled)
 } skr_rp_flag_;
 
 typedef struct {
@@ -291,7 +289,9 @@ typedef struct {
 	bool                     has_depth_stencil_resolve;   // VK_KHR_depth_stencil_resolve (implies create_renderpass2)
 	bool                     has_fragment_density_map;    // VK_EXT_fragment_density_map + fragmentDensityMap feature (foveation)
 	bool                     has_fdm_non_subsampled;      // fragmentDensityMapNonSubsampledImages: FDM passes can use ordinary attachments
-	bool                     has_msrtss;                  // VK_EXT_multisampled_render_to_single_sampled + feature (implies renderpass2 + depth_stencil_resolve)
+	bool                     has_fdm_offset;              // VK_QCOM_fragment_density_map_offset + feature: per-pass density map shifts
+	VkExtent2D               fdm_offset_granularity;      // Offsets are rounded to multiples of this
+	bool                     fdm_subsampled_loads;        // FDM2 subsampledLoads: passes may load subsampled images
 	bool                     has_present_fence;           // VK_EXT_swapchain_maintenance1, fences observe present completion
 	bool                     has_present_timing;          // VK_EXT_present_timing, presentTiming feature
 	bool                     has_present_wait2;           // VK_KHR_present_id2 + VK_KHR_present_wait2
@@ -372,6 +372,8 @@ typedef struct {
 	skr_tex_t*               current_color_texture;    // Track color texture for layout transitions
 	skr_tex_t*               current_depth_texture;    // Track depth texture for layout transitions
 	skr_tex_t*               current_resolve_texture;  // Track resolve target for layout transitions
+	uint32_t                 current_fdm_layers;       // Density map offsets end_pass applies: the map's layer count, 0 for none
+	VkOffset2D               current_fdm_offsets[SKR_FDM_MAX_LAYERS]; // Rounded to the device's granularity
 
 	// Global bindings (merged with material bindings at draw time)
 	skr_buffer_t*            global_buffers[16];
@@ -414,8 +416,7 @@ extern _skr_vk_t _skr_vk;
 // Internal helpers
 ///////////////////////////////////////////////////////////////////////////////
 
-VkFramebuffer         _skr_create_framebuffer               (VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve);
-skr_tex_t*            _skr_framebuffer_fdm                  (skr_tex_t* opt_color, skr_tex_t* opt_resolve);
+VkFramebuffer         _skr_create_framebuffer               (VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, const skr_tex_t* opt_fdm);
 VkDeviceMemory        _skr_allocate_image_memory            (VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory);
 VkSampler             _skr_sampler_create_vk                (VkDevice device, skr_tex_sampler_t settings);
 skr_err_              _skr_tex_create_scratch               (const skr_tex_t* template_src, skr_tex_t* out_tex);

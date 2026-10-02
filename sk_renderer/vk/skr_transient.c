@@ -15,6 +15,7 @@ typedef struct {
 	VkFormat   vk_format;
 	int32_t    width, height, layers;
 	bool       depth;
+	bool       fdm_offset; // Carries the density map offset bit
 	skr_tex_t  tex;
 	uint32_t   last_used_frame;
 	bool       in_use;
@@ -43,7 +44,7 @@ static void _skr_transient_entry_destroy(_skr_transient_entry_t* e) {
 	_skr_free(e);
 }
 
-static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat format, int32_t width, int32_t height, int32_t layers, bool depth) {
+static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat format, int32_t width, int32_t height, int32_t layers, bool depth, bool fdm_offset) {
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT
 		| (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 
@@ -59,6 +60,7 @@ static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat form
 		.usage         = usage,
 		.sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.flags         = fdm_offset ? VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT : 0,
 	}, NULL, &e->tex.image);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "Transient attachment vkCreateImage: 0x%X", (uint32_t)vr);
@@ -101,14 +103,16 @@ static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat form
 	e->tex.layer_count         = (uint32_t)layers;
 	e->tex.aspect_mask         = aspect;
 	e->tex.usage               = usage;
+	e->tex.flags               = skr_tex_flags_writeable | skr_tex_flags_input_attachment | (fdm_offset ? skr_tex_flags_foveated : 0);
 	e->tex.current_layout      = VK_IMAGE_LAYOUT_UNDEFINED;
 	e->tex.is_transient_discard = true;
 
-	e->vk_format = format;
-	e->width     = width;
-	e->height    = height;
-	e->layers    = layers;
-	e->depth     = depth;
+	e->vk_format  = format;
+	e->width      = width;
+	e->height     = height;
+	e->layers     = layers;
+	e->depth      = depth;
+	e->fdm_offset = fdm_offset;
 	return true;
 }
 
@@ -132,7 +136,7 @@ void _skr_transient_pool_shutdown(void) {
 	_pool = (_skr_transient_pool_t){0};
 }
 
-skr_tex_t* _skr_transient_acquire(VkFormat format, int32_t width, int32_t height, int32_t layers, bool depth) {
+skr_tex_t* _skr_transient_acquire(VkFormat format, int32_t width, int32_t height, int32_t layers, bool depth, bool fdm_offset) {
 	mtx_lock(&_pool.mutex);
 
 	// Reuse a matching idle entry. Prior-pass GPU work may still be reading
@@ -141,11 +145,12 @@ skr_tex_t* _skr_transient_acquire(VkFormat format, int32_t width, int32_t height
 	for (uint32_t i = 0; i < _pool.count; i++) {
 		_skr_transient_entry_t* e = _pool.entries[i];
 		if (!e->in_use
-			&& e->vk_format == format
-			&& e->width     == width
-			&& e->height    == height
-			&& e->layers    == layers
-			&& e->depth     == depth) {
+			&& e->vk_format  == format
+			&& e->width      == width
+			&& e->height     == height
+			&& e->layers     == layers
+			&& e->depth      == depth
+			&& e->fdm_offset == fdm_offset) {
 			e->in_use          = true;
 			e->last_used_frame = _skr_vk.frame;
 			mtx_unlock(&_pool.mutex);
@@ -167,7 +172,7 @@ skr_tex_t* _skr_transient_acquire(VkFormat format, int32_t width, int32_t height
 	}
 
 	_skr_transient_entry_t* e = _skr_calloc(1, sizeof(_skr_transient_entry_t));
-	if (!e || !_skr_transient_entry_create(e, format, width, height, layers, depth)) {
+	if (!e || !_skr_transient_entry_create(e, format, width, height, layers, depth, fdm_offset)) {
 		_skr_free(e);
 		mtx_unlock(&_pool.mutex);
 		return NULL;

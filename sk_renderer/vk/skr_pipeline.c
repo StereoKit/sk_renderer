@@ -610,6 +610,30 @@ VkRenderPass _skr_pipeline_get_renderpass(int32_t renderpass_idx) {
 // Internal helpers
 ///////////////////////////////////////////////////////////////////////////////
 
+// The density map is referenced by the create info rather than a subpass. The
+// runtime fills it, and it stays in its own layout throughout.
+static VkAttachmentDescription2 _skr_fdm_attachment_desc(void) {
+	return (VkAttachmentDescription2){
+		.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+		.format         = VK_FORMAT_R8G8_UNORM,
+		.samples        = VK_SAMPLE_COUNT_1_BIT,
+		.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
+		.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		.initialLayout  = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+		.finalLayout    = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+	};
+}
+
+static VkRenderPassFragmentDensityMapCreateInfoEXT _skr_fdm_create_info(uint32_t attachment, const void* opt_next) {
+	return (VkRenderPassFragmentDensityMapCreateInfoEXT){
+		.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
+		.pNext                        = opt_next,
+		.fragmentDensityMapAttachment = { .attachment = attachment, .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT },
+	};
+}
+
 // Down-converts a VkRenderPassCreateInfo2 to a core-1.0 vkCreateRenderPass
 // call for devices without VK_KHR_create_renderpass2. Depth-feature keys
 // never get here — per-reference aspect masks and depth-stencil resolve
@@ -744,6 +768,7 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	VkAttachmentDescription2 attachments[SKR_POSTFX_MAX_ATTACHMENTS];
 	uint32_t                 attachment_count = 0;
 
+	bool fdm           = (key->flags & skr_rp_flag_fragment_density_map) != 0;
 	bool use_msaa      = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
 	bool has_color     = key->color_format != VK_FORMAT_UNDEFINED;
 	bool has_depth     = key->depth_format != VK_FORMAT_UNDEFINED;
@@ -908,6 +933,13 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		}
 	}
 
+	// [last] Density map
+	uint32_t fdm_attachment = VK_ATTACHMENT_UNUSED;
+	if (fdm) {
+		fdm_attachment = attachment_count;
+		attachments[attachment_count++] = _skr_fdm_attachment_desc();
+	}
+
 	// --- Build subpass descriptions ---
 	uint32_t resolve_subpass_count = (key->flags & skr_rp_flag_resolve_subpass) ? 1 : 0;
 	uint32_t subpass_count = 1 + resolve_subpass_count + key->postfx_count;
@@ -1011,8 +1043,10 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 		subpasses[1] = (VkSubpassDescription2){
 			.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+			// No FRAGMENT_REGION_BIT: it needs input samples == rasterization
+			// samples, and a 4x -> 1x read already spans the pixel by region
 			.flags                   = apron_flag | ((key->flags & skr_rp_flag_custom_resolve)
-				? (VK_SUBPASS_DESCRIPTION_FRAGMENT_REGION_BIT_QCOM | VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM)
+				? VK_SUBPASS_DESCRIPTION_SHADER_RESOLVE_BIT_QCOM
 				: 0),
 			.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
 			.viewMask                = key->view_mask,
@@ -1225,6 +1259,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		.pCorrelatedViewMasks    = key->correlation_mask ? &key->correlation_mask : NULL,
 	};
 
+	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = _skr_fdm_create_info(fdm_attachment, render_pass_info.pNext);
+	if (fdm) render_pass_info.pNext = &fdm_info;
+
 	// Mark the whole render pass as a tile shading pass with the requested apron
 	VkRenderPassTileShadingCreateInfoQCOM tile_shading_info = {
 		.sType         = VK_STRUCTURE_TYPE_RENDER_PASS_TILE_SHADING_CREATE_INFO_QCOM,
@@ -1292,29 +1329,23 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 	return render_pass;
 }
 
-// Single-subpass render pass. Built with renderpass2 structs so the subpass can
-// chain VkMultisampledRenderToSingleSampledInfoEXT and the create info can
-// chain the fragment density map attachment. Devices without
+// Single-subpass render pass. Built with renderpass2 structs so the create info
+// can chain the fragment density map attachment. Devices without
 // VK_KHR_create_renderpass2 go through _skr_renderpass_create_compat, which
-// never sees those keys: both features require the extension.
+// never sees density map keys: foveation requires the extension.
 static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpass_key_t* key) {
 	// Multi-subpass path for postfx and/or manual resolve
 	if (key->postfx_count > 0 || (key->flags & skr_rp_flag_resolve_subpass))
 		return _skr_pipeline_create_multisubpass_renderpass(key);
 
-	bool msrtss    = (key->flags & skr_rp_flag_msrtss) != 0;
 	bool fdm       = (key->flags & skr_rp_flag_fragment_density_map) != 0;
-	bool use_msaa  = !msrtss && key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
+	bool use_msaa  = key->samples > VK_SAMPLE_COUNT_1_BIT && key->resolve_format != VK_FORMAT_UNDEFINED;
 	bool has_color = key->color_format != VK_FORMAT_UNDEFINED;
 	bool has_depth = key->depth_format != VK_FORMAT_UNDEFINED;
-	if ((msrtss || fdm) && !_skr_vk.has_create_renderpass2) {
-		skr_log(skr_log_critical, "MSRTSS and fragment density maps require VK_KHR_create_renderpass2");
+	if (fdm && !_skr_vk.has_create_renderpass2) {
+		skr_log(skr_log_critical, "Fragment density maps require VK_KHR_create_renderpass2");
 		return VK_NULL_HANDLE;
 	}
-
-	// MSRTSS attachments are single-sample; the subpass rasterizes at key->samples
-	// and resolves into them on store.
-	VkSampleCountFlagBits attach_samples = msrtss ? VK_SAMPLE_COUNT_1_BIT : key->samples;
 
 	VkAttachmentDescription2 attachments[4];
 	uint32_t                 attachment_count = 0;
@@ -1325,7 +1356,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		attachments[attachment_count] = (VkAttachmentDescription2){
 			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->color_format,
-			.samples        = attach_samples,
+			.samples        = key->samples,
 			.loadOp         = key->color_load_op,
 			.storeOp        = use_msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
 			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -1363,7 +1394,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		attachments[attachment_count] = (VkAttachmentDescription2){
 			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
 			.format         = key->depth_format,
-			.samples        = attach_samples,
+			.samples        = key->samples,
 			.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR,
 			.storeOp        = key->depth_store_op,
 			.stencilLoadOp  = has_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -1378,40 +1409,14 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		depth_ref.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | (has_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
 	}
 
-	// The density map is referenced by VkRenderPassFragmentDensityMapCreateInfoEXT,
-	// not by the subpass. The runtime fills it and it stays in FDM layout.
 	uint32_t fdm_attachment = VK_ATTACHMENT_UNUSED;
 	if (fdm) {
-		attachments[attachment_count] = (VkAttachmentDescription2){
-			.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-			.format         = VK_FORMAT_R8G8_UNORM,
-			.samples        = VK_SAMPLE_COUNT_1_BIT,
-			.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD,
-			.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			.initialLayout  = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
-			.finalLayout    = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
-		};
-		fdm_attachment = attachment_count++;
+		fdm_attachment = attachment_count;
+		attachments[attachment_count++] = _skr_fdm_attachment_desc();
 	}
 
-	// MSRTSS resolves a stored depth attachment in place, so the subpass needs
-	// resolve modes; SAMPLE_ZERO is always supported.
-	VkSubpassDescriptionDepthStencilResolve depth_resolve = {
-		.sType              = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
-		.depthResolveMode   = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-		.stencilResolveMode = has_stencil ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
-	};
-	VkMultisampledRenderToSingleSampledInfoEXT msrtss_info = {
-		.sType                                   = VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT,
-		.pNext                                   = has_depth ? &depth_resolve : NULL,
-		.multisampledRenderToSingleSampledEnable = VK_TRUE,
-		.rasterizationSamples                    = key->samples,
-	};
 	VkSubpassDescription2 subpass = {
 		.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-		.pNext                   = msrtss ? &msrtss_info : NULL,
 		.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
 		.viewMask                = key->view_mask,
 		.colorAttachmentCount    = has_color ? 1 : 0,
@@ -1480,10 +1485,7 @@ static VkRenderPass _skr_pipeline_create_renderpass(const skr_pipeline_renderpas
 		};
 	}
 
-	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = {
-		.sType                        = VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT,
-		.fragmentDensityMapAttachment = { .attachment = fdm_attachment, .layout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT },
-	};
+	VkRenderPassFragmentDensityMapCreateInfoEXT fdm_info = _skr_fdm_create_info(fdm_attachment, NULL);
 	VkRenderPassCreateInfo2 render_pass_info = {
 		.sType                   = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
 		.pNext                   = fdm ? &fdm_info : NULL,
@@ -1842,15 +1844,7 @@ static VkPipeline _skr_pipeline_create(int32_t material_idx, int32_t renderpass_
 // Framebuffer creation
 ///////////////////////////////////////////////////////////////////////////////
 
-// The density map rides on the image that ends up on screen: the resolve target
-// under separate-attachment MSAA, otherwise the color target. NULL = no foveation.
-skr_tex_t* _skr_framebuffer_fdm(skr_tex_t* opt_color, skr_tex_t* opt_resolve) {
-	if (opt_resolve && opt_resolve->fdm) return opt_resolve->fdm;
-	if (opt_color   && opt_color  ->fdm) return opt_color  ->fdm;
-	return NULL;
-}
-
-VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve) {
+VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, const skr_tex_t* opt_fdm) {
 	VkImageView attachments[4];
 	uint32_t    attachment_count = 0;
 	uint32_t    width            = 1;
@@ -1881,9 +1875,8 @@ VkFramebuffer _skr_create_framebuffer(VkDevice device, VkRenderPass render_pass,
 	}
 
 	// Fragment density map comes last, matching the render pass attachment order
-	skr_tex_t* fdm = _skr_framebuffer_fdm(color, opt_resolve);
-	if (fdm)
-		attachments[attachment_count++] = fdm->view;
+	if (opt_fdm)
+		attachments[attachment_count++] = opt_fdm->view;
 
 	VkFramebufferCreateInfo framebuffer_info = {
 		.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,

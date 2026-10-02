@@ -310,6 +310,11 @@ void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_te
 		skr_log(skr_log_warning, "Texture name '%s' not found", name);
 		return;
 	}
+	// Sampling one needs an immutable subsampled sampler, which materials don't build
+	if (texture && (texture->flags & skr_tex_flags_subsampled) && _skr_vk.capabilities[skr_capability_fragment_density_map]) {
+		skr_log(skr_log_critical, "skr_material_set_tex: '%s' is a subsampled texture, which can only be rendered to, not sampled", name);
+		return;
+	}
 
 	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
 	binds[meta->buffer_count + idx].texture = texture;

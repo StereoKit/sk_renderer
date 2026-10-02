@@ -127,7 +127,7 @@ static void _load_skybox(scene_gltf_t* scene, const char* path) {
 	skr_material_set_tex(&scene->equirect_convert_material, "equirect_tex", &scene->equirect_texture);
 
 	// Convert equirectangular to cubemap (wait for completion since we destroy the temp resources immediately)
-	skr_renderer_blit(&scene->equirect_convert_material, &scene->cubemap_texture, (skr_recti_t){0, 0, cube_size, cube_size});
+	skr_renderer_blit(&scene->equirect_convert_material, &scene->cubemap_texture, (skr_recti_t){0, 0, cube_size, cube_size}, NULL);
 
 	skr_material_destroy(&scene->equirect_convert_material);
 	skr_tex_destroy(&scene->equirect_texture);

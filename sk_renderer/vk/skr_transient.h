@@ -18,5 +18,5 @@ void       _skr_transient_pool_init    (void);
 void       _skr_transient_pool_shutdown(void);
 void       _skr_transient_pool_tick    (void);  // Called once per frame from frame_end
 
-skr_tex_t* _skr_transient_acquire      (VkFormat format, int32_t width, int32_t height, int32_t layers, bool depth);  // NULL on error
+skr_tex_t* _skr_transient_acquire      (VkFormat format, int32_t width, int32_t height, int32_t layers, bool depth, bool fdm_offset);  // NULL on error. fdm_offset: for a pass that shifts its density map
 void       _skr_transient_release      (skr_tex_t* transient);  // Pass recorded — entry may be reused by later passes

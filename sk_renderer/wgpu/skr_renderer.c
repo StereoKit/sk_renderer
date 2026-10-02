@@ -352,16 +352,21 @@ bool skr_renderer_get_frame_timing(skr_frame_timing_t* out_timing) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask, int32_t multisample) {
-	(void)multisample; // WebGPU has no multisampled-render-to-single-sampled
-	(void)correlation_mask; // meaningful only for real multiview
+void skr_renderer_begin_pass(const skr_pass_target_t* target) {
+	skr_tex_t* color         = target->color;
+	skr_tex_t* depth         = target->depth;
+	skr_tex_t* opt_resolve   = target->resolve;
+	skr_clear_ clear         = target->clear;
+	skr_vec4_t clear_color   = target->clear_color;
+	float      clear_depth   = target->clear_depth;
+	uint32_t   clear_stencil = target->clear_stencil;
+	uint32_t   view_mask     = target->view_count > 1 ? (1u << target->view_count) - 1 : 1;
 	if (_pass.active) { skr_log(skr_log_warning, "skr_renderer_begin_pass while a pass is active"); return; }
 	if (color == NULL && depth == NULL) return;
 
 	// Uploads recorded so far must land before the pass' submissions
 	_skr_cmd_submit();
 
-	if (view_mask == 0) view_mask = 1;
 	memset(&_pass, 0, sizeof(_pass));
 
 	skr_tex_t* size_src = color ? color : depth;
@@ -848,7 +853,8 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 // Fullscreen-triangle blit: the material's vertex stage generates the
 // triangle from vertex indices, so there's no mesh. Layered targets get one
 // pass per layer with the layer's index as sk_view_index.
-void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px) {
+void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px, const skr_foveation_t* opt_foveation) {
+	(void)opt_foveation; // No foveation on WebGPU, see skr_capability_fragment_density_map
 	if (material == NULL || to == NULL || to->texture == NULL) return;
 	if (!skr_material_is_valid(material) || material->pipeline_material_idx < 0) return;
 	if (_pass.active) { skr_log(skr_log_warning, "skr_renderer_blit inside an active pass"); return; }
@@ -1059,9 +1065,7 @@ static bool _skr_lowered_stage(skr_tex_t* target, skr_material_t* material, skr_
 void skr_pass_submit(skr_pass_t* pass) {
 	if (pass == NULL) return;
 
-	uint32_t view_mask   = pass->view_count > 1 ? (1u << pass->view_count) - 1 : 1;
-	uint32_t correlation = pass->views_correlated ? view_mask : 0;
-	int32_t  layers      = pass->view_count > 0 ? pass->view_count : 1;
+	int32_t  layers      = pass->target.view_count > 0 ? pass->target.view_count : 1;
 
 	bool            has_resolve_mat = pass->resolve_material && skr_material_is_valid(pass->resolve_material);
 	skr_material_t* postfx[SKR_PASS_MAX_POSTFX];
@@ -1071,7 +1075,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 	// --- Single-stage path ---
 	if (postfx_count == 0 && !has_resolve_mat) {
-		skr_renderer_begin_pass(pass->color, pass->depth, pass->resolve, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil, view_mask, correlation, pass->multisample);
+		skr_renderer_begin_pass(&pass->target);
 		if (pass->viewport.w > 0 || pass->viewport.h > 0) skr_renderer_set_viewport(pass->viewport);
 		if (pass->scissor.w  > 0 || pass->scissor.h  > 0) skr_renderer_set_scissor(pass->scissor);
 		for (uint32_t i = 0; i < pass->draw_count; i++)
@@ -1082,9 +1086,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 
 	// --- Multi-stage path: geometry -> [resolve] -> postfx... as sequential
 	// render passes, the previous stage bound as a plain texture ---
-	skr_tex_t* color   = pass->color;
-	skr_tex_t* depth   = pass->depth;
-	skr_tex_t* resolve = pass->resolve;
+	skr_tex_t* color   = pass->target.color;
+	skr_tex_t* depth   = pass->target.depth;
+	skr_tex_t* resolve = pass->target.resolve;
 	bool       use_msaa = resolve && color && color->samples > 1;
 
 	skr_tex_t* final_output = pass->postfx_output;
@@ -1124,7 +1128,9 @@ void skr_pass_submit(skr_pass_t* pass) {
 		if (!geometry_out) return;
 		cur = geometry_out;
 	}
-	skr_renderer_begin_pass(color, depth, geometry_out, pass->clear, pass->clear_color, pass->clear_depth, pass->clear_stencil, view_mask, correlation, 0);
+	skr_pass_target_t geometry = pass->target;
+	geometry.resolve = geometry_out;
+	skr_renderer_begin_pass(&geometry);
 	if (pass->viewport.w > 0 || pass->viewport.h > 0) skr_renderer_set_viewport(pass->viewport);
 	if (pass->scissor.w  > 0 || pass->scissor.h  > 0) skr_renderer_set_scissor(pass->scissor);
 	for (uint32_t i = 0; i < pass->draw_count; i++)

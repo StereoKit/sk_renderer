@@ -770,7 +770,8 @@ static bool _scene_gaussian_splat_get_camera(scene_t* base, scene_camera_t* out_
 	const float max_distance       = 100.0f;
 	const float move_speed         = 5.0f;
 
-	ImGuiIO* io = igGetIO_Nil();
+	// No ImGui context in the XR example, so no keyboard or mouse flight there
+	ImGuiIO* io = igGetCurrentContext() ? igGetIO_Nil() : NULL;
 
 	float cos_pitch = cosf(scene->cam_pitch);
 	float sin_pitch = sinf(scene->cam_pitch);
@@ -781,7 +782,7 @@ static bool _scene_gaussian_splat_get_camera(scene_t* base, scene_camera_t* out_
 	float3 right   = {  cos_yaw, 0.0f, -sin_yaw };
 	float3 up      = { -sin_yaw * sin_pitch, cos_pitch, -cos_yaw * sin_pitch };
 
-	if (!io->WantCaptureKeyboard) {
+	if (io && !io->WantCaptureKeyboard) {
 		float move_delta = move_speed * delta_time;
 
 		if (igIsKeyDown_Nil(ImGuiKey_LeftShift) || igIsKeyDown_Nil(ImGuiKey_RightShift)) {
@@ -818,7 +819,7 @@ static bool _scene_gaussian_splat_get_camera(scene_t* base, scene_camera_t* out_
 		}
 	}
 
-	if (!io->WantCaptureMouse) {
+	if (io && !io->WantCaptureMouse) {
 		if (io->MouseDown[0]) {
 			scene->cam_yaw_vel   -= io->MouseDelta.x * rotate_sensitivity;
 			scene->cam_pitch_vel += io->MouseDelta.y * rotate_sensitivity;
