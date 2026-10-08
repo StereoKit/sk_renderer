@@ -172,6 +172,17 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 
 	shader.setStrings         (shader_strings, 1);
 
+	// glslang keeps the pointer, so this lives as long as the shader
+	std::string preamble;
+	for (int32_t i = 0; i < settings->define_ct; i++) {
+		const char *def = settings->defines[i];
+		const char *eq  = strchr(def, '=');
+		preamble += "#define ";
+		preamble += eq ? std::string(def, eq - def) + " " + (eq + 1) : std::string(def) + " 1";
+		preamble += "\n";
+	}
+	shader.setPreamble(preamble.c_str());
+
 	// Setup includer
 	SkscIncluder includer = {};
 	includer.source_file  = filename;

@@ -21,6 +21,9 @@
 // Weight packing uses the BISE trit group helpers. 16 weights = 3 full
 // 5-trit groups + 1 partial-1 group (18×3 + 4 = 58 bits for B=2; 13×3 + 3
 // = 42 bits for B=1).
+//
+// SK_TEXENC_FAST seeds endpoints from the bounding box instead of FPS; at
+// 4x4 the LS refine recovers nearly all of the difference.
 
 Texture2D<float4>         source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
@@ -59,6 +62,12 @@ static const float UNQ_R6_V[6] = {
 ///////////////////////////////////////////////////////////////////////////////
 
 uint4 encode_mode_4x4_rgb(in float3 pixels[16]) {
+#ifdef SK_TEXENC_FAST
+	float3 lo = pixels[0], hi = pixels[0];
+	[unroll] for (uint bi = 1; bi < 16; bi++) { lo = min(lo, pixels[bi]); hi = max(hi, pixels[bi]); }
+	uint3 e0 = uint3(lo * 255.0 + 0.5);
+	uint3 e1 = uint3(hi * 255.0 + 0.5);
+#else
 	// FPS seed: 2 passes of "find pixel most distant from current anchor,
 	// anchor = that pixel" — converges to the block's diametric pixel pair,
 	// two real colors defining the principal axis. Bbox corners are fictional
@@ -81,6 +90,7 @@ uint4 encode_mode_4x4_rgb(in float3 pixels[16]) {
 	}
 	uint3 e0 = fps_b;
 	uint3 e1 = fps_a;
+#endif
 	if (e0.r + e0.g + e0.b > e1.r + e1.g + e1.b) {
 		uint3 tmp = e0; e0 = e1; e1 = tmp;
 	}
@@ -170,6 +180,14 @@ uint4 encode_mode_4x4_rgb(in float3 pixels[16]) {
 ///////////////////////////////////////////////////////////////////////////////
 
 uint4 encode_mode_4x4_rgba(in float4 pixels[16]) {
+#ifdef SK_TEXENC_FAST
+	float4 lo = pixels[0], hi = pixels[0];
+	[unroll] for (uint bi = 1; bi < 16; bi++) { lo = min(lo, pixels[bi]); hi = max(hi, pixels[bi]); }
+	uint3 e0 = uint3(lo.rgb * 255.0 + 0.5);
+	uint3 e1 = uint3(hi.rgb * 255.0 + 0.5);
+	uint  a0 = uint(lo.a * 255.0 + 0.5);
+	uint  a1 = uint(hi.a * 255.0 + 0.5);
+#else
 	// 4D FPS seed — same diametric-pair search as Mode A, in RGBA space so
 	// alpha extremes participate in the seeding too.
 	uint4 fps_a = uint4(pixels[0] * 255.0 + 0.5);
@@ -191,6 +209,7 @@ uint4 encode_mode_4x4_rgba(in float4 pixels[16]) {
 	uint3 e1 = fps_a.rgb;
 	uint  a0 = fps_b.a;
 	uint  a1 = fps_a.a;
+#endif
 	if (e0.r + e0.g + e0.b > e1.r + e1.g + e1.b) {
 		uint3 tmp = e0; e0 = e1; e1 = tmp;
 		uint  at  = a0; a0 = a1; a1 = at;

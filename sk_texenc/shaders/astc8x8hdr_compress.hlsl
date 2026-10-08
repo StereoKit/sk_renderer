@@ -25,6 +25,8 @@
 //
 // Source must be a float-format texture (RGBA16/RGBA32 float). Alpha unused.
 //
+// SK_TEXENC_FAST keeps only Mode A, which skips both SSE passes.
+//
 // NOTE: HDR ASTC is *not* decodable by mesa's software path; AMD desktop
 // will display magenta. Hardware ASTC (Adreno, Mali, Apple, NV with HDR
 // extension) decodes correctly. astcenc -dh decodes for offline validation.
@@ -168,6 +170,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			weights_A[gi] = uint(p >= TA[0]) + uint(p >= TA[1]) + uint(p >= TA[2]);
 		}
 
+#ifndef SK_TEXENC_FAST
 		[unroll] for (uint sy = 0; sy < 8; sy++) {
 			[unroll] for (uint sx = 0; sx < 8; sx++) {
 				uint  jx  = A_BL_JX[sx]; uint jx1 = min(jx + 1u, 5u);
@@ -184,8 +187,10 @@ void cs(uint3 id : SV_DispatchThreadID) {
 				sse_A += err * err;
 			}
 		}
+#endif
 	}
 
+#ifndef SK_TEXENC_FAST
 	///////////////////////////////////////////////////////////////////////
 	// Mode B: 4x4 + trit+2bit (12 levels)
 	///////////////////////////////////////////////////////////////////////
@@ -225,11 +230,19 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			}
 		}
 	}
+#endif
 
 	///////////////////////////////////////////////////////////////////////
 	// Pick winner + pack the chosen block.
 	///////////////////////////////////////////////////////////////////////
 	uint4 block = uint4(0, 0, 0, 0);
+#ifdef SK_TEXENC_FAST
+	astc_write_header_8x8_hdr_rgb_6x5(block);
+	astc_write_endpoints_v6          (block, v0, v1, v2, v3, v4, v5);
+	[unroll] for (uint wi = 0; wi < 30; wi++) {
+		astc_write_weight_2bit(block, wi, weights_A[wi]);
+	}
+#else
 	if (sse_A <= sse_B) {
 		astc_write_header_8x8_hdr_rgb_6x5(block);
 		astc_write_endpoints_v6          (block, v0, v1, v2, v3, v4, v5);
@@ -242,5 +255,6 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		// 16 weights = 3 full 5-trit groups + 1 partial-1 group.
 		astc_write_weights16_trit_2bit(block, weights_B);
 	}
+#endif
 	output_blocks[buffer_offset + by * blocks_x + bx] = block;
 }

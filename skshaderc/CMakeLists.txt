@@ -516,6 +516,8 @@ function(SKSHADERC_COMPILE_HEADERS ADD_TARGET OUTPUT_FOLDER COMMAND_STRING)
 		set(SKSHADERC_COMPILE_COMMANDS "-h $<$<CONFIG:Debug>:-d> -o ${OUTPUT_FOLDER} ${COMMAND_STRING}")
 	endif()
 	message(STATUS "sk_renderer compiling shader headers with args 'skshaderc ${SKSHADERC_COMPILE_COMMANDS} [shaders]'")
+
+	set(ARGS_STRING "${SKSHADERC_COMPILE_COMMANDS}")
 	separate_arguments(SKSHADERC_COMPILE_COMMANDS)
 
 	skshaderc_include_deps(INCLUDE_DEPS ${SKSC_INCLUDES})
@@ -523,6 +525,15 @@ function(SKSHADERC_COMPILE_HEADERS ADD_TARGET OUTPUT_FOLDER COMMAND_STRING)
 	set(SHADER_LIST)
 	foreach(SHADER IN LISTS SKSC_UNPARSED_ARGUMENTS)
 		get_filename_component(SHADER_NAME ${SHADER} NAME)
+
+		# skshaderc's up-to-date check only sees file times, so an output built
+		# with different args (a -D, -svsl) is cleared to force a rebuild
+		string(MAKE_C_IDENTIFIER "${OUTPUT_FOLDER}/${SHADER_NAME}" ARGS_KEY)
+		if(NOT "$CACHE{_SKSC_ARGS_${ARGS_KEY}}" STREQUAL "${ARGS_STRING}")
+			file(REMOVE ${OUTPUT_FOLDER}/${SHADER_NAME}.h)
+			set(_SKSC_ARGS_${ARGS_KEY} "${ARGS_STRING}" CACHE INTERNAL "")
+		endif()
+
 		add_custom_command(
 			OUTPUT ${OUTPUT_FOLDER}/${SHADER_NAME}.h
 			COMMAND ${WINE} ${SKSHADERC_EXE_PATH} ${SKSHADERC_COMPILE_COMMANDS} ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}

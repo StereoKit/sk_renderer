@@ -91,6 +91,17 @@ bool sksc_svsl_compile(const char *filename, const char *hlsl_text, const sksc_s
 	options.entry_compute = settings->cs_entrypoint[0] ? settings->cs_entrypoint : "";
 	options.opt_level     = opt_level;
 
+	// Split "NAME=VALUE" in tracked copies, freed with the include buffers
+	svsl_define_t *defines = (svsl_define_t*)_track(&inc_ctx, calloc(settings->define_ct, sizeof(svsl_define_t)));
+	for (int32_t i = 0; i < settings->define_ct; i++) {
+		char *name = (char*)_track(&inc_ctx, _dup_str(settings->defines[i]));
+		char *eq   = strchr(name, '=');
+		if (eq) *eq = '\0';
+		defines[i] = { name, eq ? eq + 1 : NULL };
+	}
+	options.defines      = defines;
+	options.define_count = settings->define_ct;
+
 	// One language per container: the target is fixed before preprocessing so
 	// TARGET_SPIRV/TARGET_WGSL can vary the source, and a container carries a
 	// single reflection table.

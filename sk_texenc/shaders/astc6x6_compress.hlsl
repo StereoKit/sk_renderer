@@ -41,6 +41,10 @@
 //            blocks where alpha doesn't correlate with color brightness —
 //            sprite cutouts, font edges, alpha masks. CCS=3 selects alpha
 //            as the secondary plane.
+//
+// SK_TEXENC_FAST keeps only Mode B for opaque blocks and Mode E for the rest,
+// where a flat secondary plane covers uniform alpha. With one mode per path
+// there's no SSE selection either.
 
 Texture2D<float4>         source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
@@ -68,6 +72,8 @@ float astc_unq_r8(uint w) { return float(w * 9u + (w >> 2)) / 64.0; }
 // upgrade from 3-bit to trit+2bit: +50% axial precision, same 4x4 grid +
 // range-256 endpoints); trit-encoded unquant is non-monotonic in v, paired
 // as (v, v^1) mirror across 0.5 — same shape as our LDR 4x4 Mode A table.
+
+#ifndef SK_TEXENC_FAST
 
 ///////////////////////////////////////////////////////////////////////////////
 // Mode C: 3x3 weight grid, 3-bit weights, 8-bit RGBA endpoints
@@ -533,6 +539,8 @@ void encode_mode_4x4_rgb_only(
 	out_sse = sse;
 }
 
+#endif // SK_TEXENC_FAST
+
 ///////////////////////////////////////////////////////////////////////////////
 // Mode B: CEM 8 (RGB-only), 6x6 per-pixel grid, 2-bit weights, range-80
 //         Sharp opaque blocks. Same alpha-against-1.0 SSE penalty.
@@ -887,6 +895,16 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	float faxis_len_sq = (faxis.r * faxis.r * PW_R_INV + faxis.g * faxis.g * PW_G_INV + faxis.b * faxis.b) / 255.0;
 	float fc0_proj     = dot(float3(imin_rgb) / 255.0, faxis);
 
+#ifdef SK_TEXENC_FAST
+	float pproj[36];
+	[unroll] for (uint i = 0; i < 36; i++) pproj[i] = dot(pixels[i].rgb, faxis);
+	uint4 best;
+	float sse;
+	if (a0 == 255u && a1 == 255u)
+		encode_mode_6x6pp_rgb_only(pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, best, sse);
+	else
+		encode_mode_dual_3x3_rgba(pixels, faxis, faxis_len_sq, fc0_proj, pproj, imin_rgb, imax_rgb, a0, a1, best, sse);
+#else
 	// Per-block early-out: pick the mode set that can possibly win based on
 	// the alpha content. Skipping unwinnable modes is safe because their
 	// SSE would be strictly higher than at least one mode we still run.
@@ -925,6 +943,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 			if (s < best_sse) { best = b; best_sse = s; }
 		}
 	}
+#endif
 
 	output_blocks[buffer_offset + by * blocks_x + bx] = best;
 }

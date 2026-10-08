@@ -28,7 +28,10 @@ option(SK_TEXENC_ASTC "Embed the ASTC encoders (4x4, 6x6, 8x8 HDR)"            $
 # For test applications: raw block encodes for readback and profiling, and
 # every encoder embedded so formats the GPU can't sample still validate.
 option(SK_TEXENC_DEBUG "Build sk_texenc's debug API and embed every encoder"   OFF)
-message(STATUS "sk_texenc: BC ${SK_TEXENC_BC}, ASTC ${SK_TEXENC_ASTC}, debug ${SK_TEXENC_DEBUG}")
+# Trims the ASTC encoders to their best value modes: 6x6 pipelines create ~5x
+# faster and every blob shrinks, for ~0.5 dB PSNR (~2.5 on soft translucency).
+option(SK_TEXENC_FAST "Leaner ASTC encoders: faster pipeline creation, smaller embed, slightly lower quality" ON)
+message(STATUS "sk_texenc: BC ${SK_TEXENC_BC}, ASTC ${SK_TEXENC_ASTC}, debug ${SK_TEXENC_DEBUG}, fast ${SK_TEXENC_FAST}")
 
 set(_skr_texenc_bc_on   ${SK_TEXENC_BC})
 set(_skr_texenc_astc_on ${SK_TEXENC_ASTC})
@@ -84,7 +87,11 @@ endif()
 if(_skr_texenc_shaders)
 	# Unoptimized encoders take Adreno's compiler minutes per pipeline, so even
 	# Debug builds optimize them. -z zips them; the host supplies the inflate.
-	skshaderc_compile_headers(sk_texenc ${CMAKE_BINARY_DIR}/sk_renderer_generated/texenc_shaders "${_skr_builtin_shader_args} -z"
+	set(_skr_texenc_shader_args "${_skr_builtin_shader_args} -z")
+	if(SK_TEXENC_FAST)
+		string(APPEND _skr_texenc_shader_args " -D SK_TEXENC_FAST")
+	endif()
+	skshaderc_compile_headers(sk_texenc ${CMAKE_BINARY_DIR}/sk_renderer_generated/texenc_shaders "${_skr_texenc_shader_args}"
 		${_skr_texenc_shaders}
 		OPTIMIZED
 		INCLUDES

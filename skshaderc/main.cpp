@@ -113,7 +113,8 @@ int main(int argc, const char **argv) {
 #if defined(_WIN32)
 	for (int32_t i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 ||
-			strcmp(argv[i], "-i") == 0) { // Skip trying to compile paths
+			strcmp(argv[i], "-i") == 0 ||
+			strcmp(argv[i], "-D") == 0) { // Skip trying to compile paths
 			i++;
 			continue;
 		}
@@ -133,7 +134,8 @@ int main(int argc, const char **argv) {
 #else
 	for (int32_t i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 ||
-			strcmp(argv[i], "-i") == 0) { // Skip trying to compile paths
+			strcmp(argv[i], "-i") == 0 ||
+			strcmp(argv[i], "-D") == 0) { // Skip trying to compile paths
 			i++;
 			continue;
 		}
@@ -159,6 +161,9 @@ int main(int argc, const char **argv) {
 	for (int32_t i = 0; i < settings.shaderc.include_folder_ct; i++)
 		free(settings.shaderc.include_folders[i]);
 	free(settings.shaderc.include_folders);
+	for (int32_t i = 0; i < settings.shaderc.define_ct; i++)
+		free(settings.shaderc.defines[i]);
+	free(settings.shaderc.defines);
 	free(settings.out_folder);
 
 	return failed_count > 0 ? 1 : 0;
@@ -229,7 +234,14 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			result.shaderc.include_folder_ct += 1;
 			result.shaderc.include_folders    = (char**)realloc(result.shaderc.include_folders, result.shaderc.include_folder_ct * sizeof(char *));
 			result.shaderc.include_folders[result.shaderc.include_folder_ct-1] = (char*)malloc(len);
-			strncpy(result.shaderc.include_folders[result.shaderc.include_folder_ct-1], argv[i+1], len); 
+			strncpy(result.shaderc.include_folders[result.shaderc.include_folder_ct-1], argv[i+1], len);
+			i++; }
+		else if (strcmp(argv[i], "-D" ) == 0 && i<argc-1) {
+			size_t len = strlen(argv[i + 1]) + 1;
+			result.shaderc.define_ct += 1;
+			result.shaderc.defines    = (char**)realloc(result.shaderc.defines, result.shaderc.define_ct * sizeof(char *));
+			result.shaderc.defines[result.shaderc.define_ct-1] = (char*)malloc(len);
+			memcpy(result.shaderc.defines[result.shaderc.define_ct-1], argv[i+1], len);
 			i++; }
 		else if (strcmp(argv[i], "-o" ) == 0) { 
 			size_t len = strlen(argv[i + 1]) + 1;
@@ -320,6 +332,9 @@ Options:
 	-i folder	Adds a folder to the include path when searching for #include
 			files. An #include is looked for next to the file that requested
 			it, then in each -i folder in the order given.
+	-D name[=value]	Defines a preprocessor macro for every shader compiled. Without
+			a value it's defined as 1. Changing defines doesn't mark an
+			output stale, so pair a change with -f.
 	-o path	Sets the output folder for compiled shaders. Default will
 			leave them in the same folder as the original file. Can also be a
 			specific filename.
