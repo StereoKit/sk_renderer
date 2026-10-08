@@ -5,149 +5,207 @@
 
 #include "_sk_renderer.h"
 
+#include <assert.h>
 #include <stdlib.h>
 
 ///////////////////////////////////////////////////////////////////////////////
-// Destroy list implementation
-//
-// This system allows queuing Vulkan resources for deferred deletion.
-// Resources are destroyed in reverse order (LIFO) when execute is called.
-//
-// To add support for a new Vulkan resource type, add one line to the
-// FOREACH_DESTROY_TYPE macro below.
-///////////////////////////////////////////////////////////////////////////////
+// Lists
 
-#define FOREACH_DESTROY_TYPE(X) \
-	X(buffer,               VkBuffer,                vkDestroyBuffer,                device)   \
-	X(image,                VkImage,                 vkDestroyImage,                 device)   \
-	X(image_view,           VkImageView,             vkDestroyImageView,             device)   \
-	X(sampler,              VkSampler,               vkDestroySampler,               device)   \
-	X(framebuffer,          VkFramebuffer,           vkDestroyFramebuffer,           device)   \
-	X(render_pass,          VkRenderPass,            vkDestroyRenderPass,            device)   \
-	X(pipeline,             VkPipeline,              vkDestroyPipeline,              device)   \
-	X(pipeline_layout,      VkPipelineLayout,        vkDestroyPipelineLayout,        device)   \
-	X(pipeline_cache,       VkPipelineCache,         vkDestroyPipelineCache,         device)   \
-	X(descriptor_set_layout,VkDescriptorSetLayout,   vkDestroyDescriptorSetLayout,   device)   \
-	X(descriptor_pool,      VkDescriptorPool,        vkDestroyDescriptorPool,        device)   \
-	X(shader_module,        VkShaderModule,          vkDestroyShaderModule,          device)   \
-	X(command_pool,         VkCommandPool,           vkDestroyCommandPool,           device)   \
-	X(fence,                VkFence,                 vkDestroyFence,                 device)   \
-	X(semaphore,            VkSemaphore,             vkDestroySemaphore,             device)   \
-	X(query_pool,           VkQueryPool,             vkDestroyQueryPool,             device)   \
-	X(swapchain,            VkSwapchainKHR,          vkDestroySwapchainKHR,          device)   \
-	X(surface,              VkSurfaceKHR,            vkDestroySurfaceKHR,            instance) \
-	X(debug_messenger,      VkDebugUtilsMessengerEXT,vkDestroyDebugUtilsMessengerEXT,instance) \
-	X(memory,               VkDeviceMemory,          vkFreeMemory,                   device)   \
-	X(ycbcr_conversion,     VkSamplerYcbcrConversion,vkDestroySamplerYcbcrConversion,device)
-
-typedef enum {
-	#define MAKE_ENUM(name, type, func, owner) skr_destroy_type_##name,
-	FOREACH_DESTROY_TYPE(MAKE_ENUM)
-	#undef MAKE_ENUM
-	// Non-Vulkan types (custom handling)
-	skr_destroy_type_bind_pool_slots,  // handle = (start << 32) | count
-} skr_destroy_type_;
-
-typedef struct {
-	skr_destroy_type_ type;
-	uint64_t          handle;
-} skr_destroy_item_t;
-
-///////////////////////////////////////////////////////////////////////////////
-
-skr_destroy_list_t _skr_destroy_list_create(void) {
-	skr_destroy_list_t list = { .items = NULL, .count = 0, .capacity = 0 };
-	mtx_init(&list.mutex, mtx_plain);
-	return list;
-}
-
-void _skr_destroy_list_free(skr_destroy_list_t* ref_list) {
-	if (!ref_list) return;
-	mtx_destroy(&ref_list->mutex);
-	_skr_free(ref_list->items);
-	ref_list->items    = NULL;
-	ref_list->count    = 0;
-	ref_list->capacity = 0;
-}
-
-static void _skr_destroy_list_ensure_capacity(skr_destroy_list_t* ref_list, uint32_t required) {
+static void _skr_destroy_list_reserve(skr_destroy_list_t* ref_list, uint32_t required) {
 	if (ref_list->capacity >= required) return;
 
 	uint32_t new_capacity = ref_list->capacity == 0 ? 8 : ref_list->capacity * 2;
-	while (new_capacity < required) {
+	while (new_capacity < required)
 		new_capacity *= 2;
-	}
 
 	skr_destroy_item_t* new_items = _skr_realloc(ref_list->items, new_capacity * sizeof(skr_destroy_item_t));
 	if (!new_items) {
 		skr_log(skr_log_critical, "Failed to resize destroy list");
 		return;
 	}
-
 	ref_list->items    = new_items;
 	ref_list->capacity = new_capacity;
 }
 
-static void _skr_destroy_list_add(skr_destroy_list_t* ref_list, uint64_t handle, skr_destroy_type_ type){
-	mtx_lock(&ref_list->mutex);
-
-	_skr_destroy_list_ensure_capacity(ref_list, ref_list->count + 1);
-
-	skr_destroy_item_t* items = (skr_destroy_item_t*)ref_list->items;
-	items[ref_list->count++] = (skr_destroy_item_t){
-		.type   = type,
-		.handle = handle,
-	};
-
-	mtx_unlock(&ref_list->mutex);
+static void _skr_destroy_list_add(skr_destroy_list_t* ref_list, skr_destroy_item_t item) {
+	_skr_destroy_list_reserve(ref_list, ref_list->count + 1);
+	ref_list->items[ref_list->count++] = item;
 }
 
-static void _skr_destroy_list_destroy(uint64_t handle, skr_destroy_type_ type) {
-	switch (type) {
-		#define MAKE_CASE(name, vk_type, destroy_func, owner) case skr_destroy_type_##name: destroy_func(_skr_vk.owner, (vk_type)handle, NULL); break;
+static void _skr_destroy_item(skr_destroy_item_t item, _skr_desc_cache_t* opt_ref_cache) {
+	switch (item.type) {
+		#define MAKE_CASE(name, vk_type, destroy_func) case skr_destroy_type_##name: destroy_func(_skr_vk.device, (vk_type)item.handle, NULL); break;
 		FOREACH_DESTROY_TYPE(MAKE_CASE)
 		#undef MAKE_CASE
-
-		// Custom (non-Vulkan) destroy types
-		case skr_destroy_type_bind_pool_slots: {
-			int32_t  start = (int32_t)(handle >> 32);
-			uint32_t count = (uint32_t)(handle & 0xFFFFFFFF);
-			_skr_bind_pool_free(start, count);
-		} break;
+		case skr_destroy_type_bind_pool_slots: _skr_bind_pool_free((int32_t)item.handle, item.aux); break;
+		case skr_destroy_type_desc_set:        _skr_desc_cache_free(opt_ref_cache, (VkDescriptorSet)item.handle, (uint8_t)item.aux); break;
 	}
 }
 
-#define MAKE_ADD_FUNCTION(name, vk_type, func, owner) \
-void _skr_cmd_destroy_##name(skr_destroy_list_t* opt_ref_list, vk_type handle) { \
-	if (handle == VK_NULL_HANDLE) return; \
-	if (opt_ref_list == NULL) { _skr_vk_thread_t* thr = _skr_cmd_get_thread(); if (thr) { _skr_cmd_ring_slot_t* active = thr->active_cmd; opt_ref_list = active ? &active->destroy_list : NULL; } } \
-	if (opt_ref_list == NULL) { _skr_cmd_ring_slot_t* active = _skr_vk.thread_pools[0].active_cmd; opt_ref_list = active ? &active->destroy_list : NULL; } \
-	if (opt_ref_list == NULL) { _skr_cmd_ring_slot_t* active = _skr_vk.thread_pools[0].last_submitted; opt_ref_list = active ? &active->destroy_list : NULL; } \
-	if (opt_ref_list == NULL) { _skr_destroy_list_destroy(              (uint64_t)handle, skr_destroy_type_##name); } \
-	else                      { _skr_destroy_list_add    (opt_ref_list, (uint64_t)handle, skr_destroy_type_##name); } \
-}
-FOREACH_DESTROY_TYPE(MAKE_ADD_FUNCTION)
-#undef MAKE_ADD_FUNCTION
-
-// Custom destroy functions (not generated by macro)
-void _skr_cmd_destroy_bind_pool_slots(skr_destroy_list_t* opt_ref_list, int32_t start, uint32_t count) {
-	if (start < 0 || count == 0) return;
-	if (opt_ref_list == NULL) { _skr_vk_thread_t* thr = _skr_cmd_get_thread(); if (thr) { _skr_cmd_ring_slot_t* active = thr->active_cmd; opt_ref_list = active ? &active->destroy_list : NULL; } }
-	if (opt_ref_list == NULL) { _skr_cmd_ring_slot_t* active = _skr_vk.thread_pools[0].active_cmd;         opt_ref_list = active ? &active->destroy_list : NULL; }
-	if (opt_ref_list == NULL) { _skr_cmd_ring_slot_t* active = _skr_vk.thread_pools[0].last_submitted;     opt_ref_list = active ? &active->destroy_list : NULL; }
-	uint64_t packed = ((uint64_t)(uint32_t)start << 32) | (uint64_t)count;
-	if (opt_ref_list == NULL) { _skr_destroy_list_destroy(              packed, skr_destroy_type_bind_pool_slots); }
-	else                      { _skr_destroy_list_add    (opt_ref_list, packed, skr_destroy_type_bind_pool_slots); }
-}
-
-void _skr_destroy_list_execute(skr_destroy_list_t* ref_list) {
-	mtx_lock(&ref_list->mutex);
-
-	// Execute in reverse order (LIFO - last in, first out)
-	skr_destroy_item_t* items = (skr_destroy_item_t*)ref_list->items;
+// The cache is the list owner's; pending blocks hold no sets and pass NULL
+void _skr_destroy_list_execute(skr_destroy_list_t* ref_list, _skr_desc_cache_t* opt_ref_cache) {
 	for (int32_t i = ref_list->count - 1; i >= 0; i--)
-		_skr_destroy_list_destroy(items[i].handle, items[i].type);
-
+		_skr_destroy_item(ref_list->items[i], opt_ref_cache);
 	ref_list->count = 0;
-	mtx_unlock(&ref_list->mutex);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Pending stack: pushed from any thread, taken whole under the queue mutex.
+// Nothing pops one node, so there is no ABA to guard.
+
+// Links a newest-to-oldest chain under the current head in one step
+static void _skr_destroy_push_chain(_skr_destroy_block_t* newest, _skr_destroy_block_t* oldest) {
+	for (;;) {
+		_skr_destroy_block_t* head = _skr_load_ptr(&_skr_vk.pending);
+		oldest->next = head;
+		if (_skr_cas_ptr(&_skr_vk.pending, head, newest)) return;
+	}
+}
+
+static _skr_destroy_block_t* _skr_destroy_block_create(skr_destroy_list_t* ref_items, skr_future_t covered_by) {
+	_skr_destroy_block_t* block = _skr_calloc(1, sizeof(_skr_destroy_block_t));
+	block->list       = *ref_items;
+	block->covered_by = covered_by;
+	*ref_items = (skr_destroy_list_t){0};
+	return block;
+}
+
+// Off the queue mutex, so a scene teardown's vkDestroy calls don't stall
+// every other thread's submit
+void _skr_destroy_execute_blocks(_skr_destroy_block_t* opt_blocks) {
+	while (opt_blocks) {
+		_skr_destroy_block_t* next = opt_blocks->next;
+		_skr_destroy_list_execute(&opt_blocks->list, NULL);
+		_skr_free(opt_blocks->list.items);
+		_skr_free(opt_blocks);
+		opt_blocks = next;
+	}
+}
+
+// Reads another thread's slot the way skr_future_check does. The owner resets
+// or destroys that fence only under the queue mutex, which the caller holds.
+static bool _skr_destroy_block_done(const _skr_destroy_block_t* block) {
+	const _skr_cmd_ring_slot_t* slot = block->covered_by.slot;
+	if (slot == NULL) return false;
+	if (slot->generation != block->covered_by.generation) return true;
+	return vkGetFenceStatus(_skr_vk.device, slot->fence) == VK_SUCCESS;
+}
+
+// Every submit calls this under the queue mutex, right after its vkQueueSubmit,
+// so `cover` orders after everything already queued and the stamp is exact.
+// Returns the done blocks, newest first, for the caller to run off the mutex.
+_skr_destroy_block_t* _skr_destroy_retire(skr_destroy_list_t* ref_shared_open, skr_future_t cover, bool may_stamp) {
+	_skr_destroy_block_t* head = _skr_exchange_ptr(&_skr_vk.pending, NULL);
+	if (ref_shared_open->count > 0) {
+		_skr_destroy_block_t* block = _skr_destroy_block_create(ref_shared_open, (skr_future_t){0});
+		block->next = head;
+		head = block;
+	}
+	_skr_destroy_block_t* oldest = head;
+	for (_skr_destroy_block_t* b = head; b; b = b->next) {
+		if (may_stamp && b->covered_by.slot == NULL) b->covered_by = cover;
+		oldest = b;
+	}
+	// The done blocks are a prefix, newest first: a split destroy pushes
+	// memory as an older block than its image, so nothing may free ahead of
+	// a newer block
+	_skr_destroy_block_t* done      = head;
+	_skr_destroy_block_t* done_last = NULL;
+	while (head && _skr_destroy_block_done(head)) {
+		done_last = head;
+		head      = head->next;
+	}
+	if (done_last) done_last->next = NULL;
+	else           done            = NULL;
+	if (head) _skr_destroy_push_chain(head, oldest);
+	return done;
+}
+
+// Before a thread destroys its fences, under the queue mutex: no block may
+// poll a dead fence, so its stamps come off and a later submit re-stamps them
+void _skr_destroy_disown(const _skr_cmd_ring_slot_t* slots) {
+	_skr_destroy_block_t* head = _skr_exchange_ptr(&_skr_vk.pending, NULL);
+	if (head == NULL) return;
+	_skr_destroy_block_t* oldest = head;
+	for (_skr_destroy_block_t* b = head; b; b = b->next) {
+		uintptr_t offset = (uintptr_t)b->covered_by.slot - (uintptr_t)slots;
+		if (offset < skr_MAX_COMMAND_RING * sizeof(_skr_cmd_ring_slot_t)) b->covered_by = (skr_future_t){0};
+		oldest = b;
+	}
+	_skr_destroy_push_chain(head, oldest);
+}
+
+// Shutdown only, with the device idle. Returns how many items it found.
+uint32_t _skr_destroy_drain(void) {
+	_skr_destroy_block_t* blocks = _skr_exchange_ptr(&_skr_vk.pending, NULL);
+	uint32_t count = 0;
+	for (_skr_destroy_block_t* b = blocks; b; b = b->next)
+		count += b->list.count;
+	_skr_destroy_execute_blocks(blocks);
+	return count;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Entry points
+
+// A compound destroy from a thread with no list to batch in (idle, or never
+// registered) gathers here and leaves as one block. Separate blocks could be
+// split by a retire taking the stack between the pushes, and the push-back
+// would then put the older one on top.
+static thread_local skr_destroy_list_t _skr_destroy_batch;
+static thread_local int32_t            _skr_destroy_batch_depth;
+
+void _skr_destroy_batch_begin(void) {
+	_skr_destroy_batch_depth++;
+}
+
+void _skr_destroy_batch_end(void) {
+	if (--_skr_destroy_batch_depth > 0 || _skr_destroy_batch.count == 0) return;
+	_skr_destroy_block_t* block = _skr_destroy_block_create(&_skr_destroy_batch, (skr_future_t){0});
+	_skr_destroy_push_chain(block, block);
+}
+
+static void _skr_destroy_shared_item(skr_destroy_item_t item) {
+	_skr_vk_thread_t* thr = _skr_cmd_get_thread();
+	if (thr && (thr->ref_count > 0 || thr->thread_idx == _skr_load_u32(&_skr_vk.main_pool_idx))) {
+		_skr_destroy_list_add(&thr->shared_open, item);
+		return;
+	}
+	if (_skr_destroy_batch_depth > 0) {
+		_skr_destroy_list_add(&_skr_destroy_batch, item);
+		return;
+	}
+	// Nothing on this thread will submit, so the item waits as its own block
+	skr_destroy_list_t one = {0};
+	_skr_destroy_list_add(&one, item);
+	_skr_destroy_block_t* block = _skr_destroy_block_create(&one, (skr_future_t){0});
+	_skr_destroy_push_chain(block, block);
+}
+
+static void _skr_destroy_private_item(skr_destroy_item_t item) {
+	_skr_vk_thread_t* thr = _skr_cmd_get_thread();
+	assert(thr && thr->ref_count > 0 && "Private destroys need a recording command buffer");
+	_skr_destroy_list_add(&thr->cmd_ring[thr->cur].destroy_list, item);
+}
+
+#define MAKE_SHARED_FUNCTION(name, vk_type, func) \
+void _skr_destroy_shared_##name(vk_type handle) { \
+	if (handle == VK_NULL_HANDLE) return; \
+	_skr_destroy_shared_item((skr_destroy_item_t){ .type = skr_destroy_type_##name, .handle = (uint64_t)handle }); \
+}
+FOREACH_DESTROY_TYPE(MAKE_SHARED_FUNCTION)
+#undef MAKE_SHARED_FUNCTION
+
+void _skr_destroy_shared_bind_pool_slots(int32_t start, uint32_t count) {
+	if (start < 0 || count == 0) return;
+	_skr_destroy_shared_item((skr_destroy_item_t){ .type = skr_destroy_type_bind_pool_slots, .handle = (uint64_t)start, .aux = count });
+}
+
+void _skr_destroy_private_buffer     (VkBuffer       handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_buffer,      .handle = (uint64_t)handle }); }
+void _skr_destroy_private_memory     (VkDeviceMemory handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_memory,      .handle = (uint64_t)handle }); }
+void _skr_destroy_private_image_view (VkImageView    handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_image_view,  .handle = (uint64_t)handle }); }
+void _skr_destroy_private_framebuffer(VkFramebuffer  handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_framebuffer, .handle = (uint64_t)handle }); }
+
+void _skr_destroy_private_desc_set(VkDescriptorSet set, uint8_t pool) {
+	_skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_desc_set, .handle = (uint64_t)set, .aux = pool });
 }

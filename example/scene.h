@@ -31,6 +31,7 @@ typedef struct {
 	void        (*render)     (scene_t* scene, int32_t width, int32_t height, skr_render_list_t* ref_render_list, su_system_buffer_t* ref_system_buffer);
 	bool        (*get_camera) (scene_t* scene, scene_camera_t* out_camera);  // Optional - return true to override camera
 	void        (*render_ui)  (scene_t* scene);  // Optional - scene-specific ImGui controls
+	void        (*idle)       (scene_t* scene);  // Optional - between frames, when this thread has no command buffer open
 } scene_vtable_t;
 
 // Base scene structure for the "inheritance" pattern
@@ -71,4 +72,5 @@ extern const scene_vtable_t scene_video_vtable;
 #define scene_update(vtable, scene, delta_time)             ((vtable)->update(scene, delta_time))
 #define scene_render(vtable, scene, w, h, render_list, buf) ((vtable)->render(scene, w, h, render_list, buf))
 #define scene_render_ui(vtable, scene)                      ((vtable)->render_ui ? (vtable)->render_ui(scene) : (void)0)
+#define scene_idle(vtable, scene)                           ((vtable)->idle      ? (vtable)->idle(scene)      : (void)0)
 #define scene_get_name(vtable)                              ((vtable)->name)

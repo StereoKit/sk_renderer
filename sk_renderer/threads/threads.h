@@ -4,6 +4,7 @@
 
 // Use pthread fallback for MinGW and platforms without C11 threads
 #include <pthread.h>
+#include <sched.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -119,6 +120,10 @@ static inline int mtx_trylock(mtx_t* mtx) {
 static inline int mtx_unlock(mtx_t* mtx) {
 	int result = pthread_mutex_unlock(mtx);
 	return (result == 0) ? thrd_success : thrd_error;
+}
+
+static inline void thrd_yield(void) {
+	sched_yield();
 }
 
 // Sleep function (C11 thrd_sleep compatibility)

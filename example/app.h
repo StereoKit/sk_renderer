@@ -52,6 +52,7 @@ void              app_add_timing       (app_t* app, const skr_frame_timing_t* op
 
 // Per-frame functions
 void app_update        (app_t* app, float delta_time);
+void app_idle          (app_t* app);  // Between frames, outside skr_renderer_frame_begin/end
 void app_render        (app_t* app, skr_tex_t* render_target, int32_t width, int32_t height);
 
 // ImGui UI building (builds the UI, does NOT render)

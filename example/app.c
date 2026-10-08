@@ -648,6 +648,11 @@ void app_update(app_t* app, float delta_time) {
 	scene_update(app->scene_types[app->scene_index], app->scene_current, delta_time);
 }
 
+void app_idle(app_t* app) {
+	if (!app || !app->scene_current) return;
+	scene_idle(app->scene_types[app->scene_index], app->scene_current);
+}
+
 void app_set_frame_time(app_t* app, float frame_time_ms) {
 	if (app) app->frame_time_ms = frame_time_ms;
 }

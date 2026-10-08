@@ -131,7 +131,7 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 
 	// Destroy old cached framebuffer if render pass or attachments changed
 	if (*cached_fb != VK_NULL_HANDLE) {
-		_skr_cmd_destroy_framebuffer(NULL, *cached_fb);
+		_skr_destroy_shared_framebuffer(*cached_fb);
 	}
 
 	// Create and cache new framebuffer
@@ -237,6 +237,8 @@ static void _skr_flush_pending_compute_barrier(VkCommandBuffer cmd) {
 
 void skr_renderer_frame_begin(void) {
 	_skr_vk.in_frame = true;
+	// The frame thread holds the long-lived open buffer, so it retires shared destroys
+	_skr_store_u32(&_skr_vk.main_pool_idx, _skr_cmd_get_thread()->thread_idx);
 
 	// Start a command buffer batch for this frame
 	// NOTE: This may block waiting for an old frame's fence if all ring slots are in use
@@ -768,8 +770,8 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 
 		vkCmdEndRenderPass(ctx.cmd);
 
-		_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
-		_skr_cmd_destroy_image_view (ctx.destroy_list, temp_view);
+		_skr_destroy_private_framebuffer(framebuffer);
+		_skr_destroy_private_image_view (temp_view);
 	} else {
 		// Regular 2D: use cached framebuffer
 		framebuffer = _skr_get_or_create_framebuffer(_skr_vk.device, to, render_pass, to, NULL, NULL, false);
@@ -1432,7 +1434,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 			framebuffer = final_output->framebuffer_depth;
 		} else {
 			if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE) {
-				_skr_cmd_destroy_framebuffer(NULL, final_output->framebuffer_depth);
+				_skr_destroy_shared_framebuffer(final_output->framebuffer_depth);
 				final_output->framebuffer_depth = VK_NULL_HANDLE;
 			}
 			VkResult vr = vkCreateFramebuffer(_skr_vk.device, &(VkFramebufferCreateInfo){
@@ -1664,7 +1666,7 @@ void skr_pass_submit(skr_pass_t* pass) {
 		// Defer-destroy the uncached framebuffer; intermediates return to the
 		// transient pool for reuse by later passes.
 		if (!cache_fb)
-			_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
+			_skr_destroy_private_framebuffer(framebuffer);
 		for (uint32_t i = 0; i < intermediate_count; i++)
 			_skr_transient_release(intermediates[i]);
 		_skr_transient_release(depth_resolve_tex);

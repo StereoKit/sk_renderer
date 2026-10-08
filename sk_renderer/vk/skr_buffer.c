@@ -189,10 +189,8 @@ skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t s
 			};
 			vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, NULL, 1, &buffer_barrier, 0, NULL);
 
-			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
-			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
-			_skr_cmd_destroy_memory(ctx.destroy_list, staging_memory);
-			_skr_cmd_destroy_buffer(ctx.destroy_list, staging_buffer);
+			_skr_destroy_private_memory(staging_memory);
+			_skr_destroy_private_buffer(staging_buffer);
 			_skr_cmd_release       (ctx.cmd);
 		}
 	}
@@ -432,11 +430,12 @@ void skr_buffer_readback_destroy(skr_buffer_readback_t* ref_readback) {
 	_skr_buffer_readback_internal_t* internal = (_skr_buffer_readback_internal_t*)ref_readback->_internal;
 
 	// No wait: the copy may sit in a command buffer this thread has yet to
-	// submit, and blocking on that here deadlocks. Deferred destruction
-	// releases the staging once the GPU is done with it (LIFO: memory first).
+	// submit, and blocking on that here deadlocks
 	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
-	_skr_cmd_destroy_memory(NULL, internal->staging_memory);
-	_skr_cmd_destroy_buffer(NULL, internal->staging_buffer);
+	_skr_destroy_batch_begin();
+	_skr_destroy_shared_memory(internal->staging_memory);
+	_skr_destroy_shared_buffer(internal->staging_buffer);
+	_skr_destroy_batch_end();
 	_skr_free(internal);
 
 	*ref_readback = (skr_buffer_readback_t){0};
@@ -447,30 +446,44 @@ void skr_buffer_set_name(skr_buffer_t* ref_buffer, const char* name) {
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_BUFFER, (uint64_t)ref_buffer->buffer, name);
 }
 
-void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
-	if (!ref_buffer || ref_buffer->buffer == VK_NULL_HANDLE) return;
+// Private when only this thread's command buffers have read it (the bump ring)
+typedef enum {
+	_skr_buffer_free_shared,   // any thread may have bound it
+	_skr_buffer_free_private,  // only this thread's command buffers read it (the bump ring)
+	_skr_buffer_free_now,      // every fence that could read it has been waited
+} _skr_buffer_free_;
 
-	// Destroy list is LIFO — push memory before buffer so vkFreeMemory runs
-	// after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
+static void _skr_buffer_free_pair(_skr_buffer_free_ how, VkDeviceMemory memory, VkBuffer buffer) {
+	switch (how) {
+		case _skr_buffer_free_shared:  _skr_destroy_shared_memory (memory); _skr_destroy_shared_buffer (buffer); break;
+		case _skr_buffer_free_private: _skr_destroy_private_memory(memory); _skr_destroy_private_buffer(buffer); break;
+		case _skr_buffer_free_now:     vkDestroyBuffer(_skr_vk.device, buffer, NULL); vkFreeMemory(_skr_vk.device, memory, NULL); break;
+	}
+}
+
+static void _skr_buffer_release(skr_buffer_t* ref_buffer, _skr_buffer_free_ how) {
+	if (ref_buffer->buffer == VK_NULL_HANDLE) return;
+
+	_skr_destroy_batch_begin();
 	if (ref_buffer->_ring_count > 0) {
-		// Ring buffer mode: destroy all allocated ring slots
 		for (uint8_t i = 0; i < ref_buffer->_ring_count; i++) {
-			if (ref_buffer->_ring[i].mapped) {
+			if (ref_buffer->_ring[i].mapped)
 				vkUnmapMemory(_skr_vk.device, ref_buffer->_ring[i].memory);
-			}
-			_skr_cmd_destroy_memory(NULL, ref_buffer->_ring[i].memory);
-			_skr_cmd_destroy_buffer(NULL, ref_buffer->_ring[i].buffer);
+			_skr_buffer_free_pair(how, ref_buffer->_ring[i].memory, ref_buffer->_ring[i].buffer);
 		}
 	} else {
-		// Single buffer mode: destroy top-level fields
-		if (ref_buffer->mapped) {
+		if (ref_buffer->mapped)
 			vkUnmapMemory(_skr_vk.device, ref_buffer->memory);
-		}
-		_skr_cmd_destroy_memory(NULL, ref_buffer->memory);
-		_skr_cmd_destroy_buffer(NULL, ref_buffer->buffer);
+		_skr_buffer_free_pair(how, ref_buffer->memory, ref_buffer->buffer);
 	}
+	_skr_destroy_batch_end();
 
 	*ref_buffer = (skr_buffer_t){0};
+}
+
+void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
+	if (!ref_buffer) return;
+	_skr_buffer_release(ref_buffer, _skr_buffer_free_shared);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -487,8 +500,9 @@ void _skr_bump_ring_init(_skr_bump_ring_t* out_ring, skr_buffer_type_ type, uint
 	};
 }
 
+// Only called once every fence that could read the ring has been waited
 void _skr_bump_ring_destroy(_skr_bump_ring_t* ref_ring) {
-	skr_buffer_destroy(&ref_ring->buffer);
+	_skr_buffer_release(&ref_ring->buffer, _skr_buffer_free_now);
 	*ref_ring = (_skr_bump_ring_t){0};
 }
 
@@ -525,8 +539,8 @@ static void _skr_bump_ring_poll(_skr_bump_ring_t* ref_ring) {
 }
 
 // In-flight slots and descriptors written earlier still read the old buffer;
-// skr_buffer_destroy defers it behind this slot's fence, which orders after
-// every earlier submission.
+// the private destroy retires it with the recording slot's fence, which
+// orders after every earlier submission.
 static bool _skr_bump_ring_grow(_skr_bump_ring_t* ref_ring, uint32_t min_capacity) {
 	uint32_t capacity = ref_ring->capacity == 0 ? _SKR_BUMP_RING_MIN : ref_ring->capacity;
 	while (capacity < min_capacity && capacity != 0) capacity *= 2;
@@ -541,7 +555,7 @@ static bool _skr_bump_ring_grow(_skr_bump_ring_t* ref_ring, uint32_t min_capacit
 		skr_log(skr_log_critical, "Bump ring couldn't grow to %u bytes: %d", capacity, err);
 		return false;
 	}
-	skr_buffer_destroy(&ref_ring->buffer);
+	_skr_buffer_release(&ref_ring->buffer, _skr_buffer_free_private);
 	ref_ring->buffer   = grown;
 	ref_ring->capacity = capacity;
 	ref_ring->head     = 0;

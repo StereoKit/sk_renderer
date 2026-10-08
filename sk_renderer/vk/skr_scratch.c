@@ -149,8 +149,6 @@ void _skr_scratch_pool_tick(void) {
 	for (uint32_t i = 0; i < _pool.count; ) {
 		_skr_scratch_entry_t* e = &_pool.entries[i];
 		if (!e->in_use && (frame - e->last_used_frame) > SKR_SCRATCH_IDLE_FRAMES) {
-			// skr_tex_destroy uses the deferred destroy chain (NULL list), so
-			// the VkImage/view/memory are held until fences clear.
 			skr_tex_destroy(&e->tex);
 
 			// Swap-remove

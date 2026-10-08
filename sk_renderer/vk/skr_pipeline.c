@@ -388,14 +388,14 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(material_idx, r, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
 			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
-				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+				_skr_destroy_shared_pipeline(_skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
 
 	// Destroy material resources
-	_skr_cmd_destroy_pipeline_layout      (NULL, _skr_pipeline_cache.materials[material_idx].layout);
-	_skr_cmd_destroy_descriptor_set_layout(NULL, _skr_pipeline_cache.materials[material_idx].descriptor_layout);
+	_skr_destroy_shared_pipeline_layout      (_skr_pipeline_cache.materials[material_idx].layout);
+	_skr_destroy_shared_descriptor_set_layout(_skr_pipeline_cache.materials[material_idx].descriptor_layout);
 	_skr_pipeline_cache.materials[material_idx].layout            = VK_NULL_HANDLE;
 	_skr_pipeline_cache.materials[material_idx].descriptor_layout = VK_NULL_HANDLE;
 
@@ -416,7 +416,7 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(m, renderpass_idx, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
 			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
-				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+				_skr_destroy_shared_pipeline(_skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -428,7 +428,7 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 		obj->ref_count--;
 		if (obj->ref_count <= 0) {
 			if (obj->render_pass != VK_NULL_HANDLE)
-				_skr_cmd_destroy_render_pass(NULL, obj->render_pass);
+				_skr_destroy_shared_render_pass(obj->render_pass);
 			obj->render_pass = VK_NULL_HANDLE;
 		}
 	}
@@ -541,7 +541,7 @@ void _skr_pipeline_unregister_vertformat(int32_t vertformat_idx) {
 		for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 			int32_t idx = _skr_pipeline_index_3d(m, r, vertformat_idx, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
 			if (_skr_pipeline_is_real(_skr_pipeline_cache.pipelines[idx]))
-				_skr_cmd_destroy_pipeline(NULL, _skr_pipeline_cache.pipelines[idx]);
+				_skr_destroy_shared_pipeline(_skr_pipeline_cache.pipelines[idx]);
 			_skr_pipeline_cache.pipelines[idx] = VK_NULL_HANDLE;
 		}
 	}
@@ -1165,9 +1165,8 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 		};
 	}
 
-	// Geometry → each depth-reading subpass: depth writes (and the on-tile
-	// depth resolve, which Vulkan places in late fragment tests / color
-	// output) must land before depth is read as an input attachment.
+	// Geometry → each depth-reading subpass. The reader also runs depth's
+	// store op (late fragment tests), so that write waits for the transition too
 	if (reads_depth || resolve_reads) {
 		for (uint32_t sp = 1; sp < subpass_count; sp++) {
 			bool is_resolve_sp = (key->flags & skr_rp_flag_resolve_subpass) && sp == 1;
@@ -1177,9 +1176,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 				.srcSubpass      = 0,
 				.dstSubpass      = sp,
 				.srcStageMask    = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				.dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				.dstStageMask    = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				.srcAccessMask   = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				.dstAccessMask   = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+				.dstAccessMask   = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 				.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
 			};
 		}
@@ -1187,8 +1186,9 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 
 	// Subpass → EXTERNAL: ensure writes complete before downstream shader reads
 	// when finalLayout transitions to a readable layout (free on tilers).
-	if (final_output_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-	    (resolve_is_final && key->final_resolve_layout && key->final_resolve_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) {
+	bool color_readable = final_output_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+	    (resolve_is_final && key->final_resolve_layout && key->final_resolve_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	if (color_readable) {
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 			.srcSubpass    = subpass_count - 1,
@@ -1199,16 +1199,23 @@ static VkRenderPass _skr_pipeline_create_multisubpass_renderpass(const skr_pipel
 			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		};
 	}
-	if (has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+	// Also whenever the color one exists: an explicit dependency out of the
+	// last subpass drops the implicit one that ordered depth's store before its final transition
+	bool depth_readable = has_depth && depth_final != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	if (depth_readable || (has_depth && color_readable)) {
 		dependencies[dep_count++] = (VkSubpassDependency2){
 			.sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
 			// A subpass that never touched depth can't source its write
 			.srcSubpass    = reads_depth ? subpass_count - 1 : (resolve_reads ? 1 : 0),
 			.dstSubpass    = VK_SUBPASS_EXTERNAL,
 			.srcStageMask  = (reads_depth || resolve_reads) ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-			.dstStageMask  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			.dstStageMask  = depth_readable
+				? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+				: VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 			.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			.dstAccessMask = depth_readable
+				? VK_ACCESS_SHADER_READ_BIT
+				: VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 		};
 	}
 

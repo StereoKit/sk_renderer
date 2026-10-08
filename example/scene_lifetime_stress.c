@@ -87,6 +87,32 @@ typedef struct {
 	int32_t        sort_stress_draw_count;
 	bool           sort_stress_enabled;
 
+	// Test 10: Worker-side destroy while the open frame references the texture
+	skr_tex_t      worker_texs[2];
+	skr_tex_t      worker_copy_dst;
+	skr_material_t worker_material;
+	int32_t        worker_cur;          // slot the material binds, main only
+	int32_t        worker_retire;       // slot the worker should destroy, -1 if none (thread_mutex)
+	bool           worker_next_ready;   // texs[worker_cur ^ 1] exists (thread_mutex)
+	bool           worker_retire_done;  // (thread_mutex)
+	uint32_t       worker_destroy_count;
+
+	// Tests 11-15: the other destroy timings, see render and idle
+	skr_shader_t   fill_shader;
+	skr_buffer_t   fill_buffer;
+	skr_tex_t      unreg_tex;             // drawn one frame, destroyed by an unregistered thread after it
+	bool           unreg_tex_live;
+	uint32_t       idle_destroy_count;    // Test 11
+	uint32_t       exit_destroy_count;    // Test 12
+	uint32_t       disown_count;          // Test 13
+	uint32_t       unreg_destroy_count;   // Test 14
+	uint32_t       compute_destroy_count; // Test 15
+
+	// Tests 16-17: futures crossing threads
+	skr_future_t   worker_future;         // the worker's latest submit (thread_mutex)
+	uint32_t       exited_readback_count; // Test 16
+	uint32_t       cross_wait_count;      // Test 17
+
 	// Test 9: Buffer readback churn (snapshots against live destroys)
 	skr_buffer_t          readback_buffers[READBACK_SLOTS];
 	skr_buffer_readback_t readbacks       [READBACK_SLOTS];
@@ -153,6 +179,41 @@ static void* _thread_create_resources(void* arg) {
 			pthread_mutex_unlock(&scene->thread_mutex);
 		}
 
+		// Test 10: retire the old texture here, on the worker, while main's
+		// open frame still references it. Then build the next replacement
+		// into the slot that just freed up.
+		pthread_mutex_lock(&scene->thread_mutex);
+		int32_t retire = scene->worker_retire;
+		pthread_mutex_unlock(&scene->thread_mutex);
+		if (retire >= 0) {
+			skr_cmd_begin();
+			skr_tex_destroy(&scene->worker_texs[retire]);
+			skr_cmd_end();
+			// Cycle this thread's whole command ring, the point at which a
+			// destroy tied to this thread's fences would run
+			for (int32_t i = 0; i < 10; i++) {
+				skr_tex_t churn = su_tex_create_solid_color(0xFF102030);
+				skr_tex_destroy(&churn);
+			}
+			pthread_mutex_lock(&scene->thread_mutex);
+			scene->worker_retire      = -1;
+			scene->worker_retire_done = true;
+			pthread_mutex_unlock(&scene->thread_mutex);
+		}
+
+		pthread_mutex_lock(&scene->thread_mutex);
+		bool    next_ready = scene->worker_next_ready;
+		int32_t next       = scene->worker_cur ^ 1;
+		pthread_mutex_unlock(&scene->thread_mutex);
+		if (!next_ready) {
+			scene->worker_texs[next] = su_tex_create_solid_color(0xFF00FFFF ^ (scene->worker_destroy_count * 0x1234));
+			skr_tex_set_name(&scene->worker_texs[next], "worker_tex");
+			pthread_mutex_lock(&scene->thread_mutex);
+			scene->worker_next_ready = true;
+			scene->worker_future     = skr_future_get();  // Test 17 waits on this from main
+			pthread_mutex_unlock(&scene->thread_mutex);
+		}
+
 		// Sleep a bit to avoid spinning
 		struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 }; // 10ms
 		nanosleep(&ts, NULL);
@@ -163,6 +224,105 @@ static void* _thread_create_resources(void* arg) {
 
 	return NULL;
 }
+
+// A thread that lives only to destroy one object: registers, destroys inside
+// a scope, cycles its ring, and exits while main's frame may still use it.
+// Unregistered skips all of that, a destroy from a thread skr never met.
+typedef struct {
+	skr_tex_t*     opt_tex;
+	skr_compute_t* opt_compute;
+	int32_t        churn;
+	bool           unregistered;
+	bool           leave_scope_open;  // exits without skr_cmd_end: an app bug the shutdown must survive
+} destroyer_t;
+
+static void* _destroyer_thread(void* arg) {
+	destroyer_t* d = (destroyer_t*)arg;
+	if (d->unregistered) {
+		if (d->opt_tex) skr_tex_destroy(d->opt_tex);
+		return NULL;
+	}
+	skr_thread_init();
+	skr_cmd_begin();
+	if (d->opt_tex)     skr_tex_destroy    (d->opt_tex);
+	if (d->opt_compute) skr_compute_destroy(d->opt_compute);
+	if (!d->leave_scope_open) skr_cmd_end();
+	for (int32_t i = 0; i < d->churn; i++) {
+		skr_tex_t churn = su_tex_create_solid_color(0xFF304050);
+		skr_tex_destroy(&churn);
+	}
+	skr_thread_shutdown();
+	return NULL;
+}
+
+static void _destroy_on_thread(destroyer_t d) {
+	pthread_t thread;
+	pthread_create(&thread, NULL, _destroyer_thread, &d);
+	pthread_join(thread, NULL);
+}
+
+// Stamps a pending block with its own fence, then exits with that block still
+// behind a newer unstamped one, so the stamp has to be disowned before the
+// fence dies. Only meaningful while main has no buffer open.
+static void* _disown_thread(void* arg) {
+	(void)arg;
+	skr_thread_init();
+	skr_tex_t a = su_tex_create_solid_color(0xFF111111);
+	skr_tex_destroy(&a);                                  // pending, unstamped
+	skr_tex_t b = su_tex_create_solid_color(0xFF222222);  // this submit stamps a's blocks
+	skr_tex_destroy(&b);                                  // newer and unstamped, so a's can't free yet
+	skr_thread_shutdown();
+	return NULL;
+}
+
+// Starts a readback on a thread that exits before anyone looks at the future,
+// so the fence it waited on is gone by the time main checks
+typedef struct {
+	skr_buffer_t          buffer;
+	skr_buffer_readback_t readback;
+	bool                  ok;
+} exited_readback_t;
+
+static void* _exited_readback_thread(void* arg) {
+	exited_readback_t* r = (exited_readback_t*)arg;
+	skr_thread_init();
+	uint32_t data[READBACK_UINTS];
+	for (uint32_t i = 0; i < READBACK_UINTS; i++) data[i] = 0xC0DE0000 + i;
+	r->ok = skr_buffer_create(data, READBACK_UINTS, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_read, &r->buffer) == skr_err_success
+	     && skr_buffer_readback(&r->buffer, &r->readback) == skr_err_success;
+	skr_thread_shutdown();
+	return NULL;
+}
+
+// Hands texs[cur] to the worker to destroy and waits for it to cycle its
+// ring. With copy, the open frame references the texture first.
+static bool _worker_swap(scene_lifetime_stress_t* scene, bool copy) {
+	pthread_mutex_lock(&scene->thread_mutex);
+	bool ready = scene->worker_next_ready;
+	pthread_mutex_unlock(&scene->thread_mutex);
+	if (!ready) return false;
+
+	int32_t cur  = scene->worker_cur;
+	int32_t next = cur ^ 1;
+	if (copy) skr_tex_copy(&scene->worker_texs[cur], &scene->worker_copy_dst, 0, 0, 0, 0, 1);
+	skr_material_set_tex(&scene->worker_material, "tex", &scene->worker_texs[next]);
+	scene->worker_cur = next;
+
+	pthread_mutex_lock(&scene->thread_mutex);
+	scene->worker_retire      = cur;
+	scene->worker_retire_done = false;
+	scene->worker_next_ready  = false;
+	pthread_mutex_unlock(&scene->thread_mutex);
+	for (bool done = false; !done; ) {
+		pthread_mutex_lock(&scene->thread_mutex);
+		done = scene->worker_retire_done;
+		pthread_mutex_unlock(&scene->thread_mutex);
+		if (!done) nanosleep(&(struct timespec){ .tv_nsec = 500000 }, NULL);
+	}
+	return true;
+}
+
+#define FILL_COUNT 1024  // uints written by buffer_fill.hlsl
 
 static scene_t* _scene_lifetime_stress_create(void) {
 	scene_lifetime_stress_t* scene = calloc(1, sizeof(scene_lifetime_stress_t));
@@ -213,6 +373,23 @@ static scene_t* _scene_lifetime_stress_create(void) {
 		for (int32_t j = 0; j < 16; j++) pixels[j] = color | ((j * 16) << 8);
 		skr_tex_set_data(&scene->sampler_test_textures[i], &(skr_tex_data_t){.data = pixels, .mip_count = 1, .layer_count = 1});
 	}
+
+	// Test 10: the worker swaps and destroys these while main draws them
+	scene->worker_texs[0]  = su_tex_create_solid_color(0xFF00FFFF);
+	scene->worker_copy_dst = su_tex_create_solid_color(0xFF000000);
+	skr_tex_set_name(&scene->worker_texs[0],  "worker_tex");
+	skr_tex_set_name(&scene->worker_copy_dst, "worker_copy_dst");
+	skr_material_create((skr_material_info_t){
+		.shader     = &scene->shader,
+		.depth_test = skr_compare_less,
+	}, &scene->worker_material);
+	skr_material_set_tex(&scene->worker_material, "tex", &scene->worker_texs[0]);
+	scene->worker_retire = -1;
+
+	// Test 15: a compute pipeline the frame dispatches before a thread destroys it
+	scene->fill_shader = su_shader_load("shaders/buffer_fill.hlsl.sks", "buffer_fill");
+	skr_buffer_create(NULL, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write, &scene->fill_buffer);
+	skr_buffer_set_name(&scene->fill_buffer, "stress_fill_buffer");
 
 	// Initialize thread resources
 	pthread_mutex_init(&scene->thread_mutex, NULL);
@@ -282,6 +459,15 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 	skr_material_destroy(&scene->replaceable_material);
 	skr_tex_destroy(&scene->replaceable_texture);
 
+	// Destroy worker swap resources; the thread is joined, so the flags are settled
+	skr_material_destroy(&scene->worker_material);
+	skr_tex_destroy(&scene->worker_texs[scene->worker_cur]);
+	if (scene->worker_next_ready) skr_tex_destroy(&scene->worker_texs[scene->worker_cur ^ 1]);
+	skr_tex_destroy(&scene->worker_copy_dst);
+	if (scene->unreg_tex_live) skr_tex_destroy(&scene->unreg_tex);
+	skr_buffer_destroy(&scene->fill_buffer);
+	skr_shader_destroy(&scene->fill_shader);
+
 	// Destroy in-flight readbacks, then their buffers
 	for (int32_t i = 0; i < READBACK_SLOTS; i++) {
 		if (scene->readback_live[i]) {
@@ -305,6 +491,9 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 
 	su_log(su_log_info, "Lifetime stress test: %u creates, %u destroys, %u draws over %u frames",
 		scene->total_creates, scene->total_destroys, scene->total_draws, scene->frame_count);
+	su_log(su_log_info, "Lifetime stress threads: %u worker in-frame, %u worker idle, %u thread-exit, %u disown, %u unregistered, %u compute, %u exited-thread futures, %u cross-thread waits",
+		scene->worker_destroy_count, scene->idle_destroy_count, scene->exit_destroy_count, scene->disown_count, scene->unreg_destroy_count, scene->compute_destroy_count,
+		scene->exited_readback_count, scene->cross_wait_count);
 	su_log(scene->readback_failures > 0 ? su_log_warning : su_log_info,
 		"Lifetime stress readbacks: %u started, %u verified, %u abandoned, %u failures",
 		scene->readback_started, scene->readback_verified, scene->readback_abandoned, scene->readback_failures);
@@ -578,6 +767,60 @@ static void _scene_lifetime_stress_render(scene_t* base, int32_t width, int32_t 
 		scene->total_draws++;
 	}
 
+	// === TEST 10: Worker-side destroy while this frame references the texture ===
+	// The copy puts the current texture in the open frame. The worker then
+	// destroys it and cycles its ring before this frame submits, so the
+	// destroy must retire on main's fence, not the worker's. Every other
+	// time, a flush then submits the copy mid-frame with that destroy pending.
+	if (scene->frame_count % 15 == 0 && _worker_swap(scene, true)) {
+		if (scene->frame_count % 30 == 0) skr_cmd_flush();
+		scene->worker_destroy_count++;
+		scene->total_destroys++;
+	}
+
+	// === TEST 12: Thread exit while this frame references the texture ===
+	// Every other time the thread exits with its scope still open
+	if (scene->frame_count % 20 == 10) {
+		skr_tex_t doomed = su_tex_create_solid_color(0xFFABCDEF);
+		skr_tex_copy(&doomed, &scene->worker_copy_dst, 0, 0, 0, 0, 1);
+		_destroy_on_thread((destroyer_t){ .opt_tex = &doomed, .churn = 10, .leave_scope_open = scene->frame_count % 40 == 10 });
+		scene->exit_destroy_count++;
+		scene->total_creates++;
+		scene->total_destroys++;
+	}
+
+	// === TEST 14, first half: a texture this frame references ===
+	// Destroyed after the frame submits, by a thread skr never met (idle)
+	if (scene->frame_count % 20 == 0 && !scene->unreg_tex_live) {
+		scene->unreg_tex = su_tex_create_solid_color(0xFF0F0F0F);
+		skr_tex_copy(&scene->unreg_tex, &scene->worker_copy_dst, 0, 0, 0, 0, 1);
+		scene->unreg_tex_live = true;
+		scene->total_creates++;
+	}
+
+	// === TEST 15: Pipeline destroyed on a thread while this frame dispatches it ===
+	if (scene->frame_count % 20 == 15) {
+		skr_compute_t doomed_compute;
+		skr_compute_create(&scene->fill_shader, (skr_compute_info_t){0}, &doomed_compute);
+		skr_compute_set_buffer(&doomed_compute, "output", &scene->fill_buffer);
+		skr_compute_set_param (&doomed_compute, "count", sksc_shader_var_uint, 1, &(uint32_t){FILL_COUNT});
+		skr_compute_execute   (&doomed_compute, (FILL_COUNT + 63) / 64, 1, 1); // 64 = [numthreads] in buffer_fill.hlsl
+		_destroy_on_thread((destroyer_t){ .opt_compute = &doomed_compute, .churn = 10 });
+		scene->compute_destroy_count++;
+		scene->total_creates++;
+		scene->total_destroys++;
+	}
+
+	if (draw_idx < STRESS_CUBE_COUNT) {
+		transforms[draw_idx] = float4x4_trs(
+			(float3){2.0f, -2.5f, 0},
+			float4_quat_from_euler((float3){scene->rotation, 0, 0}),
+			unit_scale);
+		skr_render_list_add(ref_render_list, &scene->cube_mesh, &scene->worker_material, &transforms[draw_idx], sizeof(float4x4), 1);
+		draw_idx++;
+		scene->total_draws++;
+	}
+
 	// === TEST 6: Sampler cache stress ===
 	// Create materials with different sampler settings each frame to stress the cache
 	if (scene->frame_count % 2 == 0) {
@@ -659,6 +902,69 @@ static void _scene_lifetime_stress_render(scene_t* base, int32_t width, int32_t 
 	}
 }
 
+// Between frames: this thread has no command buffer open, so a worker's own
+// submit is the first fence that covers anything pending
+static void _scene_lifetime_stress_idle(scene_t* base) {
+	scene_lifetime_stress_t* scene = (scene_lifetime_stress_t*)base;
+
+	// === TEST 11: Worker-side destroy while main is idle ===
+	// The previous frame drew the texture and has submitted, so the worker
+	// stamps the destroy with its own fence and frees it on a later churn
+	if (scene->frame_count % 15 == 7 && _worker_swap(scene, false)) {
+		scene->idle_destroy_count++;
+		scene->total_destroys++;
+	}
+
+	// === TEST 13: A thread exits with a stamped block still pending ===
+	if (scene->frame_count % 20 == 5) {
+		pthread_t thread;
+		pthread_create(&thread, NULL, _disown_thread, NULL);
+		pthread_join(thread, NULL);
+		scene->disown_count++;
+		scene->total_creates  += 2;
+		scene->total_destroys += 2;
+	}
+
+	// === TEST 14, second half: an unregistered thread destroys it ===
+	if (scene->unreg_tex_live && scene->frame_count % 20 == 0) {
+		_destroy_on_thread((destroyer_t){ .opt_tex = &scene->unreg_tex, .unregistered = true });
+		scene->unreg_tex_live = false;
+		scene->unreg_destroy_count++;
+		scene->total_destroys++;
+	}
+
+	// === TEST 16: Wait on a future whose thread has exited ===
+	if (scene->frame_count % 20 == 12) {
+		exited_readback_t r = {0};
+		pthread_t thread;
+		pthread_create(&thread, NULL, _exited_readback_thread, &r);
+		pthread_join(thread, NULL);
+		if (r.ok) {
+			skr_future_wait(&r.readback.future);
+			const uint32_t* values = (const uint32_t*)r.readback.data;
+			bool match = skr_future_check(&r.readback.future);
+			for (uint32_t i = 0; match && i < READBACK_UINTS; i++)
+				match = values[i] == 0xC0DE0000 + i;
+			if (match) scene->exited_readback_count++;
+			else       scene->readback_failures++;
+			skr_buffer_readback_destroy(&r.readback);
+			skr_buffer_destroy(&r.buffer);
+			scene->total_creates++;
+			scene->total_destroys++;
+		}
+	}
+
+	// === TEST 17: Wait on a live worker's future while it keeps submitting ===
+	if (scene->frame_count % 5 == 3) {
+		pthread_mutex_lock(&scene->thread_mutex);
+		skr_future_t future = scene->worker_future;
+		pthread_mutex_unlock(&scene->thread_mutex);
+		skr_future_wait(&future);
+		if (skr_future_check(&future)) scene->cross_wait_count++;
+		else                           scene->readback_failures++;
+	}
+}
+
 static void _scene_lifetime_stress_render_ui(scene_t* base) {
 	scene_lifetime_stress_t* scene = (scene_lifetime_stress_t*)base;
 
@@ -691,6 +997,14 @@ static void _scene_lifetime_stress_render_ui(scene_t* base) {
 	igText("Test 6 - Sampler changes: %u", scene->sampler_test_count);
 
 	igText("Test 7 - Destroy before draw: %u", scene->test7_count);
+	igText("Test 10 - Worker destroys, frame open: %u", scene->worker_destroy_count);
+	igText("Test 11 - Worker destroys, main idle: %u", scene->idle_destroy_count);
+	igText("Test 12 - Thread-exit destroys: %u",       scene->exit_destroy_count);
+	igText("Test 13 - Disowned stamps: %u",            scene->disown_count);
+	igText("Test 14 - Unregistered-thread destroys: %u", scene->unreg_destroy_count);
+	igText("Test 15 - Compute destroyed in-frame: %u", scene->compute_destroy_count);
+	igText("Test 16 - Exited-thread futures: %u",     scene->exited_readback_count);
+	igText("Test 17 - Cross-thread waits: %u",        scene->cross_wait_count);
 
 	igSeparator();
 	igText("Test 8 - Sort stress:");
@@ -726,4 +1040,5 @@ const scene_vtable_t scene_lifetime_stress_vtable = {
 	.update    = _scene_lifetime_stress_update,
 	.render    = _scene_lifetime_stress_render,
 	.render_ui = _scene_lifetime_stress_render_ui,
+	.idle      = _scene_lifetime_stress_idle,
 };

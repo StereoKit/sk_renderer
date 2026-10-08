@@ -211,7 +211,7 @@ void skr_compute_set_pipeline(skr_compute_t* ref_compute, skr_compute_info_t inf
 
 	// Swap in the new pipeline, deferred-destroy the old (safe for in-flight
 	// command buffers).
-	_skr_cmd_destroy_pipeline(NULL, ref_compute->pipeline);
+	_skr_destroy_shared_pipeline(ref_compute->pipeline);
 	ref_compute->pipeline = new_pipeline;
 }
 
@@ -230,11 +230,12 @@ skr_bind_t skr_compute_get_bind(const skr_compute_t* compute, const char* bind_n
 void skr_compute_destroy(skr_compute_t* ref_compute) {
 	if (!ref_compute) return;
 
-	_skr_cmd_destroy_pipeline             (NULL, ref_compute->pipeline);
-	_skr_cmd_destroy_pipeline_layout      (NULL, ref_compute->layout);
-	_skr_cmd_destroy_descriptor_set_layout(NULL, ref_compute->descriptor_layout);
-
-	_skr_cmd_destroy_bind_pool_slots(NULL, ref_compute->bind_start, ref_compute->bind_count);
+	_skr_destroy_batch_begin();
+	_skr_destroy_shared_pipeline             (ref_compute->pipeline);
+	_skr_destroy_shared_pipeline_layout      (ref_compute->layout);
+	_skr_destroy_shared_descriptor_set_layout(ref_compute->descriptor_layout);
+	_skr_destroy_shared_bind_pool_slots      (ref_compute->bind_start, ref_compute->bind_count);
+	_skr_destroy_batch_end();
 	_skr_free(ref_compute->param_buffer);
 
 	*ref_compute = (skr_compute_t){0};

@@ -289,7 +289,7 @@ void skr_material_destroy(skr_material_t* ref_material) {
 	_skr_free(ref_material->param_buffer);
 
 	// Defer bind pool slot release until GPU is done with this material
-	_skr_cmd_destroy_bind_pool_slots(NULL, ref_material->bind_start, ref_material->bind_count);
+	_skr_destroy_shared_bind_pool_slots(ref_material->bind_start, ref_material->bind_count);
 
 	*ref_material = (skr_material_t){0};
 }

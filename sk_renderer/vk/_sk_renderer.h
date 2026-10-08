@@ -25,13 +25,23 @@
 	#endif
 	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
 	#define _skr_store_u32(p, v)      _InterlockedExchange((volatile long*)(p), (long)(v))
+	#define _skr_load_u32(p)          (*(p))
 	#define _skr_exchange_u32(p, v)   ((uint32_t)_InterlockedExchange((volatile long*)(p), (long)(v)))
+	#define _skr_add_u32(p, v)        _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
+	#define _skr_load_ptr(p)          (*(p))
+	#define _skr_exchange_ptr(p, v)   _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
+	#define _skr_cas_ptr(p, expected, desired) (_InterlockedCompareExchangePointer((void* volatile*)(p), (void*)(desired), (void*)(expected)) == (void*)(expected))
 #else
 	#define _skr_atomic(T)            T
 	#define _skr_load_acquire(p)      __atomic_load_n ((p),      __ATOMIC_ACQUIRE)
 	#define _skr_store_release(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 	#define _skr_store_u32(p, v)      __atomic_store_n   ((p), (v), __ATOMIC_RELAXED)
+	#define _skr_load_u32(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
 	#define _skr_exchange_u32(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_RELAXED)
+	#define _skr_add_u32(p, v)        __atomic_fetch_add ((p), (v), __ATOMIC_RELAXED)
+	#define _skr_load_ptr(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
+	#define _skr_exchange_ptr(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_ACQ_REL)
+	#define _skr_cas_ptr(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELEASE, __ATOMIC_RELAXED) // MSVC's doesn't write expected back, so callers reload it
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -115,13 +125,51 @@ _Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must
 #define SKR_VK_CHECK_RET(vkResult, fnName, returnVal) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); return returnVal; } }
 #define SKR_VK_CHECK_NRET(vkResult, fnName) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); } }
 
-// Deferred destruction system
+// Deferred destruction. A list runs LIFO, so push dependents first: memory
+// before image, conversion before sampler.
+#define FOREACH_DESTROY_TYPE(X) \
+	X(buffer,               VkBuffer,                vkDestroyBuffer)                \
+	X(image,                VkImage,                 vkDestroyImage)                 \
+	X(image_view,           VkImageView,             vkDestroyImageView)             \
+	X(sampler,              VkSampler,               vkDestroySampler)               \
+	X(framebuffer,          VkFramebuffer,           vkDestroyFramebuffer)           \
+	X(render_pass,          VkRenderPass,            vkDestroyRenderPass)            \
+	X(pipeline,             VkPipeline,              vkDestroyPipeline)              \
+	X(pipeline_layout,      VkPipelineLayout,        vkDestroyPipelineLayout)        \
+	X(descriptor_set_layout,VkDescriptorSetLayout,   vkDestroyDescriptorSetLayout)   \
+	X(shader_module,        VkShaderModule,          vkDestroyShaderModule)          \
+	X(memory,               VkDeviceMemory,          vkFreeMemory)                   \
+	X(ycbcr_conversion,     VkSamplerYcbcrConversion,vkDestroySamplerYcbcrConversion)
+
+typedef enum {
+	#define MAKE_ENUM(name, type, func) skr_destroy_type_##name,
+	FOREACH_DESTROY_TYPE(MAKE_ENUM)
+	#undef MAKE_ENUM
+	skr_destroy_type_bind_pool_slots,  // handle = start, aux = count
+	skr_destroy_type_desc_set,         // handle = set, aux = pool index in the owning thread's cache; private only
+} skr_destroy_type_;
+
+typedef struct {
+	skr_destroy_type_ type;
+	uint32_t          aux;
+	uint64_t          handle;
+} skr_destroy_item_t;
+
+// Zero is an empty list. Only its owning thread touches it.
 typedef struct skr_destroy_list_t {
-	void*    items;
-	uint32_t count;
-	uint32_t capacity;
-	mtx_t    mutex;  // Thread-safe access for cross-thread destruction
+	skr_destroy_item_t* items;
+	uint32_t            count;
+	uint32_t            capacity;
 } skr_destroy_list_t;
+
+// Shared destroys in transit on the lock-free pending stack. A block is
+// stamped with the first submit whose fence covers it, and any later submit
+// frees it once that fence has signaled.
+typedef struct _skr_destroy_block_t {
+	skr_destroy_list_t           list;
+	skr_future_t                 covered_by;  // slot NULL until stamped
+	struct _skr_destroy_block_t* next;
+} _skr_destroy_block_t;
 
 // Sampler cache for deduplicating VkSampler objects
 // Most textures use one of a handful of sampler configurations
@@ -164,12 +212,15 @@ typedef struct {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// Other threads read generation and the fence under the queue mutex, and a
+// blocking wait holds `waiters` instead, so the owner can only reset or
+// destroy the fence when neither is in progress
 typedef struct {
-	VkCommandBuffer    cmd;
-	VkFence            fence;
-	skr_destroy_list_t destroy_list;
-	bool               alive;
-	uint64_t           generation;  // Incremented each time this slot is reused
+	VkCommandBuffer       cmd;
+	VkFence               fence;        // Null until the slot's first use, which reads as "never submitted"
+	skr_destroy_list_t    destroy_list;
+	uint64_t              generation;   // Starts at 1 and never resets, so a stale future can't match a reused slot
+	_skr_atomic(uint32_t) waiters;      // Threads blocked in skr_future_wait on this fence
 } _skr_cmd_ring_slot_t;
 
 // Per-frame transient data (material params, system data, instance data,
@@ -198,7 +249,6 @@ typedef struct skr_bump_result_t {
 // Command context returned from command begin/acquire
 typedef struct {
 	VkCommandBuffer     cmd;
-	skr_destroy_list_t* destroy_list;
 	_skr_bump_ring_t*   const_ring;
 	_skr_bump_ring_t*   storage_ring;
 } _skr_cmd_ctx_t;
@@ -215,36 +265,24 @@ typedef struct {
 } _skr_desc_cache_entry_t;
 
 typedef struct {
-	VkDescriptorSet set;
-	uint8_t         pool;
-} _skr_desc_retired_t;
-
-typedef struct {
 	_skr_desc_cache_entry_t* chunks[_SKR_DESC_CACHE_MAX_CHUNKS];
 	VkDescriptorPool*        pools;         // free-set pools, a new one opens when none has room
 	uint16_t*                pool_used;     // live sets per pool
 	bool*                    pool_no_room;  // refused an alloc with sets left; cleared by the next free from it
 	uint32_t                 pool_count;
 	uint32_t                 pool_capacity;
-	// A replaced set may still be bound in any in-flight command buffer, so
-	// it frees when the slot that replaced it next begins recording: that
-	// slot's fence orders after every earlier submission
-	_skr_desc_retired_t*     retired         [skr_MAX_COMMAND_RING];
-	uint32_t                 retired_count   [skr_MAX_COMMAND_RING];
-	uint32_t                 retired_capacity[skr_MAX_COMMAND_RING];
 } _skr_desc_cache_t;
 
 typedef struct {
 	VkCommandPool          cmd_pool;
-	_skr_cmd_ring_slot_t*  active_cmd;      // Currently recording command buffer
-	_skr_cmd_ring_slot_t*  last_submitted;  // Most recently submitted command buffer
 	_skr_cmd_ring_slot_t   cmd_ring[skr_MAX_COMMAND_RING];
 	_skr_bump_ring_t       const_ring;      // material params, system data, compute $Globals
 	_skr_bump_ring_t       storage_ring;    // instance data
 	_skr_desc_cache_t      desc_cache;
-	uint32_t               cmd_ring_index;
+	skr_destroy_list_t     shared_open;     // Shared destroys waiting on this thread's next submit
+	uint32_t               cur;             // Slot recording now (ref_count > 0) or last submitted
 	uint32_t               thread_idx;
-	int32_t                ref_count;
+	_skr_atomic(int32_t)   ref_count;       // Open-buffer depth; other threads read it at submit
 	bool                   alive;
 } _skr_vk_thread_t;
 
@@ -264,9 +302,6 @@ typedef struct {
 	mtx_t*                   present_queue_mutex;      // Pointer to correct mutex (may alias)
 	mtx_t*                   transfer_queue_mutex;     // Pointer to correct mutex (may alias)
 	mtx_t*                   video_decode_queue_mutex; // Pointer to correct mutex (may alias, NULL if no video decode)
-	VkCommandPool            command_pool;
-	VkCommandBuffer          command_buffers[SKR_MAX_FRAMES_IN_FLIGHT];
-	VkFence                  frame_fences[SKR_MAX_FRAMES_IN_FLIGHT];
 	VkPipelineCache          pipeline_cache;
 	VkDebugUtilsMessengerEXT debug_messenger;
 	bool                     validation_enabled;
@@ -342,7 +377,6 @@ typedef struct {
 	skr_bind_settings_t      bind_settings;
 	skr_buffering_           buffering;
 	bool                     in_frame;  // True when between frame_begin and frame_end
-	thrd_t                   main_thread_id;  // Thread that calls skr_init
 	uint32_t                 frame;
 	uint32_t                 flight_idx;
 
@@ -384,6 +418,8 @@ typedef struct {
 	bool                     has_dedicated_transfer;
 	_skr_vk_thread_t         thread_pools[skr_MAX_THREAD_POOLS];
 	mtx_t                    thread_pool_mutex;
+	_skr_atomic(uint32_t)    main_pool_idx;   // The frame thread's pool; shared destroys retire on its submits
+	_skr_atomic(_skr_destroy_block_t*) pending; // Shared destroys waiting on a fence, see _skr_destroy_retire
 
 	// Default assets
 	skr_tex_t                default_tex_white;
@@ -394,9 +430,6 @@ typedef struct {
 	// is passed and the texture format doesn't support blit.
 	skr_shader_t             builtin_mipgen_2d;
 	skr_shader_t             builtin_mipgen_cube;
-
-	// Deferred destruction
-	skr_destroy_list_t       destroy_list;
 
 	// Sampler cache
 	_skr_sampler_cache_t     sampler_cache;
@@ -499,42 +532,40 @@ bool                  _skr_cmd_init                         (void);
 void                  _skr_cmd_shutdown                     (void);
 _skr_vk_thread_t*     _skr_cmd_get_thread                   (void);
 _skr_cmd_ctx_t        _skr_cmd_begin                        (void);
-bool                  _skr_cmd_try_get_active               (_skr_cmd_ctx_t* out_ctx);
-VkCommandBuffer       _skr_cmd_end                          (void);  // Ends and returns command buffer (caller must submit)
-skr_future_t          _skr_cmd_end_submit                   (const VkSemaphore* wait_semaphores, uint32_t wait_count, const VkSemaphore* signal_semaphores, uint32_t signal_count);  // Ends and submits, returns future
+skr_future_t          _skr_cmd_end_submit                   (const VkSemaphore* opt_waits, uint32_t wait_count, const VkSemaphore* opt_signals, uint32_t signal_count);
 _skr_cmd_ctx_t        _skr_cmd_acquire                      (void);
 void                  _skr_cmd_release                      (VkCommandBuffer buffer);
 
-// Deferred destruction API
-skr_destroy_list_t    _skr_destroy_list_create              (void);
-void                  _skr_destroy_list_free                (skr_destroy_list_t* ref_list);
-void                  _skr_destroy_list_execute             (skr_destroy_list_t* ref_list);
+// Deferred destruction. Shared: anything another thread may have bound, frees
+// once a fence that covers every open buffer has signaled. Private: only this
+// thread's command buffers used it, frees with the recording slot's fence.
+void                  _skr_destroy_list_execute             (skr_destroy_list_t* ref_list, _skr_desc_cache_t* opt_ref_cache);
+_skr_destroy_block_t* _skr_destroy_retire                   (skr_destroy_list_t* ref_shared_open, skr_future_t cover, bool may_stamp);
+void                  _skr_destroy_execute_blocks           (_skr_destroy_block_t* opt_blocks);
+void                  _skr_destroy_disown                   (const _skr_cmd_ring_slot_t* slots);
+uint32_t              _skr_destroy_drain                    (void);
+void                  _skr_destroy_batch_begin              (void);  // Brackets a compound destroy so its items stay one ordered block
+void                  _skr_destroy_batch_end                (void);
 
-// Add functions for each Vulkan resource type
-void                  _skr_cmd_destroy_buffer               (skr_destroy_list_t* opt_ref_list, VkBuffer                 handle);
-void                  _skr_cmd_destroy_image                (skr_destroy_list_t* opt_ref_list, VkImage                  handle);
-void                  _skr_cmd_destroy_image_view           (skr_destroy_list_t* opt_ref_list, VkImageView              handle);
-void                  _skr_cmd_destroy_sampler              (skr_destroy_list_t* opt_ref_list, VkSampler                handle);
-void                  _skr_cmd_destroy_framebuffer          (skr_destroy_list_t* opt_ref_list, VkFramebuffer            handle);
-void                  _skr_cmd_destroy_render_pass          (skr_destroy_list_t* opt_ref_list, VkRenderPass             handle);
-void                  _skr_cmd_destroy_pipeline             (skr_destroy_list_t* opt_ref_list, VkPipeline               handle);
-void                  _skr_cmd_destroy_pipeline_layout      (skr_destroy_list_t* opt_ref_list, VkPipelineLayout         handle);
-void                  _skr_cmd_destroy_pipeline_cache       (skr_destroy_list_t* opt_ref_list, VkPipelineCache          handle);
-void                  _skr_cmd_destroy_descriptor_set_layout(skr_destroy_list_t* opt_ref_list, VkDescriptorSetLayout    handle);
-void                  _skr_cmd_destroy_descriptor_pool      (skr_destroy_list_t* opt_ref_list, VkDescriptorPool         handle);
-void                  _skr_cmd_destroy_shader_module        (skr_destroy_list_t* opt_ref_list, VkShaderModule           handle);
-void                  _skr_cmd_destroy_command_pool         (skr_destroy_list_t* opt_ref_list, VkCommandPool            handle);
-void                  _skr_cmd_destroy_fence                (skr_destroy_list_t* opt_ref_list, VkFence                  handle);
-void                  _skr_cmd_destroy_semaphore            (skr_destroy_list_t* opt_ref_list, VkSemaphore              handle);
-void                  _skr_cmd_destroy_query_pool           (skr_destroy_list_t* opt_ref_list, VkQueryPool              handle);
-void                  _skr_cmd_destroy_swapchain            (skr_destroy_list_t* opt_ref_list, VkSwapchainKHR           handle);
-void                  _skr_cmd_destroy_surface              (skr_destroy_list_t* opt_ref_list, VkSurfaceKHR             handle);
-void                  _skr_cmd_destroy_debug_messenger      (skr_destroy_list_t* opt_ref_list, VkDebugUtilsMessengerEXT handle);
-void                  _skr_cmd_destroy_memory               (skr_destroy_list_t* opt_ref_list, VkDeviceMemory           handle);
-void                  _skr_cmd_destroy_ycbcr_conversion     (skr_destroy_list_t* opt_ref_list, VkSamplerYcbcrConversion handle);
+void                  _skr_destroy_shared_buffer                   (VkBuffer                 handle);
+void                  _skr_destroy_shared_image                    (VkImage                  handle);
+void                  _skr_destroy_shared_image_view               (VkImageView              handle);
+void                  _skr_destroy_shared_sampler                  (VkSampler                handle);
+void                  _skr_destroy_shared_framebuffer              (VkFramebuffer            handle);
+void                  _skr_destroy_shared_render_pass              (VkRenderPass             handle);
+void                  _skr_destroy_shared_pipeline                 (VkPipeline               handle);
+void                  _skr_destroy_shared_pipeline_layout          (VkPipelineLayout         handle);
+void                  _skr_destroy_shared_descriptor_set_layout    (VkDescriptorSetLayout    handle);
+void                  _skr_destroy_shared_shader_module            (VkShaderModule           handle);
+void                  _skr_destroy_shared_memory                   (VkDeviceMemory           handle);
+void                  _skr_destroy_shared_ycbcr_conversion         (VkSamplerYcbcrConversion handle);
+void                  _skr_destroy_shared_bind_pool_slots          (int32_t start, uint32_t count);
 
-// Custom deferred destruction (non-Vulkan types)
-void                  _skr_cmd_destroy_bind_pool_slots      (skr_destroy_list_t* opt_ref_list, int32_t start, uint32_t count);
+void                  _skr_destroy_private_buffer             (VkBuffer      handle);
+void                  _skr_destroy_private_memory             (VkDeviceMemory handle);
+void                  _skr_destroy_private_image_view         (VkImageView   handle);
+void                  _skr_destroy_private_framebuffer        (VkFramebuffer handle);
+void                  _skr_destroy_private_desc_set           (VkDescriptorSet set, uint8_t pool);
 
 // Descriptor binding: push descriptors, or the per-thread set cache without them
 void                  _skr_desc_writes_begin                (_skr_desc_writes_t* out_writes, int32_t material_idx);
@@ -542,6 +573,6 @@ void                  _skr_write_buffer                     (_skr_desc_writes_t*
 void                  _skr_write_image                      (_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescriptorType type, VkSampler sampler, VkImageView view, VkImageLayout layout);
 bool                  _skr_bind_descriptors                 (VkCommandBuffer cmd, VkPipelineBindPoint bind_point, int32_t bind_start, VkPipelineLayout layout, VkDescriptorSetLayout desc_layout, _skr_desc_writes_t* ref_writes);
 void                  _skr_desc_cache_destroy               (_skr_desc_cache_t* ref_cache);
-void                  _skr_desc_cache_retire                (_skr_desc_cache_t* ref_cache, uint32_t slot);
+void                  _skr_desc_cache_free                  (_skr_desc_cache_t* ref_cache, VkDescriptorSet set, uint8_t pool);
 uint32_t              _skr_shader_dyn_bindings              (const sksc_shader_meta_t* meta, skr_stage_ stage_mask, bool has_push_descriptors, uint32_t out_bindings[3]);
 uint32_t              _skr_pipeline_get_dyn_bindings        (int32_t material_idx, uint32_t out_bindings[3]);

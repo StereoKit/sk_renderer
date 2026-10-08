@@ -17,7 +17,7 @@ endif()
 message(STATUS "Fetching sk_app...")
 FetchContent_Declare(sk_app
 	GIT_REPOSITORY https://github.com/StereoKit/sk_app.git
-	GIT_TAG        v2026.9.10
+	GIT_TAG        v2026.10.2
 	GIT_SHALLOW    TRUE
 	GIT_PROGRESS   TRUE
 )

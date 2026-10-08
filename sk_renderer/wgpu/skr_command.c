@@ -4,6 +4,8 @@
 
 #include "_sk_renderer.h"
 
+#include <assert.h>
+
 ///////////////////////////////////////////////////////////////////////////////
 // Threads: WebGPU objects are single-threaded on web (and the web build runs
 // without pthreads), so thread init is a no-op. Multithreaded recording can
@@ -47,7 +49,8 @@ static _skr_cmd_slot_t* _skr_cmd_slot_alloc(uint64_t* out_generation) {
 		if (slot->in_flight && slot->completed)
 			slot->in_flight = false;
 #ifndef __EMSCRIPTEN__
-		if (slot->in_flight) {
+		if (slot->in_flight && slot->future.id != 0) { // an open scope's slot has no future yet
+
 			WGPUFutureWaitInfo info = { .future = slot->future };
 			if (wgpuInstanceWaitAny(_skr_wgpu.instance, 1, &info, 0) == WGPUWaitStatus_Success && info.completed)
 				slot->in_flight = false;
@@ -80,11 +83,6 @@ skr_future_t _skr_future_from_wgpu(WGPUFuture future) {
 	return result;
 }
 
-skr_future_t skr_future_get(void) {
-	// A future for "everything submitted so far": submit any active encoder
-	return _skr_cmd_submit();
-}
-
 bool skr_future_check(const skr_future_t* future) {
 	if (future == NULL || future->slot == NULL) return true;
 	_skr_cmd_slot_t* slot = (_skr_cmd_slot_t*)future->slot;
@@ -96,7 +94,7 @@ bool skr_future_check(const skr_future_t* future) {
 	if (slot->generation == future->generation) { // else: slot recycled, long done
 		done = slot->completed;
 #ifndef __EMSCRIPTEN__
-		if (!done) {
+		if (!done && slot->future.id != 0) {
 			WGPUFutureWaitInfo info = { .future = slot->future };
 			done = wgpuInstanceWaitAny(_skr_wgpu.instance, 1, &info, 0) == WGPUWaitStatus_Success && info.completed;
 		}
@@ -112,10 +110,22 @@ void skr_future_wait(const skr_future_t* future) {
 	_skr_cmd_slot_t* slot = (_skr_cmd_slot_t*)future->slot;
 
 	_skr_slot_lock();
-	bool     ours   = slot->generation == future->generation;
+	bool       ours        = slot->generation == future->generation;
 	WGPUFuture wgpu_future = slot->future;
 	_skr_slot_unlock();
 	if (!ours) return;
+
+#ifndef __EMSCRIPTEN__
+	// A scope still open on another thread has no future to wait on yet
+	while (wgpu_future.id == 0) {
+		thrd_yield();
+		_skr_slot_lock();
+		ours        = slot->generation == future->generation;
+		wgpu_future = slot->future;
+		_skr_slot_unlock();
+		if (!ours) return;
+	}
+#endif
 
 	// Blocking wait — valid on native, a hard error on web by design; web
 	// code must poll skr_future_check from the frame loop instead. Waiting
@@ -135,12 +145,23 @@ void skr_future_wait(const skr_future_t* future) {
 // thread-local, mirroring the Vulkan backend's per-thread command buffers —
 // worker threads (asset loaders generating mips, uploading textures) record
 // and submit their own work without touching the main thread's encoder.
+//
+// Scopes nest like the Vulkan ref count: only the outermost skr_cmd_end
+// submits. A scope takes its ring slot at begin and wires the slot's future
+// at that final submit, so futures handed out inside it (inner ends,
+// skr_future_get) resolve when the scope does. Internal submits inside a
+// scope (readback copies, upload ordering) take slots of their own.
 
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
-static WGPUCommandEncoder _thread_encoder;
+	#define _skr_thread_static static
 #else
-static _Thread_local WGPUCommandEncoder _thread_encoder;
+	#define _skr_thread_static static _Thread_local
 #endif
+_skr_thread_static WGPUCommandEncoder _thread_encoder;
+_skr_thread_static int32_t            _scope_depth;
+_skr_thread_static _skr_cmd_slot_t*   _scope_slot;        // pending until the outermost end
+_skr_thread_static uint64_t           _scope_generation;
+_skr_thread_static skr_future_t       _last_future;       // what skr_future_get returns with nothing open
 
 WGPUCommandEncoder _skr_cmd_get(void) {
 	if (_thread_encoder == NULL)
@@ -148,50 +169,80 @@ WGPUCommandEncoder _skr_cmd_get(void) {
 	return _thread_encoder;
 }
 
-skr_future_t _skr_cmd_submit(void) {
-	skr_future_t result = {0};
-	if (_thread_encoder == NULL) return result;
-
+// Finishes and submits this thread's encoder, if it has one
+static bool _skr_cmd_submit_encoder(void) {
+	if (_thread_encoder == NULL) return false;
 	WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(_thread_encoder, NULL);
 	wgpuCommandEncoderRelease(_thread_encoder);
 	_thread_encoder = NULL;
-	if (cmd == NULL) return result;
-
+	if (cmd == NULL) return false;
 	wgpuQueueSubmit(_skr_wgpu.queue, 1, &cmd);
 	wgpuCommandBufferRelease(cmd);
+	return true;
+}
+
+// Caller holds the slot lock. Completes once everything submitted so far has run.
+static void _skr_cmd_slot_wire(_skr_cmd_slot_t* ref_slot, uint64_t generation) {
+	ref_slot->in_flight = true;
+	ref_slot->future    = wgpuQueueOnSubmittedWorkDone(_skr_wgpu.queue, (WGPUQueueWorkDoneCallbackInfo){
+		.mode      = _SKR_CB_MODE_ASYNC,
+		.callback  = _skr_on_work_done,
+		.userdata1 = ref_slot,
+		.userdata2 = (void*)(uintptr_t)generation });
+}
+
+skr_future_t _skr_cmd_submit(void) {
+	if (!_skr_cmd_submit_encoder()) return _last_future;
 
 	_skr_slot_lock();
 	uint64_t         generation = 0;
 	_skr_cmd_slot_t* slot       = _skr_cmd_slot_alloc(&generation);
-	slot->in_flight = true;
-	slot->future = wgpuQueueOnSubmittedWorkDone(_skr_wgpu.queue, (WGPUQueueWorkDoneCallbackInfo){
-		.mode      = _SKR_CB_MODE_ASYNC,
-		.callback  = _skr_on_work_done,
-		.userdata1 = slot,
-		.userdata2 = (void*)(uintptr_t)generation });
+	_skr_cmd_slot_wire(slot, generation);
 	_skr_slot_unlock();
 
-	result.slot       = slot;
-	result.generation = generation;
-	return result;
+	_last_future = (skr_future_t){ .slot = slot, .generation = generation };
+	return _last_future;
+}
+
+skr_future_t skr_future_get(void) {
+	if (_scope_depth > 0) return (skr_future_t){ .slot = _scope_slot, .generation = _scope_generation };
+	return _skr_cmd_submit(); // lands any implicit encoder work, else the last submission
 }
 
 void skr_cmd_begin(void) {
+	if (_scope_depth++ == 0) {
+		_skr_slot_lock();
+		_scope_slot = _skr_cmd_slot_alloc(&_scope_generation);
+		_scope_slot->in_flight = true;
+		_scope_slot->future    = (WGPUFuture){0};
+		_skr_slot_unlock();
+	}
 	_skr_cmd_get();
 }
 
 skr_future_t skr_cmd_end(void) {
-	return _skr_cmd_submit();
+	assert(_scope_depth > 0 && "Unbalanced skr_cmd_begin/end");
+	skr_future_t future = { .slot = _scope_slot, .generation = _scope_generation };
+	if (--_scope_depth > 0) return future;
+
+	_skr_cmd_submit_encoder();
+	_skr_slot_lock();
+	_skr_cmd_slot_wire(_scope_slot, _scope_generation);
+	_skr_slot_unlock();
+	_scope_slot  = NULL;
+	_last_future = future;
+	return future;
 }
 
 skr_future_t skr_cmd_flush(void) {
+	if (_scope_depth == 0) return (skr_future_t){0};
 	skr_future_t f = _skr_cmd_submit();
 	_skr_cmd_get();
 	return f;
 }
 
 bool skr_cmd_is_active(void) {
-	return _thread_encoder != NULL;
+	return _scope_depth > 0;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -245,4 +296,7 @@ void _skr_readback_destroy(_skr_readback_base_t* opt_base) {
 void _skr_command_sys_shutdown(void) {
 	if (_thread_encoder) { wgpuCommandEncoderRelease(_thread_encoder); _thread_encoder = NULL; }
 	if (_slot_mutex_ready) { _skr_mtx_destroy(&_slot_mutex); _slot_mutex_ready = false; }
+	_scope_depth = 0;
+	_scope_slot  = NULL;
+	_last_future = (skr_future_t){0};
 }

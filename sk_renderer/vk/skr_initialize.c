@@ -796,8 +796,6 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk = (_skr_vk_t){0};
 	_skr_vk.validation_enabled        = settings.enable_validation;
 	_skr_vk.current_renderpass_idx    = -1;
-	_skr_vk.main_thread_id            = thrd_current();
-	_skr_vk.destroy_list              = _skr_destroy_list_create();
 
 	// Set up memory allocators (use stdlib if none provided)
 	_skr_vk.malloc_func  = settings.malloc_func  ? settings.malloc_func  : malloc;
@@ -1024,8 +1022,6 @@ bool skr_init(skr_settings_t settings) {
 	if (_skr_vk.validation_enabled) {
 		if (!_skr_vk_create_debug_messenger(_skr_vk.instance, _skr_vk_debug_callback, &_skr_vk.debug_messenger )) {
 			skr_log(skr_log_warning, "Failed to create debug messenger");
-		} else {
-			_skr_cmd_destroy_debug_messenger(&_skr_vk.destroy_list, _skr_vk.debug_messenger);
 		}
 	}
 
@@ -1623,50 +1619,17 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.video_decode_queue_mutex = &_skr_vk.queue_mutexes[3];
 	}
 
-	// Create command pool
-	VkCommandPoolCreateInfo pool_info = {
-		.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-		.queueFamilyIndex = _skr_vk.graphics_queue_family,
-	};
-
-	vr = vkCreateCommandPool(_skr_vk.device, &pool_info, NULL, &_skr_vk.command_pool);
-	SKR_VK_CHECK_RET(vr, "vkCreateCommandPool", false);
-	_skr_cmd_destroy_command_pool(&_skr_vk.destroy_list, _skr_vk.command_pool);
-
-	// Allocate command buffers (one per frame in flight)
-	VkCommandBufferAllocateInfo alloc_info = {
-		.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		.commandPool        = _skr_vk.command_pool,
-		.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		.commandBufferCount = SKR_MAX_FRAMES_IN_FLIGHT,
-	};
-
-	vr = vkAllocateCommandBuffers(_skr_vk.device, &alloc_info, _skr_vk.command_buffers);
-	SKR_VK_CHECK_RET(vr, "vkAllocateCommandBuffers", false);
-
-	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
-		vr = vkCreateFence(_skr_vk.device, &(VkFenceCreateInfo){
-			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-			.flags = VK_FENCE_CREATE_SIGNALED_BIT, // Start signaled so first frame doesn't wait
-		}, NULL, &_skr_vk.frame_fences[i]);
-		SKR_VK_CHECK_RET(vr, "vkCreateFence", false);
-		_skr_cmd_destroy_fence(&_skr_vk.destroy_list, _skr_vk.frame_fences[i]);
-	}
-
 	vr = vkCreateQueryPool(_skr_vk.device, &(VkQueryPoolCreateInfo){
 		.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
 		.queryType  = VK_QUERY_TYPE_TIMESTAMP,
 		.queryCount = 2 * SKR_MAX_FRAMES_IN_FLIGHT,
 	}, NULL, &_skr_vk.timestamp_pool);
 	SKR_VK_CHECK_RET(vr, "vkCreateQueryPool", false);
-	_skr_cmd_destroy_query_pool(&_skr_vk.destroy_list, _skr_vk.timestamp_pool);
 
 	vr = vkCreatePipelineCache(_skr_vk.device, &(VkPipelineCacheCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
 	}, NULL, &_skr_vk.pipeline_cache);
 	SKR_VK_CHECK_RET(vr, "vkCreatePipelineCache", false);
-	_skr_cmd_destroy_pipeline_cache(&_skr_vk.destroy_list, _skr_vk.pipeline_cache);
 
 	_skr_pipeline_init();
 
@@ -1677,6 +1640,7 @@ bool skr_init(skr_settings_t settings) {
 
 	// Initialize main thread
 	skr_thread_init();
+	_skr_store_u32(&_skr_vk.main_pool_idx, _skr_cmd_get_thread()->thread_idx);
 
 	const skr_tex_sampler_t sampler = {
 		.sample  = skr_tex_sample_linear,
@@ -1822,8 +1786,8 @@ void skr_shutdown(void) {
 	_skr_cmd_shutdown      ();  // Executes per-command destroy lists (may free bind pool slots)
 	_skr_pipeline_shutdown ();
 
-	_skr_destroy_list_execute(&_skr_vk.destroy_list);  // Execute global destroy list
-	_skr_destroy_list_free   (&_skr_vk.destroy_list);
+	if (_skr_vk.pipeline_cache  != VK_NULL_HANDLE) vkDestroyPipelineCache(_skr_vk.device, _skr_vk.pipeline_cache,  NULL);
+	if (_skr_vk.timestamp_pool  != VK_NULL_HANDLE) vkDestroyQueryPool    (_skr_vk.device, _skr_vk.timestamp_pool,  NULL);
 
 	_skr_bind_pool_shutdown();     // Free bind pool after all deferred destroys are done
 	_skr_sampler_cache_shutdown(); // Destroy cached samplers after GPU is idle
@@ -1841,9 +1805,14 @@ void skr_shutdown(void) {
 	for (int32_t i = 0; i < SKR_QUEUE_TYPE_COUNT; i++) mtx_destroy(&_skr_vk.queue_mutexes[i]);
 	mtx_destroy(&_skr_vk.thread_pool_mutex);
 
-	// Destroy device and instance directly (special cases not in destroy list)
-	if (_skr_vk.device   != VK_NULL_HANDLE) { vkDestroyDevice  (_skr_vk.device,   NULL); }
-	if (_skr_vk.instance != VK_NULL_HANDLE) { vkDestroyInstance(_skr_vk.instance, NULL); }
+	// Nothing should defer after the command system is down
+	uint32_t late = _skr_destroy_drain();
+	if (late > 0) skr_log(skr_log_critical, "%u objects were deferred after command shutdown", late);
+
+	// The messenger outlives the device so leaked-object reports still arrive
+	if (_skr_vk.device          != VK_NULL_HANDLE) vkDestroyDevice                (_skr_vk.device,   NULL);
+	if (_skr_vk.debug_messenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(_skr_vk.instance, _skr_vk.debug_messenger, NULL);
+	if (_skr_vk.instance        != VK_NULL_HANDLE) vkDestroyInstance              (_skr_vk.instance, NULL);
 
 	_skr_vk = (_skr_vk_t){0};
 }

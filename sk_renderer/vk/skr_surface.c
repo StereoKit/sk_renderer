@@ -566,38 +566,30 @@ void skr_surface_destroy(skr_surface_t* ref_surface) {
 	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++)
 		if (_skr_vk.frame_surface[i] == ref_surface) _skr_vk.frame_surface[i] = NULL;
 	_skr_surface_wait_presents(ref_surface);
-	skr_destroy_list_t list = _skr_destroy_list_create();
+	VkDevice device = _skr_vk.device;
 
-	// Destroy per-frame synchronization objects
-	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
-		_skr_cmd_destroy_semaphore(&list, ref_surface->semaphore_acquire[i]);
-		_skr_cmd_destroy_fence    (&list, ref_surface->present_fence   [i]);
-	}
-
-	// Destroy per-image synchronization objects
-	if (ref_surface->semaphore_submit) {
-		for (uint32_t i = 0; i < ref_surface->image_count; i++)
-			_skr_cmd_destroy_semaphore(&list, ref_surface->semaphore_submit[i]);
-		_skr_free(ref_surface->semaphore_submit);
-	}
-
-	// Destroy image views and cached framebuffers
+	// Framebuffers and views reference the swapchain's images, so they go first
 	if (ref_surface->images) {
 		for (uint32_t i = 0; i < ref_surface->image_count; i++) {
-			_skr_cmd_destroy_framebuffer(&list, ref_surface->images[i].framebuffer);
-			_skr_cmd_destroy_framebuffer(&list, ref_surface->images[i].framebuffer_depth);
-			_skr_cmd_destroy_image_view (&list, ref_surface->images[i].view);
+			if (ref_surface->images[i].framebuffer       != VK_NULL_HANDLE) vkDestroyFramebuffer(device, ref_surface->images[i].framebuffer,       NULL);
+			if (ref_surface->images[i].framebuffer_depth != VK_NULL_HANDLE) vkDestroyFramebuffer(device, ref_surface->images[i].framebuffer_depth, NULL);
+			if (ref_surface->images[i].view              != VK_NULL_HANDLE) vkDestroyImageView  (device, ref_surface->images[i].view,              NULL);
 		}
 		_skr_free(ref_surface->images);
 	}
+	if (ref_surface->swapchain != VK_NULL_HANDLE) vkDestroySwapchainKHR(device,           ref_surface->swapchain, NULL);
+	if (ref_surface->surface   != VK_NULL_HANDLE) vkDestroySurfaceKHR  (_skr_vk.instance, ref_surface->surface,   NULL);
+
+	for (uint32_t i = 0; i < SKR_MAX_FRAMES_IN_FLIGHT; i++) {
+		if (ref_surface->semaphore_acquire[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, ref_surface->semaphore_acquire[i], NULL);
+		if (ref_surface->present_fence   [i] != VK_NULL_HANDLE) vkDestroyFence    (device, ref_surface->present_fence   [i], NULL);
+	}
+	if (ref_surface->semaphore_submit) {
+		for (uint32_t i = 0; i < ref_surface->image_count; i++)
+			if (ref_surface->semaphore_submit[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, ref_surface->semaphore_submit[i], NULL);
+		_skr_free(ref_surface->semaphore_submit);
+	}
 	if (ref_surface->image_present_id) _skr_free(ref_surface->image_present_id);
-
-	// Executes LIFO, so the surface outlives the swapchain
-	_skr_cmd_destroy_surface  (&list, ref_surface->surface  );
-	_skr_cmd_destroy_swapchain(&list, ref_surface->swapchain);
-
-	_skr_destroy_list_execute(&list);
-	_skr_destroy_list_free   (&list);
 
 	*ref_surface = (skr_surface_t){0};
 }

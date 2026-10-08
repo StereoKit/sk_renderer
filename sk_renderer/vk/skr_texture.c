@@ -658,10 +658,8 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 	}
 	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, shader_stages);
 
-	// Defer cleanup. Destroy list is LIFO — push memory before buffer so
-	// vkFreeMemory runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
-	_skr_cmd_destroy_memory(ctx.destroy_list, staging.memory);
-	_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
+	_skr_destroy_private_memory(staging.memory);
+	_skr_destroy_private_buffer(staging.buffer);
 	_skr_cmd_release(ctx.cmd);
 
 	_skr_free(regions);
@@ -873,10 +871,8 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 			out_tex->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			out_tex->first_use      = false;
 
-			// Destroy list is LIFO — push memory before buffer so vkFreeMemory
-			// runs after vkDestroyBuffer (VUID-vkFreeMemory-memory-00677).
-			_skr_cmd_destroy_memory(ctx.destroy_list, staging.memory);
-			_skr_cmd_destroy_buffer(ctx.destroy_list, staging.buffer);
+			_skr_destroy_private_memory(staging.memory);
+			_skr_destroy_private_buffer(staging.buffer);
 			_skr_cmd_release(ctx.cmd);
 		}
 	}
@@ -1277,31 +1273,26 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 	// would be dangling.
 	_skr_tex_transition_dequeue(ref_tex);
 
-	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer);
-	_skr_cmd_destroy_framebuffer(NULL, ref_tex->framebuffer_depth);
+	_skr_destroy_batch_begin();
+	_skr_destroy_shared_framebuffer(ref_tex->framebuffer);
+	_skr_destroy_shared_framebuffer(ref_tex->framebuffer_depth);
 
 	// Only release from sampler cache if we acquired from it (not YCbCr immutable samplers)
 	if (ref_tex->ycbcr_sampler == VK_NULL_HANDLE) {
 		_skr_sampler_cache_release(ref_tex->sampler_settings);
 	}
-	_skr_cmd_destroy_image_view (NULL, ref_tex->view);
+	_skr_destroy_shared_image_view (ref_tex->view);
 
-	// Only destroy image/memory if we own them (not external).
-	// Destroy list executes LIFO, so push memory FIRST and image SECOND —
-	// vkFreeMemory must run after vkDestroyImage, otherwise the validation
-	// layer reports the memory as still bound to the image (VUID-vkFreeMemory-memory-00677).
+	// External images aren't ours to free. LIFO list: memory frees after the image
 	if (!ref_tex->is_external) {
-		_skr_cmd_destroy_memory(NULL, ref_tex->memory);
-		_skr_cmd_destroy_image (NULL, ref_tex->image);
+		_skr_destroy_shared_memory(ref_tex->memory);
+		_skr_destroy_shared_image (ref_tex->image);
 	}
 
-	// Deferred destroy YCbCr resources. The destroy list executes in LIFO order,
-	// so push conversion first, then sampler. At execution time this means the
-	// sampler is destroyed before the conversion — which is required by Vulkan
-	// (the sampler references the conversion, so it must be destroyed first).
-	// WARNING: this ordering breaks if the destroy list changes from LIFO.
-	_skr_cmd_destroy_ycbcr_conversion(NULL, ref_tex->ycbcr_conversion);
-	_skr_cmd_destroy_sampler         (NULL, ref_tex->ycbcr_sampler);
+	// LIFO list: the sampler goes before the conversion it references
+	_skr_destroy_shared_ycbcr_conversion(ref_tex->ycbcr_conversion);
+	_skr_destroy_shared_sampler         (ref_tex->ycbcr_sampler);
+	_skr_destroy_batch_end();
 
 #ifdef __ANDROID__
 	// Release AHB reference if we acquired one
@@ -1653,7 +1644,7 @@ void _skr_mipgen_materials_shutdown(void) {
 	for (int32_t i = 0; i < _SKR_MIPGEN_MATERIAL_MAX; i++) {
 		if (_skr_mipgen_materials[i].shader != NULL) {
 			if (_skr_mipgen_materials[i].compute_pipeline != VK_NULL_HANDLE)
-				_skr_cmd_destroy_pipeline(NULL, _skr_mipgen_materials[i].compute_pipeline);
+				_skr_destroy_shared_pipeline(_skr_mipgen_materials[i].compute_pipeline);
 			skr_material_destroy(&_skr_mipgen_materials[i].material);
 		}
 		_skr_mipgen_materials[i] = (_skr_mipgen_material_t){0};
@@ -1692,7 +1683,7 @@ void _skr_mipgen_material_release(const skr_shader_t* shader) {
 	for (int32_t i = 0; i < _SKR_MIPGEN_MATERIAL_MAX; i++) {
 		if (_skr_mipgen_materials[i].shader == shader) {
 			if (_skr_mipgen_materials[i].compute_pipeline != VK_NULL_HANDLE)
-				_skr_cmd_destroy_pipeline(NULL, _skr_mipgen_materials[i].compute_pipeline);
+				_skr_destroy_shared_pipeline(_skr_mipgen_materials[i].compute_pipeline);
 			skr_material_destroy(&_skr_mipgen_materials[i].material);
 			_skr_mipgen_materials[i] = (_skr_mipgen_material_t){0};
 			break;
@@ -1871,7 +1862,7 @@ static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, 
 			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)(mip - 1), 1, 0, ref_tex->layer_count },
 		}, NULL, &src_view);
 		if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (compute mip src)"); continue; }
-		_skr_cmd_destroy_image_view(ctx.destroy_list, src_view);
+		_skr_destroy_private_image_view(src_view);
 
 		VkImageView dst_view = VK_NULL_HANDLE;
 		vr = vkCreateImageView(device, &(VkImageViewCreateInfo){
@@ -1882,7 +1873,7 @@ static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, 
 			.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)mip, 1, 0, ref_tex->layer_count },
 		}, NULL, &dst_view);
 		if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (compute mip dst)"); continue; }
-		_skr_cmd_destroy_image_view(ctx.destroy_list, dst_view);
+		_skr_destroy_private_image_view(dst_view);
 
 		_skr_desc_writes_t desc;
 		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
@@ -2114,7 +2105,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 				},
 			}, NULL, &src_view);
 			if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip src)"); continue; }
-			_skr_cmd_destroy_image_view(ctx.destroy_list, src_view);
+			_skr_destroy_private_image_view(src_view);
 		}
 
 
@@ -2164,7 +2155,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 					},
 				}, NULL, &mip_view);
 				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateImageView (mip target)"); continue; }
-				_skr_cmd_destroy_image_view(ctx.destroy_list, mip_view);
+				_skr_destroy_private_image_view(mip_view);
 			}
 
 			VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -2179,7 +2170,7 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 					.layers          = 1,  // Multiview: layers=1, view_mask controls layer count
 				}, NULL, &framebuffer);
 				if (vr != VK_SUCCESS) { SKR_VK_CHECK_NRET(vr, "vkCreateFramebuffer (mip)"); continue; }
-				_skr_cmd_destroy_framebuffer(ctx.destroy_list, framebuffer);
+				_skr_destroy_private_framebuffer(framebuffer);
 			}
 
 			vkCmdBeginRenderPass(ctx.cmd, &(VkRenderPassBeginInfo){
@@ -2817,7 +2808,7 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 	ref_tex->image = update.image;
 
 	if (old_view != VK_NULL_HANDLE) {
-		_skr_cmd_destroy_image_view(NULL, old_view);
+		_skr_destroy_shared_image_view(old_view);
 	}
 
 	// Update layout tracking
@@ -3873,11 +3864,12 @@ void skr_tex_readback_destroy(skr_tex_readback_t* ref_readback) {
 	_skr_tex_readback_internal_t* internal = (_skr_tex_readback_internal_t*)ref_readback->_internal;
 
 	// No wait: the copy may sit in a command buffer this thread has yet to
-	// submit, and blocking on that here deadlocks. Deferred destruction
-	// releases the staging once the GPU is done with it (LIFO: memory first).
+	// submit, and blocking on that here deadlocks
 	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
-	_skr_cmd_destroy_memory(NULL, internal->staging_memory);
-	_skr_cmd_destroy_buffer(NULL, internal->staging_buffer);
+	_skr_destroy_batch_begin();
+	_skr_destroy_shared_memory(internal->staging_memory);
+	_skr_destroy_shared_buffer(internal->staging_buffer);
+	_skr_destroy_batch_end();
 	_skr_free(internal);
 
 	*ref_readback = (skr_tex_readback_t){0};

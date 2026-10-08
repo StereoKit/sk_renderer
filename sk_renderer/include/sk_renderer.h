@@ -727,19 +727,19 @@ SKR_API WGPUQueue         skr_get_wgpu_queue               (void);
 
 SKR_API bool              skr_init                         (skr_settings_t settings);
 SKR_API void              skr_shutdown                     (void);
-SKR_API void              skr_thread_init                  (void);
-SKR_API void              skr_thread_shutdown              (void);
-SKR_API bool              skr_thread_is_initialized        (void);
+SKR_API void              skr_thread_init                  (void);  // Registers the calling thread for GPU work: uploads, command scopes, readbacks. skr_init registers its own thread. Any thread may destroy objects, registered or not; they free once every submission that could use them has finished
+SKR_API void              skr_thread_shutdown              (void);  // Waits this thread's GPU work and unregisters it. Close any skr_cmd_begin scope first. Objects it destroyed that a frame still uses stay alive until that frame's fence
+SKR_API bool              skr_thread_is_initialized        (void);  // Whether skr_thread_init ran on the calling thread
 SKR_API bool              skr_is_capable                   (skr_capability_ capability);
 
-SKR_API skr_future_t      skr_future_get                   (void);
-SKR_API bool              skr_future_check                 (const skr_future_t* future);
-SKR_API void              skr_future_wait                  (const skr_future_t* future);
+SKR_API skr_future_t      skr_future_get                   (void);  // A future for all of this thread's GPU work so far, an open scope included. Invalid before anything has been submitted
+SKR_API bool              skr_future_check                 (const skr_future_t* future);  // True once the GPU finished that work, or for an invalid future. Any thread may ask
+SKR_API void              skr_future_wait                  (const skr_future_t* future);  // Blocks until the GPU finished that work. Any thread may wait, even after the creating thread exited. Native only: the web can't block, poll skr_future_check from the frame loop instead
 
-SKR_API void              skr_cmd_begin                    (void);
-SKR_API skr_future_t      skr_cmd_end                      (void);
-SKR_API skr_future_t      skr_cmd_flush                    (void);
-SKR_API bool              skr_cmd_is_active                (void);
+SKR_API void              skr_cmd_begin                    (void);  // Opens a scope that batches this thread's GPU commands into one submission at skr_cmd_end. Keep it short: a scope held open while another thread destroys an object it uses is only protected on the frame thread
+SKR_API skr_future_t      skr_cmd_end                      (void);  // Closes the scope. Scopes nest; the outermost end submits, and every end returns a future for that submission
+SKR_API skr_future_t      skr_cmd_flush                    (void);  // Submits what the open scope has recorded so far and keeps it open; returns that submission's future, invalid when no scope is open
+SKR_API bool              skr_cmd_is_active                (void);  // Whether the calling thread has a scope open
 
 SKR_API void              skr_callback_log                 (void (*callback)(skr_log_ level, const char* text));
 SKR_API void              skr_log                          (skr_log_ level, const char* text, ...);

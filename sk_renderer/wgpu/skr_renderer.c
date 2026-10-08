@@ -284,6 +284,7 @@ static _skr_timer_frame_t* _skr_timer_flush(void) {
 
 void skr_renderer_frame_begin(void) {
 	wgpuInstanceProcessEvents(_skr_wgpu.instance);
+	skr_cmd_begin(); // the frame is a scope, as on Vulkan, so skr_cmd_is_active holds inside it
 	_bump_uniform.used = 0;
 	_bump_storage.used = 0;
 	_system_size       = 0;
@@ -305,7 +306,7 @@ void _skr_cpu_wait_add(uint64_t start_ns) {
 }
 
 void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
-	skr_future_t future = _skr_cmd_submit();
+	skr_future_t future = skr_cmd_end();
 	for (uint32_t i = 0; i < count; i++)
 		opt_surfaces[i]->frame_future[opt_surfaces[i]->frame_idx % SKR_MAX_FRAMES_IN_FLIGHT] = future;
 

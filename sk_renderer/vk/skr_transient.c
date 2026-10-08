@@ -34,12 +34,12 @@ static _skr_transient_pool_t _pool;
 ///////////////////////////////////////////////////////////////////////////////
 
 static void _skr_transient_entry_destroy(_skr_transient_entry_t* e) {
-	// Not skr_tex_destroy — these textures never acquired a sampler, and the
-	// destroy list executes LIFO, so push memory, image, then view for
-	// dependency-ordered retirement (view → image → memory).
-	_skr_cmd_destroy_memory    (NULL, e->tex.memory);
-	_skr_cmd_destroy_image     (NULL, e->tex.image);
-	_skr_cmd_destroy_image_view(NULL, e->tex.view);
+	// Not skr_tex_destroy, these never acquired a sampler. LIFO list: memory last
+	_skr_destroy_batch_begin();
+	_skr_destroy_shared_memory    (e->tex.memory);
+	_skr_destroy_shared_image     (e->tex.image);
+	_skr_destroy_shared_image_view(e->tex.view);
+	_skr_destroy_batch_end();
 	_skr_free(e);
 }
 
@@ -204,7 +204,6 @@ void _skr_transient_pool_tick(void) {
 	for (uint32_t i = 0; i < _pool.count; ) {
 		_skr_transient_entry_t* e = _pool.entries[i];
 		if (!e->in_use && (frame - e->last_used_frame) > SKR_TRANSIENT_IDLE_FRAMES) {
-			// Deferred destroy chain holds the resources until fences clear
 			_skr_transient_entry_destroy(e);
 
 			// Swap-remove

@@ -32,7 +32,7 @@ static skr_shader_stage_t _skr_shader_stage_create(VkDevice device, const void* 
 static void _skr_shader_stage_destroy(skr_shader_stage_t* ref_stage) {
 	if (!ref_stage) return;
 
-	_skr_cmd_destroy_shader_module(NULL, ref_stage->shader);
+	_skr_destroy_shared_shader_module(ref_stage->shader);
 	*ref_stage = (skr_shader_stage_t){0};
 }
 

@@ -77,13 +77,11 @@ static void app_surface_resize(ska_window_t* window, skr_surface_t* surface) {
 	skr_surface_resize(surface, (skr_vec2i_t){ w, h });
 }
 
+// This thread's last fence covers every earlier submission from any thread.
+// A raw vkDeviceWaitIdle here would race worker submits on the queue.
 static void app_device_wait_idle(void) {
-#ifdef SKR_VK
-	if (skr_get_vk_device()) vkDeviceWaitIdle(skr_get_vk_device());
-#else
 	skr_future_t f = skr_future_get();
 	skr_future_wait(&f);
-#endif
 }
 
 // Everything the frame callback needs. Static so it outlives main() on the
@@ -324,6 +322,7 @@ static bool main_frame(void* user_data) {
 	} else {
 		skr_renderer_frame_end(NULL, 0);
 	}
+	app_idle(s->app);
 
 	// Handle surface issues from either acquire or present
 	if (surface_result != skr_acquire_success) {
@@ -388,7 +387,8 @@ int main(int argc, char* argv[]) {
 	const bool enable_validation = true;
 
 	// Initialize sk_app
-	if (!ska_init(NULL)) {
+	// app_id names the window class and the kvpstore the geometry below lives in
+	if (!ska_init(&(ska_settings_t){ .app_id = "sk_renderer_test" })) {
 		su_log(su_log_critical, "sk_app initialization failed: %s\n", ska_error_get());
 		return 1;
 	}
@@ -402,7 +402,6 @@ int main(int argc, char* argv[]) {
 
 	// Load saved window geometry (kvpstore so the window starts in the right
 	// place instead of centering first and jumping after ImGui loads its ini)
-	ska_kvpstore_set_app_name("sk_renderer_test");
 	int32_t win_x = SKA_WINDOWPOS_CENTERED;
 	int32_t win_y = SKA_WINDOWPOS_CENTERED;
 	int32_t win_w = 2560;
