@@ -360,8 +360,8 @@ static _skr_atomic(uint64_t) _mem_peak;
 static _skr_atomic(uint64_t) _mem_category[skr_mem_category_max];
 
 void _skr_mem_track(skr_mem_category_ category, int64_t bytes) {
-	_skr_fetch_add_u64(&_mem_category[category], (uint64_t)bytes);
-	uint64_t used = _skr_fetch_add_u64(&_mem_used, (uint64_t)bytes) + (uint64_t)bytes;
+	_skr_add_u64(&_mem_category[category], (uint64_t)bytes);
+	uint64_t used = _skr_add_u64(&_mem_used, (uint64_t)bytes) + (uint64_t)bytes;
 	uint64_t peak = _skr_load_u64(&_mem_peak);
 	while (used > peak && !_skr_cas_u64(&_mem_peak, peak, used))
 		peak = _skr_load_u64(&_mem_peak);

@@ -12,44 +12,6 @@
 #include <volk.h>
 #include <threads.h>
 
-// Registries coordinate writers with one mutex and publish to lock-free
-// readers with release/acquire pointer stores. MSVC gates C11 <stdatomic.h>
-// behind /experimental:c11atomics, so use the intrinsics both compilers ship.
-#if defined(_MSC_VER)
-	#include <intrin.h>
-	#define _skr_atomic(T)            T volatile
-	#if defined(_M_ARM64) || defined(_M_ARM64EC)
-		#define _skr_load_acquire(p)  ((void*)__ldar64((volatile __int64*)(p)))
-	#else
-		#define _skr_load_acquire(p)  (*(p)) // x86/x64 loads carry acquire already
-	#endif
-	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
-	#define _skr_store_u32(p, v)      _InterlockedExchange((volatile long*)(p), (long)(v))
-	#define _skr_load_u32(p)          (*(p))
-	#define _skr_exchange_u32(p, v)   ((uint32_t)_InterlockedExchange((volatile long*)(p), (long)(v)))
-	#define _skr_add_u32(p, v)        _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
-	#define _skr_add_u64(p, v)        _InterlockedExchangeAdd64((volatile __int64*)(p), (__int64)(v))
-	#define _skr_load_u64(p)          (*(p))
-	#define _skr_cas_u64(p, expected, desired) (_InterlockedCompareExchange64((volatile __int64*)(p), (__int64)(desired), (__int64)(expected)) == (__int64)(expected))
-	#define _skr_load_ptr(p)          (*(p))
-	#define _skr_exchange_ptr(p, v)   _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
-	#define _skr_cas_ptr(p, expected, desired) (_InterlockedCompareExchangePointer((void* volatile*)(p), (void*)(desired), (void*)(expected)) == (void*)(expected))
-#else
-	#define _skr_atomic(T)            T
-	#define _skr_load_acquire(p)      __atomic_load_n ((p),      __ATOMIC_ACQUIRE)
-	#define _skr_store_release(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELEASE)
-	#define _skr_store_u32(p, v)      __atomic_store_n   ((p), (v), __ATOMIC_RELAXED)
-	#define _skr_load_u32(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
-	#define _skr_exchange_u32(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_RELAXED)
-	#define _skr_add_u32(p, v)        __atomic_fetch_add ((p), (v), __ATOMIC_RELAXED)
-	#define _skr_add_u64(p, v)        __atomic_fetch_add ((p), (v), __ATOMIC_RELAXED)
-	#define _skr_load_u64(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
-	#define _skr_cas_u64(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
-	#define _skr_load_ptr(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
-	#define _skr_exchange_ptr(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_ACQ_REL)
-	#define _skr_cas_ptr(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELEASE, __ATOMIC_RELAXED) // MSVC's doesn't write expected back, so callers reload it
-#endif
-
 ///////////////////////////////////////////////////////////////////////////////
 // Memory allocation wrappers
 ///////////////////////////////////////////////////////////////////////////////
@@ -111,6 +73,8 @@ _Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must
 
 #define SKR_QUEUE_TYPE_COUNT    4   // graphics, present, transfer, video_decode
 #define skr_MAX_COMMAND_RING    8   // Number of command buffers per thread
+#define skr_MARKER_CHUNK_SIZE   8   // skr_future_get_queue slots per chunk
+#define skr_MARKER_CHUNK_MAX    64  // Chunk table size, far past any real backlog
 #define skr_MAX_THREAD_POOLS    16  // Maximum concurrent threads
 
 // Bind shifts (hardcoded to match skshaderc)
@@ -232,6 +196,12 @@ typedef struct {
 	uint64_t              generation;   // Starts at 1 and never resets, so a stale future can't match a reused slot
 	_skr_atomic(uint32_t) waiters;      // Threads blocked in skr_future_wait on this fence
 } _skr_cmd_ring_slot_t;
+
+// skr_future_get_queue's slots, usable from any thread. Futures point at `slot`.
+typedef struct {
+	_skr_cmd_ring_slot_t slot;
+	_skr_atomic(void*)   claimed;       // Non-null while a caller is preparing the slot
+} _skr_marker_t;
 
 // Per-frame transient data (material params, system data, instance data,
 // compute $Globals) for one thread: one host-visible buffer shared by every
@@ -429,6 +399,8 @@ typedef struct {
 	bool                     has_dedicated_transfer;
 	_skr_vk_thread_t         thread_pools[skr_MAX_THREAD_POOLS];
 	mtx_t                    thread_pool_mutex;
+	_skr_atomic(_skr_marker_t*) marker_chunks[skr_MARKER_CHUNK_MAX]; // Fence-only slots for skr_future_get_queue, chunks never move once published
+	_skr_atomic(uint32_t)    marker_next;     // Where the next marker claim scan starts
 	_skr_atomic(uint32_t)    main_pool_idx;   // The frame thread's pool; shared destroys retire on its submits
 	_skr_atomic(_skr_destroy_block_t*) pending; // Shared destroys waiting on a fence, see _skr_destroy_retire
 	_skr_atomic(uint64_t)    next_uid;        // see _skr_uid_new

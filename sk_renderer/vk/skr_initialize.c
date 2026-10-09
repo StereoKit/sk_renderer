@@ -24,6 +24,9 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 _skr_vk_t _skr_vk;
+uint64_t  _skr_gen_floor;
+_skr_atomic(uint32_t) _skr_future_calls;
+static uint32_t _skr_session; // Outlives _skr_vk resets, so each session's generations start higher
 
 ///////////////////////////////////////////////////////////////////////////////
 // Memory allocation wrappers
@@ -795,6 +798,7 @@ bool skr_init(skr_settings_t settings) {
 	}
 
 	_skr_vk = (_skr_vk_t){0};
+	_skr_gen_floor = (uint64_t)(++_skr_session) << 40;
 	_skr_vk.validation_enabled        = settings.enable_validation;
 	_skr_vk.current_renderpass_idx    = -1;
 
@@ -1760,6 +1764,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_log_summary();
 
 	_skr_vk.initialized = true;
+	_skr_future_open();
 	return true;
 }
 
@@ -1775,6 +1780,8 @@ void _skr_device_wait_idle(void) {
 void skr_shutdown(void) {
 	if (!_skr_vk.initialized) return;
 
+	// Before the idle, so nothing can submit a marker after it
+	_skr_future_close();
 	_skr_device_wait_idle();
 
 	skr_tex_destroy(&_skr_vk.default_tex_white);

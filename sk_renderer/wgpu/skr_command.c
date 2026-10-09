@@ -32,12 +32,14 @@ static void _skr_slot_lock(void) {
 static void _skr_slot_unlock(void) { _skr_mtx_unlock(&_slot_mutex); }
 
 static void _skr_on_work_done(WGPUQueueWorkDoneStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
-	(void)status; (void)message;
+	(void)message;
 	// Web path: mark the slot completed (see _SKR_CB_MODE_ASYNC). Generation
 	// guards against a late callback landing on a recycled slot.
 	_skr_cmd_slot_t* slot = (_skr_cmd_slot_t*)userdata1;
-	if (slot && slot->generation == (uint64_t)(uintptr_t)userdata2)
+	if (slot && slot->generation == (uint64_t)(uintptr_t)userdata2) {
+		slot->failed    = status != WGPUQueueWorkDoneStatus_Success;
 		slot->completed = true;
+	}
 }
 
 // Caller holds the slot lock
@@ -59,6 +61,7 @@ static _skr_cmd_slot_t* _skr_cmd_slot_alloc(uint64_t* out_generation) {
 		if (!slot->in_flight) {
 			slot->generation = ++_skr_wgpu.generation_next;
 			slot->completed  = false;
+			slot->failed     = false;
 			*out_generation  = slot->generation;
 			return slot;
 		}
@@ -68,6 +71,8 @@ static _skr_cmd_slot_t* _skr_cmd_slot_alloc(uint64_t* out_generation) {
 	skr_log(skr_log_warning, "skr future ring exhausted; recycling oldest slot");
 	_skr_cmd_slot_t* slot = &_skr_wgpu.cmd_slots[_skr_wgpu.cmd_slot_next++ % _SKR_CMD_SLOTS];
 	slot->generation = ++_skr_wgpu.generation_next;
+	slot->completed  = false;
+	slot->failed     = false;
 	*out_generation  = slot->generation;
 	return slot;
 }
@@ -83,37 +88,38 @@ skr_future_t _skr_future_from_wgpu(WGPUFuture future) {
 	return result;
 }
 
-bool skr_future_check(const skr_future_t* future) {
-	if (future == NULL || future->slot == NULL) return true;
+static skr_future_state_ _skr_future_done(const skr_future_t* future) {
 	_skr_cmd_slot_t* slot = (_skr_cmd_slot_t*)future->slot;
 
 	wgpuInstanceProcessEvents(_skr_wgpu.instance);
 
 	_skr_slot_lock();
-	bool done = true;
+	skr_future_state_ state = skr_future_state_ready;
 	if (slot->generation == future->generation) { // else: slot recycled, long done
-		done = slot->completed;
+		bool done = slot->completed;
 #ifndef __EMSCRIPTEN__
 		if (!done && slot->future.id != 0) {
-			WGPUFutureWaitInfo info = { .future = slot->future };
-			done = wgpuInstanceWaitAny(_skr_wgpu.instance, 1, &info, 0) == WGPUWaitStatus_Success && info.completed;
+			WGPUFutureWaitInfo info   = { .future = slot->future };
+			WGPUWaitStatus     status = wgpuInstanceWaitAny(_skr_wgpu.instance, 1, &info, 0);
+			if (status == WGPUWaitStatus_Error) slot->failed = true;
+			done = slot->failed || (status == WGPUWaitStatus_Success && info.completed);
 		}
 #endif
 		if (done) slot->in_flight = false;
+		state = !done ? skr_future_state_pending : slot->failed ? skr_future_state_failed : skr_future_state_ready;
 	}
 	_skr_slot_unlock();
-	return done;
+	return state;
 }
 
-void skr_future_wait(const skr_future_t* future) {
-	if (future == NULL || future->slot == NULL) return;
+static skr_future_state_ _skr_future_block(const skr_future_t* future) {
 	_skr_cmd_slot_t* slot = (_skr_cmd_slot_t*)future->slot;
 
 	_skr_slot_lock();
 	bool       ours        = slot->generation == future->generation;
 	WGPUFuture wgpu_future = slot->future;
 	_skr_slot_unlock();
-	if (!ours) return;
+	if (!ours) return skr_future_state_ready;
 
 #ifndef __EMSCRIPTEN__
 	// A scope still open on another thread has no future to wait on yet
@@ -123,19 +129,41 @@ void skr_future_wait(const skr_future_t* future) {
 		ours        = slot->generation == future->generation;
 		wgpu_future = slot->future;
 		_skr_slot_unlock();
-		if (!ours) return;
+		if (!ours) return skr_future_state_ready;
 	}
 #endif
 
 	// Blocking wait — valid on native, a hard error on web by design; web
 	// code must poll skr_future_check from the frame loop instead. Waiting
 	// happens outside the slot lock so other threads can submit meanwhile.
-	WGPUFutureWaitInfo info = { .future = wgpu_future };
-	if (wgpuInstanceWaitAny(_skr_wgpu.instance, 1, &info, UINT64_MAX) == WGPUWaitStatus_Success && info.completed) {
-		_skr_slot_lock();
-		if (slot->generation == future->generation) slot->in_flight = false;
-		_skr_slot_unlock();
-	}
+	WGPUFutureWaitInfo info      = { .future = wgpu_future };
+	bool               completed = wgpuInstanceWaitAny(_skr_wgpu.instance, 1, &info, UINT64_MAX) == WGPUWaitStatus_Success && info.completed;
+
+	_skr_slot_lock();
+	if (slot->generation != future->generation) { _skr_slot_unlock(); return skr_future_state_ready; }
+	if (!completed) slot->failed = true;
+	slot->in_flight = false;
+	bool failed = slot->failed;
+	_skr_slot_unlock();
+	return failed ? skr_future_state_failed : skr_future_state_ready;
+}
+
+skr_future_state_ skr_future_check(const skr_future_t* future) {
+	if (future == NULL || future->slot == NULL) return skr_future_state_none;
+	if (!_skr_future_enter()) return skr_future_state_failed;
+	if (!_skr_future_current(future)) { _skr_future_leave(); return skr_future_state_failed; }
+	skr_future_state_ state = _skr_future_done(future);
+	_skr_future_leave();
+	return state;
+}
+
+skr_future_state_ skr_future_wait(const skr_future_t* future) {
+	if (future == NULL || future->slot == NULL) return skr_future_state_none;
+	if (!_skr_future_enter()) return skr_future_state_failed;
+	if (!_skr_future_current(future)) { _skr_future_leave(); return skr_future_state_failed; }
+	skr_future_state_ state = _skr_future_block(future);
+	_skr_future_leave();
+	return state;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -205,16 +233,24 @@ static void _skr_cmd_slot_wire(_skr_cmd_slot_t* ref_slot, uint64_t generation) {
 		.userdata2 = (void*)(uintptr_t)generation });
 }
 
-skr_future_t _skr_cmd_submit(void) {
-	if (!_skr_cmd_submit_encoder()) return _last_future;
+skr_future_t skr_future_get_queue(void) {
+	if (!_skr_future_enter()) return (skr_future_t){0};
+
+	// Vulkan submits unscoped work right away, so implicit encoder work counts as submitted
+	if (_scope_depth == 0) _skr_cmd_submit_encoder();
 
 	_skr_slot_lock();
 	uint64_t         generation = 0;
 	_skr_cmd_slot_t* slot       = _skr_cmd_slot_alloc(&generation);
 	_skr_cmd_slot_wire(slot, generation);
 	_skr_slot_unlock();
+	_skr_future_leave();
+	return (skr_future_t){ .slot = slot, .generation = generation };
+}
 
-	_last_future = (skr_future_t){ .slot = slot, .generation = generation };
+skr_future_t _skr_cmd_submit(void) {
+	if (!_skr_cmd_submit_encoder()) return _last_future;
+	_last_future = skr_future_get_queue();
 	return _last_future;
 }
 
@@ -285,7 +321,7 @@ void _skr_readback_finish(_skr_readback_base_t* ref_base) {
 	ref_base->staging = NULL;
 	if (ref_base->done_slot && ref_base->done_slot->generation == ref_base->done_generation)
 		ref_base->done_slot->completed = true;
-	if (_skr_fetch_add(&ref_base->settled, 1) == 1) { // destroy already ran; we free
+	if (_skr_add_acq_rel(&ref_base->settled, 1) == 1) { // destroy already ran; we free
 		_skr_free(ref_base->dest);
 		_skr_free(ref_base);
 	}
@@ -295,7 +331,7 @@ void _skr_readback_destroy(_skr_readback_base_t* opt_base) {
 	if (opt_base == NULL) return;
 	// Never blocks: when the map is still in flight, the callback arrives
 	// second and frees from _skr_readback_finish
-	if (_skr_fetch_add(&opt_base->settled, 1) == 1) {
+	if (_skr_add_acq_rel(&opt_base->settled, 1) == 1) {
 		_skr_free(opt_base->dest);
 		_skr_free(opt_base);
 	}

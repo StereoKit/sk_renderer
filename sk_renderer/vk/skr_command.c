@@ -50,6 +50,16 @@ void _skr_cmd_shutdown(void) {
 		*thread = (_skr_vk_thread_t){0};
 	}
 	mtx_unlock(&_skr_vk.thread_pool_mutex);
+
+	for (uint32_t c = 0; c < skr_MARKER_CHUNK_MAX && _skr_vk.marker_chunks[c]; c++) {
+		for (uint32_t m = 0; m < skr_MARKER_CHUNK_SIZE; m++) {
+			if (_skr_vk.marker_chunks[c][m].slot.fence != VK_NULL_HANDLE)
+				vkDestroyFence(_skr_vk.device, _skr_vk.marker_chunks[c][m].slot.fence, NULL);
+		}
+		_skr_free(_skr_vk.marker_chunks[c]);
+		_skr_vk.marker_chunks[c] = NULL;
+	}
+	_skr_vk.marker_next = 0;
 	_skr_destroy_drain();
 
 	// Each thread's pool index is a thread_local this loop can't reach. Reset
@@ -253,7 +263,7 @@ static _skr_cmd_ring_slot_t *_skr_cmd_ring_begin(_skr_vk_thread_t* ref_pool) {
 
 		snprintf(name,sizeof(name), "Command_Fence_thr%u_%u", ref_pool->thread_idx, idx);
 		_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_FENCE, (uint64_t)slot->fence, name);
-		if (slot->generation == 0) slot->generation = 1;
+		if (slot->generation == 0) slot->generation = _skr_gen_floor;
 	}
 	_skr_bump_ring_slot_begin(&ref_pool->const_ring,   idx);
 	_skr_bump_ring_slot_begin(&ref_pool->storage_ring, idx);
@@ -633,6 +643,62 @@ skr_future_t skr_future_get(void) {
 	};
 }
 
+// Claims a marker whose fence is unused or already signaled, so taking one never waits
+static _skr_marker_t* _skr_marker_claim(uint32_t idx) {
+	_skr_marker_t* chunk = _skr_load_acquire(&_skr_vk.marker_chunks[idx / skr_MARKER_CHUNK_SIZE]);
+	_skr_marker_t* marker = &chunk[idx % skr_MARKER_CHUNK_SIZE];
+	if (_skr_exchange_ptr(&marker->claimed, (void*)1) != NULL) return NULL;
+	if (marker->slot.fence == VK_NULL_HANDLE || vkGetFenceStatus(_skr_vk.device, marker->slot.fence) == VK_SUCCESS) return marker;
+	_skr_store_release(&marker->claimed, NULL);
+	return NULL;
+}
+
+// Losing the race to publish a chunk is fine, the winner's chunk serves both
+static void _skr_marker_grow(uint32_t chunk_idx) {
+	_skr_marker_t* chunk    = _skr_calloc(skr_MARKER_CHUNK_SIZE, sizeof(_skr_marker_t));
+	_skr_marker_t* expected = NULL;
+	if (!_skr_cas_ptr(&_skr_vk.marker_chunks[chunk_idx], expected, chunk))
+		_skr_free(chunk);
+}
+
+// An empty submit's fence still covers everything earlier in submission
+// order, including work other threads or an OpenXR runtime put on the queue
+skr_future_t skr_future_get_queue(void) {
+	if (!_skr_future_enter()) return (skr_future_t){0};
+	_skr_marker_t* marker = NULL;
+	while (marker == NULL) {
+		uint32_t chunks = 0;
+		while (chunks < skr_MARKER_CHUNK_MAX && _skr_load_acquire(&_skr_vk.marker_chunks[chunks]) != NULL) chunks++;
+
+		uint32_t capacity = chunks * skr_MARKER_CHUNK_SIZE;
+		uint32_t start    = _skr_add_u32(&_skr_vk.marker_next, 1);
+		for (uint32_t i = 0; i < capacity && marker == NULL; i++)
+			marker = _skr_marker_claim((start + i) % capacity);
+
+		if (marker != NULL) break;
+		if (chunks < skr_MARKER_CHUNK_MAX) _skr_marker_grow(chunks);
+		else                               thrd_yield(); // Hundreds of unfinished markers, the GPU has to catch up
+	}
+	_skr_cmd_ring_slot_t* slot = &marker->slot;
+
+	if (slot->fence != VK_NULL_HANDLE) {
+		_skr_cmd_slot_retire(slot, false);
+	} else {
+		vkCreateFence(_skr_vk.device, &(VkFenceCreateInfo){ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }, NULL, &slot->fence);
+		_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_FENCE, (uint64_t)slot->fence, "Queue_Marker_Fence");
+		slot->generation = _skr_gen_floor;
+	}
+
+	mtx_lock(_skr_vk.graphics_queue_mutex);
+	vkQueueSubmit(_skr_vk.graphics_queue, 0, NULL, slot->fence);
+	skr_future_t future = { .slot = slot, .generation = slot->generation };
+	mtx_unlock(_skr_vk.graphics_queue_mutex);
+
+	_skr_store_release(&marker->claimed, NULL);
+	_skr_future_leave();
+	return future;
+}
+
 int32_t skr_renderer_frame_fence_fd(void) {
 	if (!_skr_vk.has_external_fence_fd) return -1;
 
@@ -654,21 +720,30 @@ int32_t skr_renderer_frame_fence_fd(void) {
 	return fd;
 }
 
-// Invalid futures count as done. A generation mismatch means the slot moved
-// on, which its owner only does after waiting the fence.
-bool skr_future_check(const skr_future_t* future) {
-	if (!future || !future->slot) return true;
+// A generation mismatch means the slot moved on, which its owner only does
+// after waiting the fence.
+skr_future_state_ skr_future_check(const skr_future_t* future) {
+	if (!future || !future->slot) return skr_future_state_none;
+	if (!_skr_future_enter()) return skr_future_state_failed;
+	if (!_skr_future_current(future)) { _skr_future_leave(); return skr_future_state_failed; }
 	_skr_cmd_ring_slot_t* slot = (_skr_cmd_ring_slot_t*)future->slot;
 
 	mtx_lock(_skr_vk.graphics_queue_mutex);
-	bool done = slot->generation != future->generation
-	         || vkGetFenceStatus(_skr_vk.device, slot->fence) == VK_SUCCESS;
+	VkResult status = slot->generation != future->generation
+		? VK_SUCCESS
+		: vkGetFenceStatus(_skr_vk.device, slot->fence);
 	mtx_unlock(_skr_vk.graphics_queue_mutex);
-	return done;
+	_skr_future_leave();
+
+	if (status == VK_SUCCESS)   return skr_future_state_ready;
+	if (status == VK_NOT_READY) return skr_future_state_pending;
+	return skr_future_state_failed; // Like a lost device, so it will never finish
 }
 
-void skr_future_wait(const skr_future_t* future) {
-	if (!future || !future->slot) return;
+skr_future_state_ skr_future_wait(const skr_future_t* future) {
+	if (!future || !future->slot) return skr_future_state_none;
+	if (!_skr_future_enter()) return skr_future_state_failed;
+	if (!_skr_future_current(future)) { _skr_future_leave(); return skr_future_state_failed; }
 	_skr_cmd_ring_slot_t* slot = (_skr_cmd_ring_slot_t*)future->slot;
 
 	// Registered under the mutex, so the owner either sees us before it
@@ -677,10 +752,14 @@ void skr_future_wait(const skr_future_t* future) {
 	bool done = slot->generation != future->generation;
 	if (!done) _skr_add_u32(&slot->waiters, 1);
 	mtx_unlock(_skr_vk.graphics_queue_mutex);
-	if (done) return;
 
-	vkWaitForFences(_skr_vk.device, 1, &slot->fence, VK_TRUE, UINT64_MAX);
-	_skr_add_u32(&slot->waiters, -1);
+	VkResult result = VK_SUCCESS;
+	if (!done) {
+		result = vkWaitForFences(_skr_vk.device, 1, &slot->fence, VK_TRUE, UINT64_MAX);
+		_skr_add_u32(&slot->waiters, -1);
+	}
+	_skr_future_leave();
+	return result == VK_SUCCESS ? skr_future_state_ready : skr_future_state_failed;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

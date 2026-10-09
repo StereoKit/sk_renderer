@@ -112,6 +112,7 @@ typedef struct {
 	skr_future_t   worker_future;         // the worker's latest submit (thread_mutex)
 	uint32_t       exited_readback_count; // Test 16
 	uint32_t       cross_wait_count;      // Test 17
+	uint32_t       queue_future_count;    // Test 18
 
 	// Test 9: Buffer readback churn (snapshots against live destroys)
 	skr_buffer_t          readback_buffers[READBACK_SLOTS];
@@ -291,6 +292,28 @@ static void* _exited_readback_thread(void* arg) {
 	r->ok = skr_buffer_create(data, READBACK_UINTS, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_read, &r->buffer) == skr_err_success
 	     && skr_buffer_readback(&r->buffer, &r->readback) == skr_err_success;
 	skr_thread_shutdown();
+	return NULL;
+}
+
+// Unregistered threads race each other for marker slots, and can hold more
+// unfinished markers at once than one chunk has, so the pool may grow
+#define QUEUE_FUTURE_BURST 12
+typedef struct {
+	skr_future_t covered; // submitted before any of this thread's queue futures
+	uint32_t     ok;
+	uint32_t     failed;
+} queue_future_t;
+
+static void* _queue_future_thread(void* arg) {
+	queue_future_t* q = (queue_future_t*)arg;
+	skr_future_t futures[QUEUE_FUTURE_BURST];
+	for (uint32_t i = 0; i < QUEUE_FUTURE_BURST; i++)
+		futures[i] = skr_future_get_queue();
+	for (uint32_t i = 0; i < QUEUE_FUTURE_BURST; i++) {
+		skr_future_wait(&futures[i]);
+		if (skr_future_check(&futures[i]) == skr_future_state_ready && skr_future_check(&q->covered) == skr_future_state_ready) q->ok++;
+		else                                                                                                                       q->failed++;
+	}
 	return NULL;
 }
 
@@ -491,9 +514,9 @@ static void _scene_lifetime_stress_destroy(scene_t* base) {
 
 	su_log(su_log_info, "Lifetime stress test: %u creates, %u destroys, %u draws over %u frames",
 		scene->total_creates, scene->total_destroys, scene->total_draws, scene->frame_count);
-	su_log(su_log_info, "Lifetime stress threads: %u worker in-frame, %u worker idle, %u thread-exit, %u disown, %u unregistered, %u compute, %u exited-thread futures, %u cross-thread waits",
+	su_log(su_log_info, "Lifetime stress threads: %u worker in-frame, %u worker idle, %u thread-exit, %u disown, %u unregistered, %u compute, %u exited-thread futures, %u cross-thread waits, %u queue futures",
 		scene->worker_destroy_count, scene->idle_destroy_count, scene->exit_destroy_count, scene->disown_count, scene->unreg_destroy_count, scene->compute_destroy_count,
-		scene->exited_readback_count, scene->cross_wait_count);
+		scene->exited_readback_count, scene->cross_wait_count, scene->queue_future_count);
 	su_log(scene->readback_failures > 0 ? su_log_warning : su_log_info,
 		"Lifetime stress readbacks: %u started, %u verified, %u abandoned, %u failures",
 		scene->readback_started, scene->readback_verified, scene->readback_abandoned, scene->readback_failures);
@@ -541,7 +564,7 @@ static void _scene_lifetime_stress_update(scene_t* base, float dt) {
 		// Retire the slot's previous round: verify when complete, abandon
 		// mid-flight otherwise - both must clean up without touching freed memory
 		if (scene->readback_live[slot]) {
-			if (skr_future_check(&scene->readbacks[slot].future)) {
+			if (skr_future_check(&scene->readbacks[slot].future) == skr_future_state_ready) {
 				const uint32_t* values = (const uint32_t*)scene->readbacks[slot].data;
 				bool ok = scene->readbacks[slot].size == READBACK_UINTS * sizeof(uint32_t);
 				for (uint32_t i = 0; ok && i < READBACK_UINTS; i++)
@@ -942,7 +965,7 @@ static void _scene_lifetime_stress_idle(scene_t* base) {
 		if (r.ok) {
 			skr_future_wait(&r.readback.future);
 			const uint32_t* values = (const uint32_t*)r.readback.data;
-			bool match = skr_future_check(&r.readback.future);
+			bool match = skr_future_check(&r.readback.future) == skr_future_state_ready;
 			for (uint32_t i = 0; match && i < READBACK_UINTS; i++)
 				match = values[i] == 0xC0DE0000 + i;
 			if (match) scene->exited_readback_count++;
@@ -960,8 +983,27 @@ static void _scene_lifetime_stress_idle(scene_t* base) {
 		skr_future_t future = scene->worker_future;
 		pthread_mutex_unlock(&scene->thread_mutex);
 		skr_future_wait(&future);
-		if (skr_future_check(&future)) scene->cross_wait_count++;
-		else                           scene->readback_failures++;
+		// None means the worker hadn't submitted yet, which counts as done
+		skr_future_state_ state = skr_future_check(&future);
+		if (state == skr_future_state_ready || state == skr_future_state_none) scene->cross_wait_count++;
+		else                                                                    scene->readback_failures++;
+	}
+
+	// === TEST 18: Queue futures from unregistered threads ===
+	// Main's last submit comes earlier in submission order, so every queue future covers it
+	if (scene->frame_count % 10 == 6) {
+		queue_future_t q[3] = {0};
+		pthread_t      threads[3];
+		skr_future_t   covered = skr_future_get();
+		for (int32_t t = 0; t < 3; t++) {
+			q[t].covered = covered;
+			pthread_create(&threads[t], NULL, _queue_future_thread, &q[t]);
+		}
+		for (int32_t t = 0; t < 3; t++) {
+			pthread_join(threads[t], NULL);
+			scene->queue_future_count += q[t].ok;
+			scene->readback_failures  += q[t].failed;
+		}
 	}
 }
 
@@ -1005,6 +1047,7 @@ static void _scene_lifetime_stress_render_ui(scene_t* base) {
 	igText("Test 15 - Compute destroyed in-frame: %u", scene->compute_destroy_count);
 	igText("Test 16 - Exited-thread futures: %u",     scene->exited_readback_count);
 	igText("Test 17 - Cross-thread waits: %u",        scene->cross_wait_count);
+	igText("Test 18 - Queue futures: %u",             scene->queue_future_count);
 
 	igSeparator();
 	igText("Test 8 - Sort stress:");

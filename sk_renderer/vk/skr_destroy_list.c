@@ -98,7 +98,7 @@ static bool _skr_destroy_block_done(const _skr_destroy_block_t* block) {
 	return vkGetFenceStatus(_skr_vk.device, slot->fence) == VK_SUCCESS;
 }
 
-// Every submit calls this under the queue mutex, right after its vkQueueSubmit,
+// Every command buffer submit calls this under the queue mutex, right after its vkQueueSubmit,
 // so `cover` orders after everything already queued and the stamp is exact.
 // Returns the done blocks, newest first, for the caller to run off the mutex.
 _skr_destroy_block_t* _skr_destroy_retire(skr_destroy_list_t* ref_shared_open, skr_future_t cover, bool may_stamp) {

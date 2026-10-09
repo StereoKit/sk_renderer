@@ -253,7 +253,7 @@ static void _scene_tex_copy_update(scene_t* s, float delta_time) {
 	scene->time += delta_time;
 
 	// Check if readback is complete
-	if (scene->readback_pending && skr_future_check(&scene->readback.future)) {
+	if (scene->readback_pending && skr_future_check(&scene->readback.future) == skr_future_state_ready) {
 		// Save to file
 		if (_save_ppm("icon_readback.ppm", (const uint8_t*)scene->readback.data, ICON_SIZE, ICON_SIZE)) {
 			su_log(su_log_info, "scene_tex_copy: Saved icon to icon_readback.ppm (%u bytes)", scene->readback.size);
@@ -268,7 +268,7 @@ static void _scene_tex_copy_update(scene_t* s, float delta_time) {
 	}
 
 	// Check if the buffer readback is complete, and verify the compute pattern
-	if (scene->buffer_readback_pending && skr_future_check(&scene->buffer_readback.future)) {
+	if (scene->buffer_readback_pending && skr_future_check(&scene->buffer_readback.future) == skr_future_state_ready) {
 		const uint32_t* values = (const uint32_t*)scene->buffer_readback.data;
 		bool ok = scene->buffer_readback.size == FILL_COUNT * sizeof(uint32_t);
 		for (uint32_t i = 0; ok && i < FILL_COUNT; i++)
@@ -282,7 +282,7 @@ static void _scene_tex_copy_update(scene_t* s, float delta_time) {
 		scene->buffer_readback_ok      = ok;
 	}
 
-	if (scene->static_pending && skr_future_check(&scene->static_readback.future)) {
+	if (scene->static_pending && skr_future_check(&scene->static_readback.future) == skr_future_state_ready) {
 		const uint32_t* values = (const uint32_t*)scene->static_readback.data;
 		bool ok = scene->static_readback.size == FILL_COUNT * sizeof(uint32_t);
 		for (uint32_t i = 0; ok && i < FILL_COUNT; i++)
@@ -293,7 +293,7 @@ static void _scene_tex_copy_update(scene_t* s, float delta_time) {
 		scene->static_done    = true;
 	}
 
-	if (scene->rename_pending && skr_future_check(&scene->rename_readback.future)) {
+	if (scene->rename_pending && skr_future_check(&scene->rename_readback.future) == skr_future_state_ready) {
 		const uint32_t* values = (const uint32_t*)scene->rename_readback.data;
 		for (uint32_t i = 0; i < RENAME_SETS; i++) {
 			if (values[i] == scene->rename_base + i) continue;

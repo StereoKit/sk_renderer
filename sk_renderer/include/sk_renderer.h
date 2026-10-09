@@ -114,6 +114,13 @@ typedef enum skr_err_ {
 	skr_err_device_error      = -4, // GPU/Vulkan error
 } skr_err_;
 
+typedef enum skr_future_state_ {
+	skr_future_state_failed  = -1, // Can't complete, like work still pending when sk_renderer shut down
+	skr_future_state_none    =  0, // Not a valid future, counts as done
+	skr_future_state_pending =  1,
+	skr_future_state_ready   =  2,
+} skr_future_state_;
+
 ///////////////////////////////////////////////////////////////////////////////
 
 typedef enum skr_buffer_type_ {
@@ -761,8 +768,9 @@ SKR_API bool              skr_thread_is_initialized        (void);  // Whether s
 SKR_API bool              skr_is_capable                   (skr_capability_ capability);
 
 SKR_API skr_future_t      skr_future_get                   (void);  // A future for all of this thread's GPU work so far, an open scope included. Invalid before anything has been submitted
-SKR_API bool              skr_future_check                 (const skr_future_t* future);  // True once the GPU finished that work, or for an invalid future. Any thread may ask
-SKR_API void              skr_future_wait                  (const skr_future_t* future);  // Blocks until the GPU finished that work. Any thread may wait, even after the creating thread exited. Native only: the web can't block, poll skr_future_check from the frame loop instead
+SKR_API skr_future_t      skr_future_get_queue             (void);  // A future for everything submitted to the graphics queue so far, by any thread or outside submitter like an OpenXR runtime. Callable from any thread, each call costs an empty queue submit. Work still recording in an open scope isn't covered
+SKR_API skr_future_state_ skr_future_check                 (const skr_future_t* future);  // Where that work is at, without blocking. Anything but pending is done, and after skr_shutdown every valid future reads failed. Any thread may ask
+SKR_API skr_future_state_ skr_future_wait                  (const skr_future_t* future);  // Blocks until the GPU finished that work, and returns how it ended. Any thread may wait, even after the creating thread exited. Native only: the web can't block, poll skr_future_check from the frame loop instead
 
 SKR_API void              skr_cmd_begin                    (void);  // Opens a scope that batches this thread's GPU commands into one submission at skr_cmd_end. Keep it short: a scope held open while another thread destroys an object it uses is only protected on the frame thread
 SKR_API skr_future_t      skr_cmd_end                      (void);  // Closes the scope. Scopes nest; the outermost end submits, and every end returns a future for that submission

@@ -6,6 +6,8 @@
 #include "skr_pipeline.h"
 
 _skr_wgpu_state_t _skr_wgpu = {0};
+uint64_t          _skr_gen_floor;
+_skr_atomic(uint32_t) _skr_future_calls;
 
 // User-overridable allocators from skr_settings_t (see _skr_shared.h)
 static void* (*_skr_malloc_fn) (size_t)         = NULL;
@@ -75,6 +77,7 @@ bool skr_init(skr_settings_t settings) {
 		skr_log(skr_log_warning, "skr_init called while already initialized");
 		return true;
 	}
+	_skr_gen_floor = _skr_wgpu.generation_next + 1;
 
 	_skr_malloc_fn  = settings.malloc_func;
 	_skr_calloc_fn  = settings.calloc_func;
@@ -199,6 +202,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_material_sys_init();
 
 	_skr_wgpu.initialized = true;
+	_skr_future_open();
 	return true;
 }
 
@@ -214,6 +218,7 @@ void skr_shutdown(void) {
 #else
 	_skr_cmd_submit();
 #endif
+	_skr_future_close();
 
 	// Subsystems before the device: internal materials unregister from the
 	// pipeline registry, so the registry tears down after them
@@ -227,7 +232,11 @@ void skr_shutdown(void) {
 	if (_skr_wgpu.device)   wgpuDeviceRelease  (_skr_wgpu.device);
 	if (_skr_wgpu.adapter)  wgpuAdapterRelease (_skr_wgpu.adapter);
 	if (_skr_wgpu.instance) wgpuInstanceRelease(_skr_wgpu.instance);
+
+	// Generations keep counting, so the next session's start above this one's
+	uint64_t generation_next = _skr_wgpu.generation_next;
 	memset(&_skr_wgpu, 0, sizeof(_skr_wgpu));
+	_skr_wgpu.generation_next = generation_next;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

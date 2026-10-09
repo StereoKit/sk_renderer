@@ -12,41 +12,15 @@
 #include <string.h>
 
 // Threading shims: apps may create resources from worker threads on native
-// (Dawn's API is thread-safe; our registries coordinate writers with one
-// mutex and publish to lock-free readers with release/acquire pointer
-// stores), while the web build is single-threaded and compiles both away.
+// (Dawn's API is thread-safe, and our registries coordinate writers with one
+// mutex), while the web build is single-threaded and compiles them away.
+// Atomics live in skr_atomics.h.
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 	typedef int _skr_mtx_t;
 	#define _skr_mtx_init(m)    (void)(m)
 	#define _skr_mtx_destroy(m) (void)(m)
 	#define _skr_mtx_lock(m)    (void)(m)
 	#define _skr_mtx_unlock(m)  (void)(m)
-	#define _skr_atomic(T)      T
-	#define _skr_load_acquire(p)      (*(p))
-	#define _skr_store_release(p, v)  (*(p) = (v))
-	#define _skr_fetch_add(p, v)      ((*(p) += (v)) - (v))
-	#define _skr_fetch_add_u64(p, v)  ((*(p) += (v)) - (v))
-	#define _skr_load_u64(p)          (*(p))
-	#define _skr_cas_u64(p, expected, desired) (*(p) == (expected) ? (*(p) = (desired), true) : false)
-#elif defined(_MSC_VER)
-	#include <threads.h>
-	#include <intrin.h>
-	typedef mtx_t _skr_mtx_t;
-	#define _skr_mtx_init(m)    mtx_init((m), mtx_plain)
-	#define _skr_mtx_destroy(m) mtx_destroy(m)
-	#define _skr_mtx_lock(m)    mtx_lock(m)
-	#define _skr_mtx_unlock(m)  mtx_unlock(m)
-	#define _skr_atomic(T)      T volatile
-	#if defined(_M_ARM64) || defined(_M_ARM64EC)
-		#define _skr_load_acquire(p)  ((void*)__ldar64((volatile __int64*)(p)))
-	#else
-		#define _skr_load_acquire(p)  (*(p)) // x86/x64 loads carry acquire already
-	#endif
-	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
-	#define _skr_fetch_add(p, v)      _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
-	#define _skr_fetch_add_u64(p, v)  ((uint64_t)_InterlockedExchangeAdd64((volatile __int64*)(p), (__int64)(v)))
-	#define _skr_load_u64(p)          (*(p))
-	#define _skr_cas_u64(p, expected, desired) (_InterlockedCompareExchange64((volatile __int64*)(p), (__int64)(desired), (__int64)(expected)) == (__int64)(expected))
 #else
 	#include <threads.h>
 	typedef mtx_t _skr_mtx_t;
@@ -54,13 +28,6 @@
 	#define _skr_mtx_destroy(m) mtx_destroy(m)
 	#define _skr_mtx_lock(m)    mtx_lock(m)
 	#define _skr_mtx_unlock(m)  mtx_unlock(m)
-	#define _skr_atomic(T)      T
-	#define _skr_load_acquire(p)      __atomic_load_n  ((p),      __ATOMIC_ACQUIRE)
-	#define _skr_store_release(p, v)  __atomic_store_n ((p), (v), __ATOMIC_RELEASE)
-	#define _skr_fetch_add(p, v)      __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
-	#define _skr_fetch_add_u64(p, v)  __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
-	#define _skr_load_u64(p)          __atomic_load_n((p), __ATOMIC_RELAXED)
-	#define _skr_cas_u64(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -116,6 +83,7 @@ typedef struct _skr_cmd_slot_t {
 	uint64_t      generation;
 	bool          in_flight;
 	volatile bool completed;
+	volatile bool failed;    // The queue reported an error instead of finishing
 } _skr_cmd_slot_t;
 
 typedef struct _skr_wgpu_state_t {
@@ -149,7 +117,7 @@ extern _skr_wgpu_state_t _skr_wgpu;
 
 // Identity for a buffer handle. Handle values can come back once released;
 // these never do, so caches key on them.
-static inline uint64_t _skr_uid_new(void) { return _skr_fetch_add_u64(&_skr_wgpu.next_uid, 1) + 1; }
+static inline uint64_t _skr_uid_new(void) { return _skr_add_u64(&_skr_wgpu.next_uid, 1) + 1; }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Internal helpers
