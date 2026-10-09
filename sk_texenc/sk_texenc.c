@@ -452,4 +452,34 @@ bool sk_texenc_debug_encode(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_
 	return true;
 }
 
+bool sk_texenc_debug_shader(sk_texenc_fmt_ format, const void* sks, size_t sks_size) {
+	if (!_te.initialized || !_te_fmt_valid(format)) return false;
+	_te_shader_   id     = _te_formats[format].shader;
+	skr_shader_t* shader = (skr_shader_t*)calloc(1, sizeof(skr_shader_t));
+	if (skr_shader_create(sks, (uint32_t)sks_size, shader) != skr_err_success || !_te_params_match(&shader->meta)) {
+		skr_log(skr_log_critical, "sk_texenc: the replacement for %s isn't a usable encoder", _te_shader_srcs[id].name);
+		if (skr_shader_is_valid(shader)) skr_shader_destroy(shader);
+		free(shader);
+		return false;
+	}
+	skr_shader_set_name(shader, _te_shader_srcs[id].name);
+
+	// Pipelines built from the old shader go with it, to rebuild from the new one
+	for (int32_t f = 0; f < _TE_FMT_COUNT; f++) {
+		if (_te_formats[f].shader != id) continue;
+		for (int32_t m = 0; m < _te_mode_count; m++) {
+			if (_te.computes[f][m] == NULL) continue;
+			skr_compute_destroy(_te.computes[f][m]);
+			free(_te.computes[f][m]);
+			_te.computes[f][m] = NULL;
+		}
+	}
+	if (_te.shaders[id]) {
+		skr_shader_destroy(_te.shaders[id]);
+		free(_te.shaders[id]);
+	}
+	_te.shaders[id] = shader;
+	return true;
+}
+
 #endif

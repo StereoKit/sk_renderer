@@ -20,7 +20,7 @@
 typedef struct {
 	_skr_pipeline_material_key_t     key;
 	VkPipelineLayout                 layout;
-	VkDescriptorSetLayout            descriptor_layout;
+	_skr_desc_layout_t               descriptor_layout;
 	uint32_t                         dyn_bindings[3]; // dynamic-offset bindings of descriptor_layout, ascending
 	uint32_t                         dyn_count;
 	int32_t                          ref_count;
@@ -166,8 +166,8 @@ void _skr_pipeline_shutdown(void) {
 				if (_skr_pipeline_cache.materials[m].layout != VK_NULL_HANDLE) {
 					vkDestroyPipelineLayout(_skr_vk.device, _skr_pipeline_cache.materials[m].layout, NULL);
 				}
-				if (_skr_pipeline_cache.materials[m].descriptor_layout != VK_NULL_HANDLE) {
-					vkDestroyDescriptorSetLayout(_skr_vk.device, _skr_pipeline_cache.materials[m].descriptor_layout, NULL);
+				if (_skr_pipeline_cache.materials[m].descriptor_layout.handle != VK_NULL_HANDLE) {
+					vkDestroyDescriptorSetLayout(_skr_vk.device, _skr_pipeline_cache.materials[m].descriptor_layout.handle, NULL);
 				}
 			}
 		}
@@ -249,11 +249,12 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 	skr_stage_ stage_mask = skr_stage_vertex | skr_stage_pixel | skr_stage_compute;
 
 	// Register new material
-	_skr_pipeline_cache.materials[free_slot].key               = *key;
-	_skr_pipeline_cache.materials[free_slot].descriptor_layout = _skr_shader_make_layout    (_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, stage_mask, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
-	_skr_pipeline_cache.materials[free_slot].layout            = _skr_pipeline_create_layout(_skr_pipeline_cache.materials[free_slot].descriptor_layout);
-	_skr_pipeline_cache.materials[free_slot].dyn_count         = _skr_shader_dyn_bindings   (&key->shader->meta, stage_mask, _skr_vk.has_push_descriptors, _skr_pipeline_cache.materials[free_slot].dyn_bindings);
-	_skr_pipeline_cache.materials[free_slot].ref_count         = 1;
+	_skr_pipeline_cache.materials[free_slot].key                      = *key;
+	_skr_pipeline_cache.materials[free_slot].descriptor_layout.uid    = _skr_uid_new();
+	_skr_pipeline_cache.materials[free_slot].descriptor_layout.handle = _skr_shader_make_layout(_skr_vk.device, _skr_vk.has_push_descriptors, &key->shader->meta, stage_mask, key->immutable_samplers, key->immutable_sampler_slots, key->immutable_sampler_count);
+	_skr_pipeline_cache.materials[free_slot].layout                   = _skr_pipeline_create_layout(_skr_pipeline_cache.materials[free_slot].descriptor_layout.handle);
+	_skr_pipeline_cache.materials[free_slot].dyn_count                = _skr_shader_dyn_bindings(&key->shader->meta, stage_mask, _skr_vk.has_push_descriptors, _skr_pipeline_cache.materials[free_slot].dyn_bindings);
+	_skr_pipeline_cache.materials[free_slot].ref_count                = 1;
 
 	// Generate and set debug name for pipeline layout
 	char name[512]; // shader name is up to 256, plus the config suffixes
@@ -265,7 +266,7 @@ int32_t _skr_pipeline_register_material(const _skr_pipeline_material_key_t* key)
 	// Generate debug name based on shader
 	snprintf(name, sizeof(name), "layoutdesc_%s_", shader_name);
 	_skr_append_material_config(name, sizeof(name), key);
-	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)_skr_pipeline_cache.materials[free_slot].descriptor_layout, name);
+	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)_skr_pipeline_cache.materials[free_slot].descriptor_layout.handle, name);
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
 	return free_slot;
@@ -384,6 +385,7 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 	if (_skr_pipeline_cache.materials[material_idx].ref_count > 0) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	// Destroy all pipelines using this material
+	_skr_destroy_batch_begin();
 	for (int32_t r = 0; r < _skr_pipeline_cache.renderpass_capacity; r++) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(material_idx, r, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
@@ -395,9 +397,10 @@ void _skr_pipeline_unregister_material(int32_t material_idx) {
 
 	// Destroy material resources
 	_skr_destroy_shared_pipeline_layout      (_skr_pipeline_cache.materials[material_idx].layout);
-	_skr_destroy_shared_descriptor_set_layout(_skr_pipeline_cache.materials[material_idx].descriptor_layout);
+	_skr_destroy_shared_descriptor_set_layout(_skr_pipeline_cache.materials[material_idx].descriptor_layout.handle);
+	_skr_destroy_batch_end();
 	_skr_pipeline_cache.materials[material_idx].layout            = VK_NULL_HANDLE;
-	_skr_pipeline_cache.materials[material_idx].descriptor_layout = VK_NULL_HANDLE;
+	_skr_pipeline_cache.materials[material_idx].descriptor_layout = (_skr_desc_layout_t){0};
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
 }
@@ -412,6 +415,7 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 	if (_skr_pipeline_cache.renderpasses[renderpass_idx].ref_count > 0) { mtx_unlock(&_skr_pipeline_cache.mutex); return; }
 
 	// Destroy all pipelines using this render pass
+	_skr_destroy_batch_begin();
 	for (int32_t m = 0; m < _skr_pipeline_cache.material_capacity; m++) {
 		for (int32_t v = 0; v < _skr_pipeline_cache.vertformat_capacity; v++) {
 			int32_t idx = _skr_pipeline_index_3d(m, renderpass_idx, v, _skr_pipeline_cache.renderpass_capacity, _skr_pipeline_cache.vertformat_capacity);
@@ -432,6 +436,7 @@ void _skr_pipeline_unregister_renderpass(int32_t renderpass_idx) {
 			obj->render_pass = VK_NULL_HANDLE;
 		}
 	}
+	_skr_destroy_batch_end();
 	_skr_pipeline_cache.renderpasses[renderpass_idx].object_idx = -1;
 
 	mtx_unlock(&_skr_pipeline_cache.mutex);
@@ -581,9 +586,9 @@ VkPipelineLayout _skr_pipeline_get_layout(int32_t material_idx) {
 	return _skr_pipeline_cache.materials[material_idx].layout;
 }
 
-VkDescriptorSetLayout _skr_pipeline_get_descriptor_layout(int32_t material_idx) {
-	if (material_idx < 0 || material_idx >= _skr_pipeline_cache.material_capacity) return VK_NULL_HANDLE;
-	if (_skr_pipeline_cache.materials[material_idx].ref_count <= 0)                return VK_NULL_HANDLE;
+_skr_desc_layout_t _skr_pipeline_get_descriptor_layout(int32_t material_idx) {
+	if (material_idx < 0 || material_idx >= _skr_pipeline_cache.material_capacity) return (_skr_desc_layout_t){0};
+	if (_skr_pipeline_cache.materials[material_idx].ref_count <= 0)                return (_skr_desc_layout_t){0};
 
 	return _skr_pipeline_cache.materials[material_idx].descriptor_layout;
 }

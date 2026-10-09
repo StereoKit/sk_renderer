@@ -36,7 +36,7 @@ static _skr_transient_pool_t _pool;
 static void _skr_transient_entry_destroy(_skr_transient_entry_t* e) {
 	// Not skr_tex_destroy, these never acquired a sampler. LIFO list: memory last
 	_skr_destroy_batch_begin();
-	_skr_destroy_shared_memory    (e->tex.memory);
+	_skr_destroy_shared_mem       (e->tex.mem);
 	_skr_destroy_shared_image     (e->tex.image);
 	_skr_destroy_shared_image_view(e->tex.view);
 	_skr_destroy_batch_end();
@@ -64,12 +64,11 @@ static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat form
 		skr_log(skr_log_critical, "Transient attachment vkCreateImage: 0x%X", (uint32_t)vr);
 		return false;
 	}
-	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, e->tex.image, true, &e->tex.memory) == VK_NULL_HANDLE) {
+	if (_skr_mem_bind_image(e->tex.image, usage, _skr_mem_usage_lazy, skr_mem_category_target, &e->tex.mem) != skr_err_success) {
 		skr_log(skr_log_critical, "Transient attachment memory allocation failed");
 		vkDestroyImage(_skr_vk.device, e->tex.image, NULL);
 		return false;
 	}
-	vkBindImageMemory(_skr_vk.device, e->tex.image, e->tex.memory, 0);
 
 	// Depth views cover only the depth aspect — that's all a depth resolve
 	// writes and all a SubpassInput descriptor may reference.
@@ -89,8 +88,8 @@ static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat form
 	}, NULL, &e->tex.view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "Transient attachment vkCreateImageView: 0x%X", (uint32_t)vr);
-		vkDestroyImage(_skr_vk.device, e->tex.image,  NULL);
-		vkFreeMemory  (_skr_vk.device, e->tex.memory, NULL);
+		vkDestroyImage(_skr_vk.device, e->tex.image, NULL);
+		_skr_mem_free (e->tex.mem);
 		return false;
 	}
 
@@ -103,6 +102,7 @@ static bool _skr_transient_entry_create(_skr_transient_entry_t* e, VkFormat form
 	e->tex.usage               = usage;
 	e->tex.current_layout      = VK_IMAGE_LAYOUT_UNDEFINED;
 	e->tex.is_transient_discard = true;
+	e->tex.bind_uid             = _skr_uid_new();
 
 	e->vk_format = format;
 	e->width     = width;

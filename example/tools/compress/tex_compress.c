@@ -75,7 +75,7 @@ uint8_t* tex_compress_readback(skr_tex_t* source, tex_compress_fmt_ format, int3
 	if (bytes == 0) return NULL;
 
 	skr_buffer_t blocks;
-	if (skr_buffer_create(NULL, bytes, 1, skr_buffer_type_storage, (skr_use_)(skr_use_dynamic | skr_use_compute_readwrite), &blocks) != skr_err_success)
+	if (skr_buffer_create(NULL, bytes, 1, skr_buffer_type_storage, (skr_use_)(skr_use_dynamic | skr_use_compute_readwrite | skr_use_uninitialized), &blocks) != skr_err_success)
 		return NULL;
 	skr_buffer_set_name(&blocks, "tc_gpu_readback");
 
@@ -101,7 +101,7 @@ void tex_compress_profile(skr_tex_t* source, tex_compress_fmt_ format) {
 	if (skr_buffer_get_size(&g_profile_buffer) < bytes) {
 		if (skr_buffer_is_valid(&g_profile_buffer)) skr_buffer_destroy(&g_profile_buffer);
 		g_profile_buffer = (skr_buffer_t){0};
-		if (skr_buffer_create(NULL, bytes, 1, skr_buffer_type_storage, skr_use_compute_readwrite, &g_profile_buffer) != skr_err_success)
+		if (skr_buffer_create(NULL, bytes, 1, skr_buffer_type_storage, (skr_use_)(skr_use_compute_readwrite | skr_use_uninitialized), &g_profile_buffer) != skr_err_success)
 			return;
 		skr_buffer_set_name(&g_profile_buffer, "tc_gpu_profile");
 	}

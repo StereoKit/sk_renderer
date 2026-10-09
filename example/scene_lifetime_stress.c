@@ -366,7 +366,7 @@ static scene_t* _scene_lifetime_stress_create(void) {
 			.anisotropy = (i % 4) + 1,
 		};
 
-		skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_dynamic, sampler, (skr_vec3i_t){4, 4, 1}, 1, 1, NULL, &scene->sampler_test_textures[i]);
+		skr_tex_create(skr_tex_fmt_rgba32_linear, skr_tex_flags_dynamic | skr_tex_flags_uninitialized, sampler, (skr_vec3i_t){4, 4, 1}, 1, 1, NULL, &scene->sampler_test_textures[i]);
 
 		// Fill with color
 		uint32_t pixels[16];
@@ -388,7 +388,7 @@ static scene_t* _scene_lifetime_stress_create(void) {
 
 	// Test 15: a compute pipeline the frame dispatches before a thread destroys it
 	scene->fill_shader = su_shader_load("shaders/buffer_fill.hlsl.sks", "buffer_fill");
-	skr_buffer_create(NULL, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write, &scene->fill_buffer);
+	skr_buffer_create(NULL, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write | skr_use_uninitialized, &scene->fill_buffer);
 	skr_buffer_set_name(&scene->fill_buffer, "stress_fill_buffer");
 
 	// Initialize thread resources

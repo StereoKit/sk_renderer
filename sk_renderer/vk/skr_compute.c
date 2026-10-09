@@ -133,22 +133,23 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info,
 			.pBindings    = bindings,
 		};
 
-		VkResult vr = vkCreateDescriptorSetLayout(_skr_vk.device, &layout_info, NULL, &out_compute->descriptor_layout);
+		VkResult vr = vkCreateDescriptorSetLayout(_skr_vk.device, &layout_info, NULL, &out_compute->descriptor_layout.handle);
 		SKR_VK_CHECK_RET(vr, "vkCreateDescriptorSetLayout", skr_err_device_error);
+		out_compute->descriptor_layout.uid = _skr_uid_new();
 	}
 
 	// Create pipeline layout
 	VkPipelineLayoutCreateInfo pipeline_layout_info = {
 		.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = out_compute->descriptor_layout != VK_NULL_HANDLE ? 1 : 0,
-		.pSetLayouts    = out_compute->descriptor_layout != VK_NULL_HANDLE ? &out_compute->descriptor_layout : NULL,
+		.setLayoutCount = out_compute->descriptor_layout.handle != VK_NULL_HANDLE ? 1 : 0,
+		.pSetLayouts    = out_compute->descriptor_layout.handle != VK_NULL_HANDLE ? &out_compute->descriptor_layout.handle : NULL,
 	};
 
 	VkResult vr = vkCreatePipelineLayout(_skr_vk.device, &pipeline_layout_info, NULL, &out_compute->layout);
 	if (vr != VK_SUCCESS) {
 		SKR_VK_CHECK_NRET(vr, "vkCreatePipelineLayout");
-		if (out_compute->descriptor_layout) {
-			vkDestroyDescriptorSetLayout(_skr_vk.device, out_compute->descriptor_layout, NULL);
+		if (out_compute->descriptor_layout.handle) {
+			vkDestroyDescriptorSetLayout(_skr_vk.device, out_compute->descriptor_layout.handle, NULL);
 		}
 		*out_compute = (skr_compute_t){0};
 		return skr_err_device_error;
@@ -157,8 +158,8 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info,
 	skr_err_ err = _skr_compute_build_pipeline(out_compute, info, &out_compute->pipeline);
 	if (err != skr_err_success) {
 		vkDestroyPipelineLayout(_skr_vk.device, out_compute->layout, NULL);
-		if (out_compute->descriptor_layout) {
-			vkDestroyDescriptorSetLayout(_skr_vk.device, out_compute->descriptor_layout, NULL);
+		if (out_compute->descriptor_layout.handle) {
+			vkDestroyDescriptorSetLayout(_skr_vk.device, out_compute->descriptor_layout.handle, NULL);
 		}
 		*out_compute = (skr_compute_t){0};
 		return err;
@@ -233,7 +234,7 @@ void skr_compute_destroy(skr_compute_t* ref_compute) {
 	_skr_destroy_batch_begin();
 	_skr_destroy_shared_pipeline             (ref_compute->pipeline);
 	_skr_destroy_shared_pipeline_layout      (ref_compute->layout);
-	_skr_destroy_shared_descriptor_set_layout(ref_compute->descriptor_layout);
+	_skr_destroy_shared_descriptor_set_layout(ref_compute->descriptor_layout.handle);
 	_skr_destroy_shared_bind_pool_slots      (ref_compute->bind_start, ref_compute->bind_count);
 	_skr_destroy_batch_end();
 	_skr_free(ref_compute->param_buffer);
@@ -432,7 +433,7 @@ static bool _skr_compute_record(const skr_compute_t* compute, const skr_material
 			return false;
 		}
 		global_slot = meta->buffers[meta->global_buffer_id].bind.slot;
-		_skr_write_buffer(&desc, (uint32_t)global_slot, false, result.buffer, result.offset, params_size);
+		_skr_write_buffer(&desc, (uint32_t)global_slot, false, result.buffer, result.uid, result.offset, params_size);
 	}
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute->pipeline);

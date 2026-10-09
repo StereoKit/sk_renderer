@@ -43,6 +43,7 @@ option(SKR_BUILD_KTX2 "Build the sk_ktx2 KTX2/Basis Universal transcoder" ON)
 option(SKR_BUILD_TEXENC "Build the sk_texenc GPU texture compressor" ON)
 option(SKR_BUILD_EXAMPLES "Build sk_renderer example application" ON)
 option(SKR_BUILD_XR_EXAMPLE "Build OpenXR example application (Linux/Windows only)" OFF)
+option(SKR_BUILD_TESTS "Build host unit tests (no GPU), run with ctest" OFF)
 set(SKR_SK_APP_DIR "" CACHE PATH "Local sk_app checkout for the example (empty = fetch the pinned release)")
 
 # Rendering backend, chosen at build time: Vulkan on native platforms, WebGPU
@@ -168,7 +169,7 @@ if(NOT SKR_USE_WEBGPU)
 		set_target_properties(volk PROPERTIES POSITION_INDEPENDENT_CODE ON)
 		target_compile_definitions(volk         PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
 		target_compile_definitions(sk_renderer  PUBLIC  VK_USE_PLATFORM_ANDROID_KHR)
-		target_link_libraries(sk_renderer PRIVATE log)  # Android logging library
+		target_link_libraries(sk_renderer PRIVATE log android)  # logging, AHardwareBuffer
 	elseif(WIN32)
 		target_compile_definitions(volk         PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 		target_compile_definitions(sk_renderer  PUBLIC  VK_USE_PLATFORM_WIN32_KHR)
@@ -255,6 +256,9 @@ if(NOT SKR_USE_WEBGPU)
 		sk_renderer/vk/skr_scratch.c
 		sk_renderer/vk/skr_transient.h
 		sk_renderer/vk/skr_transient.c
+		sk_renderer/vk/skr_tlsf.h
+		sk_renderer/vk/skr_tlsf.c
+		sk_renderer/vk/skr_memory.c
 		sk_renderer/vk/skr_pipeline.h
 		sk_renderer/vk/skr_pipeline.c
 		sk_renderer/vk/skr_compute.c
@@ -305,6 +309,15 @@ endif()
 skshaderc_compile_headers(sk_renderer ${CMAKE_BINARY_DIR}/sk_renderer_generated/builtin_shaders "${_skr_builtin_shader_args}"
 	${_skr_builtin_shaders}
 )
+
+###############################################################################
+# Host unit tests
+###############################################################################
+
+if(SKR_BUILD_TESTS)
+	enable_testing() # must happen in the top-level list file for ctest to find tests/
+	add_subdirectory(tests)
+endif()
 
 ###############################################################################
 # sk_texenc GPU texture compression

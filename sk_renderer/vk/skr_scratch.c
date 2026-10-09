@@ -28,10 +28,10 @@ typedef struct {
 } _skr_scratch_entry_t;
 
 typedef struct {
-	mtx_t                 mutex;
-	_skr_scratch_entry_t* entries;
-	uint32_t              count;
-	uint32_t              capacity;
+	mtx_t                  mutex;
+	_skr_scratch_entry_t** entries;  // Individually allocated, so acquired pointers survive growth
+	uint32_t               count;
+	uint32_t               capacity;
 } _skr_scratch_pool_t;
 
 static _skr_scratch_pool_t _pool;
@@ -56,15 +56,14 @@ void _skr_scratch_pool_init(void) {
 
 	_pool.capacity = SKR_SCRATCH_INITIAL_CAPACITY;
 	_pool.count    = 0;
-	_pool.entries  = _skr_calloc(_pool.capacity, sizeof(_skr_scratch_entry_t));
+	_pool.entries  = _skr_calloc(_pool.capacity, sizeof(_skr_scratch_entry_t*));
 }
 
 void _skr_scratch_pool_shutdown(void) {
 	// No mutex needed — caller guarantees device is idle and no other threads are active
 	for (uint32_t i = 0; i < _pool.count; i++) {
-		if (_pool.entries[i].tex.image != VK_NULL_HANDLE) {
-			skr_tex_destroy(&_pool.entries[i].tex);
-		}
+		skr_tex_destroy(&_pool.entries[i]->tex);
+		_skr_free(_pool.entries[i]);
 	}
 
 	mtx_destroy(&_pool.mutex);
@@ -79,7 +78,7 @@ skr_tex_t* _skr_scratch_acquire(const skr_tex_t* template_src) {
 
 	// Look for an unused entry matching the template
 	for (uint32_t i = 0; i < _pool.count; i++) {
-		_skr_scratch_entry_t* e = &_pool.entries[i];
+		_skr_scratch_entry_t* e = _pool.entries[i];
 		if (!e->in_use && _skr_scratch_matches(e, template_src)) {
 			e->in_use = true;
 			mtx_unlock(&_pool.mutex);
@@ -90,28 +89,25 @@ skr_tex_t* _skr_scratch_acquire(const skr_tex_t* template_src) {
 	// Grow if needed
 	if (_pool.count >= _pool.capacity) {
 		uint32_t new_cap = _pool.capacity * 2;
-		_skr_scratch_entry_t* new_entries = _skr_realloc(_pool.entries, new_cap * sizeof(_skr_scratch_entry_t));
+		_skr_scratch_entry_t** new_entries = _skr_realloc(_pool.entries, new_cap * sizeof(_skr_scratch_entry_t*));
 		if (!new_entries) {
 			skr_log(skr_log_critical, "Scratch pool grow failed");
 			mtx_unlock(&_pool.mutex);
 			return NULL;
-		}
-		// Zero-init newly allocated slots
-		for (uint32_t i = _pool.capacity; i < new_cap; i++) {
-			new_entries[i] = (_skr_scratch_entry_t){0};
 		}
 		_pool.entries  = new_entries;
 		_pool.capacity = new_cap;
 	}
 
 	// Create a new scratch entry
-	_skr_scratch_entry_t* e = &_pool.entries[_pool.count];
-	skr_err_ err = _skr_tex_create_scratch(template_src, &e->tex);
-	if (err != skr_err_success) {
+	_skr_scratch_entry_t* e = _skr_calloc(1, sizeof(_skr_scratch_entry_t));
+	if (!e || _skr_tex_create_scratch(template_src, &e->tex) != skr_err_success) {
 		skr_log(skr_log_critical, "Scratch texture creation failed for mipgen");
+		_skr_free(e);
 		mtx_unlock(&_pool.mutex);
 		return NULL;
 	}
+	_pool.entries[_pool.count] = e;
 	e->fmt                 = template_src->format;
 	e->template_size       = template_src->size;
 	e->template_mip_levels = template_src->mip_levels;
@@ -131,7 +127,7 @@ void _skr_scratch_release(skr_tex_t* scratch) {
 	mtx_lock(&_pool.mutex);
 
 	for (uint32_t i = 0; i < _pool.count; i++) {
-		_skr_scratch_entry_t* e = &_pool.entries[i];
+		_skr_scratch_entry_t* e = _pool.entries[i];
 		if (&e->tex == scratch) {
 			e->in_use          = false;
 			e->last_used_frame = _skr_vk.frame;
@@ -147,16 +143,13 @@ void _skr_scratch_pool_tick(void) {
 
 	uint32_t frame = _skr_vk.frame;
 	for (uint32_t i = 0; i < _pool.count; ) {
-		_skr_scratch_entry_t* e = &_pool.entries[i];
+		_skr_scratch_entry_t* e = _pool.entries[i];
 		if (!e->in_use && (frame - e->last_used_frame) > SKR_SCRATCH_IDLE_FRAMES) {
 			skr_tex_destroy(&e->tex);
+			_skr_free(e);
 
 			// Swap-remove
-			if (i + 1 < _pool.count) {
-				_pool.entries[i] = _pool.entries[_pool.count - 1];
-			}
-			_pool.entries[_pool.count - 1] = (_skr_scratch_entry_t){0};
-			_pool.count--;
+			_pool.entries[i] = _pool.entries[--_pool.count];
 			continue;
 		}
 		i++;

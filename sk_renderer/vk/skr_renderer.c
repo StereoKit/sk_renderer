@@ -103,10 +103,10 @@ static uint64_t _skr_gpu_ticks_to_host_ns(uint64_t ticks) {
 // when any attachment it references is destroyed — the cache target texture
 // can outlive the others (e.g. a swapchain image cache target with recreated
 // color/depth attachments), so the render pass alone under-keys the cache.
-static uint64_t _skr_view_fingerprint(const VkImageView* views, uint32_t count) {
+static uint64_t _skr_view_fingerprint(const uint64_t* uids, uint32_t count) {
 	uint64_t hash = 0xcbf29ce484222325ull;
 	for (uint32_t i = 0; i < count; i++) {
-		hash ^= (uint64_t)views[i];
+		hash ^= uids[i];
 		hash *= 0x100000001b3ull;
 	}
 	return hash;
@@ -117,12 +117,12 @@ static VkFramebuffer _skr_get_or_create_framebuffer(VkDevice device, skr_tex_t* 
 	VkRenderPass*  cached_pass  = has_depth ? &cache_target->framebuffer_depth_pass  : &cache_target->framebuffer_pass;
 	uint64_t*      cached_views = has_depth ? &cache_target->framebuffer_depth_views : &cache_target->framebuffer_views;
 
-	VkImageView views[3];
-	uint32_t    view_count = 0;
-	if (color)       views[view_count++] = color->view;
-	if (depth)       views[view_count++] = depth->view;
-	if (opt_resolve) views[view_count++] = opt_resolve->view;
-	uint64_t fingerprint = _skr_view_fingerprint(views, view_count);
+	uint64_t uids[3];
+	uint32_t uid_count = 0;
+	if (color)       uids[uid_count++] = color->bind_uid;
+	if (depth)       uids[uid_count++] = depth->bind_uid;
+	if (opt_resolve) uids[uid_count++] = opt_resolve->bind_uid;
+	uint64_t fingerprint = _skr_view_fingerprint(uids, uid_count);
 
 	// Check if we have a cached framebuffer for this render pass + attachments
 	if (*cached_fb != VK_NULL_HANDLE && *cached_pass == render_pass && *cached_views == fingerprint) {
@@ -344,6 +344,7 @@ void skr_renderer_frame_end(skr_surface_t** opt_surfaces, uint32_t count) {
 
 	_skr_scratch_pool_tick();    // Evict scratch mipgen textures idle for N frames
 	_skr_transient_pool_tick();  // Evict transient postfx attachments idle for N frames
+	_skr_mem_tick(_skr_vk.frame);
 
 	_skr_vk.in_frame = false;
 	_skr_vk.frame++;
@@ -649,7 +650,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	if (material->param_buffer_size > 0) {
 		skr_bump_result_t param_bump = _skr_bump_ring_write(ctx.const_ring, material->param_buffer, material->param_buffer_size);
 		if (param_bump.buffer)
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.offset, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.uid, param_bump.offset, material->param_buffer_size);
 	}
 
 	// Material texture and buffer binds
@@ -823,11 +824,11 @@ static bool _skr_list_bind_descriptors(const _skr_cmd_ctx_t* ctx, const skr_rend
 	_skr_desc_writes_begin(&desc, item->pipeline_material_idx);
 
 	if (item->param_buffer_size > 0 && material_bump.buffer)
-		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.offset + item->param_data_offset, item->param_buffer_size);
+		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.uid, material_bump.offset + item->param_data_offset, item->param_buffer_size);
 	if ((item->flags & skr_item_flag_system_buffer) && system_bump.buffer)
-		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,   false, system_bump.buffer,   system_bump.offset,   system_data_size);
+		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,   false, system_bump.buffer,   system_bump.uid, system_bump.offset,   system_data_size);
 	if ((item->flags & skr_item_flag_instance_buffer) && instance_bump.buffer)
-		_skr_write_buffer(&desc, SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot, true,  instance_bump.buffer, instance_bump.offset, instance_range);
+		_skr_write_buffer(&desc, SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot, true,  instance_bump.buffer, instance_bump.uid, instance_bump.offset, instance_range);
 
 	const int32_t ignore_slots[] = {
 		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
@@ -1016,7 +1017,7 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	if (material->param_buffer_size > 0) {
 		skr_bump_result_t material_bump = _skr_bump_ring_write(ctx.const_ring, material->param_buffer, material->param_buffer_size);
 		if (material_bump.buffer)
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.offset, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.uid, material_bump.offset, material->param_buffer_size);
 	}
 
 	// No system buffer or instance buffer for immediate draws
@@ -1132,7 +1133,7 @@ static int32_t _skr_build_material_descriptors(_skr_cmd_ctx_t* ctx, skr_material
 	if (mat->param_buffer_size > 0) {
 		skr_bump_result_t param_bump = _skr_bump_ring_write(ctx->const_ring, mat->param_buffer, mat->param_buffer_size);
 		if (param_bump.buffer)
-			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.offset, mat->param_buffer_size);
+			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.uid, param_bump.offset, mat->param_buffer_size);
 	}
 
 	// System data buffer, the same per-pass data the geometry draws get, so
@@ -1140,7 +1141,7 @@ static int32_t _skr_build_material_descriptors(_skr_cmd_ctx_t* ctx, skr_material
 	if (mat->has_system_buffer && system_data && system_data_size > 0) {
 		skr_bump_result_t system_bump = _skr_bump_ring_write(ctx->const_ring, system_data, system_data_size);
 		if (system_bump.buffer)
-			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot, false, system_bump.buffer, system_bump.offset, system_data_size);
+			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot, false, system_bump.buffer, system_bump.uid, system_bump.offset, system_data_size);
 	}
 
 	// Material texture/buffer/input attachment binds. The instance buffer is
@@ -1410,24 +1411,31 @@ void skr_pass_submit(skr_pass_t* pass) {
 	// Build framebuffer with all attachments matching renderpass attachment order:
 	// [color], [resolve], [depth], [intermediates...], [final output]
 	{
-		VkImageView fb_attachments[SKR_POSTFX_MAX_ATTACHMENTS];
-		uint32_t    fb_count = 0;
+		const skr_tex_t* fb_texs[SKR_POSTFX_MAX_ATTACHMENTS];
+		uint32_t         fb_count = 0;
 
-		if (has_color)          fb_attachments[fb_count++] = color->view;
-		if (use_msaa)           fb_attachments[fb_count++] = resolve->view;
-		if (has_depth)          fb_attachments[fb_count++] = depth->view;
-		if (depth_resolve_tex)  fb_attachments[fb_count++] = depth_resolve_tex->view;
+		if (has_color)          fb_texs[fb_count++] = color;
+		if (use_msaa)           fb_texs[fb_count++] = resolve;
+		if (has_depth)          fb_texs[fb_count++] = depth;
+		if (depth_resolve_tex)  fb_texs[fb_count++] = depth_resolve_tex;
 		for (uint32_t i = 0; i < intermediate_count; i++)
-			fb_attachments[fb_count++] = intermediates[i]->view;
+			fb_texs[fb_count++] = intermediates[i];
 		bool resolve_is_final = has_resolve && pass->postfx_count == 0;
 		if (!resolve_is_final)
-			fb_attachments[fb_count++] = final_output->view;
+			fb_texs[fb_count++] = final_output;
+
+		VkImageView fb_attachments[SKR_POSTFX_MAX_ATTACHMENTS];
+		uint64_t    fb_uids       [SKR_POSTFX_MAX_ATTACHMENTS];
+		for (uint32_t i = 0; i < fb_count; i++) {
+			fb_attachments[i] = fb_texs[i]->view;
+			fb_uids       [i] = fb_texs[i]->bind_uid;
+		}
 
 		// Cache framebuffer on final_output when no pooled transients are
 		// attached (common case) — pooled views vary between frames.
 		VkFramebuffer framebuffer  = VK_NULL_HANDLE;
 		bool     cache_fb    = (intermediate_count == 0 && !depth_resolve_tex && !scene_transient);
-		uint64_t fingerprint = _skr_view_fingerprint(fb_attachments, fb_count);
+		uint64_t fingerprint = _skr_view_fingerprint(fb_uids, fb_count);
 		if (cache_fb && final_output->framebuffer_depth != VK_NULL_HANDLE
 			&& final_output->framebuffer_depth_pass  == render_pass
 			&& final_output->framebuffer_depth_views == fingerprint) {

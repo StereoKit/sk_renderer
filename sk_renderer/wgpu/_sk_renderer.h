@@ -25,6 +25,9 @@
 	#define _skr_load_acquire(p)      (*(p))
 	#define _skr_store_release(p, v)  (*(p) = (v))
 	#define _skr_fetch_add(p, v)      ((*(p) += (v)) - (v))
+	#define _skr_fetch_add_u64(p, v)  ((*(p) += (v)) - (v))
+	#define _skr_load_u64(p)          (*(p))
+	#define _skr_cas_u64(p, expected, desired) (*(p) == (expected) ? (*(p) = (desired), true) : false)
 #elif defined(_MSC_VER)
 	#include <threads.h>
 	#include <intrin.h>
@@ -41,6 +44,9 @@
 	#endif
 	#define _skr_store_release(p, v)  _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
 	#define _skr_fetch_add(p, v)      _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
+	#define _skr_fetch_add_u64(p, v)  ((uint64_t)_InterlockedExchangeAdd64((volatile __int64*)(p), (__int64)(v)))
+	#define _skr_load_u64(p)          (*(p))
+	#define _skr_cas_u64(p, expected, desired) (_InterlockedCompareExchange64((volatile __int64*)(p), (__int64)(desired), (__int64)(expected)) == (__int64)(expected))
 #else
 	#include <threads.h>
 	typedef mtx_t _skr_mtx_t;
@@ -52,6 +58,9 @@
 	#define _skr_load_acquire(p)      __atomic_load_n  ((p),      __ATOMIC_ACQUIRE)
 	#define _skr_store_release(p, v)  __atomic_store_n ((p), (v), __ATOMIC_RELEASE)
 	#define _skr_fetch_add(p, v)      __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
+	#define _skr_fetch_add_u64(p, v)  __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
+	#define _skr_load_u64(p)          __atomic_load_n((p), __ATOMIC_RELAXED)
+	#define _skr_cas_u64(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -130,11 +139,17 @@ typedef struct _skr_wgpu_state_t {
 	uint32_t        cmd_slot_next;
 	uint64_t        generation_next;
 
+	_skr_atomic(uint64_t) next_uid; // see _skr_uid_new
+
 	skr_bind_settings_t binds;    // resolved bind slots (material/system/instance)
 	bool                initialized;
 } _skr_wgpu_state_t;
 
 extern _skr_wgpu_state_t _skr_wgpu;
+
+// Identity for a buffer handle. Handle values can come back once released;
+// these never do, so caches key on them.
+static inline uint64_t _skr_uid_new(void) { return _skr_fetch_add_u64(&_skr_wgpu.next_uid, 1) + 1; }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Internal helpers
@@ -148,6 +163,11 @@ WGPUCommandEncoder _skr_cmd_get(void);
 
 // Finish + submit the active encoder (no-op future if none active)
 skr_future_t _skr_cmd_submit(void);
+
+void     _skr_queue_submit  (uint32_t count, const WGPUCommandBuffer* cmds); // every submit goes through here, see _skr_cmd_submits
+uint64_t _skr_cmd_submits   (void); // this thread's submit count
+bool     _skr_cmd_recording (void); // this thread has recorded work it hasn't submitted
+bool     _skr_pass_recording(void); // a render pass is open (skr_renderer.c)
 
 // Wrap any WGPUFuture (mapAsync etc.) in a pollable skr_future_t slot
 skr_future_t _skr_future_from_wgpu(WGPUFuture future);
@@ -208,6 +228,7 @@ const WGPUPassTimestampWrites* _skr_timer_pass_writes(WGPUPassTimestampWrites* t
 void _skr_fullscreen_pass(WGPUCommandEncoder encoder, WGPUTextureView target, WGPULoadOp load_op, const skr_recti_t* opt_bounds, WGPURenderPipeline pipeline, WGPUBindGroup bind_group, const uint32_t* dyn_offsets, uint32_t dyn_count);
 void _skr_bind_pool_drain   (void); // reclaim ranges freed last frame; call at frame begin
 void _skr_material_sys_init (void); // bind-pool writer mutex + default textures; call from skr_init
+void _skr_mem_track(skr_mem_category_ category, int64_t bytes); // WebGPU hides real memory, so skr_mem_get_stats reports this tally
 
 // Subsystem teardown for skr_shutdown -> skr_init cycles: every GPU handle
 // released, every lazy-init flag reset, locks destroyed for re-creation
@@ -223,9 +244,18 @@ typedef struct _skr_draw_buffers_t {
 	uint32_t instance_offset;
 } _skr_draw_buffers_t;
 
+// Slots fed from the frame's bump buffers, UINT32_MAX where there's none.
+// Compute, like Vulkan, only reserves its $Global (skr_renderer.c)
+typedef struct _skr_bump_slots_t {
+	uint32_t params;   // material params, or a compute shader's $Global
+	uint32_t system;
+	uint32_t instance; // t register, so it carries SKSC_SLOT_TEXTURE
+} _skr_bump_slots_t;
+_skr_bump_slots_t _skr_bump_slots(const sksc_shader_meta_t* meta, uint8_t stage_mask);
+
 // Bind group assembly from shader meta + a material-style bind list; used by
 // draws, compute dispatch, and mipgen (skr_renderer.c)
-WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, WGPUBindGroupLayout layout, const skr_material_bind_t* binds, uint32_t bind_count);
+WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t stage_mask, WGPUBindGroupLayout layout, const skr_material_bind_t* binds, uint32_t bind_count);
 
 // Dynamic offsets for the reserved material/system/instance slots, ordered
 // the way SetBindGroup expects; returns the count (skr_renderer.c)
@@ -241,7 +271,8 @@ void     _skr_bind_epoch_bump(void);
 // frame-stable, so one group per material slice serves every draw
 typedef struct _skr_bind_cache_t {
 	WGPUBindGroup group;
-	uint64_t      epoch; // matches _skr_bind_epoch() when valid; 0 = dirty
+	uint64_t      epoch;   // matches _skr_bind_epoch() when valid; 0 = dirty
+	uint64_t      buffers; // identities of the buffers the group binds
 } _skr_bind_cache_t;
 _skr_bind_cache_t* _skr_bind_cache_slot      (int32_t start); // draw thread; creates storage on demand
 void               _skr_bind_cache_invalidate(int32_t start); // any thread; marks stale

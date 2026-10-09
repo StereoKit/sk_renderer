@@ -452,7 +452,7 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 		ref_surface->images[i].framebuffer_pass       = VK_NULL_HANDLE;
 		ref_surface->images[i].framebuffer_depth_pass = VK_NULL_HANDLE;
 		ref_surface->images[i].sampler           = VK_NULL_HANDLE;
-		ref_surface->images[i].memory            = VK_NULL_HANDLE;  // Swapchain owns memory
+		ref_surface->images[i].mem               = (_skr_mem_t){0}; // Swapchain owns memory
 
 		// Initialize layout tracking for swapchain images
 		// Swapchain images start in UNDEFINED, render pass will transition them
@@ -479,6 +479,7 @@ static bool _skr_surface_create_swapchain(VkDevice device, VkPhysicalDevice phys
 
 		vr = vkCreateImageView(device, &view_info, NULL, &ref_surface->images[i].view);
 		SKR_VK_CHECK_NRET(vr, "vkCreateImageView");
+		ref_surface->images[i].bind_uid = _skr_uid_new();
 	}
 
 	return true;

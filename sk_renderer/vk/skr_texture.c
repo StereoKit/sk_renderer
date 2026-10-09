@@ -29,110 +29,25 @@
 // Helper functions
 ///////////////////////////////////////////////////////////////////////////////
 
-// Find memory type index with required properties, returns UINT32_MAX if not found
-static uint32_t _skr_find_memory_type(VkPhysicalDevice phys_device, VkMemoryRequirements mem_requirements, VkMemoryPropertyFlags required_props) {
-	VkPhysicalDeviceMemoryProperties mem_properties;
-	vkGetPhysicalDeviceMemoryProperties(phys_device, &mem_properties);
-
-	for (uint32_t i = 0; i < mem_properties.memoryTypeCount; i++) {
-		if ((mem_requirements.memoryTypeBits & (1 << i)) &&
-		    (mem_properties.memoryTypes[i].propertyFlags & required_props) == required_props) {
-			return i;
-		}
-	}
-	return UINT32_MAX;
-}
-
-// Allocate device memory for an image, trying lazily-allocated first for transient attachments
-VkDeviceMemory _skr_allocate_image_memory(VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory) {
-	VkMemoryRequirements mem_requirements;
-	vkGetImageMemoryRequirements(device, image, &mem_requirements);
-
-	uint32_t memory_type_index = UINT32_MAX;
-
-	// For transient MSAA attachments, prefer lazily allocated memory
-	if (is_transient_attachment) {
-		memory_type_index = _skr_find_memory_type(phys_device, mem_requirements, VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT);
-	}
-
-	// Fallback to device local memory
-	if (memory_type_index == UINT32_MAX) {
-		memory_type_index = _skr_find_memory_type(phys_device, mem_requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	}
-
-	if (memory_type_index == UINT32_MAX) {
-		return VK_NULL_HANDLE;
-	}
-
-	VkMemoryAllocateInfo alloc_info = {
-		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize  = mem_requirements.size,
-		.memoryTypeIndex = memory_type_index,
-	};
-
-	VkResult vr = vkAllocateMemory(device, &alloc_info, NULL, out_memory);
-	SKR_VK_CHECK_RET(vr, "vkAllocateMemory", VK_NULL_HANDLE);
-
-	return *out_memory;
-}
-
-// Create staging buffer and memory for texture uploads
+// Upload source for one copy
 typedef struct {
-	VkBuffer       buffer;
-	VkDeviceMemory memory;
-	void*          mapped_data;
-	bool           valid;
-} staging_buffer_t;
+	VkBuffer   buffer;
+	_skr_mem_t mem;
+	void*      mapped;
+} _skr_staging_t;
 
-static staging_buffer_t _skr_create_staging_buffer(VkDevice device, VkPhysicalDevice phys_device, VkDeviceSize size) {
-	staging_buffer_t result = {0};
+static skr_err_ _skr_staging_create(VkDeviceSize size, _skr_staging_t* out_staging) {
+	return _skr_buffer_create_vk(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, _skr_mem_usage_staging, skr_mem_category_staging,
+		&out_staging->buffer, &out_staging->mem, &out_staging->mapped);
+}
 
-	VkBufferCreateInfo buffer_info = {
-		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size        = size,
-		.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	};
+static void _skr_staging_retire(_skr_staging_t staging) {
+	_skr_buffer_destroy_vk(staging.buffer, staging.mem);
+}
 
-	VkResult vr = vkCreateBuffer(device, &buffer_info, NULL, &result.buffer);
-	SKR_VK_CHECK_RET(vr, "vkCreateBuffer", result);
-
-	VkMemoryRequirements mem_requirements;
-	vkGetBufferMemoryRequirements(device, result.buffer, &mem_requirements);
-
-	uint32_t memory_type_index = _skr_find_memory_type(phys_device, mem_requirements,
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-	if (memory_type_index == UINT32_MAX) {
-		vkDestroyBuffer(device, result.buffer, NULL);
-		return result;
-	}
-
-	VkMemoryAllocateInfo alloc_info = {
-		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize  = mem_requirements.size,
-		.memoryTypeIndex = memory_type_index,
-	};
-
-	vr = vkAllocateMemory(device, &alloc_info, NULL, &result.memory);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkAllocateMemory");
-		vkDestroyBuffer(device, result.buffer, NULL);
-		return result;
-	}
-
-	vkBindBufferMemory(device, result.buffer, result.memory, 0);
-
-	vr = vkMapMemory(device, result.memory, 0, size, 0, &result.mapped_data);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkMapMemory");
-		vkFreeMemory   (device, result.memory, NULL);
-		vkDestroyBuffer(device, result.buffer, NULL);
-		return result;
-	}
-
-	result.valid = true;
-	return result;
+static void _skr_staging_free_now(_skr_staging_t staging) {
+	vkDestroyBuffer(_skr_vk.device, staging.buffer, NULL);
+	_skr_mem_free(staging.mem);
 }
 
 // Create VkSamplerYcbcrConversion + immutable sampler for YUV textures.
@@ -416,6 +331,18 @@ void _skr_tex_transition_for_storage(VkCommandBuffer cmd, skr_tex_t* ref_tex) {
 		VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
+// Every mip and layer, left in TRANSFER_DST for the caller's next transition
+static void _skr_tex_zero(VkCommandBuffer cmd, skr_tex_t* ref_tex) {
+	_skr_tex_transition(cmd, ref_tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	VkImageSubresourceRange range = {
+		.aspectMask = ref_tex->aspect_mask,
+		.levelCount = VK_REMAINING_MIP_LEVELS,
+		.layerCount = VK_REMAINING_ARRAY_LAYERS,
+	};
+	if (ref_tex->aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) vkCmdClearColorImage       (cmd, ref_tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &(VkClearColorValue){0},        1, &range);
+	else                                                  vkCmdClearDepthStencilImage(cmd, ref_tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &(VkClearDepthStencilValue){0}, 1, &range);
+}
+
 // Queue family ownership transfer (for future async upload)
 void _skr_tex_transition_queue_family(VkCommandBuffer cmd, skr_tex_t* ref_tex,
                                      uint32_t src_queue_family, uint32_t dst_queue_family,
@@ -579,8 +506,8 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 	}
 
 	// Create staging buffer
-	staging_buffer_t staging = _skr_create_staging_buffer(_skr_vk.device, _skr_vk.physical_device, total_size);
-	if (!staging.valid) {
+	_skr_staging_t staging;
+	if (_skr_staging_create(total_size, &staging) != skr_err_success) {
 		skr_log(skr_log_critical, "Failed to create staging buffer for texture upload (%llu bytes)", (unsigned long long)total_size);
 		return skr_err_out_of_memory;
 	}
@@ -597,7 +524,7 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 		uint32_t row_count  = ((mip_size.y + block_h - 1) / block_h) * mip_size.z * data->layer_count;
 
 		const uint8_t* src = (const uint8_t*)data->data;
-		uint8_t*       dst = (uint8_t*)staging.mapped_data;
+		uint8_t*       dst = (uint8_t*)staging.mapped;
 		for (uint32_t row = 0; row < row_count; row++) {
 			memcpy(dst, src, dst_pitch);
 			src += data->row_pitch;
@@ -605,15 +532,13 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 		}
 	} else {
 		// Tightly packed - single memcpy
-		memcpy(staging.mapped_data, data->data, total_size);
+		memcpy(staging.mapped, data->data, total_size);
 	}
 
 	// Build copy regions (one per mip level, covering all layers for that mip)
 	VkBufferImageCopy* regions = _skr_malloc(sizeof(VkBufferImageCopy) * data->mip_count);
 	if (!regions) {
-		vkUnmapMemory  (_skr_vk.device, staging.memory);
-		vkFreeMemory   (_skr_vk.device, staging.memory, NULL);
-		vkDestroyBuffer(_skr_vk.device, staging.buffer, NULL);
+		_skr_staging_free_now(staging);
 		return skr_err_out_of_memory;
 	}
 
@@ -658,8 +583,7 @@ static skr_err_ _skr_tex_upload_data(skr_tex_t* ref_tex, const skr_tex_data_t* d
 	}
 	_skr_tex_transition_for_shader_read(ctx.cmd, ref_tex, shader_stages);
 
-	_skr_destroy_private_memory(staging.memory);
-	_skr_destroy_private_buffer(staging.buffer);
+	_skr_staging_retire(staging);
 	_skr_cmd_release(ctx.cmd);
 
 	_skr_free(regions);
@@ -709,14 +633,13 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 	out_tex->usage = image_info.usage;
 
 	// Single allocation for all planes (non-disjoint)
-	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
+	skr_err_ mem_err = _skr_mem_bind_image(out_tex->image, out_tex->usage, _skr_mem_usage_gpu, skr_mem_category_texture, &out_tex->mem);
+	if (mem_err != skr_err_success) {
 		skr_log(skr_log_critical, "_skr_tex_create_yuv: failed to allocate texture memory");
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
 		*out_tex = (skr_tex_t){0};
-		return skr_err_out_of_memory;
+		return mem_err;
 	}
-
-	vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, 0);
 
 	// Create YCbCr conversion + immutable sampler with sensible defaults:
 	// BT.709 narrow range (standard for video), cosited-even chroma (standard for NV12/P010)
@@ -735,7 +658,7 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 		&ycbcr_sampler);
 
 	if (err != skr_err_success) {
-		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return err;
@@ -767,7 +690,7 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 		skr_log(skr_log_critical, "_skr_tex_create_yuv: vkCreateImageView failed: 0x%X", (uint32_t)vr);
 		vkDestroySampler                (_skr_vk.device, ycbcr_sampler,    NULL);
 		vkDestroySamplerYcbcrConversion (_skr_vk.device, ycbcr_conversion, NULL);
-		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -788,6 +711,7 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 	out_tex->ycbcr_sampler     = ycbcr_sampler;
 	out_tex->sampler_settings  = sampler;
 	out_tex->sampler           = ycbcr_sampler;
+	out_tex->bind_uid          = _skr_uid_new();
 
 	// Upload data if provided
 	if (opt_data && opt_data->data) {
@@ -823,12 +747,12 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 		VkDeviceSize total_size = 0;
 		for (uint32_t p = 0; p < plane_count; p++) total_size += plane_sizes[p];
 
-		staging_buffer_t staging = _skr_create_staging_buffer(_skr_vk.device, _skr_vk.physical_device, total_size);
-		if (!staging.valid) {
+		_skr_staging_t staging;
+		if (_skr_staging_create(total_size, &staging) != skr_err_success) {
 			skr_log(skr_log_critical, "_skr_tex_create_yuv: staging buffer creation failed");
 			// Texture is still valid, just without data
 		} else {
-			memcpy(staging.mapped_data, opt_data->data, total_size);
+			memcpy(staging.mapped, opt_data->data, total_size);
 
 			_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
@@ -871,8 +795,7 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 			out_tex->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 			out_tex->first_use      = false;
 
-			_skr_destroy_private_memory(staging.memory);
-			_skr_destroy_private_buffer(staging.buffer);
+			_skr_staging_retire(staging);
 			_skr_cmd_release(ctx.cmd);
 		}
 	}
@@ -998,23 +921,8 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 			0,
 			&format_props);
 
-		// Check if lazily allocated memory is available
-		bool has_lazy_memory = false;
-		if (result == VK_SUCCESS) {
-			VkPhysicalDeviceMemoryProperties mem_properties;
-			vkGetPhysicalDeviceMemoryProperties(_skr_vk.physical_device, &mem_properties);
-
-			// Check if any memory type has LAZILY_ALLOCATED_BIT
-			for (uint32_t i = 0; i < mem_properties.memoryTypeCount; i++) {
-				if (mem_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) {
-					has_lazy_memory = true;
-					break;
-				}
-			}
-		}
-
 		// Only use transient attachment if both format is supported AND lazy memory is available
-		if (result == VK_SUCCESS && has_lazy_memory) {
+		if (result == VK_SUCCESS && _skr_mem_has_lazy()) {
 			usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
 			// Remove SAMPLED_BIT and TRANSFER_DST_BIT for transient attachments
 			usage &= ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
@@ -1054,6 +962,17 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		}
 	}
 
+	// Data-less textures nothing renders into start zeroed, since pooled memory
+	// holds whatever its last owner left. Render passes define their targets.
+	uint32_t block_width = 1;
+	skr_tex_fmt_block_info(format, &block_width, NULL, NULL);
+	bool zero = !(opt_data && opt_data->data)
+	         && !(flags & skr_tex_flags_uninitialized)
+	         && !is_transient_candidate
+	         && block_width == 1
+	         && (!(flags & skr_tex_flags_writeable) || (flags & skr_tex_flags_compute));
+	if (zero) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
 	// Create image (use normalized out_tex->size where z is always depth)
 	VkImageCreateInfo image_info = {
 		.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -1077,16 +996,16 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	}
 	out_tex->usage = usage;
 
-	// Allocate memory using helper
-	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, is_transient_candidate, &out_tex->memory) == VK_NULL_HANDLE) {
+	bool              gpu_written = out_tex->flags & (skr_tex_flags_writeable | skr_tex_flags_compute);
+	skr_mem_category_ category    = gpu_written ? skr_mem_category_target : skr_mem_category_texture;
+	skr_err_          mem_err     = _skr_mem_bind_image(out_tex->image, usage, is_transient_candidate ? _skr_mem_usage_lazy : _skr_mem_usage_gpu, category, &out_tex->mem);
+	if (mem_err != skr_err_success) {
 		skr_log(skr_log_critical, "Failed to allocate texture memory - Format: %d, Size: %dx%dx%d, Mips: %d, Layers: %d, Samples: %d, Usage: 0x%x, Flags: 0x%x",
 			format, size.x, size.y, size.z, out_tex->mip_levels, out_tex->layer_count, out_tex->samples, usage, out_tex->flags);
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
 		*out_tex = (skr_tex_t){0};
-		return skr_err_out_of_memory;
+		return mem_err;
 	}
-
-	vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, 0);
 
 	// Initialize layout tracking BEFORE any transitions
 	// This must happen before _skr_tex_upload_data or _skr_tex_transition calls
@@ -1101,17 +1020,18 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	if (opt_data && opt_data->data) {
 		skr_err_ upload_err = _skr_tex_upload_data(out_tex, opt_data);
 		if (upload_err != skr_err_success) {
-			vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+			_skr_mem_free(out_tex->mem);
 			vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 			*out_tex = (skr_tex_t){0};
 			return upload_err;
 		}
-	} else if (!is_transient_candidate && !(out_tex->flags & skr_tex_flags_writeable)) {
+	} else if (zero || (!is_transient_candidate && !(out_tex->flags & skr_tex_flags_writeable))) {
 		// No data provided, transition to appropriate layout for read-only textures
 		// Skip for transient attachments - they don't need initial layout transition
 		// Skip for writeable textures - let the first render pass handle the transition
 
 		_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+		if (zero) _skr_tex_zero(ctx.cmd, out_tex);
 		// Use automatic transition system - handles storage vs regular textures
 		if (out_tex->flags & skr_tex_flags_compute) { _skr_tex_transition_for_storage    (ctx.cmd, out_tex); }
 		else                                        { _skr_tex_transition_for_shader_read(ctx.cmd, out_tex, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT); }
@@ -1152,14 +1072,15 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "vkCreateImageView failed");
-		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
 
 	// Store texture properties
-	out_tex->sampler = _skr_sampler_cache_acquire(sampler);
+	out_tex->sampler  = _skr_sampler_cache_acquire(sampler);
+	out_tex->bind_uid = _skr_uid_new();
 
 	return skr_err_success;
 }
@@ -1218,14 +1139,13 @@ skr_err_ _skr_tex_create_scratch(const skr_tex_t* template_src, skr_tex_t* out_t
 	}
 	out_tex->usage = usage;
 
-	if (_skr_allocate_image_memory(_skr_vk.device, _skr_vk.physical_device, out_tex->image, false, &out_tex->memory) == VK_NULL_HANDLE) {
+	skr_err_ mem_err = _skr_mem_bind_image(out_tex->image, usage, _skr_mem_usage_gpu, skr_mem_category_target, &out_tex->mem);
+	if (mem_err != skr_err_success) {
 		skr_log(skr_log_critical, "Failed to allocate scratch texture memory");
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
 		*out_tex = (skr_tex_t){0};
-		return skr_err_out_of_memory;
+		return mem_err;
 	}
-
-	vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, 0);
 
 	out_tex->current_layout       = VK_IMAGE_LAYOUT_UNDEFINED;
 	out_tex->current_queue_family = _skr_vk.graphics_queue_family;
@@ -1252,12 +1172,13 @@ skr_err_ _skr_tex_create_scratch(const skr_tex_t* template_src, skr_tex_t* out_t
 	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "vkCreateImageView (scratch) failed: 0x%X", (uint32_t)vr);
-		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
 
+	out_tex->bind_uid = _skr_uid_new();
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_IMAGE,      (uint64_t)out_tex->image, "mipgen_scratch");
 	_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)out_tex->view,  "mipgen_scratch_view");
 
@@ -1285,8 +1206,8 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 
 	// External images aren't ours to free. LIFO list: memory frees after the image
 	if (!ref_tex->is_external) {
-		_skr_destroy_shared_memory(ref_tex->memory);
-		_skr_destroy_shared_image (ref_tex->image);
+		_skr_destroy_shared_mem  (ref_tex->mem);
+		_skr_destroy_shared_image(ref_tex->image);
 	}
 
 	// LIFO list: the sampler goes before the conversion it references
@@ -1345,6 +1266,7 @@ void skr_tex_set_sampler(skr_tex_t* ref_tex, skr_tex_sampler_t sampler) {
 
 	// Acquire new sampler from cache and update settings
 	ref_tex->sampler          = _skr_sampler_cache_acquire(sampler);
+	ref_tex->bind_uid         = _skr_uid_new();
 	ref_tex->sampler_settings = sampler;
 }
 
@@ -1799,7 +1721,7 @@ static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, 
 
 	_skr_pipeline_lock();
 	VkPipelineLayout      layout      = _skr_pipeline_get_layout           (material->pipeline_material_idx);
-	VkDescriptorSetLayout desc_layout = _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx);
+	_skr_desc_layout_t    desc_layout = _skr_pipeline_get_descriptor_layout(material->pipeline_material_idx);
 	_skr_pipeline_unlock();
 
 	VkPipeline pipeline = _skr_mipgen_compute_pipeline_get(shader, layout);
@@ -1878,10 +1800,10 @@ static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, 
 		_skr_desc_writes_t desc;
 		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
 		if (skr_buffer_is_valid(&params_buffer))
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, (mip - 1) * aligned_stride, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, params_buffer.uid, (mip - 1) * aligned_stride, material->param_buffer_size);
 		// Both views are in GENERAL, not the texture's canonical sample layout
-		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, VK_IMAGE_LAYOUT_GENERAL);
-		_skr_write_image(&desc, bind_dst.slot,    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          VK_NULL_HANDLE,   dst_view, VK_IMAGE_LAYOUT_GENERAL);
+		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, _skr_uid_new(), VK_IMAGE_LAYOUT_GENERAL);
+		_skr_write_image(&desc, bind_dst.slot,    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          VK_NULL_HANDLE,   dst_view, _skr_uid_new(), VK_IMAGE_LAYOUT_GENERAL);
 
 		const int32_t ignore_slots[] = {
 			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
@@ -2113,10 +2035,10 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_desc_writes_t desc;
 		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
 		if (skr_buffer_is_valid(&params_buffer))
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, (mip - 1) * aligned_stride, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, params_buffer.uid, (mip - 1) * aligned_stride, material->param_buffer_size);
 		// Both ref_tex mip 0 and scratch mips sit in SHADER_READ_ONLY_OPTIMAL
 		// during the mip loop, whatever ref_tex's canonical sample layout is.
-		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, _skr_uid_new(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 		// Add any other material bindings (textures/buffers, including globals)
 		const int32_t ignore_slots[] = {
@@ -2706,7 +2628,6 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 	// Store external image reference
 	// Normalize size.z to 1 since external textures don't support 3D
 	out_tex->image       = info.image;
-	out_tex->memory      = info.memory;  // May be VK_NULL_HANDLE for truly external memory
 	out_tex->size        = (skr_vec3i_t){ info.size.x, info.size.y, 1 };
 	out_tex->format      = info.format;
 	out_tex->flags       = is_array ? (skr_tex_flags_)(info.flags | skr_tex_flags_array) : info.flags;
@@ -2751,9 +2672,23 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 		}
 	}
 
+	// An owned image hands over its memory too. Last, so every failure above
+	// leaves the caller still owning it.
+	if (info.owns_image && info.memory != VK_NULL_HANDLE) {
+		VkMemoryRequirements reqs;
+		vkGetImageMemoryRequirements(_skr_vk.device, info.image, &reqs);
+		out_tex->mem = _skr_mem_import(info.memory, reqs.size);
+		if (out_tex->mem.block == 0) {
+			if (info.view == VK_NULL_HANDLE) vkDestroyImageView(_skr_vk.device, out_tex->view, NULL);
+			*out_tex = (skr_tex_t){0};
+			return skr_err_out_of_memory;
+		}
+	}
+
 	// Acquire sampler from cache
 	out_tex->sampler_settings = info.sampler;
 	out_tex->sampler          = _skr_sampler_cache_acquire(info.sampler);
+	out_tex->bind_uid         = _skr_uid_new();
 
 	return skr_err_success;
 }
@@ -2804,8 +2739,9 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 
 	// Swap: update view and image, then defer-destroy the old view
 	VkImageView old_view = ref_tex->view;
-	ref_tex->view  = new_view;
-	ref_tex->image = update.image;
+	ref_tex->view     = new_view;
+	ref_tex->image    = update.image;
+	ref_tex->bind_uid = _skr_uid_new();
 
 	if (old_view != VK_NULL_HANDLE) {
 		_skr_destroy_shared_image_view(old_view);
@@ -2910,8 +2846,7 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 	vkGetImageMemoryRequirements(_skr_vk.device, out_tex->image, &mem_reqs);
 
 	// Find compatible memory type
-	uint32_t memory_type_index = _skr_find_memory_type(
-		_skr_vk.physical_device, mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	uint32_t memory_type_index = _skr_mem_find_type(mem_reqs.memoryTypeBits, _skr_mem_usage_gpu);
 
 	if (memory_type_index == UINT32_MAX) {
 		skr_log(skr_log_critical, "skr_tex_create_external_gl: no compatible memory type");
@@ -2954,7 +2889,8 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 
 	// Note: on success, fd is consumed by vkAllocateMemory and must not be closed.
 	// On Windows, the handle is duplicated internally.
-	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &out_tex->memory);
+	VkDeviceMemory memory;
+	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &memory);
 
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_gl: vkAllocateMemory failed: 0x%X", (uint32_t)vr);
@@ -2962,11 +2898,18 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
+	out_tex->mem = _skr_mem_import(memory, alloc_info.allocationSize);
+	if (out_tex->mem.block == 0) {
+		vkFreeMemory  (_skr_vk.device, memory, NULL);
+		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
+		*out_tex = (skr_tex_t){0};
+		return skr_err_out_of_memory;
+	}
 
-	vr = vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, info.memory_offset);
+	vr = vkBindImageMemory(_skr_vk.device, out_tex->image, memory, info.memory_offset);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_gl: vkBindImageMemory failed: 0x%X", (uint32_t)vr);
-		vkFreeMemory (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -2995,7 +2938,7 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_gl: vkCreateImageView failed: 0x%X", (uint32_t)vr);
-		vkFreeMemory (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -3021,6 +2964,7 @@ skr_err_ skr_tex_create_external_gl(skr_tex_external_gl_info_t info, skr_tex_t* 
 	// Sampler
 	out_tex->sampler_settings = info.sampler;
 	out_tex->sampler          = _skr_sampler_cache_acquire(info.sampler);
+	out_tex->bind_uid         = _skr_uid_new();
 
 	return skr_err_success;
 }
@@ -3106,8 +3050,7 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 	vkGetImageMemoryRequirements(_skr_vk.device, out_tex->image, &mem_reqs);
 
 	// Find compatible memory type
-	uint32_t memory_type_index = _skr_find_memory_type(
-		_skr_vk.physical_device, mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	uint32_t memory_type_index = _skr_mem_find_type(mem_reqs.memoryTypeBits, _skr_mem_usage_gpu);
 
 	if (memory_type_index == UINT32_MAX) {
 		skr_log(skr_log_critical, "skr_tex_create_external_dma: no compatible memory type");
@@ -3134,19 +3077,27 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 		.memoryTypeIndex = memory_type_index,
 	};
 
-	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &out_tex->memory);
+	VkDeviceMemory memory;
+	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &memory);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_dma: vkAllocateMemory failed: 0x%X", (uint32_t)vr);
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
+	out_tex->mem = _skr_mem_import(memory, alloc_info.allocationSize);
+	if (out_tex->mem.block == 0) {
+		vkFreeMemory  (_skr_vk.device, memory, NULL);
+		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
+		*out_tex = (skr_tex_t){0};
+		return skr_err_out_of_memory;
+	}
 	// Note: on success, the fd is consumed by vkAllocateMemory and must not be closed
 
-	vr = vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, 0);
+	vr = vkBindImageMemory(_skr_vk.device, out_tex->image, memory, 0);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_dma: vkBindImageMemory failed: 0x%X", (uint32_t)vr);
-		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -3174,7 +3125,7 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 			&ycbcr_sampler);
 
 		if (err != skr_err_success) {
-			vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+			_skr_mem_free(out_tex->mem);
 			vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 			*out_tex = (skr_tex_t){0};
 			return err;
@@ -3203,7 +3154,7 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 		skr_log(skr_log_critical, "skr_tex_create_external_dma: vkCreateImageView failed: 0x%X", (uint32_t)vr);
 		if (ycbcr_sampler)    vkDestroySampler                (_skr_vk.device, ycbcr_sampler,    NULL);
 		if (ycbcr_conversion) vkDestroySamplerYcbcrConversion (_skr_vk.device, ycbcr_conversion, NULL);
-		vkFreeMemory  (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -3233,6 +3184,7 @@ skr_err_ skr_tex_create_external_dma(skr_tex_external_dma_info_t info, skr_tex_t
 	// Sampler: use immutable YCbCr sampler for YUV, otherwise use sampler cache
 	out_tex->sampler_settings = info.sampler;
 	out_tex->sampler          = ycbcr_sampler != VK_NULL_HANDLE ? ycbcr_sampler : _skr_sampler_cache_acquire(info.sampler);
+	out_tex->bind_uid         = _skr_uid_new();
 
 	return skr_err_success;
 }
@@ -3343,15 +3295,7 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 	};
 
 	// Find memory type from AHB-reported bits
-	uint32_t memory_type_index = UINT32_MAX;
-	VkPhysicalDeviceMemoryProperties mem_props;
-	vkGetPhysicalDeviceMemoryProperties(_skr_vk.physical_device, &mem_props);
-	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-		if (ahb_props.memoryTypeBits & (1 << i)) {
-			memory_type_index = i;
-			break;
-		}
-	}
+	uint32_t memory_type_index = _skr_mem_find_type(ahb_props.memoryTypeBits, _skr_mem_usage_gpu);
 
 	if (memory_type_index == UINT32_MAX) {
 		skr_log(skr_log_critical, "skr_tex_create_external_ahb: no compatible memory type");
@@ -3367,18 +3311,26 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 		.memoryTypeIndex = memory_type_index,
 	};
 
-	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &out_tex->memory);
+	VkDeviceMemory memory;
+	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &memory);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_ahb: vkAllocateMemory failed: 0x%X", (uint32_t)vr);
 		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
+	out_tex->mem = _skr_mem_import(memory, alloc_info.allocationSize);
+	if (out_tex->mem.block == 0) {
+		vkFreeMemory  (_skr_vk.device, memory, NULL);
+		vkDestroyImage(_skr_vk.device, out_tex->image, NULL);
+		*out_tex = (skr_tex_t){0};
+		return skr_err_out_of_memory;
+	}
 
-	vr = vkBindImageMemory(_skr_vk.device, out_tex->image, out_tex->memory, 0);
+	vr = vkBindImageMemory(_skr_vk.device, out_tex->image, memory, 0);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "skr_tex_create_external_ahb: vkBindImageMemory failed: 0x%X", (uint32_t)vr);
-		vkFreeMemory (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -3419,7 +3371,7 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 
 		if (err != skr_err_success) {
 			if (info.owns_buffer) AHardwareBuffer_release(ahb);
-			vkFreeMemory (_skr_vk.device, out_tex->memory, NULL);
+			_skr_mem_free(out_tex->mem);
 			vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 			*out_tex = (skr_tex_t){0};
 			return err;
@@ -3456,7 +3408,7 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 		if (ycbcr_sampler)    vkDestroySampler                (_skr_vk.device, ycbcr_sampler,    NULL);
 		if (ycbcr_conversion) vkDestroySamplerYcbcrConversion (_skr_vk.device, ycbcr_conversion, NULL);
 		if (info.owns_buffer) AHardwareBuffer_release(ahb);
-		vkFreeMemory (_skr_vk.device, out_tex->memory, NULL);
+		_skr_mem_free(out_tex->mem);
 		vkDestroyImage(_skr_vk.device, out_tex->image,  NULL);
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
@@ -3493,6 +3445,7 @@ skr_err_ skr_tex_create_external_ahb(skr_tex_external_ahb_info_t info, skr_tex_t
 		out_tex->sampler_settings = info.sampler;
 		out_tex->sampler          = _skr_sampler_cache_acquire(info.sampler);
 	}
+	out_tex->bind_uid = _skr_uid_new();
 
 	return skr_err_success;
 #endif // __ANDROID__
@@ -3619,7 +3572,7 @@ skr_err_ skr_tex_create_copy(const skr_tex_t* src, skr_tex_fmt_ format, skr_tex_
 	// Use the source's sampler settings for convenience
 	skr_tex_sampler_t sampler = src->sampler_settings;
 
-	skr_err_ err = skr_tex_create(dst_format, flags, sampler, src->size, dst_samples, src->mip_levels, NULL, out_tex);
+	skr_err_ err = skr_tex_create(dst_format, flags | skr_tex_flags_uninitialized, sampler, src->size, dst_samples, src->mip_levels, NULL, out_tex);
 	if (err != skr_err_success) {
 		return err;
 	}
@@ -3703,8 +3656,8 @@ skr_err_ skr_tex_create_copy(const skr_tex_t* src, skr_tex_fmt_ format, skr_tex_
 
 // Internal structure for readback state
 typedef struct _skr_tex_readback_internal_t {
-	VkBuffer       staging_buffer;
-	VkDeviceMemory staging_memory;
+	VkBuffer   staging_buffer;
+	_skr_mem_t staging_mem;
 } _skr_tex_readback_internal_t;
 
 skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t array_layer, skr_tex_readback_t* out_readback) {
@@ -3751,58 +3704,14 @@ skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t arr
 		return skr_err_unsupported;
 	}
 
-	// Create staging buffer with TRANSFER_DST usage
-	VkBufferCreateInfo buffer_info = {
-		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size        = data_size,
-		.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	};
-
-	VkBuffer staging_buffer;
-	VkResult vr = vkCreateBuffer(_skr_vk.device, &buffer_info, NULL, &staging_buffer);
-	if (vr != VK_SUCCESS) {
-		skr_log(skr_log_critical, "skr_tex_readback: vkCreateBuffer failed");
-		return skr_err_device_error;
-	}
-
-	// Allocate host-visible memory
-	VkMemoryRequirements mem_requirements;
-	vkGetBufferMemoryRequirements(_skr_vk.device, staging_buffer, &mem_requirements);
-
-	uint32_t memory_type_index = _skr_find_memory_type(_skr_vk.physical_device, mem_requirements,
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-	if (memory_type_index == UINT32_MAX) {
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-		skr_log(skr_log_critical, "skr_tex_readback: no suitable memory type found");
-		return skr_err_out_of_memory;
-	}
-
-	VkMemoryAllocateInfo alloc_info = {
-		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize  = mem_requirements.size,
-		.memoryTypeIndex = memory_type_index,
-	};
-
-	VkDeviceMemory staging_memory;
-	vr = vkAllocateMemory(_skr_vk.device, &alloc_info, NULL, &staging_memory);
-	if (vr != VK_SUCCESS) {
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-		skr_log(skr_log_critical, "skr_tex_readback: vkAllocateMemory failed");
-		return skr_err_out_of_memory;
-	}
-
-	vkBindBufferMemory(_skr_vk.device, staging_buffer, staging_memory, 0);
-
-	// Map the staging buffer (persistent mapping)
-	void* mapped_data;
-	vr = vkMapMemory(_skr_vk.device, staging_memory, 0, data_size, 0, &mapped_data);
-	if (vr != VK_SUCCESS) {
-		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-		skr_log(skr_log_critical, "skr_tex_readback: vkMapMemory failed");
-		return skr_err_device_error;
+	VkBuffer   staging_buffer;
+	_skr_mem_t staging_mem;
+	void*      mapped_data;
+	skr_err_   err = _skr_buffer_create_vk(data_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, _skr_mem_usage_readback, skr_mem_category_staging,
+		&staging_buffer, &staging_mem, &mapped_data);
+	if (err != skr_err_success) {
+		skr_log(skr_log_critical, "skr_tex_readback: staging buffer creation failed");
+		return err;
 	}
 
 	// Acquire command buffer and issue copy
@@ -3840,14 +3749,12 @@ skr_err_ skr_tex_readback(const skr_tex_t* tex, uint32_t mip_level, uint32_t arr
 	// Allocate internal state
 	_skr_tex_readback_internal_t* internal = (_skr_tex_readback_internal_t*)_skr_malloc(sizeof(_skr_tex_readback_internal_t));
 	if (!internal) {
-		vkUnmapMemory  (_skr_vk.device, staging_memory);
-		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
+		_skr_buffer_destroy_vk(staging_buffer, staging_mem);
 		return skr_err_out_of_memory;
 	}
 
 	internal->staging_buffer = staging_buffer;
-	internal->staging_memory = staging_memory;
+	internal->staging_mem    = staging_mem;
 
 	// Populate output
 	out_readback->data      = mapped_data;
@@ -3865,11 +3772,7 @@ void skr_tex_readback_destroy(skr_tex_readback_t* ref_readback) {
 
 	// No wait: the copy may sit in a command buffer this thread has yet to
 	// submit, and blocking on that here deadlocks
-	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
-	_skr_destroy_batch_begin();
-	_skr_destroy_shared_memory(internal->staging_memory);
-	_skr_destroy_shared_buffer(internal->staging_buffer);
-	_skr_destroy_batch_end();
+	_skr_buffer_destroy_vk(internal->staging_buffer, internal->staging_mem);
 	_skr_free(internal);
 
 	*ref_readback = (skr_tex_readback_t){0};

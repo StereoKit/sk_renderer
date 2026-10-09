@@ -11,13 +11,12 @@
 #define SKR_MAX_FRAMES_IN_FLIGHT 3
 #define SKR_MAX_SURFACES 2  // Maximum surfaces for VR stereo rendering
 
-// Number of copies in a dynamic buffer's flipbook ring. This is one more than
-// the in-flight frame count: callers write the new frame's data before the
-// oldest in-flight frame is retired (the per-frame fence wait happens at
-// present/acquire, after dynamic buffers are updated), so up to
-// SKR_MAX_FRAMES_IN_FLIGHT frames can still be reading older slots when we
-// write. We need a free slot beyond those to avoid stomping in-flight data.
-#define SKR_DYNAMIC_BUFFER_COPIES (SKR_MAX_FRAMES_IN_FLIGHT + 1)
+// A device memory allocation from skr_memory.c, zero when none
+typedef struct _skr_mem_t {
+	uint32_t block;        // 1 based index into the block table
+	uint32_t node     : 24; // suballocation within the block, unused when dedicated
+	uint32_t category : 8;  // skr_mem_category_
+} _skr_mem_t;
 
 // Future type for tracking command buffer completion (must be before skr_surface_t)
 typedef struct skr_future_t {
@@ -50,22 +49,14 @@ typedef struct skr_buffer_readback_t {
 } skr_buffer_readback_t;
 
 typedef struct skr_buffer_t {
-	VkBuffer            buffer;  // Current buffer for binding (= _ring[_ring_index] if ring active)
-	VkDeviceMemory      memory;  // Current memory
-	void*               mapped;  // Current mapped pointer (for dynamic buffers)
-	uint32_t            size;
-	skr_buffer_type_    type;
-	skr_use_            use;
-
-	// Ring buffer for safe dynamic updates (lazy allocated slots)
-	// Allows updates without stomping data still in use by in-flight frames
-	struct {
-		VkBuffer       buffer;
-		VkDeviceMemory memory;
-		void*          mapped;
-	}                   _ring[SKR_DYNAMIC_BUFFER_COPIES];
-	uint8_t             _ring_count;  // Slots allocated so far (0 = no ring, use top-level fields)
-	uint8_t             _ring_index;  // Current active slot for reading
+	VkBuffer                   buffer;  // Current slot, for binding
+	_skr_mem_t                 mem;
+	void*                      mapped;  // Dynamic buffers only
+	uint32_t                   size;
+	skr_buffer_type_           type;
+	skr_use_                   use;
+	struct _skr_buffer_ring_t* _ring;   // Rename slots for skr_buffer_set, NULL until the first one
+	uint64_t                   uid;     // Current slot's identity, for caches keyed on what's bound
 } skr_buffer_t;
 
 typedef struct skr_vert_type_t {
@@ -93,7 +84,7 @@ typedef struct skr_mesh_t {
 
 typedef struct skr_tex_t {
 	VkImage                image;
-	VkDeviceMemory         memory;
+	_skr_mem_t             mem;
 	VkImageView            view;
 	VkFramebuffer          framebuffer;             // Cached framebuffer (color only, no depth)
 	VkFramebuffer          framebuffer_depth;       // Cached framebuffer (color + depth, if last used with depth)
@@ -103,6 +94,7 @@ typedef struct skr_tex_t {
 	uint64_t               framebuffer_depth_views; // from — other attachments can be destroyed while the cache
 	                                                // target survives, so the render pass alone under-keys the cache
 	VkSampler              sampler;          // Vulkan sampler handle
+	uint64_t               bind_uid;         // Identity of this view + sampler pairing, renewed when either changes
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
 	skr_vec3i_t            size;
 	skr_tex_fmt_           format;
@@ -323,10 +315,15 @@ typedef struct skr_param_buffer_slot_t {
 	uint64_t     hash;  // Content hash for reuse matching
 } skr_param_buffer_slot_t;
 
+typedef struct {
+	VkDescriptorSetLayout handle;
+	uint64_t              uid; // see _skr_uid_new
+} _skr_desc_layout_t;
+
 typedef struct skr_compute_t {
 	const skr_shader_t*    shader;  // Reference to shader (not owned)
 	VkPipelineLayout       layout;
-	VkDescriptorSetLayout  descriptor_layout;
+	_skr_desc_layout_t     descriptor_layout;
 	VkPipeline             pipeline;
 
 	int32_t                bind_start;  // Index into the bind pool, shared with materials

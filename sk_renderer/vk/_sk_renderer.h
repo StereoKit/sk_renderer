@@ -28,6 +28,9 @@
 	#define _skr_load_u32(p)          (*(p))
 	#define _skr_exchange_u32(p, v)   ((uint32_t)_InterlockedExchange((volatile long*)(p), (long)(v)))
 	#define _skr_add_u32(p, v)        _InterlockedExchangeAdd((volatile long*)(p), (long)(v))
+	#define _skr_add_u64(p, v)        _InterlockedExchangeAdd64((volatile __int64*)(p), (__int64)(v))
+	#define _skr_load_u64(p)          (*(p))
+	#define _skr_cas_u64(p, expected, desired) (_InterlockedCompareExchange64((volatile __int64*)(p), (__int64)(desired), (__int64)(expected)) == (__int64)(expected))
 	#define _skr_load_ptr(p)          (*(p))
 	#define _skr_exchange_ptr(p, v)   _InterlockedExchangePointer((void* volatile*)(p), (void*)(v))
 	#define _skr_cas_ptr(p, expected, desired) (_InterlockedCompareExchangePointer((void* volatile*)(p), (void*)(desired), (void*)(expected)) == (void*)(expected))
@@ -39,6 +42,9 @@
 	#define _skr_load_u32(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
 	#define _skr_exchange_u32(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_RELAXED)
 	#define _skr_add_u32(p, v)        __atomic_fetch_add ((p), (v), __ATOMIC_RELAXED)
+	#define _skr_add_u64(p, v)        __atomic_fetch_add ((p), (v), __ATOMIC_RELAXED)
+	#define _skr_load_u64(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
+	#define _skr_cas_u64(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
 	#define _skr_load_ptr(p)          __atomic_load_n    ((p),      __ATOMIC_RELAXED)
 	#define _skr_exchange_ptr(p, v)   __atomic_exchange_n((p), (v), __ATOMIC_ACQ_REL)
 	#define _skr_cas_ptr(p, expected, desired) __atomic_compare_exchange_n((p), &(expected), (desired), false, __ATOMIC_RELEASE, __ATOMIC_RELAXED) // MSVC's doesn't write expected back, so callers reload it
@@ -125,6 +131,8 @@ _Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must
 #define SKR_VK_CHECK_RET(vkResult, fnName, returnVal) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); return returnVal; } }
 #define SKR_VK_CHECK_NRET(vkResult, fnName) { VkResult __vr = (vkResult); if (__vr != VK_SUCCESS) { skr_log(skr_log_critical, "%s: 0x%X", fnName, (uint32_t)__vr); } }
 
+typedef struct _skr_buffer_slot_t _skr_buffer_slot_t; // skr_buffer.c
+
 // Deferred destruction. A list runs LIFO, so push dependents first: memory
 // before image, conversion before sampler.
 #define FOREACH_DESTROY_TYPE(X) \
@@ -138,7 +146,6 @@ _Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must
 	X(pipeline_layout,      VkPipelineLayout,        vkDestroyPipelineLayout)        \
 	X(descriptor_set_layout,VkDescriptorSetLayout,   vkDestroyDescriptorSetLayout)   \
 	X(shader_module,        VkShaderModule,          vkDestroyShaderModule)          \
-	X(memory,               VkDeviceMemory,          vkFreeMemory)                   \
 	X(ycbcr_conversion,     VkSamplerYcbcrConversion,vkDestroySamplerYcbcrConversion)
 
 typedef enum {
@@ -147,6 +154,8 @@ typedef enum {
 	#undef MAKE_ENUM
 	skr_destroy_type_bind_pool_slots,  // handle = start, aux = count
 	skr_destroy_type_desc_set,         // handle = set, aux = pool index in the owning thread's cache; private only
+	skr_destroy_type_mem,              // handle = _skr_mem_t
+	skr_destroy_type_buffer_slot,      // handle = a dynamic buffer's rename slot, which this frees for reuse
 } skr_destroy_type_;
 
 typedef struct {
@@ -202,6 +211,7 @@ typedef struct {
 #define _SKR_DESC_INFOS_MAX  16
 typedef struct {
 	VkWriteDescriptorSet   writes      [_SKR_DESC_WRITES_MAX];
+	uint64_t               uids        [_SKR_DESC_WRITES_MAX]; // what each write points at, for the set cache
 	VkDescriptorBufferInfo buffer_infos[_SKR_DESC_INFOS_MAX];
 	VkDescriptorImageInfo  image_infos [_SKR_DESC_INFOS_MAX];
 	uint32_t               write_ct;
@@ -243,6 +253,7 @@ typedef struct {
 
 typedef struct skr_bump_result_t {
 	VkBuffer buffer; // VK_NULL_HANDLE when the write failed
+	uint64_t uid;    // the buffer's, see _skr_uid_new
 	uint32_t offset;
 } skr_bump_result_t;
 
@@ -420,6 +431,7 @@ typedef struct {
 	mtx_t                    thread_pool_mutex;
 	_skr_atomic(uint32_t)    main_pool_idx;   // The frame thread's pool; shared destroys retire on its submits
 	_skr_atomic(_skr_destroy_block_t*) pending; // Shared destroys waiting on a fence, see _skr_destroy_retire
+	_skr_atomic(uint64_t)    next_uid;        // see _skr_uid_new
 
 	// Default assets
 	skr_tex_t                default_tex_white;
@@ -437,12 +449,15 @@ typedef struct {
 
 extern _skr_vk_t _skr_vk;
 
+// Identity for anything a descriptor can point at. Driver handle values get
+// reused once an object is destroyed; these never are, so caches key on them.
+static inline uint64_t _skr_uid_new(void) { return _skr_add_u64(&_skr_vk.next_uid, 1) + 1; }
+
 ///////////////////////////////////////////////////////////////////////////////
 // Internal helpers
 ///////////////////////////////////////////////////////////////////////////////
 
 VkFramebuffer         _skr_create_framebuffer               (VkDevice device, VkRenderPass render_pass, skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve);
-VkDeviceMemory        _skr_allocate_image_memory            (VkDevice device, VkPhysicalDevice phys_device, VkImage image, bool is_transient_attachment, VkDeviceMemory* out_memory);
 VkSampler             _skr_sampler_create_vk                (VkDevice device, skr_tex_sampler_t settings);
 skr_err_              _skr_tex_create_scratch               (const skr_tex_t* template_src, skr_tex_t* out_tex);
 VkDescriptorSetLayout _skr_shader_make_layout               (VkDevice device, bool has_push_descriptors, const sksc_shader_meta_t* meta, skr_stage_ stage_mask, const VkSampler* immutable_samplers, const int32_t* immutable_sampler_slots, int32_t immutable_sampler_count);
@@ -481,6 +496,29 @@ void                  _skr_bump_ring_destroy                (_skr_bump_ring_t* r
 void                  _skr_bump_ring_slot_begin             (_skr_bump_ring_t* ref_ring, uint32_t slot);
 uint32_t              _skr_bump_ring_reserve_window         (_skr_bump_ring_t* ref_ring, uint32_t bytes);
 skr_bump_result_t     _skr_bump_ring_write                  (_skr_bump_ring_t* ref_ring, const void* data, uint32_t size);
+
+// Device memory (skr_memory.c), requested by what it's for rather than by property flags
+typedef enum {
+	_skr_mem_usage_gpu,      // device only: textures, static buffers, targets
+	_skr_mem_usage_stream,   // CPU writes often, GPU reads: dynamic buffers, bump rings
+	_skr_mem_usage_staging,  // CPU writes once, GPU copies
+	_skr_mem_usage_readback, // GPU writes, CPU reads
+	_skr_mem_usage_lazy,     // transient attachments, tile memory where the GPU has it
+	_skr_mem_usage_upload,   // device only, but mapped when VRAM is host visible, so static data skips staging
+	_skr_mem_usage_max,
+} _skr_mem_usage_;
+
+void                  _skr_mem_init                         (void);
+void                  _skr_mem_shutdown                     (void);
+void                  _skr_mem_tick                         (uint32_t frame); // Once per frame: returns long-empty blocks to the driver
+skr_err_              _skr_mem_bind_buffer                  (VkBuffer buffer, _skr_mem_usage_ usage, skr_mem_category_ category, _skr_mem_t* out_mem, void** opt_out_mapped);
+skr_err_              _skr_mem_bind_image                   (VkImage  image,  VkImageUsageFlags image_usage, _skr_mem_usage_ usage, skr_mem_category_ category, _skr_mem_t* out_mem);
+_skr_mem_t            _skr_mem_import                       (VkDeviceMemory memory, VkDeviceSize size); // Takes ownership; zero on failure, and the caller still owns memory
+void                  _skr_mem_free                         (_skr_mem_t mem);
+bool                  _skr_mem_has_lazy                     (void);
+uint32_t              _skr_mem_find_type                    (uint32_t type_bits, _skr_mem_usage_ usage); // For imports, which allocate their own; UINT32_MAX when none fits
+skr_err_              _skr_buffer_create_vk                 (VkDeviceSize size, VkBufferUsageFlags usage, _skr_mem_usage_ mem_usage, skr_mem_category_ category, VkBuffer* out_buffer, _skr_mem_t* out_mem, void** opt_out_mapped);
+void                  _skr_buffer_destroy_vk                (VkBuffer buffer, _skr_mem_t mem); // Shared destroy, once no submission reads it
 
 // Render list sorting
 void                  _skr_render_list_sort                 (skr_render_list_t* ref_list);
@@ -557,21 +595,23 @@ void                  _skr_destroy_shared_pipeline                 (VkPipeline  
 void                  _skr_destroy_shared_pipeline_layout          (VkPipelineLayout         handle);
 void                  _skr_destroy_shared_descriptor_set_layout    (VkDescriptorSetLayout    handle);
 void                  _skr_destroy_shared_shader_module            (VkShaderModule           handle);
-void                  _skr_destroy_shared_memory                   (VkDeviceMemory           handle);
 void                  _skr_destroy_shared_ycbcr_conversion         (VkSamplerYcbcrConversion handle);
 void                  _skr_destroy_shared_bind_pool_slots          (int32_t start, uint32_t count);
+void                  _skr_destroy_shared_mem                      (_skr_mem_t mem);
+void                  _skr_destroy_shared_buffer_slot              (_skr_buffer_slot_t* slot);
+void                  _skr_buffer_slot_retired                     (_skr_buffer_slot_t* slot); // No submission reads it anymore
 
 void                  _skr_destroy_private_buffer             (VkBuffer      handle);
-void                  _skr_destroy_private_memory             (VkDeviceMemory handle);
+void                  _skr_destroy_private_mem                (_skr_mem_t     mem);
 void                  _skr_destroy_private_image_view         (VkImageView   handle);
 void                  _skr_destroy_private_framebuffer        (VkFramebuffer handle);
 void                  _skr_destroy_private_desc_set           (VkDescriptorSet set, uint8_t pool);
 
 // Descriptor binding: push descriptors, or the per-thread set cache without them
 void                  _skr_desc_writes_begin                (_skr_desc_writes_t* out_writes, int32_t material_idx);
-void                  _skr_write_buffer                     (_skr_desc_writes_t* ref_writes, uint32_t binding, bool storage, VkBuffer buffer, uint32_t offset, uint32_t range);
-void                  _skr_write_image                      (_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescriptorType type, VkSampler sampler, VkImageView view, VkImageLayout layout);
-bool                  _skr_bind_descriptors                 (VkCommandBuffer cmd, VkPipelineBindPoint bind_point, int32_t bind_start, VkPipelineLayout layout, VkDescriptorSetLayout desc_layout, _skr_desc_writes_t* ref_writes);
+void                  _skr_write_buffer                     (_skr_desc_writes_t* ref_writes, uint32_t binding, bool storage, VkBuffer buffer, uint64_t uid, uint32_t offset, uint32_t range);
+void                  _skr_write_image                      (_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescriptorType type, VkSampler sampler, VkImageView view, uint64_t uid, VkImageLayout layout);
+bool                  _skr_bind_descriptors                 (VkCommandBuffer cmd, VkPipelineBindPoint bind_point, int32_t bind_start, VkPipelineLayout layout, _skr_desc_layout_t desc_layout, _skr_desc_writes_t* ref_writes);
 void                  _skr_desc_cache_destroy               (_skr_desc_cache_t* ref_cache);
 void                  _skr_desc_cache_free                  (_skr_desc_cache_t* ref_cache, VkDescriptorSet set, uint8_t pool);
 uint32_t              _skr_shader_dyn_bindings              (const sksc_shader_meta_t* meta, skr_stage_ stage_mask, bool has_push_descriptors, uint32_t out_bindings[3]);

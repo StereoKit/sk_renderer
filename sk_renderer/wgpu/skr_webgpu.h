@@ -41,14 +41,13 @@ typedef struct skr_buffer_readback_t {
 	void*        _internal; // Internal state (staging buffer/map) - do not access directly
 } skr_buffer_readback_t;
 
-// No update ring here: wgpuQueueWriteBuffer stages data internally and lands
-// in queue order, so in-flight frames keep the contents they were submitted
-// with (see skr_buffer_set)
 typedef struct skr_buffer_t {
-	WGPUBuffer          buffer;
-	uint32_t            size;
-	skr_buffer_type_    type;
-	skr_use_            use;
+	WGPUBuffer                 buffer;
+	uint64_t                   uid;   // identity of `buffer`, renewed whenever it changes
+	uint32_t                   size;
+	skr_buffer_type_           type;
+	skr_use_                   use;
+	struct _skr_buffer_ring_t* _ring; // slots skr_buffer_set stepped off of, NULL until it renames
 } skr_buffer_t;
 
 typedef struct skr_vert_type_t {

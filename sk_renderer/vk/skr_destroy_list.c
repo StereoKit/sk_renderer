@@ -7,6 +7,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
 
 ///////////////////////////////////////////////////////////////////////////////
 // Lists
@@ -39,6 +40,12 @@ static void _skr_destroy_item(skr_destroy_item_t item, _skr_desc_cache_t* opt_re
 		#undef MAKE_CASE
 		case skr_destroy_type_bind_pool_slots: _skr_bind_pool_free((int32_t)item.handle, item.aux); break;
 		case skr_destroy_type_desc_set:        _skr_desc_cache_free(opt_ref_cache, (VkDescriptorSet)item.handle, (uint8_t)item.aux); break;
+		case skr_destroy_type_mem: {
+			_skr_mem_t mem;
+			memcpy(&mem, &item.handle, sizeof(mem));
+			_skr_mem_free(mem);
+		} break;
+		case skr_destroy_type_buffer_slot: _skr_buffer_slot_retired((_skr_buffer_slot_t*)(uintptr_t)item.handle); break;
 	}
 }
 
@@ -101,23 +108,20 @@ _skr_destroy_block_t* _skr_destroy_retire(skr_destroy_list_t* ref_shared_open, s
 		block->next = head;
 		head = block;
 	}
-	_skr_destroy_block_t* oldest = head;
-	for (_skr_destroy_block_t* b = head; b; b = b->next) {
+	// Compound destroys are batched into one block, and a block's own stamp
+	// covers everything in it, so done blocks free in any order
+	_skr_destroy_block_t* done      = NULL;
+	_skr_destroy_block_t* done_tail = NULL;
+	_skr_destroy_block_t* keep      = NULL;
+	_skr_destroy_block_t* keep_tail = NULL;
+	for (_skr_destroy_block_t* b = head, *next; b; b = next) {
+		next    = b->next;
+		b->next = NULL;
 		if (may_stamp && b->covered_by.slot == NULL) b->covered_by = cover;
-		oldest = b;
+		if (_skr_destroy_block_done(b)) { if (done_tail) done_tail->next = b; else done = b; done_tail = b; }
+		else                            { if (keep_tail) keep_tail->next = b; else keep = b; keep_tail = b; }
 	}
-	// The done blocks are a prefix, newest first: a split destroy pushes
-	// memory as an older block than its image, so nothing may free ahead of
-	// a newer block
-	_skr_destroy_block_t* done      = head;
-	_skr_destroy_block_t* done_last = NULL;
-	while (head && _skr_destroy_block_done(head)) {
-		done_last = head;
-		head      = head->next;
-	}
-	if (done_last) done_last->next = NULL;
-	else           done            = NULL;
-	if (head) _skr_destroy_push_chain(head, oldest);
+	if (keep) _skr_destroy_push_chain(keep, keep_tail);
 	return done;
 }
 
@@ -201,8 +205,20 @@ void _skr_destroy_shared_bind_pool_slots(int32_t start, uint32_t count) {
 	_skr_destroy_shared_item((skr_destroy_item_t){ .type = skr_destroy_type_bind_pool_slots, .handle = (uint64_t)start, .aux = count });
 }
 
+static skr_destroy_item_t _skr_destroy_mem_item(_skr_mem_t mem) {
+	_Static_assert(sizeof(_skr_mem_t) == sizeof(uint64_t), "_skr_mem_t must pack into a destroy item handle");
+	skr_destroy_item_t item = { .type = skr_destroy_type_mem };
+	memcpy(&item.handle, &mem, sizeof(mem));
+	return item;
+}
+void _skr_destroy_shared_mem (_skr_mem_t mem) { if (mem.block != 0) _skr_destroy_shared_item (_skr_destroy_mem_item(mem)); }
+
+void _skr_destroy_shared_buffer_slot(_skr_buffer_slot_t* slot) {
+	_skr_destroy_shared_item((skr_destroy_item_t){ .type = skr_destroy_type_buffer_slot, .handle = (uint64_t)(uintptr_t)slot });
+}
+void _skr_destroy_private_mem(_skr_mem_t mem) { if (mem.block != 0) _skr_destroy_private_item(_skr_destroy_mem_item(mem)); }
+
 void _skr_destroy_private_buffer     (VkBuffer       handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_buffer,      .handle = (uint64_t)handle }); }
-void _skr_destroy_private_memory     (VkDeviceMemory handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_memory,      .handle = (uint64_t)handle }); }
 void _skr_destroy_private_image_view (VkImageView    handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_image_view,  .handle = (uint64_t)handle }); }
 void _skr_destroy_private_framebuffer(VkFramebuffer  handle) { if (handle != VK_NULL_HANDLE) _skr_destroy_private_item((skr_destroy_item_t){ .type = skr_destroy_type_framebuffer, .handle = (uint64_t)handle }); }
 

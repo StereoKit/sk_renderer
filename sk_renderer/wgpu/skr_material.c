@@ -298,7 +298,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i].bind = meta->buffers[i].bind;
 	for (uint32_t i = 0; i < meta->resource_count; i++) binds[i + meta->buffer_count].bind = meta->resources[i].bind;
 
-	uint32_t instance_slot = SKSC_SLOT_TEXTURE + (uint32_t)_skr_wgpu.binds.instance_slot; // StructuredBuffers live in t registers
+	uint32_t instance_slot = _skr_bump_slots(meta, (uint8_t)(skr_stage_vertex | skr_stage_pixel)).instance;
 	out_material->instance_buffer_stride = 0;
 	for (uint32_t i = 0; i < meta->resource_count; i++)
 		if (meta->resources[i].bind.slot == instance_slot && meta->resources[i].bind.stage_bits != 0)

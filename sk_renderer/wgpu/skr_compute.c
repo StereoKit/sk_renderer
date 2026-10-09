@@ -106,7 +106,7 @@ static void _skr_compute_record(const skr_compute_t* compute, const skr_material
 	}
 	uint32_t      dyn_offsets[3];
 	uint32_t      dyn_count  = _skr_dynamic_offsets(&compute->shader->meta, (uint8_t)skr_stage_compute, &db, dyn_offsets);
-	WGPUBindGroup bind_group = _skr_build_bind_group_meta(&compute->shader->meta, compute->bind_group_layout, binds, bind_count);
+	WGPUBindGroup bind_group = _skr_build_bind_group_meta(&compute->shader->meta, (uint8_t)skr_stage_compute, compute->bind_group_layout, binds, bind_count);
 	if (bind_group == NULL) {
 		skr_log(skr_log_critical, "Compute dispatch missing bindings in shader '%s'", compute->shader->meta.name);
 		return;

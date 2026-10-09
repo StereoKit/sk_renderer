@@ -389,7 +389,7 @@ static void _create_software_textures(
 
 	skr_tex_create(
 		skr_tex_fmt_r8,
-		skr_tex_flags_dynamic,
+		skr_tex_flags_dynamic | skr_tex_flags_uninitialized,
 		sampler,
 		(skr_vec3i_t){width, height, 1},
 		1, 1, NULL, out_tex_y);
@@ -397,7 +397,7 @@ static void _create_software_textures(
 
 	skr_tex_create(
 		skr_tex_fmt_r8g8,
-		skr_tex_flags_dynamic,
+		skr_tex_flags_dynamic | skr_tex_flags_uninitialized,
 		sampler,
 		(skr_vec3i_t){width / 2, height / 2, 1},
 		1, 1, NULL, out_tex_uv);
@@ -896,7 +896,7 @@ skr_tex_t video_extract_thumbnail(const char* filename, int32_t max_size) {
 	// Create texture from RGBA data
 	skr_tex_create(
 		skr_tex_fmt_rgba32_srgb,
-		skr_tex_flags_none,
+		skr_tex_flags_uninitialized,
 		(skr_tex_sampler_t){ .sample = skr_tex_sample_linear, .address = skr_tex_address_clamp },
 		(skr_vec3i_t){ dst_w, dst_h, 1 },
 		1, 1, NULL, &result);

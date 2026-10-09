@@ -162,11 +162,25 @@ _skr_thread_static int32_t            _scope_depth;
 _skr_thread_static _skr_cmd_slot_t*   _scope_slot;        // pending until the outermost end
 _skr_thread_static uint64_t           _scope_generation;
 _skr_thread_static skr_future_t       _last_future;       // what skr_future_get returns with nothing open
+_skr_thread_static uint64_t           _thread_submits;
 
 WGPUCommandEncoder _skr_cmd_get(void) {
 	if (_thread_encoder == NULL)
 		_thread_encoder = wgpuDeviceCreateCommandEncoder(_skr_wgpu.device, NULL);
 	return _thread_encoder;
+}
+
+void _skr_queue_submit(uint32_t count, const WGPUCommandBuffer* cmds) {
+	wgpuQueueSubmit(_skr_wgpu.queue, count, cmds);
+	_thread_submits++;
+}
+
+uint64_t _skr_cmd_submits(void) {
+	return _thread_submits;
+}
+
+bool _skr_cmd_recording(void) {
+	return _thread_encoder != NULL || _skr_pass_recording();
 }
 
 // Finishes and submits this thread's encoder, if it has one
@@ -176,7 +190,7 @@ static bool _skr_cmd_submit_encoder(void) {
 	wgpuCommandEncoderRelease(_thread_encoder);
 	_thread_encoder = NULL;
 	if (cmd == NULL) return false;
-	wgpuQueueSubmit(_skr_wgpu.queue, 1, &cmd);
+	_skr_queue_submit(1, &cmd);
 	wgpuCommandBufferRelease(cmd);
 	return true;
 }

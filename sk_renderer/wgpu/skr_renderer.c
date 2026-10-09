@@ -110,10 +110,14 @@ static uint32_t _skr_bump_write(_skr_bump_t* bump, WGPUBufferUsage usage, const 
 		// Old buffer stays alive for this frame's earlier bind groups via
 		// their own references; our release here is safe. Cached groups
 		// reference the old buffer too — the epoch bump retires them.
-		if (bump->buffer) wgpuBufferRelease(bump->buffer);
+		if (bump->buffer) {
+			wgpuBufferRelease(bump->buffer);
+			_skr_mem_track(skr_mem_category_frame, -(int64_t)bump->capacity);
+		}
 		WGPUBufferDescriptor desc = { .usage = usage | WGPUBufferUsage_CopyDst, .size = new_cap };
 		bump->buffer   = wgpuDeviceCreateBuffer(_skr_wgpu.device, &desc);
 		bump->capacity = (uint32_t)new_cap;
+		_skr_mem_track(skr_mem_category_frame, (int64_t)new_cap);
 		bump->used     = 0;
 		offset         = 0;
 		needed         = (size + 3) & ~3u;
@@ -268,7 +272,7 @@ static _skr_timer_frame_t* _skr_timer_flush(void) {
 	wgpuCommandEncoderCopyBufferToBuffer(encoder, _timer_resolve, 0, frame->readback, 0, size);
 	WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, NULL);
 	wgpuCommandEncoderRelease(encoder);
-	wgpuQueueSubmit(_skr_wgpu.queue, 1, &cmd);
+	_skr_queue_submit(1, &cmd);
 	wgpuCommandBufferRelease(cmd);
 
 	frame->pair_count = pairs;
@@ -351,6 +355,30 @@ bool skr_renderer_get_frame_timing(skr_frame_timing_t* out_timing) {
 	return true;
 }
 
+static _skr_atomic(uint64_t) _mem_used;
+static _skr_atomic(uint64_t) _mem_peak;
+static _skr_atomic(uint64_t) _mem_category[skr_mem_category_max];
+
+void _skr_mem_track(skr_mem_category_ category, int64_t bytes) {
+	_skr_fetch_add_u64(&_mem_category[category], (uint64_t)bytes);
+	uint64_t used = _skr_fetch_add_u64(&_mem_used, (uint64_t)bytes) + (uint64_t)bytes;
+	uint64_t peak = _skr_load_u64(&_mem_peak);
+	while (used > peak && !_skr_cas_u64(&_mem_peak, peak, used))
+		peak = _skr_load_u64(&_mem_peak);
+}
+
+// Sizes the backend asked for. The browser or Dawn decides the real layout,
+// so reserved can't be known and is reported equal to used.
+void skr_mem_get_stats(skr_mem_stats_t* out_stats) {
+	*out_stats = (skr_mem_stats_t){
+		.used_bytes      = _skr_load_u64(&_mem_used),
+		.reserved_bytes  = _skr_load_u64(&_mem_used),
+		.peak_used_bytes = _skr_load_u64(&_mem_peak),
+	};
+	for (int32_t c = 0; c < skr_mem_category_max; c++)
+		out_stats->category_bytes[c] = _skr_load_u64(&_mem_category[c]);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 void skr_renderer_begin_pass(skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask) {
@@ -424,10 +452,14 @@ void skr_renderer_end_pass(void) {
 		buffers[v] = wgpuCommandEncoderFinish(_pass.encoders[v], NULL);
 		wgpuCommandEncoderRelease(_pass.encoders[v]);
 	}
-	wgpuQueueSubmit(_skr_wgpu.queue, _pass.view_count, buffers);
+	_skr_queue_submit(_pass.view_count, buffers);
 	for (uint32_t v = 0; v < _pass.view_count; v++)
 		wgpuCommandBufferRelease(buffers[v]);
 	memset(&_pass, 0, sizeof(_pass));
+}
+
+bool _skr_pass_recording(void) {
+	return _pass.active;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -491,29 +523,43 @@ static void _skr_bump_ensure(_skr_bump_t* bump, WGPUBufferUsage usage) {
 	bump->buffer   = wgpuDeviceCreateBuffer(_skr_wgpu.device, &desc);
 	bump->capacity = (uint32_t)cap;
 	bump->used     = 0;
+	_skr_mem_track(skr_mem_category_frame, (int64_t)cap);
 	_skr_bind_epoch_bump();
+}
+
+_skr_bump_slots_t _skr_bump_slots(const sksc_shader_meta_t* meta, uint8_t stage_mask) {
+	if (stage_mask & skr_stage_compute) {
+		return (_skr_bump_slots_t){
+			.params   = meta->global_buffer_id >= 0 ? meta->buffers[meta->global_buffer_id].bind.slot : UINT32_MAX,
+			.system   = UINT32_MAX,
+			.instance = UINT32_MAX,
+		};
+	}
+	return (_skr_bump_slots_t){
+		.params   = (uint32_t)_skr_wgpu.binds.material_slot,
+		.system   = (uint32_t)_skr_wgpu.binds.system_slot,
+		.instance = SKSC_SLOT_TEXTURE + (uint32_t)_skr_wgpu.binds.instance_slot,
+	};
 }
 
 // Fills the dynamic-offset array for a draw, ordered by binding number the
 // way SetBindGroup expects. Presence must mirror _skr_bind_layout_create's
 // dynamic entries exactly: declared in meta and visible to stage_mask.
 uint32_t _skr_dynamic_offsets(const sksc_shader_meta_t* meta, uint8_t stage_mask, const _skr_draw_buffers_t* db, uint32_t out_offsets[3]) {
-	uint32_t material_slot = (uint32_t)_skr_wgpu.binds.material_slot;
-	uint32_t system_slot   = (uint32_t)_skr_wgpu.binds.system_slot;
-	uint32_t instance_slot = SKSC_SLOT_TEXTURE + (uint32_t)_skr_wgpu.binds.instance_slot; // StructuredBuffers live in t registers
+	_skr_bump_slots_t bump = _skr_bump_slots(meta, stage_mask);
 
 	struct { uint32_t binding, offset; } d[3];
 	uint32_t n = 0;
 	for (uint32_t i = 0; i < meta->buffer_count && n < 3; i++) {
 		if (!(meta->buffers[i].bind.stage_bits & stage_mask)) continue;
 		uint32_t slot = meta->buffers[i].bind.slot;
-		if      (slot == material_slot) { d[n].binding = slot; d[n].offset = db->material_offset; n++; }
-		else if (slot == system_slot)   { d[n].binding = slot; d[n].offset = db->system_offset;   n++; }
+		if      (slot == bump.params) { d[n].binding = slot; d[n].offset = db->material_offset; n++; }
+		else if (slot == bump.system) { d[n].binding = slot; d[n].offset = db->system_offset;   n++; }
 	}
 	for (uint32_t i = 0; i < meta->resource_count && n < 3; i++) {
 		if (!(meta->resources[i].bind.stage_bits & stage_mask)) continue;
-		if (meta->resources[i].bind.register_type == skr_register_read_buffer && meta->resources[i].bind.slot == instance_slot) {
-			d[n].binding = instance_slot; d[n].offset = db->instance_offset; n++;
+		if (meta->resources[i].bind.register_type == skr_register_read_buffer && meta->resources[i].bind.slot == bump.instance) {
+			d[n].binding = bump.instance; d[n].offset = db->instance_offset; n++;
 		}
 	}
 	// Insertion sort by binding — SetBindGroup consumes offsets in
@@ -528,10 +574,53 @@ uint32_t _skr_dynamic_offsets(const sksc_shader_meta_t* meta, uint8_t stage_mask
 	return n;
 }
 
-WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, WGPUBindGroupLayout layout, const skr_material_bind_t* binds, uint32_t bind_count) {
-	uint32_t material_slot = (uint32_t)_skr_wgpu.binds.material_slot;
-	uint32_t system_slot   = (uint32_t)_skr_wgpu.binds.system_slot;
-	uint32_t instance_slot = SKSC_SLOT_TEXTURE + (uint32_t)_skr_wgpu.binds.instance_slot; // StructuredBuffers live in t registers
+// What a bind reads. Globals take priority over the material's own binds
+// (which include baked-in defaults), matching the Vulkan backend — texture-type
+// bindings only see texture globals, buffer-type only buffer globals.
+// Global binds use raw register indices (t5, b1, ...) while material
+// slots carry the WGSL register shift, so unshift before matching.
+static void _skr_bind_resolve(const skr_material_bind_t* bind, const skr_tex_t** out_tex, const skr_buffer_t** out_buf) {
+	bool is_buffer_bind = bind->bind.register_type == skr_register_constant
+	                   || bind->bind.register_type == skr_register_read_buffer
+	                   || bind->bind.register_type == skr_register_readwrite;
+	int32_t global_slot = (int32_t)bind->bind.slot;
+	switch (bind->bind.register_type) {
+		case skr_register_texture:
+		case skr_register_read_buffer:
+		case skr_register_input_attachment: global_slot -= SKSC_SLOT_TEXTURE;   break;
+		case skr_register_readwrite:
+		case skr_register_readwrite_tex:    global_slot -= SKSC_SLOT_READWRITE; break;
+		default: break;
+	}
+
+	*out_tex = NULL;
+	*out_buf = NULL;
+	for (uint32_t g = 0; g < _global_count; g++) {
+		if (_globals[g].slot != global_slot) continue;
+		if (is_buffer_bind) *out_buf = _globals[g].buffer;
+		else                *out_tex = _globals[g].tex;
+		break;
+	}
+	if (*out_tex == NULL && *out_buf == NULL) {
+		if (is_buffer_bind) *out_buf = bind->buffer;
+		else                *out_tex = bind->texture;
+	}
+}
+
+// Identities of the buffers a slice's group binds, so a renamed one rebuilds it
+static uint64_t _skr_bind_buffer_key(const skr_material_bind_t* binds, uint32_t bind_count) {
+	uint64_t key = 0xcbf29ce484222325ull;
+	for (uint32_t i = 0; i < bind_count; i++) {
+		const skr_tex_t*    tex;
+		const skr_buffer_t* buf;
+		_skr_bind_resolve(&binds[i], &tex, &buf);
+		if (buf) key = (key ^ buf->uid) * 0x100000001b3ull;
+	}
+	return key;
+}
+
+WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t stage_mask, WGPUBindGroupLayout layout, const skr_material_bind_t* binds, uint32_t bind_count) {
+	_skr_bump_slots_t bump = _skr_bump_slots(meta, stage_mask);
 
 	WGPUBindGroupEntry entries[64];
 	uint32_t           entry_count = 0;
@@ -541,14 +630,14 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, WGPUBin
 		const skr_material_bind_t* bind = &binds[i];
 		uint32_t slot = bind->bind.slot;
 
-		if ((slot == material_slot || slot == system_slot) && bind->bind.register_type == skr_register_constant) {
+		if ((slot == bump.params || slot == bump.system) && bind->bind.register_type == skr_register_constant) {
 			_skr_bump_ensure(&_bump_uniform, WGPUBufferUsage_Uniform);
 			uint32_t size = _skr_meta_buffer_size(meta, slot);
 			if (size > 0)
 				entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = _bump_uniform.buffer, .offset = 0, .size = size };
 			continue;
 		}
-		if (slot == instance_slot && bind->bind.register_type == skr_register_read_buffer) {
+		if (slot == bump.instance && bind->bind.register_type == skr_register_read_buffer) {
 			_skr_bump_ensure(&_bump_storage, WGPUBufferUsage_Storage);
 			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = _bump_storage.buffer, .offset = 0, .size = _skr_bump_window(&_bump_storage) };
 			continue;
@@ -569,37 +658,9 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, WGPUBin
 			continue;
 		}
 
-		// Globals take priority over the material's own binds (which include
-		// baked-in defaults), matching the Vulkan backend — texture-type
-		// bindings only see texture globals, buffer-type only buffer globals.
-		// Global binds use raw register indices (t5, b1, ...) while material
-		// slots carry the WGSL register shift, so unshift before matching.
-		bool is_buffer_bind = bind->bind.register_type == skr_register_constant
-		                   || bind->bind.register_type == skr_register_read_buffer
-		                   || bind->bind.register_type == skr_register_readwrite;
-		int32_t global_slot = (int32_t)slot;
-		switch (bind->bind.register_type) {
-			case skr_register_texture:
-			case skr_register_read_buffer:
-			case skr_register_input_attachment: global_slot -= SKSC_SLOT_TEXTURE;   break;
-			case skr_register_readwrite:
-			case skr_register_readwrite_tex:    global_slot -= SKSC_SLOT_READWRITE; break;
-			default: break;
-		}
-
-		const skr_tex_t*    tex = NULL;
-		const skr_buffer_t* buf = NULL;
-		for (uint32_t g = 0; g < _global_count; g++) {
-			if (_globals[g].slot != global_slot) continue;
-			if (is_buffer_bind) buf = _globals[g].buffer;
-			else                tex = _globals[g].tex;
-			break;
-		}
-		if (tex == NULL && buf == NULL) {
-			if (is_buffer_bind) buf = bind->buffer;
-			else                tex = bind->texture;
-		}
-
+		const skr_tex_t*    tex;
+		const skr_buffer_t* buf;
+		_skr_bind_resolve(bind, &tex, &buf);
 		if (buf && buf->buffer) {
 			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = buf->buffer, .offset = 0, .size = (buf->size + 3) & ~3u };
 		} else if (tex && tex->view) {
@@ -653,27 +714,31 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, WGPUBin
 static WGPUBindGroup _skr_build_bind_group(int32_t material_idx, const skr_material_bind_t* binds, uint32_t bind_count) {
 	const _skr_pipeline_material_key_t* key = _skr_pipeline_get_key(material_idx);
 	if (key == NULL || key->shader == NULL) return NULL;
-	return _skr_build_bind_group_meta(&key->shader->meta, _skr_pipeline_get_bind_layout(material_idx), binds, bind_count);
+	return _skr_build_bind_group_meta(&key->shader->meta, (uint8_t)(skr_stage_vertex | skr_stage_pixel), _skr_pipeline_get_bind_layout(material_idx), binds, bind_count);
 }
 
 // One cached bind group per material slice: dynamic offsets carry the
 // per-draw buffer positions, so a group survives across draws and frames
-// until the slice's binds change or the global bind epoch moves. Slices that
-// can't cache (uncacheable = pass-input readers whose views change per stage)
-// get a fresh group the caller must release (*out_owned).
+// until the slice's binds change, a buffer it binds renames, or the global
+// bind epoch moves. Slices that can't cache (uncacheable = pass-input readers
+// whose views change per stage) get a fresh group the caller must release
+// (*out_owned).
 static WGPUBindGroup _skr_bind_group_get(int32_t material_idx, int32_t bind_start, uint32_t bind_count, bool cacheable, bool* out_owned) {
 	*out_owned = false;
-	uint64_t           epoch = _skr_bind_epoch();
-	_skr_bind_cache_t* cache = cacheable ? _skr_bind_cache_slot(bind_start) : NULL;
-	if (cache && cache->group && cache->epoch == epoch)
+	const skr_material_bind_t* binds   = _skr_bind_pool_get(bind_start);
+	uint64_t                   epoch   = _skr_bind_epoch();
+	_skr_bind_cache_t*         cache   = cacheable ? _skr_bind_cache_slot(bind_start) : NULL;
+	uint64_t                   buffers = cache ? _skr_bind_buffer_key(binds, bind_count) : 0;
+	if (cache && cache->group && cache->epoch == epoch && cache->buffers == buffers)
 		return cache->group;
 
-	WGPUBindGroup group = _skr_build_bind_group(material_idx, _skr_bind_pool_get(bind_start), bind_count);
+	WGPUBindGroup group = _skr_build_bind_group(material_idx, binds, bind_count);
 	if (group == NULL) return NULL;
 	if (cache) {
 		if (cache->group) wgpuBindGroupRelease(cache->group);
-		cache->group = group;
-		cache->epoch = epoch;
+		cache->group   = group;
+		cache->epoch   = epoch;
+		cache->buffers = buffers;
 	} else {
 		*out_owned = true;
 	}
@@ -895,7 +960,7 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 		_skr_fullscreen_pass(encoder, _skr_tex_layer_view(to, layer), WGPULoadOp_Load, &bounds_px, pipeline, bind_group, dyn_offsets, dyn_count);
 		WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, NULL);
 		wgpuCommandEncoderRelease(encoder);
-		wgpuQueueSubmit(_skr_wgpu.queue, 1, &cmd);
+		_skr_queue_submit(1, &cmd);
 		wgpuCommandBufferRelease(cmd);
 	}
 	if (owned) wgpuBindGroupRelease(bind_group);
@@ -1191,6 +1256,7 @@ void _skr_renderer_sys_shutdown(void) {
 
 	if (_bump_uniform.buffer) wgpuBufferRelease(_bump_uniform.buffer);
 	if (_bump_storage.buffer) wgpuBufferRelease(_bump_storage.buffer);
+	_skr_mem_track(skr_mem_category_frame, -(int64_t)(_bump_uniform.capacity + (uint64_t)_bump_storage.capacity));
 	memset(&_bump_uniform, 0, sizeof(_bump_uniform));
 	memset(&_bump_storage, 0, sizeof(_bump_storage));
 	_system_offset = 0;

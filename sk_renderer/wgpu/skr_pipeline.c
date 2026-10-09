@@ -177,9 +177,7 @@ WGPUBindGroupLayout _skr_bind_layout_create(const sksc_shader_meta_t* meta, uint
 	WGPUBindGroupLayoutEntry entries[64];
 	uint32_t                 entry_count = 0;
 
-	uint32_t system_slot   = (uint32_t)_skr_wgpu.binds.system_slot;
-	uint32_t material_slot = (uint32_t)_skr_wgpu.binds.material_slot;
-	uint32_t instance_slot = SKSC_SLOT_TEXTURE + (uint32_t)_skr_wgpu.binds.instance_slot; // StructuredBuffers live in t registers
+	_skr_bump_slots_t bump = _skr_bump_slots(meta, stage_mask);
 
 	for (uint32_t i = 0; i < meta->buffer_count && entry_count < 64; i++) {
 		uint8_t stages = meta->buffers[i].bind.stage_bits & stage_mask;
@@ -188,7 +186,7 @@ WGPUBindGroupLayout _skr_bind_layout_create(const sksc_shader_meta_t* meta, uint
 		// System + material params come from per-frame bump allocations at a
 		// new offset every frame. Dynamic offsets keep the bind group itself
 		// stable, so one group per material serves every draw and frame.
-		bool dynamic = slot == material_slot || slot == system_slot;
+		bool dynamic = slot == bump.params || slot == bump.system;
 		entries[entry_count++] = (WGPUBindGroupLayoutEntry){
 			.binding    = slot,
 			.visibility = _skr_stage_visibility(stages),
@@ -229,7 +227,7 @@ WGPUBindGroupLayout _skr_bind_layout_create(const sksc_shader_meta_t* meta, uint
 				// buffer; a dynamic offset selects each draw's slice
 				entry.buffer = (WGPUBufferBindingLayout){
 					.type             = WGPUBufferBindingType_ReadOnlyStorage,
-					.hasDynamicOffset = res->bind.slot == instance_slot,
+					.hasDynamicOffset = res->bind.slot == bump.instance,
 				};
 				break;
 			case skr_register_readwrite:

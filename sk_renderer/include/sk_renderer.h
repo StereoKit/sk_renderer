@@ -128,7 +128,8 @@ typedef enum skr_use_ {
 	skr_use_dynamic       = 1 << 2,
 	skr_use_compute_read  = 1 << 3,
 	skr_use_compute_write = 1 << 4,
-	skr_use_compute_readwrite = skr_use_compute_read | skr_use_compute_write
+	skr_use_compute_readwrite = skr_use_compute_read | skr_use_compute_write,
+	skr_use_uninitialized = 1 << 5,  // Created without data, skip zeroing; contents start undefined (WebGPU always zeroes)
 } skr_use_;
 
 typedef enum skr_tex_fmt_ {
@@ -251,6 +252,7 @@ typedef enum skr_tex_flags_ {
 	skr_tex_flags_compute          = 1 << 7,  // For compute shader RWTexture (storage image)
 	skr_tex_flags_cubemap          = 1 << 8,  // Cubemap texture (requires 6 array layers)
 	skr_tex_flags_input_attachment = 1 << 9,  // Used as input attachment in subpass (SubpassInput)
+	skr_tex_flags_uninitialized    = 1 << 10, // Created without data, skip zeroing; contents start undefined (WebGPU always zeroes)
 } skr_tex_flags_;
 
 typedef enum skr_tex_sample_ {
@@ -423,6 +425,32 @@ typedef struct skr_frame_timing_t {
 	uint64_t gpu_time_ns;  // 0 when the GPU timestamps weren't ready
 	uint64_t present_id;   // the skr_surface_present of the first surface given to frame_end, when it came before the next frame_begin; 0 if none did
 } skr_frame_timing_t;
+
+typedef enum skr_mem_category_ {
+	skr_mem_category_texture,  // sampled images with CPU-supplied data
+	skr_mem_category_target,   // render targets, depth, storage images, mipgen scratch
+	skr_mem_category_geometry, // vertex and index buffers, dynamic copies included
+	skr_mem_category_buffer,   // constant and storage buffers
+	skr_mem_category_frame,    // per-frame bump rings
+	skr_mem_category_staging,  // upload and readback copies in flight
+	skr_mem_category_max,
+} skr_mem_category_;
+
+// Device memory sk_renderer allocated. Swapchain images belong to the
+// presentation engine or the XR runtime and aren't counted.
+typedef struct skr_mem_stats_t {
+	uint64_t reserved_bytes;                        // held from the driver, in blocks and dedicated allocations
+	uint64_t used_bytes;                            // bound to live resources; reserved - used is slack
+	uint64_t peak_used_bytes;                       // since skr_init
+	uint64_t category_bytes[skr_mem_category_max];  // used, by category
+	uint64_t lazy_bytes;                            // lazily allocated attachments, not in the totals above
+	uint64_t external_bytes;                        // imported memory (AHB, dma-buf, GL), not in the totals above
+	uint64_t budget_bytes;                          // device local heaps, 0 when the driver can't say
+	uint64_t device_usage_bytes;                    // device local heaps, this process across all APIs, 0 when the driver can't say
+	uint32_t block_count;                           // shared blocks that small allocations are packed into
+	uint32_t dedicated_count;                       // allocations with a block to themselves, lazy and external excluded
+	uint32_t allocation_count;                      // live allocations, packed plus dedicated
+} skr_mem_stats_t;
 
 typedef struct skr_tex_sampler_t {
 	skr_tex_sample_      sample;
@@ -908,6 +936,7 @@ SKR_API uint64_t          skr_renderer_get_gpu_time_us     (void);
 SKR_API uint64_t          skr_renderer_get_cpu_time_us     (void);
 SKR_API bool              skr_renderer_get_frame_timing    (skr_frame_timing_t* out_timing);  // Most recently completed frame; false until one has
 SKR_API uint64_t          skr_time_now_ns                  (void);  // The clock every timestamp in skr_frame_timing_t and skr_present_info_t is on
+SKR_API void              skr_mem_get_stats                (skr_mem_stats_t* out_stats);
 
 SKR_API void              skr_pass_add_draw                (skr_pass_t* pass, skr_render_list_t* list, const void* system_data, uint32_t system_data_size);
 SKR_API void              skr_pass_add_resolve             (skr_pass_t* pass, skr_material_t* resolve_material);

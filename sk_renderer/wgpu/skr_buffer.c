@@ -17,6 +17,10 @@ static WGPUBufferUsage _skr_buffer_usage(skr_buffer_type_ type, skr_use_ use) {
 	return usage;
 }
 
+static skr_mem_category_ _skr_buffer_category(skr_buffer_type_ type) {
+	return (type & (skr_buffer_type_vertex | skr_buffer_type_index)) ? skr_mem_category_geometry : skr_mem_category_buffer;
+}
+
 skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t size_stride, skr_buffer_type_ type, skr_use_ use, skr_buffer_t* out_buffer) {
 	if (out_buffer == NULL)                  return skr_err_invalid_parameter;
 	memset(out_buffer, 0, sizeof(*out_buffer));
@@ -46,10 +50,69 @@ skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t s
 	}
 
 	out_buffer->buffer = buffer;
+	out_buffer->uid    = _skr_uid_new();
 	out_buffer->size   = size;
 	out_buffer->type   = type;
 	out_buffer->use    = use;
+	_skr_mem_track(_skr_buffer_category(type), (int64_t)size);
 	return skr_err_success;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Rename slots: writeBuffer lands ahead of unsubmitted work, so a set while recording
+// writes another buffer. Slots live as long as the buffer, list items keep their handles.
+
+typedef struct {
+	WGPUBuffer buffer;
+	uint64_t   uid;
+	uint64_t   retired; // _skr_cmd_submits() when it stopped being current; free once that moves
+} _skr_buffer_slot_t;
+
+typedef struct _skr_buffer_ring_t {
+	_skr_buffer_slot_t* slots;
+	uint32_t            count;
+	uint32_t            capacity;
+} _skr_buffer_ring_t;
+
+static void _skr_buffer_slot_release(const skr_buffer_t* buffer, _skr_buffer_slot_t slot) {
+	wgpuBufferRelease(slot.buffer);
+	_skr_mem_track(_skr_buffer_category(buffer->type), -(int64_t)buffer->size);
+}
+
+// A free slot, or a new one when the set rate outruns the ring
+static bool _skr_buffer_slot_take(skr_buffer_t* ref_buffer, _skr_buffer_slot_t* out_slot) {
+	_skr_buffer_ring_t* ring    = ref_buffer->_ring;
+	uint64_t            submits = _skr_cmd_submits();
+	for (uint32_t i = 0; ring && i < ring->count; i++) {
+		if (ring->slots[i].retired >= submits) continue;
+		*out_slot      = ring->slots[i];
+		ring->slots[i] = ring->slots[--ring->count];
+		return true;
+	}
+
+	WGPUBuffer buffer = wgpuDeviceCreateBuffer(_skr_wgpu.device, &(WGPUBufferDescriptor){
+		.usage = _skr_buffer_usage(ref_buffer->type, ref_buffer->use),
+		.size  = (ref_buffer->size + 3) & ~3ull,
+	});
+	if (buffer == NULL) return false;
+	_skr_mem_track(_skr_buffer_category(ref_buffer->type), (int64_t)ref_buffer->size);
+	*out_slot = (_skr_buffer_slot_t){ .buffer = buffer, .uid = _skr_uid_new() };
+	return true;
+}
+
+static void _skr_buffer_slot_retire(skr_buffer_t* ref_buffer) {
+	if (ref_buffer->_ring == NULL)
+		ref_buffer->_ring = _skr_calloc(1, sizeof(_skr_buffer_ring_t));
+	_skr_buffer_ring_t* ring = ref_buffer->_ring;
+	if (ring->count == ring->capacity) {
+		ring->capacity = ring->capacity == 0 ? 2 : ring->capacity * 2;
+		ring->slots    = _skr_realloc(ring->slots, ring->capacity * sizeof(_skr_buffer_slot_t));
+	}
+	ring->slots[ring->count++] = (_skr_buffer_slot_t){
+		.buffer  = ref_buffer->buffer,
+		.uid     = ref_buffer->uid,
+		.retired = _skr_cmd_submits(),
+	};
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -57,6 +120,13 @@ skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t s
 void skr_buffer_destroy(skr_buffer_t* ref_buffer) {
 	if (ref_buffer == NULL || ref_buffer->buffer == NULL) return;
 	wgpuBufferRelease(ref_buffer->buffer);
+	_skr_mem_track(_skr_buffer_category(ref_buffer->type), -(int64_t)ref_buffer->size);
+	if (ref_buffer->_ring) {
+		for (uint32_t i = 0; i < ref_buffer->_ring->count; i++)
+			_skr_buffer_slot_release(ref_buffer, ref_buffer->_ring->slots[i]);
+		_skr_free(ref_buffer->_ring->slots);
+		_skr_free(ref_buffer->_ring);
+	}
 	memset(ref_buffer, 0, sizeof(*ref_buffer));
 }
 
@@ -70,8 +140,17 @@ void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_by
 	if (ref_buffer == NULL || ref_buffer->buffer == NULL || data == NULL) return;
 	if (size_bytes > ref_buffer->size) size_bytes = ref_buffer->size;
 
-	// writeBuffer stages internally and lands in queue order, so in-flight
-	// frames keep the data they were submitted with — no ring needed here.
+	if (_skr_cmd_recording()) {
+		_skr_buffer_slot_t next;
+		if (_skr_buffer_slot_take(ref_buffer, &next)) {
+			_skr_buffer_slot_retire(ref_buffer);
+			ref_buffer->buffer = next.buffer;
+			ref_buffer->uid    = next.uid;
+		} else {
+			skr_log(skr_log_critical, "skr_buffer_set: out of memory for a rename slot, overwriting data recorded work may still read");
+		}
+	}
+
 	// Copy size must be a multiple of 4; the allocation is padded for this.
 	uint32_t write_size = (size_bytes + 3) & ~3u;
 	if (write_size == size_bytes) {

@@ -229,6 +229,7 @@ static void _skr_register_internal_requests(void) {
 	_skr_ext_request(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
 	_skr_ext_request(VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME);
 	_skr_ext_request(VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);           // Sync FD export for frame fences (VK_KHR_external_fence is core 1.1)
+	_skr_ext_request(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);               // Budget and usage in skr_mem_get_stats
 	_skr_ext_request(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);         // Postfx depth input attachments (per-reference aspect masks)
 	_skr_ext_request(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME); // Legacy instanced stereo: SV_RenderTargetArrayIndex from the vertex stage
 	// All three alias the same enum value, so any one of them will do. The 1.3
@@ -1418,8 +1419,11 @@ bool skr_init(skr_settings_t settings) {
 	// Calibration is only useful if the device can pair its own clock with the
 	// one skr_time_now_ns reads
 	_skr_vk.has_calibrated_timestamps = false;
-	if (skr_vk_request_enabled(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) || skr_vk_request_enabled(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
-		PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_domains = vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+	// Chosen by the enabled extension, not by a non-null pointer: with only EXT
+	// enabled, a layer can still hand back a KHR entry that dispatches to nothing
+	bool calibrated_khr = skr_vk_request_enabled(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+	if (calibrated_khr || skr_vk_request_enabled(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+		PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR get_domains = calibrated_khr
 			? vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
 			: vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
 		uint32_t        domain_count = 0;
@@ -1435,7 +1439,7 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.has_calibrated_timestamps = has_device && has_host;
 	}
 	if (_skr_vk.has_calibrated_timestamps)
-		_skr_vk.get_calibrated_timestamps = vkGetCalibratedTimestampsKHR ? vkGetCalibratedTimestampsKHR : vkGetCalibratedTimestampsEXT;
+		_skr_vk.get_calibrated_timestamps = calibrated_khr ? vkGetCalibratedTimestampsKHR : vkGetCalibratedTimestampsEXT;
 	_skr_vk.has_subpass_merge_feedback  = skr_vk_request_enabled("subpass_merge_feedback");
 	_skr_vk.has_subgroup_size_control   = skr_vk_request_enabled("subgroup_size_control");
 	_skr_vk.has_ycbcr_conversion        = skr_vk_request_enabled("ycbcr_conversion");
@@ -1578,6 +1582,7 @@ bool skr_init(skr_settings_t settings) {
 	if (_skr_vk.device == VK_NULL_HANDLE) return false;
 
 	volkLoadDevice(_skr_vk.device);
+	_skr_mem_init();
 
 	// Get graphics queue
 	vkGetDeviceQueue(_skr_vk.device, _skr_vk.graphics_queue_family, 0, &_skr_vk.graphics_queue);
@@ -1808,6 +1813,7 @@ void skr_shutdown(void) {
 	// Nothing should defer after the command system is down
 	uint32_t late = _skr_destroy_drain();
 	if (late > 0) skr_log(skr_log_critical, "%u objects were deferred after command shutdown", late);
+	_skr_mem_shutdown();
 
 	// The messenger outlives the device so leaked-object reports still arrive
 	if (_skr_vk.device          != VK_NULL_HANDLE) vkDestroyDevice                (_skr_vk.device,   NULL);

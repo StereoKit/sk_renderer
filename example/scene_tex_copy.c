@@ -65,8 +65,34 @@ typedef struct {
 	bool                  buffer_readback_done;
 	bool                  buffer_readback_ok;
 
+	// Dynamic buffer renaming: RENAME_SETS sets in one frame, each dispatch
+	// must read the value set just before it, not a later one
+	skr_shader_t          rename_shader;
+	skr_compute_t         rename_compute;
+	skr_buffer_t          rename_params;
+	skr_buffer_t          rename_output;
+	skr_buffer_readback_t rename_readback;
+	bool                  rename_pending;
+	uint32_t              rename_base;     // value of the current round's first set
+	uint32_t              rename_rounds;
+	uint32_t              rename_failures;
+
+	// Static buffer created with data, read straight back: covers the upload
+	// path, which writes in place on unified memory and stages elsewhere
+	skr_buffer_t          static_buffer;
+	skr_buffer_readback_t static_readback;
+	bool                  static_pending;
+	bool                  static_done;
+
 	float time;
 } scene_tex_copy_t;
+
+#define RENAME_SETS 8  // twice the old fixed ring, so a reused slot shows up in one frame
+typedef struct {
+	uint32_t value;
+	uint32_t slot;
+	uint32_t _pad[2];
+} rename_params_t;
 
 // Save RGBA data to PPM file (simple format, no external deps)
 static bool _save_ppm(const char* filename, const uint8_t* data, int32_t width, int32_t height) {
@@ -146,11 +172,22 @@ static scene_t* _scene_tex_copy_create(void) {
 
 	// Compute-filled storage buffer for the buffer readback check
 	scene->fill_shader = su_shader_load("shaders/buffer_fill.hlsl.sks", "buffer_fill");
-	skr_buffer_create(NULL, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write, &scene->fill_buffer);
+	skr_buffer_create(NULL, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write | skr_use_uninitialized, &scene->fill_buffer);
 	skr_buffer_set_name(&scene->fill_buffer, "fill_buffer");
 	skr_compute_create(&scene->fill_shader, (skr_compute_info_t){0}, &scene->fill_compute);
 	skr_compute_set_buffer(&scene->fill_compute, "output", &scene->fill_buffer);
 	skr_compute_set_param (&scene->fill_compute, "count", sksc_shader_var_uint, 1, &(uint32_t){FILL_COUNT});
+
+	scene->rename_shader = su_shader_load("shaders/buffer_rename.hlsl.sks", "buffer_rename");
+	skr_buffer_create(&(rename_params_t){0}, 1, sizeof(rename_params_t), skr_buffer_type_constant, skr_use_dynamic, &scene->rename_params);
+	skr_buffer_create(NULL, RENAME_SETS, sizeof(uint32_t), skr_buffer_type_storage, skr_use_compute_write | skr_use_uninitialized, &scene->rename_output);
+	skr_compute_create(&scene->rename_shader, (skr_compute_info_t){0}, &scene->rename_compute);
+	skr_compute_set_buffer(&scene->rename_compute, "RenameParams", &scene->rename_params);
+	skr_compute_set_buffer(&scene->rename_compute, "output",       &scene->rename_output);
+
+	uint32_t pattern[FILL_COUNT];
+	for (uint32_t i = 0; i < FILL_COUNT; i++) pattern[i] = i * 2246822519u + 7u;
+	skr_buffer_create(pattern, FILL_COUNT, sizeof(uint32_t), skr_buffer_type_storage, skr_use_static, &scene->static_buffer);
 
 	su_log(su_log_info, "scene_tex_copy: Created with %d spheres", SPHERE_COUNT);
 
@@ -168,6 +205,18 @@ static void _scene_tex_copy_destroy(scene_t* s) {
 	skr_compute_destroy(&scene->fill_compute);
 	skr_buffer_destroy (&scene->fill_buffer);
 	skr_shader_destroy (&scene->fill_shader);
+
+	su_log(scene->rename_failures == 0 ? su_log_info : su_log_warning,
+		"scene_tex_copy: buffer rename: %u rounds of %d sets, %u failures", scene->rename_rounds, RENAME_SETS, scene->rename_failures);
+	if (scene->rename_pending)
+		skr_buffer_readback_destroy(&scene->rename_readback);
+	if (scene->static_pending)
+		skr_buffer_readback_destroy(&scene->static_readback);
+	skr_buffer_destroy(&scene->static_buffer);
+	skr_compute_destroy(&scene->rename_compute);
+	skr_buffer_destroy (&scene->rename_params);
+	skr_buffer_destroy (&scene->rename_output);
+	skr_shader_destroy (&scene->rename_shader);
 
 	// Destroy icon textures and materials
 	if (scene->icons_created) {
@@ -232,6 +281,32 @@ static void _scene_tex_copy_update(scene_t* s, float delta_time) {
 		scene->buffer_readback_done    = true;
 		scene->buffer_readback_ok      = ok;
 	}
+
+	if (scene->static_pending && skr_future_check(&scene->static_readback.future)) {
+		const uint32_t* values = (const uint32_t*)scene->static_readback.data;
+		bool ok = scene->static_readback.size == FILL_COUNT * sizeof(uint32_t);
+		for (uint32_t i = 0; ok && i < FILL_COUNT; i++)
+			ok = values[i] == i * 2246822519u + 7u;
+		su_log(ok ? su_log_info : su_log_warning, "scene_tex_copy: static buffer upload %s", ok ? "matches its data" : "DOES NOT match its data");
+		skr_buffer_readback_destroy(&scene->static_readback);
+		scene->static_pending = false;
+		scene->static_done    = true;
+	}
+
+	if (scene->rename_pending && skr_future_check(&scene->rename_readback.future)) {
+		const uint32_t* values = (const uint32_t*)scene->rename_readback.data;
+		for (uint32_t i = 0; i < RENAME_SETS; i++) {
+			if (values[i] == scene->rename_base + i) continue;
+			if (scene->rename_failures == 0)
+				su_log(su_log_warning, "scene_tex_copy: buffer rename: dispatch %u read %u, expected %u", i, values[i], scene->rename_base + i);
+			scene->rename_failures++;
+			break;
+		}
+		skr_buffer_readback_destroy(&scene->rename_readback);
+		scene->rename_pending = false;
+		scene->rename_rounds++;
+		scene->rename_base   += RENAME_SETS;
+	}
 }
 
 static void _render_sphere_to_icon(scene_tex_copy_t* scene, int32_t sphere_idx, su_system_buffer_t* ref_system_buffer) {
@@ -293,6 +368,17 @@ static void _scene_tex_copy_render(scene_t* s, int32_t width, int32_t height,
 			su_log(su_log_warning, "scene_tex_copy: skr_buffer_readback failed: %d", err);
 			scene->buffer_readback_done = true;
 		}
+	}
+
+	if (!scene->static_done && !scene->static_pending)
+		scene->static_pending = skr_buffer_readback(&scene->static_buffer, &scene->static_readback) == skr_err_success;
+
+	if (!scene->rename_pending) {
+		for (uint32_t i = 0; i < RENAME_SETS; i++) {
+			skr_buffer_set(&scene->rename_params, &(rename_params_t){ .value = scene->rename_base + i, .slot = i }, sizeof(rename_params_t));
+			skr_compute_execute(&scene->rename_compute, 1, 1, 1);
+		}
+		scene->rename_pending = skr_buffer_readback(&scene->rename_output, &scene->rename_readback) == skr_err_success;
 	}
 
 	// First pass: Create icon textures for each sphere (once only)

@@ -47,7 +47,7 @@ double tex_psnr(const skr_tex_t* reference, const skr_tex_t* compressed) {
 	skr_buffer_t partials;
 	if (skr_buffer_create(NULL, groups, sizeof(float),
 			skr_buffer_type_storage,
-			(skr_use_)(skr_use_dynamic | skr_use_compute_readwrite),
+			(skr_use_)(skr_use_dynamic | skr_use_compute_readwrite | skr_use_uninitialized),
 			&partials) != skr_err_success) {
 		return -1.0;
 	}

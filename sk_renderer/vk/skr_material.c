@@ -552,7 +552,7 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			}
 			if (!buffer) return (int32_t)i;
 
-			_skr_write_buffer(ref_writes, (uint32_t)slot, false, buffer->buffer, offset, range > 0 ? range : buffer->size);
+			_skr_write_buffer(ref_writes, (uint32_t)slot, false, buffer->buffer, buffer->uid, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_read_buffer: { // StructuredBuffer, (t in HLSL)
 			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_TEXTURE];
@@ -565,7 +565,7 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			}
 			if (!buffer) return (int32_t)i;
 
-			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, offset, range > 0 ? range : buffer->size);
+			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, buffer->uid, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_texture: { // Textures (Texture2D, etc.) (t in HLSL)
 			skr_tex_t* tex = _skr_vk.global_textures[slot-SKR_BIND_SHIFT_TEXTURE];
@@ -593,7 +593,7 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			// this shader and the pipeline is expected to be rejected anyway.
 			VkSampler sampler = (binds[i].image_proc_sampler && _skr_vk.sampler_image_proc != VK_NULL_HANDLE)
 				? _skr_vk.sampler_image_proc : tex->sampler;
-			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler, tex->view, _skr_tex_sample_layout(tex));
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler, tex->view, tex->bind_uid, _skr_tex_sample_layout(tex));
 		} break;
 		case skr_register_readwrite: { // RWStructuredBuffer (u in HLSL)
 			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_UAV];
@@ -606,7 +606,7 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			}
 			if (!buffer) return (int32_t)i;
 
-			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, offset, range > 0 ? range : buffer->size);
+			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, buffer->uid, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_readwrite_tex: { // Storage images (RWTexture2D, etc.)
 			skr_tex_t* tex = _skr_vk.global_textures[slot-SKR_BIND_SHIFT_UAV];
@@ -616,13 +616,13 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			// _skr_tex_sample_layout returns GENERAL for compute-flagged textures —
 			// same value the spec mandates for STORAGE_IMAGE, but routes through the
 			// single canonical-layout helper for consistency with the sampled path.
-			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, tex->sampler, tex->view, _skr_tex_sample_layout(tex));
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, tex->sampler, tex->view, tex->bind_uid, _skr_tex_sample_layout(tex));
 		} break;
 		case skr_register_input_attachment: { // Input attachments (SubpassInput)
 			skr_tex_t* tex = binds[i].texture;
 			if (!tex) return (int32_t)i;
 
-			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_NULL_HANDLE, tex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_NULL_HANDLE, tex->view, tex->bind_uid, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 		} break;
 		case skr_register_tile_sampled:      // [tile_attachment] Texture2D — VK_QCOM_tile_shading
 		case skr_register_tile_storage: {    // [tile_attachment] RWTexture2D
@@ -641,7 +641,7 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			bool sampled = register_type == skr_register_tile_sampled;
 			_skr_write_image(ref_writes, (uint32_t)slot,
 				sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-				sampled ? tex->sampler : VK_NULL_HANDLE, tex->view,
+				sampled ? tex->sampler : VK_NULL_HANDLE, tex->view, tex->bind_uid,
 				sampled ? _skr_tex_sample_layout(tex) : VK_IMAGE_LAYOUT_GENERAL);
 		} break;
 		default: break;}

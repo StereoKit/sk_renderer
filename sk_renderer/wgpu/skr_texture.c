@@ -133,6 +133,20 @@ static WGPUTextureViewDimension _skr_view_dimension(const skr_tex_t* tex) {
 	return WGPUTextureViewDimension_2D;
 }
 
+static skr_mem_category_ _skr_tex_category(const skr_tex_t* tex) {
+	return (tex->flags & (skr_tex_flags_writeable | skr_tex_flags_compute)) ? skr_mem_category_target : skr_mem_category_texture;
+}
+
+// From the texture's own fields, so creation and destruction always agree
+static uint64_t _skr_tex_bytes(const skr_tex_t* tex) {
+	skr_vec3i_t base = tex->size;
+	if (!(tex->flags & skr_tex_flags_3d)) base.z = 1;
+	uint64_t bytes = 0;
+	for (uint32_t m = 0; m < tex->mip_levels; m++)
+		bytes += skr_tex_calc_mip_size(tex->format, base, m);
+	return bytes * tex->layer_count * (tex->samples > 0 ? tex->samples : 1);
+}
+
 skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampler_t sampler, skr_vec3i_t size, int32_t multisample, int32_t mip_count, const skr_tex_data_t* opt_data, skr_tex_t* out_tex) {
 	if (out_tex == NULL) return skr_err_invalid_parameter;
 	memset(out_tex, 0, sizeof(*out_tex));
@@ -208,6 +222,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	out_tex->mip_levels       = mips;
 	out_tex->layer_count      = is_3d ? 1 : layers;
 	out_tex->sampler_settings = sampler;
+	_skr_mem_track(_skr_tex_category(out_tex), (int64_t)_skr_tex_bytes(out_tex));
 
 	WGPUTextureViewDescriptor view_desc = {
 		.format          = wgpu_fmt,
@@ -273,6 +288,7 @@ skr_err_ skr_tex_create_external_wgpu(skr_tex_external_wgpu_info_t info, skr_tex
 	out_tex->layer_count      = layers;
 	out_tex->sampler_settings = info.sampler;
 	out_tex->is_external      = !info.owns_texture;
+	if (info.owns_texture) _skr_mem_track(_skr_tex_category(out_tex), (int64_t)_skr_tex_bytes(out_tex)); // skr_tex_destroy untracks it
 
 	out_tex->view = wgpuTextureCreateView(out_tex->texture, &(WGPUTextureViewDescriptor){
 		.format          = _skr_tex_fmt_to_wgpu(info.format),
@@ -383,7 +399,10 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 	if (ref_tex->sampler)         wgpuSamplerRelease(ref_tex->sampler);
 	if (ref_tex->sampler_compare) wgpuSamplerRelease(ref_tex->sampler_compare);
 	if (ref_tex->view)    wgpuTextureViewRelease(ref_tex->view);
-	if (ref_tex->texture && !ref_tex->is_external) wgpuTextureRelease(ref_tex->texture);
+	if (ref_tex->texture && !ref_tex->is_external) {
+		wgpuTextureRelease(ref_tex->texture);
+		_skr_mem_track(_skr_tex_category(ref_tex), -(int64_t)_skr_tex_bytes(ref_tex));
+	}
 	memset(ref_tex, 0, sizeof(*ref_tex));
 }
 
@@ -806,7 +825,7 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_filter_sh
 
 	WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, NULL);
 	wgpuCommandEncoderRelease(encoder);
-	wgpuQueueSubmit(_skr_wgpu.queue, 1, &cmd);
+	_skr_queue_submit(1, &cmd);
 	wgpuCommandBufferRelease(cmd);
 
 	// A caller-shader material is transient; its registry slot and bind slice

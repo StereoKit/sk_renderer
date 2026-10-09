@@ -237,7 +237,7 @@ static skr_err_ _skr_mesh_buffer_replace(skr_buffer_t* ref_buffer, skr_buffer_ty
 	if (capacity < count) capacity = count;
 
 	skr_buffer_t new_buffer;
-	skr_err_ err = skr_buffer_create(NULL, capacity, stride, type, skr_use_dynamic, &new_buffer);
+	skr_err_ err = skr_buffer_create(NULL, capacity, stride, type, skr_use_dynamic | skr_use_uninitialized, &new_buffer);
 	if (err != skr_err_success) return err;
 	memcpy(new_buffer.mapped, data, count * stride);
 

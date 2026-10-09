@@ -245,7 +245,7 @@ static void _create_render_targets(app_t* app, int32_t width, int32_t height, sk
 		// Offscreen target at render scale. Readable so the upscale blit can sample it.
 		// Also writeable + input_attachment for use as resolve intermediate in multi-subpass.
 		skr_tex_create(app->offscreen_format,
-			skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_input_attachment
+			skr_tex_flags_readable | skr_tex_flags_writeable | skr_tex_flags_input_attachment | skr_tex_flags_uninitialized
 				| (enable_offscreen ? skr_tex_flags_compute : 0),
 			linear_clamp,
 			(skr_vec3i_t){render_w, render_h, 1}, 1, 1, NULL, &app->scene_color);
@@ -1091,6 +1091,11 @@ void app_render_imgui(app_t* app, skr_tex_t* render_target, int32_t width, int32
 		igText("Render: %d x %d, Viewport: %d x %d", rw, rh, vw, vh);
 	}
 	igText("MSAA: %dx", app->msaa);
+	{
+		skr_mem_stats_t mem;
+		skr_mem_get_stats(&mem);
+		igText("GPU memory: %.1f MB used, %.1f MB reserved", mem.used_bytes / 1048576.0, mem.reserved_bytes / 1048576.0);
+	}
 	if (app->msaa > 1)
 		igCombo_Str_arr("Resolve Mode", &app->resolve_mode, resolve_mode_names, resolve_mode_max, 0);
 

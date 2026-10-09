@@ -89,6 +89,10 @@ SK_TEXENC_API skr_tex_t    sk_texenc_cube         (skr_tex_t* source, sk_texenc_
 // GPU can't sample. ref_blocks needs sk_texenc_debug_size bytes of storage.
 SK_TEXENC_API bool         sk_texenc_debug_encode (skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, uint32_t mip, skr_buffer_t* ref_blocks);
 SK_TEXENC_API uint32_t     sk_texenc_debug_size   (const skr_tex_t* source, sk_texenc_fmt_ format, uint32_t mip);
+// Swaps format's encoder for an uncompressed .sks (another compiler's build of
+// it, say) until shutdown. Formats sharing an encoder share the swap. Call with
+// no encodes in flight.
+SK_TEXENC_API bool         sk_texenc_debug_shader (sk_texenc_fmt_ format, const void* sks, size_t sks_size);
 #endif
 
 #ifdef __cplusplus

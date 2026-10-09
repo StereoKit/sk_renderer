@@ -50,7 +50,7 @@ int32_t               _skr_pipeline_register_vertformat_unlocked (const skr_vert
 // 2. Ensuring no concurrent modifications (single-threaded use)
 VkPipeline            _skr_pipeline_get                  (int32_t material_idx, int32_t renderpass_idx, int32_t vertformat_idx);
 VkPipelineLayout      _skr_pipeline_get_layout           (int32_t material_idx  );
-VkDescriptorSetLayout _skr_pipeline_get_descriptor_layout(int32_t material_idx  );
+_skr_desc_layout_t    _skr_pipeline_get_descriptor_layout(int32_t material_idx  );
 VkRenderPass          _skr_pipeline_get_renderpass       (int32_t renderpass_idx);
 
 // Thread safety: Lock the pipeline cache for a region of operations.

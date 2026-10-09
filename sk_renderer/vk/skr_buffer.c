@@ -14,234 +14,241 @@
 // Helper functions
 ///////////////////////////////////////////////////////////////////////////////
 
-static uint32_t _skr_find_memory_type(VkPhysicalDevice physical_device, uint32_t type_filter, VkMemoryPropertyFlags properties) {
-	VkPhysicalDeviceMemoryProperties mem_properties;
-	vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
-
-	for (uint32_t i = 0; i < mem_properties.memoryTypeCount; i++) {
-		if ((type_filter & (1 << i)) &&
-		    (mem_properties.memoryTypes[i].propertyFlags & properties) == properties) {
-			return i;
-		}
+skr_err_ _skr_buffer_create_vk(VkDeviceSize size, VkBufferUsageFlags usage, _skr_mem_usage_ mem_usage, skr_mem_category_ category, VkBuffer* out_buffer, _skr_mem_t* out_mem, void** opt_out_mapped) {
+	*out_mem = (_skr_mem_t){0};
+	VkResult vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
+		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size        = size,
+		.usage       = usage,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	}, NULL, out_buffer);
+	if (vr != VK_SUCCESS) {
+		skr_log(skr_log_critical, "vkCreateBuffer: 0x%X", (uint32_t)vr);
+		*out_buffer = VK_NULL_HANDLE;
+		return skr_err_device_error;
 	}
 
-	skr_log(skr_log_critical, "Failed to find suitable memory type");
-	return 0;
+	skr_err_ err = _skr_mem_bind_buffer(*out_buffer, mem_usage, category, out_mem, opt_out_mapped);
+	if (err != skr_err_success) {
+		vkDestroyBuffer(_skr_vk.device, *out_buffer, NULL);
+		*out_buffer = VK_NULL_HANDLE;
+	}
+	return err;
+}
+
+void _skr_buffer_destroy_vk(VkBuffer buffer, _skr_mem_t mem) {
+	_skr_destroy_batch_begin();
+	_skr_destroy_shared_mem   (mem);
+	_skr_destroy_shared_buffer(buffer);
+	_skr_destroy_batch_end();
+}
+
+// Creation and rename slots share this, so a slot always matches the buffer it renames
+static VkBufferUsageFlags _skr_buffer_usage(skr_buffer_type_ type, skr_use_ use, bool initial_data) {
+	VkBufferUsageFlags usage = _skr_to_vk_buffer_usage(type);
+	if (initial_data && !(use & skr_use_dynamic)) usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	return usage;
+}
+
+static skr_mem_category_ _skr_buffer_category(skr_buffer_type_ type) {
+	return (type & (skr_buffer_type_vertex | skr_buffer_type_index)) ? skr_mem_category_geometry : skr_mem_category_buffer;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Buffer creation and destruction
 ///////////////////////////////////////////////////////////////////////////////
 
+static skr_err_ _skr_buffer_create(const void* opt_data, uint32_t size, skr_buffer_type_ type, skr_use_ use, skr_mem_category_ category, skr_buffer_t* out_buffer) {
+	*out_buffer = (skr_buffer_t){ .size = size, .type = type, .use = use };
+	bool dynamic = use & skr_use_dynamic;
+	bool zero    = opt_data == NULL && !(use & skr_use_uninitialized);
+
+	VkBufferUsageFlags usage = _skr_buffer_usage(type, use, opt_data != NULL || zero);
+
+	_skr_mem_usage_ mem_usage = dynamic ? _skr_mem_usage_stream : opt_data ? _skr_mem_usage_upload : _skr_mem_usage_gpu;
+	void*           mapped;
+	skr_err_        err       = _skr_buffer_create_vk(size, usage, mem_usage, category, &out_buffer->buffer, &out_buffer->mem, &mapped);
+	if (err != skr_err_success) {
+		*out_buffer = (skr_buffer_t){0};
+		return err;
+	}
+	if (dynamic) out_buffer->mapped = mapped;
+	out_buffer->uid = _skr_uid_new();
+
+	// Zeroed unless asked not to, since pooled memory holds whatever its last owner left
+	if (opt_data == NULL && !zero) return skr_err_success;
+	// Memory the CPU can write directly needs no staging copy: vkQueueSubmit
+	// makes earlier host writes visible to anything it runs
+	if (mapped) {
+		if (opt_data) memcpy(mapped, opt_data, size);
+		else          memset(mapped, 0, size);
+		return skr_err_success;
+	}
+
+	VkBuffer   staging_buffer = VK_NULL_HANDLE;
+	_skr_mem_t staging_mem    = {0};
+	if (opt_data) {
+		void* staging_mapped;
+		err = _skr_buffer_create_vk(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, _skr_mem_usage_staging, skr_mem_category_staging,
+			&staging_buffer, &staging_mem, &staging_mapped);
+		if (err != skr_err_success) {
+			vkDestroyBuffer(_skr_vk.device, out_buffer->buffer, NULL);
+			_skr_mem_free(out_buffer->mem);
+			*out_buffer = (skr_buffer_t){0};
+			return err;
+		}
+		memcpy(staging_mapped, opt_data, size);
+	}
+
+	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
+
+	if (opt_data) vkCmdCopyBuffer(ctx.cmd, staging_buffer, out_buffer->buffer, 1, &(VkBufferCopy){ .size = out_buffer->size });
+	else          vkCmdFillBuffer(ctx.cmd, out_buffer->buffer, 0, VK_WHOLE_SIZE, 0);
+
+	// The copy carries no implicit dependency with later reads. Those reads
+	// may land in this same command buffer (_skr_cmd_acquire hands back the
+	// active one, so creation can nest inside an open context), or in a
+	// later submission on this queue — submissions overlap freely. Either
+	// way the barrier below is what orders them.
+	VkAccessFlags        dst_access = 0;
+	VkPipelineStageFlags dst_stage  = 0;
+	if (type & skr_buffer_type_vertex) {
+		dst_access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+		dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+	}
+	if (type & skr_buffer_type_index) {
+		dst_access |= VK_ACCESS_INDEX_READ_BIT;
+		dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+	}
+	if (type & skr_buffer_type_constant) {
+		dst_access |= VK_ACCESS_UNIFORM_READ_BIT;
+		dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	}
+	if (type & skr_buffer_type_storage) {
+		// SHADER_WRITE covers the WAW against a compute pass that writes the
+		// buffer on its first dispatch. Storage buffers also double as
+		// indirect args (skr_compute_execute_indirect), so cover that read.
+		dst_access |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+		dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+	}
+	if (dst_stage == 0) {
+		// A skr_buffer_type_ with no mapping above. Fail loud in debug, and
+		// stay conservative in release — dropping the barrier here would
+		// surface as intermittent corruption, not a clean failure.
+		assert(false && "skr_buffer_type_ has no barrier mapping, add one above");
+		dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+		dst_stage  = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	}
+	VkBufferMemoryBarrier buffer_barrier = {
+		.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.dstAccessMask       = dst_access,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.buffer              = out_buffer->buffer,
+		.offset              = 0,
+		.size                = out_buffer->size,
+	};
+	vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, NULL, 1, &buffer_barrier, 0, NULL);
+
+	if (opt_data) _skr_buffer_destroy_vk(staging_buffer, staging_mem);
+	_skr_cmd_release(ctx.cmd);
+	return skr_err_success;
+}
+
 skr_err_ skr_buffer_create(const void* opt_data, uint32_t size_count, uint32_t size_stride,
                             skr_buffer_type_ type, skr_use_ use, skr_buffer_t* out_buffer) {
 	if (!out_buffer) return skr_err_invalid_parameter;
-
-	// Zero out immediately
 	*out_buffer = (skr_buffer_t){0};
+	if (size_count == 0 || size_stride == 0) return skr_err_invalid_parameter;
 
-	// Validate inputs
-	if (size_count == 0 || size_stride == 0) {
-		return skr_err_invalid_parameter;
-	}
-
-	out_buffer->size = size_count * size_stride;
-	out_buffer->type = type;
-	out_buffer->use  = use;
-
-	VkBufferUsageFlags usage = _skr_to_vk_buffer_usage(type);
-
-	// Add transfer dst for initial data upload (unless dynamic)
-	if (opt_data != NULL && !(use & skr_use_dynamic)) {
-		usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	}
-
-	// Create buffer
-	VkResult vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
-		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size        = out_buffer->size,
-		.usage       = usage,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	}, NULL, &out_buffer->buffer);
-	SKR_VK_CHECK_RET(vr, "vkCreateBuffer", skr_err_device_error);
-
-	// Allocate memory
-	VkMemoryRequirements mem_requirements;
-	vkGetBufferMemoryRequirements(_skr_vk.device, out_buffer->buffer, &mem_requirements);
-
-	VkMemoryPropertyFlags mem_properties = (use & skr_use_dynamic)
-		? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-		: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	vr = vkAllocateMemory(_skr_vk.device, &(VkMemoryAllocateInfo){
-		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize  = mem_requirements.size,
-		.memoryTypeIndex = _skr_find_memory_type(_skr_vk.physical_device, mem_requirements.memoryTypeBits, mem_properties),
-	}, NULL, &out_buffer->memory);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkAllocateMemory");
-		vkDestroyBuffer(_skr_vk.device, out_buffer->buffer, NULL);
-		*out_buffer = (skr_buffer_t){0};
-		return skr_err_out_of_memory;
-	}
-
-	vkBindBufferMemory(_skr_vk.device, out_buffer->buffer, out_buffer->memory, 0);
-
-	// Upload initial data
-	if (opt_data != NULL) {
-		if (use & skr_use_dynamic) {
-			// Direct map and copy for dynamic buffers
-			void* mapped;
-			vkMapMemory(_skr_vk.device, out_buffer->memory, 0, out_buffer->size, 0, &mapped);
-			memcpy(mapped, opt_data, out_buffer->size);
-			vkUnmapMemory(_skr_vk.device, out_buffer->memory);
-		} else {
-			// Use staging buffer for static buffers
-			VkBuffer staging_buffer;
-			vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
-				.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-				.size        = out_buffer->size,
-				.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-			}, NULL, &staging_buffer);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkCreateBuffer");
-				vkDestroyBuffer(_skr_vk.device, out_buffer->buffer, NULL);
-				vkFreeMemory(_skr_vk.device, out_buffer->memory, NULL);
-				*out_buffer = (skr_buffer_t){0};
-				return skr_err_device_error;
-			}
-
-			VkMemoryRequirements staging_mem_req;
-			vkGetBufferMemoryRequirements(_skr_vk.device, staging_buffer, &staging_mem_req);
-
-			VkDeviceMemory staging_memory;
-			vr = vkAllocateMemory(_skr_vk.device, &(VkMemoryAllocateInfo){
-				.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-				.allocationSize  = staging_mem_req.size,
-				.memoryTypeIndex = _skr_find_memory_type(_skr_vk.physical_device, staging_mem_req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-			}, NULL, &staging_memory);
-			if (vr != VK_SUCCESS) {
-				SKR_VK_CHECK_NRET(vr, "vkAllocateMemory");
-				vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-				vkDestroyBuffer(_skr_vk.device, out_buffer->buffer, NULL);
-				vkFreeMemory(_skr_vk.device, out_buffer->memory, NULL);
-				*out_buffer = (skr_buffer_t){0};
-				return skr_err_out_of_memory;
-			}
-			vkBindBufferMemory(_skr_vk.device, staging_buffer, staging_memory, 0);
-
-			// Copy data to staging buffer
-			void* mapped;
-			vkMapMemory(_skr_vk.device, staging_memory, 0, out_buffer->size, 0, &mapped);
-			memcpy(mapped, opt_data, out_buffer->size);
-			vkUnmapMemory(_skr_vk.device, staging_memory);
-
-			_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
-
-			vkCmdCopyBuffer(ctx.cmd, staging_buffer, out_buffer->buffer, 1, &(VkBufferCopy){
-				.size = out_buffer->size,
-			});
-
-			// The copy carries no implicit dependency with later reads. Those reads
-			// may land in this same command buffer (_skr_cmd_acquire hands back the
-			// active one, so creation can nest inside an open context), or in a
-			// later submission on this queue — submissions overlap freely. Either
-			// way the barrier below is what orders them.
-			VkAccessFlags        dst_access = 0;
-			VkPipelineStageFlags dst_stage  = 0;
-			if (type & skr_buffer_type_vertex) {
-				dst_access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-			}
-			if (type & skr_buffer_type_index) {
-				dst_access |= VK_ACCESS_INDEX_READ_BIT;
-				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
-			}
-			if (type & skr_buffer_type_constant) {
-				dst_access |= VK_ACCESS_UNIFORM_READ_BIT;
-				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-			}
-			if (type & skr_buffer_type_storage) {
-				// SHADER_WRITE covers the WAW against a compute pass that writes the
-				// buffer on its first dispatch. Storage buffers also double as
-				// indirect args (skr_compute_execute_indirect), so cover that read.
-				dst_access |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-				dst_stage  |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
-			}
-			if (dst_stage == 0) {
-				// A skr_buffer_type_ with no mapping above. Fail loud in debug, and
-				// stay conservative in release — dropping the barrier here would
-				// surface as intermittent corruption, not a clean failure.
-				assert(false && "skr_buffer_type_ has no barrier mapping, add one above");
-				dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-				dst_stage  = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-			}
-			VkBufferMemoryBarrier buffer_barrier = {
-				.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-				.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
-				.dstAccessMask       = dst_access,
-				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-				.buffer              = out_buffer->buffer,
-				.offset              = 0,
-				.size                = out_buffer->size,
-			};
-			vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage, 0, 0, NULL, 1, &buffer_barrier, 0, NULL);
-
-			_skr_destroy_private_memory(staging_memory);
-			_skr_destroy_private_buffer(staging_buffer);
-			_skr_cmd_release       (ctx.cmd);
-		}
-	}
-
-	// Keep dynamic buffers mapped
-	if (use & skr_use_dynamic) {
-		vkMapMemory(_skr_vk.device, out_buffer->memory, 0, out_buffer->size, 0, &out_buffer->mapped);
-	}
-
-	return skr_err_success;
+	return _skr_buffer_create(opt_data, size_count * size_stride, type, use, _skr_buffer_category(type), out_buffer);
 }
 
 bool skr_buffer_is_valid(const skr_buffer_t* buffer) {
 	return buffer && buffer->buffer != VK_NULL_HANDLE;
 }
 
-// Helper to allocate a new ring slot for dynamic buffer updates
-static bool _skr_buffer_alloc_ring_slot(skr_buffer_t* ref_buffer, uint8_t slot_idx) {
-	VkBufferUsageFlags usage = _skr_to_vk_buffer_usage(ref_buffer->type);
+///////////////////////////////////////////////////////////////////////////////
+// Rename slots. skr_buffer_set writes into a slot no submission reads, and
+// the slot it replaces retires through the shared destroy path, the same proof
+// a destroy waits for, before anything writes it again.
 
-	VkResult vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
-		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size        = ref_buffer->size,
-		.usage       = usage,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	}, NULL, &ref_buffer->_ring[slot_idx].buffer);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkCreateBuffer (ring slot)");
-		return false;
+typedef enum {
+	_skr_slot_current,
+	_skr_slot_pending, // replaced, a submission may still read it
+	_skr_slot_free,
+	_skr_slot_orphan,  // its buffer was destroyed while pending; retiring frees it
+} _skr_slot_;
+
+// Slots live until their buffer is destroyed: render list items keep the
+// handle they captured, so an idle slot may still be drawn
+struct _skr_buffer_slot_t {
+	VkBuffer              buffer;
+	_skr_mem_t            mem;
+	void*                 mapped;
+	uint64_t              uid;
+	_skr_atomic(uint32_t) state; // _skr_slot_
+};
+
+typedef struct _skr_buffer_ring_t {
+	_skr_buffer_slot_t** slots;
+	uint32_t             count;
+	uint32_t             capacity;
+	uint32_t             current;
+} _skr_buffer_ring_t;
+
+void _skr_buffer_slot_retired(_skr_buffer_slot_t* slot) {
+	if (_skr_exchange_u32(&slot->state, _skr_slot_free) != _skr_slot_orphan) return;
+	vkDestroyBuffer(_skr_vk.device, slot->buffer, NULL);
+	_skr_mem_free(slot->mem);
+	_skr_free(slot);
+}
+
+static bool _skr_buffer_ring_add(_skr_buffer_ring_t* ref_ring, _skr_buffer_slot_t* slot) {
+	if (ref_ring->count == ref_ring->capacity) {
+		uint32_t             capacity = ref_ring->capacity == 0 ? 4 : ref_ring->capacity * 2;
+		_skr_buffer_slot_t** slots    = _skr_realloc(ref_ring->slots, capacity * sizeof(_skr_buffer_slot_t*));
+		if (!slots) return false;
+		ref_ring->slots    = slots;
+		ref_ring->capacity = capacity;
 	}
-
-	VkMemoryRequirements mem_requirements;
-	vkGetBufferMemoryRequirements(_skr_vk.device, ref_buffer->_ring[slot_idx].buffer, &mem_requirements);
-
-	vr = vkAllocateMemory(_skr_vk.device, &(VkMemoryAllocateInfo){
-		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize  = mem_requirements.size,
-		.memoryTypeIndex = _skr_find_memory_type(_skr_vk.physical_device, mem_requirements.memoryTypeBits,
-		                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-	}, NULL, &ref_buffer->_ring[slot_idx].memory);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkAllocateMemory (ring slot)");
-		vkDestroyBuffer(_skr_vk.device, ref_buffer->_ring[slot_idx].buffer, NULL);
-		ref_buffer->_ring[slot_idx].buffer = VK_NULL_HANDLE;
-		return false;
-	}
-
-	vkBindBufferMemory(_skr_vk.device, ref_buffer->_ring[slot_idx].buffer, ref_buffer->_ring[slot_idx].memory, 0);
-	vkMapMemory(_skr_vk.device, ref_buffer->_ring[slot_idx].memory, 0, ref_buffer->size, 0, &ref_buffer->_ring[slot_idx].mapped);
-
+	ref_ring->slots[ref_ring->count++] = slot;
 	return true;
+}
+
+// The buffer's own allocation becomes the first slot
+static _skr_buffer_ring_t* _skr_buffer_ring_create(const skr_buffer_t* buffer) {
+	_skr_buffer_ring_t* ring = _skr_calloc(1, sizeof(_skr_buffer_ring_t));
+	_skr_buffer_slot_t* slot = _skr_malloc(sizeof(_skr_buffer_slot_t));
+	if (!ring || !slot || !_skr_buffer_ring_add(ring, slot)) {
+		_skr_free(ring);
+		_skr_free(slot);
+		return NULL;
+	}
+	*slot = (_skr_buffer_slot_t){ .buffer = buffer->buffer, .mem = buffer->mem, .mapped = buffer->mapped, .uid = buffer->uid, .state = _skr_slot_current };
+	return ring;
+}
+
+// A free slot, or a new one when the set rate outruns the ring
+static _skr_buffer_slot_t* _skr_buffer_ring_take(_skr_buffer_ring_t* ref_ring, const skr_buffer_t* buffer) {
+	for (uint32_t i = 0; i < ref_ring->count; i++)
+		if (_skr_load_u32(&ref_ring->slots[i]->state) == _skr_slot_free) return ref_ring->slots[i];
+
+	_skr_buffer_slot_t* taken = _skr_malloc(sizeof(_skr_buffer_slot_t));
+	if (!taken) return NULL;
+	*taken = (_skr_buffer_slot_t){ .uid = _skr_uid_new(), .state = _skr_slot_free };
+	if (_skr_buffer_create_vk(buffer->size, _skr_buffer_usage(buffer->type, buffer->use, false), _skr_mem_usage_stream, (skr_mem_category_)buffer->mem.category,
+	                          &taken->buffer, &taken->mem, &taken->mapped) != skr_err_success
+	    || !_skr_buffer_ring_add(ref_ring, taken)) {
+		if (taken->buffer != VK_NULL_HANDLE) {
+			vkDestroyBuffer(_skr_vk.device, taken->buffer, NULL);
+			_skr_mem_free(taken->mem);
+		}
+		_skr_free(taken);
+		return NULL;
+	}
+	return taken;
 }
 
 void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_bytes) {
@@ -254,51 +261,28 @@ void skr_buffer_set(skr_buffer_t* ref_buffer, const void* data, uint32_t size_by
 
 	uint32_t copy_size = size_bytes < ref_buffer->size ? size_bytes : ref_buffer->size;
 
-	// First update: initialize ring buffer system
-	if (ref_buffer->_ring_count == 0) {
-		// Migrate existing buffer to ring[0]
-		ref_buffer->_ring[0].buffer = ref_buffer->buffer;
-		ref_buffer->_ring[0].memory = ref_buffer->memory;
-		ref_buffer->_ring[0].mapped = ref_buffer->mapped;
-		ref_buffer->_ring_count     = 1;
-		ref_buffer->_ring_index     = 0;
-
-		// Allocate ring[1] for this write
-		if (!_skr_buffer_alloc_ring_slot(ref_buffer, 1)) {
-			// Fallback: write directly (unsafe but better than crash)
-			memcpy(ref_buffer->mapped, data, copy_size);
-			return;
-		}
-		ref_buffer->_ring_count = 2;
-
-		// Write to ring[1] and make it current
-		memcpy(ref_buffer->_ring[1].mapped, data, copy_size);
-		ref_buffer->_ring_index = 1;
-		ref_buffer->buffer      = ref_buffer->_ring[1].buffer;
-		ref_buffer->memory      = ref_buffer->_ring[1].memory;
-		ref_buffer->mapped      = ref_buffer->_ring[1].mapped;
+	if (!ref_buffer->_ring) ref_buffer->_ring = _skr_buffer_ring_create(ref_buffer);
+	_skr_buffer_ring_t* ring = ref_buffer->_ring;
+	_skr_buffer_slot_t* next = ring ? _skr_buffer_ring_take(ring, ref_buffer) : NULL;
+	if (!next) {
+		skr_log(skr_log_critical, "skr_buffer_set: out of memory for a rename slot, overwriting data that may still be in use");
+		memcpy(ref_buffer->mapped, data, copy_size);
 		return;
 	}
 
-	// Subsequent updates: advance to next slot in ring
-	uint8_t next_idx = (ref_buffer->_ring_index + 1) % SKR_DYNAMIC_BUFFER_COPIES;
+	memcpy(next->mapped, data, copy_size);
+	_skr_store_u32(&next->state, _skr_slot_current);
 
-	// Allocate slot if not yet allocated
-	if (next_idx >= ref_buffer->_ring_count) {
-		if (!_skr_buffer_alloc_ring_slot(ref_buffer, next_idx)) {
-			// Fallback: write to current slot (unsafe but better than crash)
-			memcpy(ref_buffer->mapped, data, copy_size);
-			return;
-		}
-		ref_buffer->_ring_count = next_idx + 1;
-	}
+	_skr_buffer_slot_t* prev = ring->slots[ring->current];
+	_skr_store_u32(&prev->state, _skr_slot_pending);
+	_skr_destroy_shared_buffer_slot(prev);
 
-	// Write to the new slot and make it current
-	memcpy(ref_buffer->_ring[next_idx].mapped, data, copy_size);
-	ref_buffer->_ring_index = next_idx;
-	ref_buffer->buffer      = ref_buffer->_ring[next_idx].buffer;
-	ref_buffer->memory      = ref_buffer->_ring[next_idx].memory;
-	ref_buffer->mapped      = ref_buffer->_ring[next_idx].mapped;
+	for (uint32_t i = 0; i < ring->count; i++)
+		if (ring->slots[i] == next) ring->current = i;
+	ref_buffer->buffer = next->buffer;
+	ref_buffer->mem    = next->mem;
+	ref_buffer->mapped = next->mapped;
+	ref_buffer->uid    = next->uid;
 }
 
 void skr_buffer_get(const skr_buffer_t *buffer, void *ref_buffer, uint32_t buffer_size) {
@@ -325,8 +309,8 @@ uint32_t skr_buffer_get_size(const skr_buffer_t* buffer) {
 
 // Internal state for readback: the host-visible staging snapshot
 typedef struct _skr_buffer_readback_internal_t {
-	VkBuffer       staging_buffer;
-	VkDeviceMemory staging_memory;
+	VkBuffer   staging_buffer;
+	_skr_mem_t staging_mem;
 } _skr_buffer_readback_internal_t;
 
 skr_err_ skr_buffer_readback(const skr_buffer_t* buffer, skr_buffer_readback_t* out_readback) {
@@ -339,46 +323,13 @@ skr_err_ skr_buffer_readback(const skr_buffer_t* buffer, skr_buffer_readback_t* 
 		return skr_err_unsupported;
 	}
 
-	VkBuffer staging_buffer;
-	VkResult vr = vkCreateBuffer(_skr_vk.device, &(VkBufferCreateInfo){
-		.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size        = buffer->size,
-		.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	}, NULL, &staging_buffer);
-	SKR_VK_CHECK_RET(vr, "vkCreateBuffer", skr_err_device_error);
+	VkBuffer   staging_buffer;
+	_skr_mem_t staging_mem;
+	void*      mapped;
+	skr_err_   err = _skr_buffer_create_vk(buffer->size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, _skr_mem_usage_readback, skr_mem_category_staging,
+		&staging_buffer, &staging_mem, &mapped);
+	if (err != skr_err_success) return err;
 
-	VkMemoryRequirements mem_requirements;
-	vkGetBufferMemoryRequirements(_skr_vk.device, staging_buffer, &mem_requirements);
-
-	VkDeviceMemory staging_memory;
-	vr = vkAllocateMemory(_skr_vk.device, &(VkMemoryAllocateInfo){
-		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.allocationSize  = mem_requirements.size,
-		.memoryTypeIndex = _skr_find_memory_type(_skr_vk.physical_device, mem_requirements.memoryTypeBits,
-		                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-	}, NULL, &staging_memory);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkAllocateMemory");
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-		return skr_err_out_of_memory;
-	}
-	vr = vkBindBufferMemory(_skr_vk.device, staging_buffer, staging_memory, 0);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkBindBufferMemory");
-		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-		return skr_err_device_error;
-	}
-
-	void* mapped;
-	vr = vkMapMemory(_skr_vk.device, staging_memory, 0, buffer->size, 0, &mapped);
-	if (vr != VK_SUCCESS) {
-		SKR_VK_CHECK_NRET(vr, "vkMapMemory");
-		vkFreeMemory   (_skr_vk.device, staging_memory, NULL);
-		vkDestroyBuffer(_skr_vk.device, staging_buffer, NULL);
-		return skr_err_device_error;
-	}
 	_skr_cmd_ctx_t ctx = _skr_cmd_acquire();
 
 	VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -416,7 +367,7 @@ skr_err_ skr_buffer_readback(const skr_buffer_t* buffer, skr_buffer_readback_t* 
 
 	_skr_buffer_readback_internal_t* internal = (_skr_buffer_readback_internal_t*)_skr_malloc(sizeof(_skr_buffer_readback_internal_t));
 	internal->staging_buffer = staging_buffer;
-	internal->staging_memory = staging_memory;
+	internal->staging_mem    = staging_mem;
 
 	out_readback->data      = mapped;
 	out_readback->size      = buffer->size;
@@ -431,11 +382,7 @@ void skr_buffer_readback_destroy(skr_buffer_readback_t* ref_readback) {
 
 	// No wait: the copy may sit in a command buffer this thread has yet to
 	// submit, and blocking on that here deadlocks
-	vkUnmapMemory(_skr_vk.device, internal->staging_memory);
-	_skr_destroy_batch_begin();
-	_skr_destroy_shared_memory(internal->staging_memory);
-	_skr_destroy_shared_buffer(internal->staging_buffer);
-	_skr_destroy_batch_end();
+	_skr_buffer_destroy_vk(internal->staging_buffer, internal->staging_mem);
 	_skr_free(internal);
 
 	*ref_readback = (skr_buffer_readback_t){0};
@@ -453,11 +400,11 @@ typedef enum {
 	_skr_buffer_free_now,      // every fence that could read it has been waited
 } _skr_buffer_free_;
 
-static void _skr_buffer_free_pair(_skr_buffer_free_ how, VkDeviceMemory memory, VkBuffer buffer) {
+static void _skr_buffer_free_pair(_skr_buffer_free_ how, _skr_mem_t mem, VkBuffer buffer) {
 	switch (how) {
-		case _skr_buffer_free_shared:  _skr_destroy_shared_memory (memory); _skr_destroy_shared_buffer (buffer); break;
-		case _skr_buffer_free_private: _skr_destroy_private_memory(memory); _skr_destroy_private_buffer(buffer); break;
-		case _skr_buffer_free_now:     vkDestroyBuffer(_skr_vk.device, buffer, NULL); vkFreeMemory(_skr_vk.device, memory, NULL); break;
+		case _skr_buffer_free_shared:  _skr_destroy_shared_mem (mem); _skr_destroy_shared_buffer (buffer); break;
+		case _skr_buffer_free_private: _skr_destroy_private_mem(mem); _skr_destroy_private_buffer(buffer); break;
+		case _skr_buffer_free_now:     vkDestroyBuffer(_skr_vk.device, buffer, NULL); _skr_mem_free(mem); break;
 	}
 }
 
@@ -465,16 +412,19 @@ static void _skr_buffer_release(skr_buffer_t* ref_buffer, _skr_buffer_free_ how)
 	if (ref_buffer->buffer == VK_NULL_HANDLE) return;
 
 	_skr_destroy_batch_begin();
-	if (ref_buffer->_ring_count > 0) {
-		for (uint8_t i = 0; i < ref_buffer->_ring_count; i++) {
-			if (ref_buffer->_ring[i].mapped)
-				vkUnmapMemory(_skr_vk.device, ref_buffer->_ring[i].memory);
-			_skr_buffer_free_pair(how, ref_buffer->_ring[i].memory, ref_buffer->_ring[i].buffer);
+	_skr_buffer_ring_t* ring = ref_buffer->_ring;
+	if (ring) {
+		// A pending slot's retire item still holds it, so that frees it instead
+		for (uint32_t i = 0; i < ring->count; i++) {
+			_skr_buffer_slot_t* slot = ring->slots[i];
+			if (_skr_exchange_u32(&slot->state, _skr_slot_orphan) == _skr_slot_pending) continue;
+			_skr_buffer_free_pair(how, slot->mem, slot->buffer);
+			_skr_free(slot);
 		}
+		_skr_free(ring->slots);
+		_skr_free(ring);
 	} else {
-		if (ref_buffer->mapped)
-			vkUnmapMemory(_skr_vk.device, ref_buffer->memory);
-		_skr_buffer_free_pair(how, ref_buffer->memory, ref_buffer->buffer);
+		_skr_buffer_free_pair(how, ref_buffer->mem, ref_buffer->buffer);
 	}
 	_skr_destroy_batch_end();
 
@@ -550,7 +500,7 @@ static bool _skr_bump_ring_grow(_skr_bump_ring_t* ref_ring, uint32_t min_capacit
 	}
 	// Create first, so a failed grow keeps the old buffer instead of none
 	skr_buffer_t grown = {0};
-	skr_err_ err = skr_buffer_create(NULL, capacity, 1, ref_ring->buffer_type, skr_use_dynamic, &grown);
+	skr_err_ err = _skr_buffer_create(NULL, capacity, ref_ring->buffer_type, skr_use_dynamic | skr_use_uninitialized, skr_mem_category_frame, &grown);
 	if (err != skr_err_success) {
 		skr_log(skr_log_critical, "Bump ring couldn't grow to %u bytes: %d", capacity, err);
 		return false;
@@ -589,7 +539,7 @@ skr_bump_result_t _skr_bump_ring_write(_skr_bump_ring_t* ref_ring, const void* d
 			if (ref_ring->start[slot] == ref_ring->end[slot]) ref_ring->start[slot] = pos;
 			ref_ring->end[slot] = end;
 			ref_ring->head      = end;
-			return (skr_bump_result_t){ .buffer = ref_ring->buffer.buffer, .offset = offset };
+			return (skr_bump_result_t){ .buffer = ref_ring->buffer.buffer, .uid = ref_ring->buffer.uid, .offset = offset };
 		}
 		if (attempt == 0) { _skr_bump_ring_poll(ref_ring); continue; }
 		if (!_skr_bump_ring_grow(ref_ring, ref_ring->capacity * 2)) return result;

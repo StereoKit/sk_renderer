@@ -279,8 +279,9 @@ void _skr_desc_writes_begin(_skr_desc_writes_t* out_writes, int32_t material_idx
 
 // Every buffer descriptor goes through here, so the layout's choice of dynamic
 // vs plain is honored no matter which caller supplies the buffer
-void _skr_write_buffer(_skr_desc_writes_t* ref_writes, uint32_t binding, bool storage, VkBuffer buffer, uint32_t offset, uint32_t range) {
+void _skr_write_buffer(_skr_desc_writes_t* ref_writes, uint32_t binding, bool storage, VkBuffer buffer, uint64_t uid, uint32_t offset, uint32_t range) {
 	if (ref_writes->write_ct >= _SKR_DESC_WRITES_MAX || ref_writes->buffer_ct >= _SKR_DESC_INFOS_MAX) return;
+	assert((buffer == VK_NULL_HANDLE || uid != 0) && "Buffer without an identity, see _skr_uid_new");
 
 	// A dynamic binding keeps the buffer at offset 0 in the set and takes the
 	// draw's offset at bind time, so the set stays valid across frames
@@ -305,12 +306,14 @@ void _skr_write_buffer(_skr_desc_writes_t* ref_writes, uint32_t binding, bool st
 		.descriptorType  = type,
 		.pBufferInfo     = &ref_writes->buffer_infos[ref_writes->buffer_ct],
 	};
+	ref_writes->uids[ref_writes->write_ct] = uid;
 	ref_writes->buffer_ct++;
 	ref_writes->write_ct++;
 }
 
-void _skr_write_image(_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescriptorType type, VkSampler sampler, VkImageView view, VkImageLayout layout) {
+void _skr_write_image(_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescriptorType type, VkSampler sampler, VkImageView view, uint64_t uid, VkImageLayout layout) {
 	if (ref_writes->write_ct >= _SKR_DESC_WRITES_MAX || ref_writes->image_ct >= _SKR_DESC_INFOS_MAX) return;
+	assert((view == VK_NULL_HANDLE || uid != 0) && "View without an identity, see _skr_uid_new");
 
 	ref_writes->image_infos[ref_writes->image_ct] = (VkDescriptorImageInfo){
 		.sampler     = sampler,
@@ -324,6 +327,7 @@ void _skr_write_image(_skr_desc_writes_t* ref_writes, uint32_t binding, VkDescri
 		.descriptorType  = type,
 		.pImageInfo      = &ref_writes->image_infos[ref_writes->image_ct],
 	};
+	ref_writes->uids[ref_writes->write_ct] = uid;
 	ref_writes->image_ct++;
 	ref_writes->write_ct++;
 }
@@ -334,22 +338,18 @@ static inline uint64_t _skr_hash_word(uint64_t hash, uint64_t word) {
 	return hash ^ (hash >> 29);
 }
 
-// Fingerprint of a set's contents: the layout it targets and every handle,
-// offset and range it would be written with. Never returns 0.
-static uint64_t _skr_hash_writes(VkDescriptorSetLayout layout, const VkWriteDescriptorSet* writes, uint32_t write_count) {
-	uint64_t hash = _skr_hash_word(0x9E3779B97F4A7C15ull, (uint64_t)layout);
-	for (uint32_t i = 0; i < write_count; i++) {
-		hash = _skr_hash_word(hash, ((uint64_t)writes[i].dstBinding << 32) | (uint32_t)writes[i].descriptorType);
-		if (writes[i].pBufferInfo) {
-			const VkDescriptorBufferInfo* info = writes[i].pBufferInfo;
-			hash = _skr_hash_word(hash, (uint64_t)info->buffer);
-			hash = _skr_hash_word(hash, info->offset);
-			hash = _skr_hash_word(hash, info->range);
-		} else if (writes[i].pImageInfo) {
-			const VkDescriptorImageInfo* info = writes[i].pImageInfo;
-			hash = _skr_hash_word(hash, (uint64_t)info->sampler);
-			hash = _skr_hash_word(hash, (uint64_t)info->imageView);
-			hash = _skr_hash_word(hash, (uint64_t)info->imageLayout);
+// Keys on identities rather than handles, see _skr_uid_new. Never returns 0.
+static uint64_t _skr_hash_writes(uint64_t layout_uid, const _skr_desc_writes_t* writes) {
+	uint64_t hash = _skr_hash_word(0x9E3779B97F4A7C15ull, layout_uid);
+	for (uint32_t i = 0; i < writes->write_ct; i++) {
+		const VkWriteDescriptorSet* write = &writes->writes[i];
+		hash = _skr_hash_word(hash, ((uint64_t)write->dstBinding << 32) | (uint32_t)write->descriptorType);
+		hash = _skr_hash_word(hash, writes->uids[i]);
+		if (write->pBufferInfo) {
+			hash = _skr_hash_word(hash, write->pBufferInfo->offset);
+			hash = _skr_hash_word(hash, write->pBufferInfo->range);
+		} else if (write->pImageInfo) {
+			hash = _skr_hash_word(hash, (uint64_t)write->pImageInfo->imageLayout);
 		}
 	}
 	return hash ? hash : 1;
@@ -446,7 +446,7 @@ static bool _skr_desc_cache_alloc(_skr_desc_cache_t* ref_cache, VkDescriptorSetL
 	return true;
 }
 
-bool _skr_bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, int32_t bind_start, VkPipelineLayout layout, VkDescriptorSetLayout desc_layout, _skr_desc_writes_t* ref_writes) {
+bool _skr_bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, int32_t bind_start, VkPipelineLayout layout, _skr_desc_layout_t desc_layout, _skr_desc_writes_t* ref_writes) {
 	if (ref_writes->write_ct == 0) return true;
 
 	if (_skr_vk.has_push_descriptors) {
@@ -463,7 +463,7 @@ bool _skr_bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, 
 		return false;
 	}
 
-	uint64_t hash = _skr_hash_writes(desc_layout, ref_writes->writes, ref_writes->write_ct);
+	uint64_t hash = _skr_hash_writes(desc_layout.uid, ref_writes);
 	if (entry->hash != hash) {
 		// The replaced set may still be bound in an in-flight buffer, so it
 		// frees with this slot's fence, which orders after every earlier submit
@@ -471,7 +471,7 @@ bool _skr_bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, 
 			_skr_destroy_private_desc_set(entry->set, entry->pool);
 		entry->set  = VK_NULL_HANDLE;
 		entry->hash = 0;
-		if (!_skr_desc_cache_alloc(cache, desc_layout, &entry->set, &entry->pool))
+		if (!_skr_desc_cache_alloc(cache, desc_layout.handle, &entry->set, &entry->pool))
 			return false;
 		for (uint32_t i = 0; i < ref_writes->write_ct; i++)
 			ref_writes->writes[i].dstSet = entry->set;

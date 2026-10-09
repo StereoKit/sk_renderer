@@ -241,6 +241,7 @@ skshaderc_compile_assets(sk_renderer_test ${CMAKE_CURRENT_BINARY_DIR}/generated/
 	assets/shaders/bloom_downsample.hlsl
 	assets/shaders/bloom_upsample.hlsl
 	assets/shaders/buffer_fill.hlsl
+	assets/shaders/buffer_rename.hlsl
 	assets/shaders/compute_test.hlsl
 	assets/shaders/cubemap_mipgen.hlsl
 	assets/shaders/cubemap_reflection.hlsl
@@ -303,10 +304,11 @@ target_skapp_assets(sk_renderer_test
 	${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 ###############################################################################
-# ASTC encoder validation tool (desktop only)
+# Encoder tools: astc_validate (desktop only) and texenc_bench
 ###############################################################################
 
 add_subdirectory(tools/compress/validate)
+add_subdirectory(tools/compress/bench)
 
 ###############################################################################
 # "run" command
