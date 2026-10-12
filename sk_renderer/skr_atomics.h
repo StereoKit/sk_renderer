@@ -40,6 +40,7 @@
 #elif defined(_MSC_VER)
 	#include <intrin.h>
 	#include <threads.h>
+	// MSVC 19.51's optimizer crashes on `x = (T){0}` when T holds these, so memset such structs instead
 	#define _skr_atomic(T)                 T volatile
 	#if defined(_M_ARM64) || defined(_M_ARM64EC)
 		#define _skr_load_acquire(p)       ((void*)__ldar64((volatile __int64*)(p)))

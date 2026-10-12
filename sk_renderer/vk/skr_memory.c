@@ -360,7 +360,7 @@ static skr_err_ _skr_mem_alloc(const VkMemoryRequirements* reqs, bool prefer_ded
 ///////////////////////////////////////////////////////////////////////////////
 
 void _skr_mem_init(void) {
-	_mem = (_skr_mem_state_t){0};
+	memset(&_mem, 0, sizeof(_mem)); // Not a compound literal, see _skr_atomic
 	mtx_init(&_mem.table_mutex, mtx_plain);
 
 	VkPhysicalDeviceMaintenance3Properties maintenance3 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES };
@@ -443,7 +443,7 @@ void _skr_mem_shutdown(void) {
 		mtx_destroy(&_mem.pools[p].mutex);
 	}
 	mtx_destroy(&_mem.table_mutex);
-	_mem = (_skr_mem_state_t){0};
+	memset(&_mem, 0, sizeof(_mem)); // Not a compound literal, see _skr_atomic
 }
 
 skr_err_ _skr_mem_bind_buffer(VkBuffer buffer, _skr_mem_usage_ usage, skr_mem_category_ category, _skr_mem_t* out_mem, void** opt_out_mapped) {

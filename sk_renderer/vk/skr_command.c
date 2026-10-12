@@ -47,7 +47,7 @@ void _skr_cmd_shutdown(void) {
 		if (thread->cmd_pool != VK_NULL_HANDLE)
 			vkDestroyCommandPool(_skr_vk.device, thread->cmd_pool, NULL);
 
-		*thread = (_skr_vk_thread_t){0};
+		memset(thread, 0, sizeof(*thread)); // Not a compound literal, see _skr_atomic
 	}
 	mtx_unlock(&_skr_vk.thread_pool_mutex);
 

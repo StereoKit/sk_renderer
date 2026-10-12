@@ -797,7 +797,7 @@ bool skr_init(skr_settings_t settings) {
 		return false;
 	}
 
-	_skr_vk = (_skr_vk_t){0};
+	memset(&_skr_vk, 0, sizeof(_skr_vk)); // Not a compound literal, see _skr_atomic
 	_skr_gen_floor = (uint64_t)(++_skr_session) << 40;
 	_skr_vk.validation_enabled        = settings.enable_validation;
 	_skr_vk.current_renderpass_idx    = -1;
@@ -1827,7 +1827,7 @@ void skr_shutdown(void) {
 	if (_skr_vk.debug_messenger != VK_NULL_HANDLE) vkDestroyDebugUtilsMessengerEXT(_skr_vk.instance, _skr_vk.debug_messenger, NULL);
 	if (_skr_vk.instance        != VK_NULL_HANDLE) vkDestroyInstance              (_skr_vk.instance, NULL);
 
-	_skr_vk = (_skr_vk_t){0};
+	memset(&_skr_vk, 0, sizeof(_skr_vk)); // Not a compound literal, see _skr_atomic
 }
 
 VkInstance skr_get_vk_instance(void) {
