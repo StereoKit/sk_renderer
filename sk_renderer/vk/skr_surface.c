@@ -102,7 +102,7 @@ static void _skr_surface_timing_setup(skr_surface_t* ref_surface, bool timing, u
 	                                               | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT | VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT);
 	// A surface with no queryable stage has nothing to report; the acquire tiers do better
 	ref_surface->timing                  = timing && ref_surface->timing_stages != 0 && vkSetSwapchainPresentTimingQueueSizeEXT != NULL;
-	ref_surface->timing_domain           = 0;
+	ref_surface->timing_domain           = VK_TIME_DOMAIN_DEVICE_KHR;
 	ref_surface->timing_domain_id        = 0;
 	ref_surface->timing_frames           = 0;
 	memset(ref_surface->timing_stage_offset_ns, 0, sizeof(ref_surface->timing_stage_offset_ns));

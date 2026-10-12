@@ -994,7 +994,7 @@ bool skr_init(skr_settings_t settings) {
 	if (settings.instance_create_callback) {
 		skr_instance_create_info_t create_info = {
 			.instance_create_info   = &instance_info,
-			.get_instance_proc_addr = global_get_instance_proc_addr,
+			.get_instance_proc_addr = (void*)global_get_instance_proc_addr,
 		};
 		_skr_vk.instance = (VkInstance)settings.instance_create_callback(&create_info, settings.instance_create_user_data);
 		if (_skr_vk.instance == VK_NULL_HANDLE) {
@@ -1569,7 +1569,7 @@ bool skr_init(skr_settings_t settings) {
 		skr_device_create_info_t create_info = {
 			.vk_physical_device     = _skr_vk.physical_device,
 			.device_create_info     = &device_info,
-			.get_instance_proc_addr = global_get_instance_proc_addr,
+			.get_instance_proc_addr = (void*)global_get_instance_proc_addr,
 		};
 		_skr_vk.device = (VkDevice)settings.device_create_callback(&create_info, settings.device_create_user_data);
 		if (_skr_vk.device == VK_NULL_HANDLE)

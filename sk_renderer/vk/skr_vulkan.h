@@ -214,7 +214,7 @@ typedef struct skr_surface_t {
 	bool               timing;
 	uint32_t           timing_stages;       // VkPresentStageFlagsEXT this surface can query
 	uint64_t           timing_domain_id;
-	uint32_t           timing_domain;       // VkTimeDomainKHR behind timing_domain_id
+	VkTimeDomainKHR    timing_domain;       // Behind timing_domain_id
 	int64_t            timing_stage_offset_ns[4]; // host ns = stamp + offset, per present stage bit; stage-local domains give every stage its own clock
 	uint64_t           timing_seq_id;       // Next id for in-order results when no present ids are chained
 	uint32_t           timing_frames;       // Frames since the refresh duration was last read

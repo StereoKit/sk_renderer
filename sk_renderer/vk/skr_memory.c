@@ -98,6 +98,14 @@ static _skr_mem_block_t* _block(uint32_t idx) {
 	return &_mem.chunks[(idx - 1) >> _SKR_MEM_CHUNK_SHIFT][(idx - 1) & (_SKR_MEM_CHUNK - 1)];
 }
 
+// Field by field, since MSVC's C compiler can crash on designated initializers for bit-fields
+static _skr_mem_t _mem_make(uint32_t block, skr_mem_category_ category) {
+	_skr_mem_t result = {0};
+	result.block    = block;
+	result.category = category;
+	return result;
+}
+
 static uint32_t _block_new(void) {
 	mtx_lock(&_mem.table_mutex);
 	uint32_t idx = _mem.free_slot;
@@ -199,7 +207,7 @@ static bool _alloc_dedicated(uint32_t type, VkDeviceSize size, VkBuffer opt_buff
 		.size   = size,
 		.kind   = lazy ? _skr_mem_block_lazy : _skr_mem_block_dedicated,
 	};
-	*out_mem = (_skr_mem_t){ .block = idx, .category = category };
+	*out_mem = _mem_make(idx, category);
 
 	if (lazy) {
 		_skr_add_u64(&_mem.lazy, size);
@@ -250,7 +258,7 @@ static bool _alloc_pooled(uint32_t pool_idx, const VkMemoryRequirements* reqs, s
 	_skr_mem_pool_t* pool  = &_mem.pools[pool_idx];
 	uint32_t         size  = (uint32_t)reqs->size;
 	uint32_t         align = (uint32_t)reqs->alignment;
-	*out_mem = (_skr_mem_t){ .category = category };
+	*out_mem = _mem_make(0, category);
 
 	// About an eighth of the pool, so growth overshoots ~12.5% at most; cheap,
 	// since vkAllocateMemory costs by the byte rather than by the call
@@ -513,7 +521,7 @@ _skr_mem_t _skr_mem_import(VkDeviceMemory memory, VkDeviceSize size) {
 		.kind   = _skr_mem_block_external,
 	};
 	_skr_add_u64(&_mem.external, size);
-	return (_skr_mem_t){ .block = idx };
+	return _mem_make(idx, (skr_mem_category_)0);
 }
 
 void _skr_mem_free(_skr_mem_t mem) {

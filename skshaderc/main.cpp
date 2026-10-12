@@ -77,10 +77,10 @@ void                iterate_dir   (const char *directory_path, void *callback_da
 compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit); 
 void                show_usage    ();
 uint64_t            file_time     (const char *file);
-void                exe_path      (const char *argv0, char *out_path, size_t path_size);
+void                exe_path      (const char *argv0, char *out_path, size_t out_path_size);
 void                file_name     (const char *file, char *out_name, size_t name_size);
 void                file_name_ext (const char *file, char *out_name, size_t name_size);
-void                file_dir      (const char *file, char *out_path, size_t path_size);
+void                file_dir      (const char *file, char *out_path, size_t out_path_size);
 bool                file_exists   (const char *path);
 bool                path_is_file  (const char *path);
 bool                path_is_wild  (const char *path);
@@ -252,10 +252,10 @@ compiler_settings_t check_settings(int32_t argc, const char **argv, bool *exit) 
 			set_targets = true;
 			const char *targets = argv[i + 1];
 			size_t      len     = strlen(targets);
-			for (size_t i = 0; i < len; i++) {
-				if      (targets[i] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
-				else if (targets[i] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
-				else { printf("Unrecognized shader language target '%c'\n", targets[i]); *exit = true; }
+			for (size_t t = 0; t < len; t++) {
+				if      (targets[t] == 's') result.shaderc.target_langs[skr_shader_lang_spirv] = true;
+				else if (targets[t] == 'w') result.shaderc.target_langs[skr_shader_lang_wgsl]  = true;
+				else { printf("Unrecognized shader language target '%c'\n", targets[t]); *exit = true; }
 			}
 			i++;
 		}
@@ -448,7 +448,7 @@ void compile_file(const char *src_filename, compiler_settings_t *settings) {
 			
 			free(sks_data);
 			sks_data = sks_data_z;
-			sks_size = sks_size_z;
+			sks_size = (uint32_t)sks_size_z;
 		}
 
 		// Write to file
@@ -819,7 +819,7 @@ void make_cs_name(const char *name, char *out_cs_name) {
 		if (c == '.') continue;
 		if (c == '_') { upper = true; continue; }
 
-		*dst = upper ? toupper(c) : c;
+		*dst = upper ? (char)toupper((unsigned char)c) : c;
 		dst++;
 
 		upper = false;
@@ -964,23 +964,23 @@ uint64_t file_time(const char *file) {
 
 // argv[0] doesn't resolve when we're launched off PATH, and file_time's 0 then
 // silently disables the compiler half of the up-to-date check.
-void exe_path(const char *argv0, char *out_path, size_t path_size) {
+void exe_path(const char *argv0, char *out_path, size_t out_path_size) {
 #if defined(_WIN32)
-	DWORD len = GetModuleFileNameA(NULL, out_path, (DWORD)path_size);
-	if (len > 0 && len < path_size)
+	DWORD len = GetModuleFileNameA(NULL, out_path, (DWORD)out_path_size);
+	if (len > 0 && len < out_path_size)
 		return;
 #elif defined(__linux__)
-	ssize_t len = readlink("/proc/self/exe", out_path, path_size - 1);
+	ssize_t len = readlink("/proc/self/exe", out_path, out_path_size - 1);
 	if (len > 0) {
 		out_path[len] = '\0'; // readlink doesn't terminate
 		return;
 	}
 #elif defined(__APPLE__)
-	uint32_t size = (uint32_t)path_size;
+	uint32_t size = (uint32_t)out_path_size;
 	if (_NSGetExecutablePath(out_path, &size) == 0) // may contain symlinks or '..', stat follows both
 		return;
 #endif
-	snprintf(out_path, path_size, "%s", argv0);
+	snprintf(out_path, out_path_size, "%s", argv0);
 }
 
 ///////////////////////////////////////////
@@ -1024,7 +1024,7 @@ void file_name_ext(const char *file, char *out_name, size_t name_size) {
 
 ///////////////////////////////////////////
 
-void file_dir(const char *file, char *out_path, size_t path_size) {
+void file_dir(const char *file, char *out_path, size_t out_path_size) {
 	size_t      len   = strlen(file);
 	const char *end = file + len;
 
@@ -1033,15 +1033,13 @@ void file_dir(const char *file, char *out_path, size_t path_size) {
 	// No separator means a bare filename, its folder is the cwd. Without this
 	// the copy below emits the name's first character as a phantom folder.
 	if (end == file && *end != '\\' && *end != '/') {
-		snprintf(out_path, path_size, "./");
+		snprintf(out_path, out_path_size, "./");
 		return;
 	}
 
-	for (size_t i=0; file+i <= end && i<path_size; i++) {
-		out_path[i] = file[i];
-	}
 	size_t last = (end - file)+1;
-	if (last > path_size) last = path_size;
+	if (last > out_path_size - 1) last = out_path_size - 1; // Leave room for the terminator
+	memcpy(out_path, file, last);
 	out_path[last] = '\0';
 }
 

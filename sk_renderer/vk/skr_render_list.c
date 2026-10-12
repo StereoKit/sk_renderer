@@ -155,10 +155,11 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 	item->bind_count            = (uint8_t)material->bind_count;
 
 	// Pack flags (vertex_buffer_count in bits 2-3)
-	item->flags = (material->has_system_buffer       ? skr_item_flag_system_buffer : 0)
+	item->flags = (uint8_t)(
+	              (material->has_system_buffer       ? skr_item_flag_system_buffer : 0)
 	            | (mesh->ind_format_vk               ? skr_item_flag_index_32bit   : 0)
 	            | (material->instance_buffer_stride   ? skr_item_flag_instance_buffer  : 0)
-	            | (mesh->vertex_buffer_count << skr_item_flag_vb_count_shift);
+	            | (mesh->vertex_buffer_count << skr_item_flag_vb_count_shift));
 
 	// Validate instance_buffer_stride at add-time (removed from item)
 	if (material->instance_buffer_stride > 0 && single_instance_data_size != material->instance_buffer_stride) {
