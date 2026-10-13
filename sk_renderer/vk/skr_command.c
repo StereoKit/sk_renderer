@@ -746,6 +746,14 @@ skr_future_state_ skr_future_wait(const skr_future_t* future) {
 	if (!_skr_future_current(future)) { _skr_future_leave(); return skr_future_state_failed; }
 	_skr_cmd_ring_slot_t* slot = (_skr_cmd_ring_slot_t*)future->slot;
 
+	// Only this thread can submit its open scope, so that wait would never return
+	_skr_vk_thread_t* self = _skr_cmd_get_thread();
+	if (self && self->ref_count > 0 && slot == &self->cmd_ring[self->cur] && slot->generation == future->generation) {
+		skr_log(skr_log_critical, "skr_future_wait on this thread's open scope would deadlock, skr_cmd_flush it first");
+		_skr_future_leave();
+		return skr_future_state_failed;
+	}
+
 	// Registered under the mutex, so the owner either sees us before it
 	// retires the generation, or we see the retired generation
 	mtx_lock(_skr_vk.graphics_queue_mutex);

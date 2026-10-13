@@ -44,10 +44,6 @@ static void ImGui_ImplSkRenderer_DestroyTexture(ImTextureData* tex) {
 	skr_tex_t* skr_tex = (skr_tex_t*)tex->BackendUserData;
 	if (!skr_tex) return;
 
-	// Frames in flight may still reference it
-	skr_future_t pending = skr_future_get();
-	skr_future_wait(&pending);
-
 	skr_tex_destroy(skr_tex);
 	free(skr_tex);
 

@@ -31,6 +31,8 @@ static void _skr_slot_lock(void) {
 }
 static void _skr_slot_unlock(void) { _skr_mtx_unlock(&_slot_mutex); }
 
+static bool _skr_scope_owns(const skr_future_t* future);
+
 static void _skr_on_work_done(WGPUQueueWorkDoneStatus status, WGPUStringView message, void* userdata1, void* userdata2) {
 	(void)message;
 	// Web path: mark the slot completed (see _SKR_CB_MODE_ASYNC). Generation
@@ -161,6 +163,11 @@ skr_future_state_ skr_future_wait(const skr_future_t* future) {
 	if (future == NULL || future->slot == NULL) return skr_future_state_none;
 	if (!_skr_future_enter()) return skr_future_state_failed;
 	if (!_skr_future_current(future)) { _skr_future_leave(); return skr_future_state_failed; }
+	if (_skr_scope_owns(future)) {
+		skr_log(skr_log_critical, "skr_future_wait on this thread's open scope would deadlock, skr_cmd_flush it first");
+		_skr_future_leave();
+		return skr_future_state_failed;
+	}
 	skr_future_state_ state = _skr_future_block(future);
 	_skr_future_leave();
 	return state;
@@ -191,6 +198,11 @@ _skr_thread_static _skr_cmd_slot_t*   _scope_slot;        // pending until the o
 _skr_thread_static uint64_t           _scope_generation;
 _skr_thread_static skr_future_t       _last_future;       // what skr_future_get returns with nothing open
 _skr_thread_static uint64_t           _thread_submits;
+
+// Whether the future is the calling thread's open scope, which only it can submit
+static bool _skr_scope_owns(const skr_future_t* future) {
+	return _scope_depth > 0 && future->slot == _scope_slot && future->generation == _scope_generation;
+}
 
 WGPUCommandEncoder _skr_cmd_get(void) {
 	if (_thread_encoder == NULL)

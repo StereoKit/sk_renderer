@@ -770,7 +770,7 @@ SKR_API bool              skr_is_capable                   (skr_capability_ capa
 SKR_API skr_future_t      skr_future_get                   (void);  // A future for all of this thread's GPU work so far, an open scope included. Invalid before anything has been submitted
 SKR_API skr_future_t      skr_future_get_queue             (void);  // A future for everything submitted to the graphics queue so far, by any thread or outside submitter like an OpenXR runtime. Callable from any thread, each call costs an empty queue submit. Work still recording in an open scope isn't covered
 SKR_API skr_future_state_ skr_future_check                 (const skr_future_t* future);  // Where that work is at, without blocking. Anything but pending is done, and after skr_shutdown every valid future reads failed. Any thread may ask
-SKR_API skr_future_state_ skr_future_wait                  (const skr_future_t* future);  // Blocks until the GPU finished that work, and returns how it ended. Any thread may wait, even after the creating thread exited. Native only: the web can't block, poll skr_future_check from the frame loop instead
+SKR_API skr_future_state_ skr_future_wait                  (const skr_future_t* future);  // Blocks until the GPU finished that work, and returns how it ended. Any thread may wait, even after the creating thread exited. Waiting on the calling thread's own open scope fails, skr_cmd_flush first. Native only: the web can't block, poll skr_future_check from the frame loop instead
 
 SKR_API void              skr_cmd_begin                    (void);  // Opens a scope that batches this thread's GPU commands into one submission at skr_cmd_end. Keep it short: a scope held open while another thread destroys an object it uses is only protected on the frame thread
 SKR_API skr_future_t      skr_cmd_end                      (void);  // Closes the scope. Scopes nest; the outermost end submits, and every end returns a future for that submission
@@ -781,7 +781,7 @@ SKR_API void              skr_callback_log                 (void (*callback)(skr
 SKR_API void              skr_log                          (skr_log_ level, const char* text, ...);
 
 SKR_API skr_err_          skr_buffer_create                (const void *opt_data, uint32_t size_count, uint32_t size_stride, skr_buffer_type_ type, skr_use_ use, skr_buffer_t *out_buffer);
-SKR_API void              skr_buffer_destroy               (      skr_buffer_t* ref_buffer);
+SKR_API void              skr_buffer_destroy               (      skr_buffer_t* ref_buffer);  // Safe while queued or in-flight frames still use it, no wait needed. It frees once they finish
 SKR_API bool              skr_buffer_is_valid              (const skr_buffer_t*     buffer);
 SKR_API void              skr_buffer_set                   (      skr_buffer_t* ref_buffer, const void *data, uint32_t size_bytes);
 SKR_API void              skr_buffer_get                   (const skr_buffer_t*     buffer, void *ref_buffer, uint32_t buffer_size);
@@ -796,7 +796,7 @@ SKR_API void              skr_vert_type_destroy            (      skr_vert_type_
 
 SKR_API skr_err_          skr_mesh_create                  (const skr_vert_type_t* vert_type, skr_index_fmt_ ind_type, const void* opt_vert_data, uint32_t vert_count, const void* opt_ind_data, uint32_t ind_count, skr_mesh_t* out_mesh);
 SKR_API bool              skr_mesh_is_valid                (const skr_mesh_t*     mesh);
-SKR_API void              skr_mesh_destroy                 (      skr_mesh_t* ref_mesh);
+SKR_API void              skr_mesh_destroy                 (      skr_mesh_t* ref_mesh);  // Safe while queued or in-flight frames still use it, no wait needed. It frees once they finish
 SKR_API uint32_t          skr_mesh_get_vert_count          (const skr_mesh_t*     mesh);
 SKR_API uint32_t          skr_mesh_get_ind_count           (const skr_mesh_t*     mesh);
 SKR_API void              skr_mesh_set_name                (      skr_mesh_t* ref_mesh, const char* name);
@@ -830,7 +830,7 @@ SKR_API skr_err_          skr_tex_update_external          (      skr_tex_t* ref
 #endif
 
 SKR_API bool              skr_tex_is_valid                 (const skr_tex_t*     tex);
-SKR_API void              skr_tex_destroy                  (      skr_tex_t* ref_tex);
+SKR_API void              skr_tex_destroy                  (      skr_tex_t* ref_tex);  // Safe while queued or in-flight frames still use it, no wait needed. It frees once they finish
 SKR_API skr_err_          skr_tex_copy                     (const skr_tex_t*     src, skr_tex_t* dst, uint32_t src_mip, uint32_t src_layer, uint32_t dst_mip, uint32_t dst_layer, uint32_t layer_count);
 SKR_API skr_err_          skr_tex_readback                 (const skr_tex_t*     tex, uint32_t mip_level, uint32_t array_layer, skr_tex_readback_t* out_readback);
 SKR_API void              skr_tex_readback_destroy         (      skr_tex_readback_t* ref_readback);
