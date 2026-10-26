@@ -235,6 +235,7 @@ endif()
 target_include_directories(sk_renderer PUBLIC sk_renderer/include)
 target_sources(sk_renderer PRIVATE
 	sk_renderer/include/sk_renderer.h
+	sk_renderer/skr_globals.c
 	sk_renderer/skr_log.c
 	sk_renderer/skr_present.c
 	sk_renderer/sksc_file.c

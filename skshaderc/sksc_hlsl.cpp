@@ -165,10 +165,10 @@ compile_result_ sksc_hlsl_to_spirv(const char *filename, const char *hlsl, const
 	}
 
 	shader.setAutoMapBindings(true); // Necessary for shifts?
-	shader.setShiftBinding    (glslang::EResUbo,     0);   // b registers (CBVs)
-	shader.setShiftBinding    (glslang::EResTexture, 100); // t registers (textures)
-	shader.setShiftBinding    (glslang::EResSampler, 100); // s registers (samplers)
-	shader.setShiftBinding    (glslang::EResUav,     200); // u registers (UAVs)
+	shader.setShiftBinding    (glslang::EResUbo,     SKSC_SLOT_CONSTANT);
+	shader.setShiftBinding    (glslang::EResTexture, SKSC_SLOT_TEXTURE);
+	shader.setShiftBinding    (glslang::EResSampler, SKSC_SLOT_TEXTURE); // samplers merge with their texture
+	shader.setShiftBinding    (glslang::EResUav,     SKSC_SLOT_READWRITE);
 
 	shader.setStrings         (shader_strings, 1);
 

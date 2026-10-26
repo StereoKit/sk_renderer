@@ -1690,12 +1690,10 @@ bool skr_init(skr_settings_t settings) {
 		.sample  = skr_tex_sample_linear,
 		.address = skr_tex_address_clamp
 	};
-	uint32_t color = 0xFFFFFFFF;
-	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_white);
-	color = 0xFF808080;
-	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_gray);
-	color = 0xFF000000;
-	skr_tex_create( skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &color, .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex_black);
+	for (int32_t i = 0; i < _skr_default_count; i++)
+		skr_tex_create(skr_tex_fmt_rgba32, skr_tex_flags_readable, sampler, (skr_vec3i_t){1, 1, 1}, 1, 1, &(skr_tex_data_t){.data = &_skr_default_colors[i], .mip_count = 1, .layer_count = 1}, &_skr_vk.default_tex[i]);
+	_skr_default_tex_begin = (uintptr_t)&_skr_vk.default_tex[0];
+	_skr_default_tex_end   = (uintptr_t)&_skr_vk.default_tex[_skr_default_count];
 
 	// Populate capability array
 	_skr_vk.capabilities[skr_capability_external_vk ] = true;
@@ -1821,9 +1819,8 @@ void skr_shutdown(void) {
 	_skr_future_close();
 	_skr_device_wait_idle();
 
-	skr_tex_destroy(&_skr_vk.default_tex_white);
-	skr_tex_destroy(&_skr_vk.default_tex_gray);
-	skr_tex_destroy(&_skr_vk.default_tex_black);
+	for (int32_t i = 0; i < _skr_default_count; i++)
+		skr_tex_destroy(&_skr_vk.default_tex[i]);
 
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_2d);
 	skr_shader_destroy(&_skr_vk.builtin_mipgen_cube);
@@ -1865,6 +1862,7 @@ void skr_shutdown(void) {
 	if (_skr_vk.instance        != VK_NULL_HANDLE) vkDestroyInstance              (_skr_vk.instance, NULL);
 
 	memset(&_skr_vk, 0, sizeof(_skr_vk)); // Not a compound literal, see _skr_atomic
+	_skr_globals_reset();
 }
 
 VkInstance skr_get_vk_instance(void) {

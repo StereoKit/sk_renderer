@@ -168,7 +168,7 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info,
 	// The bind pool slice doubles as this dispatch's descriptor cache key
 	out_compute->bind_count = shader->meta.resource_count + shader->meta.buffer_count;
 	out_compute->bind_start = _skr_bind_pool_alloc(out_compute->bind_count);
-	_skr_binds_init(&shader->meta, _skr_bind_pool_get(out_compute->bind_start));
+	_skr_binds_init(&shader->meta, true, _skr_bind_pool_get(out_compute->bind_start));
 
 	// Initialize parameter buffer if shader has $Global cbuffer
 	const sksc_shader_meta_t* meta = &shader->meta;
@@ -436,10 +436,12 @@ static bool _skr_compute_record(const skr_compute_t* compute, const skr_material
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute->pipeline);
 
+	_skr_globals_snap_t globals = _skr_globals_snap();
 	for (uint32_t i = 0; i < bind_count; i++) {
 		const skr_material_bind_t *res = &binds[i];
-		if      (res->bind.register_type == skr_register_readwrite_tex && res->texture) {_skr_tex_transition_for_storage    (cmd, res->texture); }
-		else if (res->bind.register_type == skr_register_texture       && res->texture) {_skr_tex_transition_for_shader_read(cmd, res->texture, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); }
+		skr_tex_t*                 tex = (skr_tex_t*)_skr_bind_tex(globals, res);
+		if      (res->bind.register_type == skr_register_readwrite_tex && tex) {_skr_tex_transition_for_storage    (cmd, tex); }
+		else if (res->bind.register_type == skr_register_texture       && tex) {_skr_tex_transition_for_shader_read(cmd, tex, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); }
 	}
 
 	if (opt_indirect) {
@@ -504,7 +506,7 @@ void skr_compute_dispatch(const skr_compute_t* compute, const skr_compute_bind_t
 		skr_log(skr_log_critical, "skr_compute_dispatch: shader '%s' has %u binds, above the %u it supports", meta->name, slot_count, (uint32_t)(sizeof(slots) / sizeof(slots[0])));
 		return;
 	}
-	_skr_binds_init(meta, slots);
+	_skr_binds_init(meta, false, slots); // stateless, so globals don't apply
 	for (uint32_t b = 0; b < bind_count; b++) {
 		for (uint32_t i = 0; i < slot_count; i++) {
 			if (slots[i].bind.slot != binds[b].bind.slot || slots[i].bind.register_type != binds[b].bind.register_type) continue;

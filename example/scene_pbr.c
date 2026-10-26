@@ -200,7 +200,7 @@ static void _load_skybox(scene_pbr_t* scene, const char* path) {
 		.queue_offset = 100,
 	}, &scene->skybox_material);
 	// Honor the compressed-view toggle across skybox reloads — render() swaps
-	// the global t5 from the same state, and the two must agree.
+	// the environment_map global from the same state, and the two must agree.
 	skr_material_set_tex(&scene->skybox_material, "cubemap",
 		(scene->show_compressed && skr_tex_is_valid(&scene->cubemap_compressed))
 			? &scene->cubemap_compressed : &scene->cubemap_texture);
@@ -280,6 +280,8 @@ static scene_t* _scene_pbr_create(void) {
 static void _scene_pbr_destroy(scene_t* base) {
 	scene_pbr_t* scene = (scene_pbr_t*)base;
 
+	skr_renderer_set_global_tex("environment_map", NULL); // outlives the scene
+
 	for (int32_t i = 0; i < PBR_GRID_SIZE * PBR_GRID_SIZE; i++) {
 		skr_material_destroy(&scene->materials[i]);
 	}
@@ -308,7 +310,7 @@ static void _scene_pbr_render(scene_t* base, int32_t width, int32_t height, skr_
 			? &scene->cubemap_compressed : &scene->cubemap_texture;
 		ref_system_buffer->cubemap_info = (float4){(float)env->size.x, (float)env->size.y, (float)env->mip_levels, 0.0f};
 		ref_system_buffer->time         = scene->time;
-		skr_renderer_set_global_texture(5, env);
+		skr_renderer_set_global_tex("environment_map", env);
 	}
 
 	if (scene->cubemap_ready) {
@@ -435,7 +437,7 @@ static void _scene_pbr_render_ui(scene_t* base) {
 	if (skr_tex_is_valid(&scene->cubemap_compressed)) {
 		if (igCheckbox("Compressed environment", &scene->show_compressed)) {
 			// Skybox samples via its own material; PBR materials pick up the
-			// swap through the per-frame global t5 binding in render().
+			// swap through the per-frame environment_map global in render().
 			skr_material_set_tex(&scene->skybox_material, "cubemap",
 				scene->show_compressed ? &scene->cubemap_compressed : &scene->cubemap_texture);
 		}

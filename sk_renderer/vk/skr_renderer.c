@@ -31,9 +31,6 @@
 // Query pool has 2 queries per frame (start/end timestamps)
 #define SKR_QUERIES_PER_FRAME 2
 
-// Maximum global buffer/texture binding slots
-#define SKR_MAX_GLOBAL_BINDINGS 16
-
 ///////////////////////////////////////////////////////////////////////////////
 // Helpers
 ///////////////////////////////////////////////////////////////////////////////
@@ -543,33 +540,31 @@ void skr_renderer_end_pass(void) {
 	_skr_pipeline_unlock();
 }
 
+// Runs on every set, changed or not: the texture may have been a render
+// target since. Flushed before the next render pass begins.
+static void _skr_global_tex_transition(const skr_tex_t* opt_tex) {
+	if (!opt_tex) return;
+	uint8_t type = (opt_tex->flags & skr_tex_flags_compute) ? 1 : 0;  // storage : shader_read
+	if (_skr_tex_needs_transition(opt_tex, type))
+		_skr_tex_transition_enqueue((skr_tex_t*)opt_tex, type);
+}
+
+void skr_renderer_set_global_tex(const char* name, const skr_tex_t* opt_tex) {
+	_skr_global_set_tex(name, opt_tex);
+	_skr_global_tex_transition(opt_tex);
+}
+
+void skr_renderer_set_global_buffer(const char* name, const skr_buffer_t* opt_buffer) {
+	_skr_global_set_buffer(name, opt_buffer);
+}
+
 void skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer) {
-	if (bind < 0 || bind >= SKR_MAX_GLOBAL_BINDINGS) {
-		if (bind >= SKR_MAX_GLOBAL_BINDINGS) {
-			skr_log(skr_log_critical, "Global buffer binding %d exceeds maximum of %d slots", bind, SKR_MAX_GLOBAL_BINDINGS);
-		}
-		return;
-	}
-	_skr_vk.global_buffers[bind] = (skr_buffer_t*)buffer;
+	_skr_global_set_num_buffer(bind, buffer);
 }
 
 void skr_renderer_set_global_texture(int32_t bind, const skr_tex_t* tex) {
-	if (bind < 0 || bind >= SKR_MAX_GLOBAL_BINDINGS) {
-		if (bind >= SKR_MAX_GLOBAL_BINDINGS) {
-			skr_log(skr_log_critical, "Global texture binding %d exceeds maximum of %d slots", bind, SKR_MAX_GLOBAL_BINDINGS);
-		}
-		return;
-	}
-	_skr_vk.global_textures[bind] = (skr_tex_t*)tex;
-
-	// Queue transition for this global texture (only if needed)
-	// It will be flushed before the next render pass begins
-	if (tex) {
-		uint8_t type = (tex->flags & skr_tex_flags_compute) ? 1 : 0;  // storage : shader_read
-		if (_skr_tex_needs_transition(tex, type)) {
-			_skr_tex_transition_enqueue((skr_tex_t*)tex, type);
-		}
-	}
+	_skr_global_set_num_tex(bind, tex);
+	_skr_global_tex_transition(tex);
 }
 
 void skr_renderer_set_viewport(skr_rect_t viewport) {
@@ -650,12 +645,12 @@ void skr_renderer_blit(skr_material_t* material, skr_tex_t* to, skr_recti_t boun
 	if (material->param_buffer_size > 0) {
 		skr_bump_result_t param_bump = _skr_bump_ring_write(ctx.const_ring, material->param_buffer, material->param_buffer_size);
 		if (param_bump.buffer)
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.uid, param_bump.offset, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.uid, param_bump.offset, material->param_buffer_size);
 	}
 
 	// Material texture and buffer binds
 	const sksc_shader_meta_t* meta = &material->key.shader->meta;
-	const int32_t ignore_slots[] = { SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot };
+	const int32_t ignore_slots[] = { SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot };
 
 	skr_material_bind_t* mat_binds = _skr_bind_pool_get(material->bind_start);
 
@@ -824,16 +819,16 @@ static bool _skr_list_bind_descriptors(const _skr_cmd_ctx_t* ctx, const skr_rend
 	_skr_desc_writes_begin(&desc, item->pipeline_material_idx);
 
 	if (item->param_buffer_size > 0 && material_bump.buffer)
-		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.uid, material_bump.offset + item->param_data_offset, item->param_buffer_size);
+		_skr_write_buffer(&desc, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.uid, material_bump.offset + item->param_data_offset, item->param_buffer_size);
 	if ((item->flags & skr_item_flag_system_buffer) && system_bump.buffer)
-		_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,   false, system_bump.buffer,   system_bump.uid, system_bump.offset,   system_data_size);
+		_skr_write_buffer(&desc, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.system_slot,   false, system_bump.buffer,   system_bump.uid, system_bump.offset,   system_data_size);
 	if ((item->flags & skr_item_flag_instance_buffer) && instance_bump.buffer)
-		_skr_write_buffer(&desc, SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot, true,  instance_bump.buffer, instance_bump.uid, instance_bump.offset, instance_range);
+		_skr_write_buffer(&desc, SKSC_SLOT_TEXTURE  + _skr_vk.bind_settings.instance_slot, true,  instance_bump.buffer, instance_bump.uid, instance_bump.offset, instance_range);
 
 	const int32_t ignore_slots[] = {
-		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
-		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
-		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
+		SKSC_SLOT_TEXTURE  + _skr_vk.bind_settings.instance_slot,
+		SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot,
+		SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.system_slot };
 
 	const skr_material_bind_t* binds = _skr_bind_pool_get(item->bind_start);
 	int32_t fail_idx = _skr_material_add_writes(binds, item->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);
@@ -843,13 +838,13 @@ static bool _skr_list_bind_descriptors(const _skr_cmd_ctx_t* ctx, const skr_rend
 		char          reg_char;
 		int32_t       reg_num;
 		switch (type) {
-		case skr_register_constant:         reg_char = 'b'; reg_num = slot - SKR_BIND_SHIFT_BUFFER;           break;
+		case skr_register_constant:         reg_char = 'b'; reg_num = slot - SKSC_SLOT_CONSTANT;  break;
 		case skr_register_texture:
-		case skr_register_read_buffer:      reg_char = 't'; reg_num = slot - SKR_BIND_SHIFT_TEXTURE;          break;
+		case skr_register_read_buffer:      reg_char = 't'; reg_num = slot - SKSC_SLOT_TEXTURE;   break;
 		case skr_register_readwrite:
-		case skr_register_readwrite_tex:    reg_char = 'u'; reg_num = slot - SKR_BIND_SHIFT_UAV;              break;
-		case skr_register_input_attachment: reg_char = 'i'; reg_num = slot - SKR_BIND_SHIFT_INPUT_ATTACHMENT; break;
-		default:                            reg_char = '?'; reg_num = slot;                                   break;
+		case skr_register_readwrite_tex:    reg_char = 'u'; reg_num = slot - SKSC_SLOT_READWRITE; break;
+		case skr_register_input_attachment: reg_char = 'i'; reg_num = slot - SKSC_SLOT_INPUT_ATT; break;
+		default:                            reg_char = '?'; reg_num = slot;                       break;
 		}
 		skr_log(skr_log_critical, "Draw call missing binding for register(%c%d)", reg_char, reg_num);
 		return false;
@@ -1017,14 +1012,14 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 	if (material->param_buffer_size > 0) {
 		skr_bump_result_t material_bump = _skr_bump_ring_write(ctx.const_ring, material->param_buffer, material->param_buffer_size);
 		if (material_bump.buffer)
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.uid, material_bump.offset, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot, false, material_bump.buffer, material_bump.uid, material_bump.offset, material->param_buffer_size);
 	}
 
 	// No system buffer or instance buffer for immediate draws
 	const int32_t ignore_slots[] = {
-		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot,
-		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
-		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot };
+		SKSC_SLOT_TEXTURE  + _skr_vk.bind_settings.instance_slot,
+		SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot,
+		SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.system_slot };
 
 	// Add material texture and buffer bindings
 	const sksc_shader_meta_t* meta = &material->key.shader->meta;
@@ -1133,7 +1128,7 @@ static int32_t _skr_build_material_descriptors(_skr_cmd_ctx_t* ctx, skr_material
 	if (mat->param_buffer_size > 0) {
 		skr_bump_result_t param_bump = _skr_bump_ring_write(ctx->const_ring, mat->param_buffer, mat->param_buffer_size);
 		if (param_bump.buffer)
-			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.uid, param_bump.offset, mat->param_buffer_size);
+			_skr_write_buffer(out_writes, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot, false, param_bump.buffer, param_bump.uid, param_bump.offset, mat->param_buffer_size);
 	}
 
 	// System data buffer, the same per-pass data the geometry draws get, so
@@ -1141,16 +1136,16 @@ static int32_t _skr_build_material_descriptors(_skr_cmd_ctx_t* ctx, skr_material
 	if (mat->has_system_buffer && system_data && system_data_size > 0) {
 		skr_bump_result_t system_bump = _skr_bump_ring_write(ctx->const_ring, system_data, system_data_size);
 		if (system_bump.buffer)
-			_skr_write_buffer(out_writes, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot, false, system_bump.buffer, system_bump.uid, system_bump.offset, system_data_size);
+			_skr_write_buffer(out_writes, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.system_slot, false, system_bump.buffer, system_bump.uid, system_bump.offset, system_data_size);
 	}
 
 	// Material texture/buffer/input attachment binds. The instance buffer is
 	// ignored like the draw path does — shader includes may declare it even
 	// though a fullscreen subpass never reads instances.
 	const int32_t ignore_slots[] = {
-		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.material_slot,
-		SKR_BIND_SHIFT_BUFFER  + _skr_vk.bind_settings.system_slot,
-		SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot };
+		SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot,
+		SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.system_slot,
+		SKSC_SLOT_TEXTURE  + _skr_vk.bind_settings.instance_slot };
 
 	return _skr_material_add_writes(_skr_bind_pool_get(mat->bind_start), mat->bind_count,
 		(skr_stage_)(skr_stage_vertex | skr_stage_pixel),

@@ -157,6 +157,10 @@ static scene_t* _scene_shadows_create(void) {
 static void _scene_shadows_destroy(scene_t* base) {
 	scene_shadows_t* scene = (scene_shadows_t*)base;
 
+	// Numeric globals outrank named ones, so a stale one would shadow the next scene's
+	skr_renderer_set_global_constants(13, NULL);
+	skr_renderer_set_global_texture  (14, NULL);
+
 	skr_render_list_destroy(&scene->render_list);
 	skr_render_list_destroy(&scene->shadow_list);
 	skr_mesh_destroy(&scene->cube_mesh);

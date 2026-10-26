@@ -338,9 +338,9 @@ static const VkSampler* _skr_find_immutable_sampler(int32_t slot, const VkSample
 uint32_t _skr_shader_dyn_bindings(const sksc_shader_meta_t* meta, skr_stage_ stage_mask, bool has_push_descriptors, uint32_t out_bindings[3]) {
 	if (has_push_descriptors) return 0; // push descriptor sets can't hold dynamic descriptors
 
-	uint32_t material = SKR_BIND_SHIFT_BUFFER  + (uint32_t)_skr_vk.bind_settings.material_slot;
-	uint32_t system   = SKR_BIND_SHIFT_BUFFER  + (uint32_t)_skr_vk.bind_settings.system_slot;
-	uint32_t instance = SKR_BIND_SHIFT_TEXTURE + (uint32_t)_skr_vk.bind_settings.instance_slot;
+	uint32_t material = SKSC_SLOT_CONSTANT + (uint32_t)_skr_vk.bind_settings.material_slot;
+	uint32_t system   = SKSC_SLOT_CONSTANT + (uint32_t)_skr_vk.bind_settings.system_slot;
+	uint32_t instance = SKSC_SLOT_TEXTURE  + (uint32_t)_skr_vk.bind_settings.instance_slot;
 	uint32_t count    = 0;
 	for (uint32_t i = 0; i < meta->buffer_count && count < 3; i++) {
 		skr_bind_t bind = meta->buffers[i].bind;

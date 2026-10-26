@@ -86,6 +86,7 @@ typedef struct skr_tex_t {
 	                                         // filtering samplers, so both variants exist and draws
 	                                         // bind whichever the shader's usage expects.
 	skr_tex_sampler_t      sampler_settings; // Sampler settings
+	uint64_t               bind_uid;         // Identity of the views and samplers bind groups capture, renewed when any change
 	skr_vec3i_t            size;
 	// Authored dimensions, pre-padding. WebGPU (following D3D12) requires
 	// block-aligned compressed textures, so `size` rounds up to the block
@@ -140,9 +141,17 @@ typedef struct  {
 		skr_tex_t*    texture;
 		skr_buffer_t* buffer;
 	};
+	uint64_t   global_hash; // Name hash globals match, 0 = never reads globals
 	skr_bind_t bind;
-	bool       array_view; // The shader declares a 2D array here, see _skr_tex_array_view
+	bool       array_view;  // The shader declares a 2D array here, see _skr_tex_array_view
+	uint8_t    global_bit;  // _skr_global_bit of global_hash, precomputed for the draw-time filter
 } skr_material_bind_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(skr_material_bind_t) == 24, "skr_material_bind_t grew; the bind pool scales with it");
+#else
+_Static_assert(sizeof(skr_material_bind_t) == 24, "skr_material_bind_t grew; the bind pool scales with it");
+#endif
 
 // Internal key struct for pipeline-affecting material parameters only.
 // Excludes queue_offset which affects render list sorting but not pipeline

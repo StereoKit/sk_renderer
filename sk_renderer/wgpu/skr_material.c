@@ -58,8 +58,8 @@ skr_material_bind_t* _skr_bind_pool_get(int32_t start) {
 // Bind group cache — one cached WGPUBindGroup per bind-pool slice (i.e. per
 // material instance), keyed on the slice's start index. Dynamic offsets keep
 // the group valid across frames; it's rebuilt when the material's own binds
-// change (set_tex/set_buffer set epoch 0) or the global bind epoch moves
-// (globals/sampler/bump-buffer changes — see _skr_bind_epoch). Storage
+// change (set_tex/set_buffer set epoch 0), anything it resolves changes
+// identity (see _skr_bind_key), or the bump-buffer epoch moves. Storage
 // mirrors the pool's chunking: only the draw thread creates entries, worker
 // threads at most zero an epoch, and the release-published chunk pointers
 // keep both sides safe without locks.
@@ -203,11 +203,12 @@ void _skr_bind_pool_drain(void) {
 // 3 = 3D]. Multisampled/1D/cube-array resources get no default (NULL). All
 // twelve are tiny, so they're created eagerly at init — no lazy-init locking
 // even though materials can be created from worker threads.
-static skr_tex_t _defaults[3][4];
+static skr_tex_t _defaults[_skr_default_count][4];
 
 static void _skr_defaults_create(void) {
-	const uint32_t colors[3] = { 0xFFFFFFFF, 0xFF000000, 0xFF808080 };
-	for (int32_t c = 0; c < 3; c++)
+	_skr_default_tex_begin = (uintptr_t)&_defaults[0][0];
+	_skr_default_tex_end   = (uintptr_t)&_defaults[_skr_default_count][0];
+	for (int32_t c = 0; c < _skr_default_count; c++)
 	for (int32_t f = 0; f < 4; f++) {
 		if (_defaults[c][f].texture != NULL) continue;
 		skr_tex_flags_ flags  = f == 1 ? skr_tex_flags_array
@@ -217,7 +218,7 @@ static void _skr_defaults_create(void) {
 		uint32_t       layers = f == 2 ? 6 : f == 1 ? 2 : 1;
 
 		uint32_t pixels[2 * 2 * 6];
-		for (uint32_t i = 0; i < 2 * 2 * (f == 3 ? 2 : layers); i++) pixels[i] = colors[c];
+		for (uint32_t i = 0; i < 2 * 2 * (f == 3 ? 2 : layers); i++) pixels[i] = _skr_default_colors[c];
 		skr_tex_data_t data = { .data = pixels, .mip_count = 1, .layer_count = layers };
 		skr_tex_sampler_t sampler = {0};
 		skr_tex_create(skr_tex_fmt_rgba32, flags, sampler, size, 1, 1, &data, &_defaults[c][f]);
@@ -228,11 +229,6 @@ static skr_tex_t* _skr_default_tex(const char* value, uint8_t shape) {
 	if (shape & SKSC_SHAPE_MS)         return NULL; // no meaningful multisampled default
 	if (shape & SKSC_SHAPE_COMPARISON) return NULL; // depth-comparison bindings need a real depth texture
 
-	int32_t color_idx = 0;
-	if      (strcmp(value, "black") == 0) color_idx = 1;
-	else if (strcmp(value, "gray" ) == 0 ||
-	         strcmp(value, "grey" ) == 0) color_idx = 2;
-
 	uint32_t dim     = shape & SKSC_SHAPE_DIM_MASK;
 	bool     arrayed = (shape & SKSC_SHAPE_ARRAYED) != 0;
 	int32_t  family  = 0;
@@ -242,15 +238,16 @@ static skr_tex_t* _skr_default_tex(const char* value, uint8_t shape) {
 	else if (dim == SKSC_SHAPE_DIM_1D)              return NULL;
 	else if (arrayed)                               family = 1;
 
-	skr_tex_t* tex = &_defaults[color_idx][family];
+	skr_tex_t* tex = &_defaults[_skr_default_for(value)][family];
 	return tex->texture ? tex : NULL;
 }
 
-void _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds) {
+void _skr_binds_init(const sksc_shader_meta_t* meta, bool globals, skr_material_bind_t* out_binds) {
 	for (uint32_t i = 0; i < meta->buffer_count; i++)
 		out_binds[i] = (skr_material_bind_t){ .bind = meta->buffers[i].bind };
 	for (uint32_t i = 0; i < meta->resource_count; i++)
 		out_binds[meta->buffer_count + i] = (skr_material_bind_t){ .bind = meta->resources[i].bind, .array_view = _skr_resource_is_2d_array(&meta->resources[i]) };
+	if (globals) _skr_binds_init_globals(meta, out_binds);
 }
 
 WGPUTextureView _skr_default_white_array_view(void) {
@@ -306,7 +303,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		*out_material = (skr_material_t){ .pipeline_material_idx = -1, .bind_start = -1 };
 		return skr_err_out_of_memory;
 	}
-	_skr_binds_init(meta, binds);
+	_skr_binds_init(meta, true, binds);
 
 	uint32_t instance_slot = _skr_bump_slots(meta, (uint8_t)(skr_stage_vertex | skr_stage_pixel)).instance;
 	out_material->instance_buffer_stride = 0;
@@ -325,9 +322,8 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 
 	// Default textures for every sampled resource
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
-		if (meta->resources[i].bind.register_type != skr_register_texture) continue;
-		skr_tex_t* def = _skr_default_tex(meta->resources[i].value, meta->resources[i].shape);
-		if (def) skr_material_set_tex(out_material, meta->resources[i].name, def);
+		if (meta->resources[i].bind.register_type == skr_register_texture)
+			skr_material_set_tex(out_material, meta->resources[i].name, NULL);
 	}
 
 	return skr_err_success;
@@ -379,8 +375,18 @@ void skr_material_destroy(skr_material_t* ref_material) {
 
 void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_tex_t* texture) {
 	if (ref_material == NULL || name == NULL || ref_material->key.shader == NULL) return;
-	skr_bind_t bind = sksc_shader_meta_get_bind(&ref_material->key.shader->meta, name);
+	const sksc_shader_meta_t* meta = &ref_material->key.shader->meta;
+	skr_bind_t                bind = sksc_shader_meta_get_bind(meta, name);
 	if (bind.stage_bits == 0) return;
+
+	// NULL restores the shader's default, which a named global may replace
+	if (texture == NULL && bind.register_type == skr_register_texture) {
+		for (uint32_t r = 0; r < meta->resource_count; r++) {
+			if (meta->resources[r].bind.slot != bind.slot || meta->resources[r].bind.register_type != bind.register_type) continue;
+			texture = _skr_default_tex(meta->resources[r].value, meta->resources[r].shape);
+			break;
+		}
+	}
 
 	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
 	for (uint32_t i = 0; i < ref_material->bind_count; i++) {
@@ -462,7 +468,7 @@ bool skr_material_get_tex_info(const skr_material_t* material, const char* tex_n
 // Full teardown so skr_shutdown -> skr_init cycles start clean: default
 // textures released, bind pool storage freed, locks destroyed for re-init
 void _skr_material_sys_shutdown(void) {
-	for (int32_t c = 0; c < 3; c++)
+	for (int32_t c = 0; c < _skr_default_count; c++)
 	for (int32_t f = 0; f < 4; f++)
 		if (_defaults[c][f].texture) skr_tex_destroy(&_defaults[c][f]);
 	memset(_defaults, 0, sizeof(_defaults));

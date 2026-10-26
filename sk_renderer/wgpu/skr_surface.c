@@ -186,6 +186,7 @@ skr_acquire_ skr_surface_next_tex(skr_surface_t* ref_surface, skr_vec2i_t size, 
 	tex->samples     = 1;
 	tex->mip_levels  = 1;
 	tex->layer_count = 1;
+	tex->bind_uid    = _skr_uid_new();
 	tex->is_external = true; // released here, not by skr_tex_destroy
 
 	if (out_tex) *out_tex = tex;

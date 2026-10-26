@@ -56,7 +56,7 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info,
 
 	out_compute->bind_count = meta->resource_count + meta->buffer_count;
 	out_compute->binds      = (skr_material_bind_t*)_skr_calloc(out_compute->bind_count > 0 ? out_compute->bind_count : 1, sizeof(skr_material_bind_t));
-	_skr_binds_init(meta, out_compute->binds);
+	_skr_binds_init(meta, true, out_compute->binds);
 
 	if (meta->global_buffer_id >= 0) {
 		sksc_shader_buffer_t* global_buffer = &meta->buffers[meta->global_buffer_id];
@@ -143,7 +143,7 @@ void skr_compute_dispatch(const skr_compute_t* compute, const skr_compute_bind_t
 		skr_log(skr_log_critical, "skr_compute_dispatch: shader '%s' has %u binds, above the %u it supports", meta->name, compute->bind_count, (uint32_t)(sizeof(slots) / sizeof(slots[0])));
 		return;
 	}
-	_skr_binds_init(meta, slots);
+	_skr_binds_init(meta, false, slots); // stateless, so globals don't apply
 	for (uint32_t b = 0; b < bind_count; b++) {
 		for (uint32_t i = 0; i < compute->bind_count; i++) {
 			if (slots[i].bind.slot != binds[b].bind.slot || slots[i].bind.register_type != binds[b].bind.register_type) continue;

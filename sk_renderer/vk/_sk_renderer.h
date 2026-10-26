@@ -77,12 +77,6 @@ _Static_assert(sizeof(skr_pipeline_renderpass_key_t) == 56, "renderpass key must
 #define skr_MARKER_CHUNK_MAX    64  // Chunk table size, far past any real backlog
 #define skr_MAX_THREAD_POOLS    16  // Maximum concurrent threads
 
-// Bind shifts (hardcoded to match skshaderc)
-#define SKR_BIND_SHIFT_BUFFER  0
-#define SKR_BIND_SHIFT_TEXTURE 100
-#define SKR_BIND_SHIFT_UAV              200
-#define SKR_BIND_SHIFT_INPUT_ATTACHMENT 300
-
 // PostFX multi-subpass limits
 #define SKR_POSTFX_MAX_ATTACHMENTS 8
 #define SKR_POSTFX_MAX_SUBPASSES   (SKR_PASS_MAX_POSTFX + 2)  // geometry + resolve + postfx
@@ -384,10 +378,6 @@ typedef struct {
 	skr_tex_t*               current_depth_texture;    // Track depth texture for layout transitions
 	skr_tex_t*               current_resolve_texture;  // Track resolve target for layout transitions
 
-	// Global bindings (merged with material bindings at draw time)
-	skr_buffer_t*            global_buffers[16];
-	skr_tex_t*               global_textures[16];
-
 	// Deferred compute→graphics barrier (flushed before next render pass)
 	_skr_atomic(uint32_t)    pending_compute_barrier; // set from any recording thread
 
@@ -408,9 +398,7 @@ typedef struct {
 	_skr_atomic(uint64_t)    next_uid;        // see _skr_uid_new
 
 	// Default assets
-	skr_tex_t                default_tex_white;
-	skr_tex_t                default_tex_black;
-	skr_tex_t                default_tex_gray;
+	skr_tex_t                default_tex[_skr_default_count]; // by _skr_default_
 
 	// Built-in mipgen fallbacks. Used by skr_tex_generate_mips when no shader
 	// is passed and the texture format doesn't support blit.
@@ -443,7 +431,7 @@ uint64_t              _skr_time_get_ns                      (void);
 uint64_t              _skr_time_from_host_domain            (uint64_t stamp);  // A raw host_time_domain stamp onto the _skr_time_get_ns scale
 void                  _skr_frame_note_present               (const skr_surface_t* surface, uint64_t id);  // Joins a present to the frame that just ended, when it was that frame's surface
 
-void                  _skr_binds_init                       (const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds); // meta's buffers then resources, nothing bound
+void                  _skr_binds_init                       (const sksc_shader_meta_t* meta, bool globals, skr_material_bind_t* out_binds); // meta's buffers then resources, nothing bound
 
 // Material descriptor caching. Returns -1 on success, or the failing bind index if a resource is missing.
 int32_t               _skr_material_add_writes              (const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, _skr_desc_writes_t* ref_writes);

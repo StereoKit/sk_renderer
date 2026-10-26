@@ -217,7 +217,7 @@ typedef struct _skr_draw_buffers_t {
 typedef struct _skr_bump_slots_t {
 	uint32_t params;   // material params, or a compute shader's $Global
 	uint32_t system;
-	uint32_t instance; // t register, so it carries SKSC_SLOT_TEXTURE
+	uint32_t instance;
 } _skr_bump_slots_t;
 _skr_bump_slots_t _skr_bump_slots(const sksc_shader_meta_t* meta, uint8_t stage_mask);
 
@@ -230,8 +230,7 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t
 uint32_t _skr_dynamic_offsets(const sksc_shader_meta_t* meta, uint8_t stage_mask, const _skr_draw_buffers_t* db, uint32_t out_offsets[3]);
 
 // Bind epoch: cached bind groups are valid only while this holds still
-// (skr_renderer.c). Bumped on global-bind changes, bump-buffer reallocation,
-// and sampler swaps on live textures.
+// (skr_renderer.c). Bumped when a bump buffer reallocates or its window grows.
 uint64_t _skr_bind_epoch     (void);
 void     _skr_bind_epoch_bump(void);
 
@@ -240,7 +239,7 @@ void     _skr_bind_epoch_bump(void);
 typedef struct _skr_bind_cache_t {
 	WGPUBindGroup group;
 	uint64_t      epoch;   // matches _skr_bind_epoch() when valid; 0 = dirty
-	uint64_t      buffers; // identities of the buffers the group binds
+	uint64_t      key;     // identities of everything the group binds, see _skr_bind_key
 } _skr_bind_cache_t;
 _skr_bind_cache_t* _skr_bind_cache_slot      (int32_t start); // draw thread; creates storage on demand
 void               _skr_bind_cache_invalidate(int32_t start); // any thread; marks stale
@@ -260,4 +259,4 @@ void     _skr_frame_forget_surface(const skr_surface_t* surface);
 WGPUTextureView _skr_tex_layer_view(skr_tex_t* tex, uint32_t layer);
 WGPUTextureView _skr_tex_array_view(const skr_tex_t* tex);
 WGPUTextureView _skr_default_white_array_view(void);  // skr_material.c
-void            _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds);  // meta's buffers then resources, nothing bound
+void            _skr_binds_init(const sksc_shader_meta_t* meta, bool globals, skr_material_bind_t* out_binds);  // meta's buffers then resources, nothing bound

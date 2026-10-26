@@ -622,6 +622,13 @@ static scene_t* _scene_gi_create(void) {
 static void _scene_gi_destroy(scene_t* base) {
 	scene_gi_t* scene = (scene_gi_t*)base;
 
+	// Globals outlive the scene, so don't leave them pointing at its resources
+	const char* global_texs[] = { "environment_map", "gi_sh_r", "gi_sh_g", "gi_sh_b", "gi_voxel", "shadow_map" };
+	for (int32_t i = 0; i < (int32_t)(sizeof(global_texs) / sizeof(global_texs[0])); i++)
+		skr_renderer_set_global_tex(global_texs[i], NULL);
+	skr_renderer_set_global_buffer("GIBuffer",     NULL);
+	skr_renderer_set_global_buffer("ShadowBuffer", NULL);
+
 	// Model
 	su_gltf_destroy(scene->model);
 	free(scene->model_path);
@@ -885,16 +892,16 @@ static void _gi_run_fast_voxelize(
 		},
 	};
 	skr_buffer_set(&scene->gi_const_buffer, &gi_capture_data, sizeof(gi_buffer_data_t));
-	skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
+	skr_renderer_set_global_buffer("GIBuffer", &scene->gi_const_buffer);
 
 	// Bind SH textures globally (shader sees zeros since gi_intensity=0)
-	skr_renderer_set_global_texture(6, &scene->gi_sh_r);
-	skr_renderer_set_global_texture(7, &scene->gi_sh_g);
-	skr_renderer_set_global_texture(8, &scene->gi_sh_b);
+	skr_renderer_set_global_tex("gi_sh_r", &scene->gi_sh_r);
+	skr_renderer_set_global_tex("gi_sh_g", &scene->gi_sh_g);
+	skr_renderer_set_global_tex("gi_sh_b", &scene->gi_sh_b);
 
 	// Shadow data needs to be bound for the capture shader
-	skr_renderer_set_global_constants(13, &scene->shadow_buffer);
-	skr_renderer_set_global_texture  (14, &scene->shadow_map);
+	skr_renderer_set_global_buffer("ShadowBuffer", &scene->shadow_buffer);
+	skr_renderer_set_global_tex   ("shadow_map",   &scene->shadow_map);
 
 	// Two passes: center outward, then edges inward
 	bool passes[2] = { true, false };
@@ -969,7 +976,7 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			0.0f
 		};
 		ref_system_buffer->time = scene->time;
-		skr_renderer_set_global_texture(5, &scene->cubemap_texture);
+		skr_renderer_set_global_tex("environment_map", &scene->cubemap_texture);
 	}
 
 	// Compute model transform (needed by both GI captures and main pass)
@@ -1070,12 +1077,12 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 				},
 			};
 			skr_buffer_set(&scene->gi_const_buffer, &gi_capture_data, sizeof(gi_buffer_data_t));
-			skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
+			skr_renderer_set_global_buffer("GIBuffer", &scene->gi_const_buffer);
 
 			// Bind SH textures globally (shader sees zeros since gi_intensity=0)
-			skr_renderer_set_global_texture(6, &scene->gi_sh_r);
-			skr_renderer_set_global_texture(7, &scene->gi_sh_g);
-			skr_renderer_set_global_texture(8, &scene->gi_sh_b);
+			skr_renderer_set_global_tex("gi_sh_r", &scene->gi_sh_r);
+			skr_renderer_set_global_tex("gi_sh_g", &scene->gi_sh_g);
+			skr_renderer_set_global_tex("gi_sh_b", &scene->gi_sh_b);
 
 			// Capture +direction and -direction
 			float dir_signs[2] = { 1.0f, -1.0f };
@@ -1107,8 +1114,8 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 				}
 
 				// Shadow data needs to be bound for the PBR shader during capture
-				skr_renderer_set_global_constants(13, &scene->shadow_buffer);
-				skr_renderer_set_global_texture  (14, &scene->shadow_map);
+				skr_renderer_set_global_buffer("ShadowBuffer", &scene->shadow_buffer);
+				skr_renderer_set_global_tex   ("shadow_map",   &scene->shadow_map);
 
 				// Render scene into capture RT
 				if (scene->show_floor)
@@ -1187,16 +1194,16 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 			},
 		};
 		skr_buffer_set(&scene->gi_const_buffer, &gi_data, sizeof(gi_buffer_data_t));
-		skr_renderer_set_global_constants(12, &scene->gi_const_buffer);
-		skr_renderer_set_global_texture(6, &scene->gi_sh_r);
-		skr_renderer_set_global_texture(7, &scene->gi_sh_g);
-		skr_renderer_set_global_texture(8, &scene->gi_sh_b);
-		skr_renderer_set_global_texture(9,  &scene->gi_voxel[1 - scene->gi_voxel_write]); // voxel read buffer
+		skr_renderer_set_global_buffer("GIBuffer", &scene->gi_const_buffer);
+		skr_renderer_set_global_tex("gi_sh_r", &scene->gi_sh_r);
+		skr_renderer_set_global_tex("gi_sh_g", &scene->gi_sh_g);
+		skr_renderer_set_global_tex("gi_sh_b", &scene->gi_sh_b);
+		skr_renderer_set_global_tex("gi_voxel", &scene->gi_voxel[1 - scene->gi_voxel_write]); // voxel read buffer
 	}
 
-	// Bind cubemap globally for cubemap irradiance shader (t5)
+	// Bind cubemap globally for cubemap irradiance shader
 	if (scene->cubemap_ready) {
-		skr_renderer_set_global_texture(5, &scene->cubemap_texture);
+		skr_renderer_set_global_tex("environment_map", &scene->cubemap_texture);
 	}
 
 	// --- Shadow pass ---
@@ -1208,9 +1215,9 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	shadow_sys.viewproj  [0] = shadow_transform;
 
 	// --- Shadow pass (depth only, using cheap shadow_caster shader) ---
-	// Bind a dummy texture to slot 14 so the shadow map isn't simultaneously
+	// Bind a dummy texture to shadow_map so the shadow map isn't simultaneously
 	// bound as a texture while being used as the depth render target.
-	skr_renderer_set_global_texture(14, &scene->white_texture);
+	skr_renderer_set_global_tex("shadow_map", &scene->white_texture);
 
 	if (scene->show_floor)
 		skr_render_list_add(&scene->shadow_list, &scene->floor_mesh, &scene->shadow_caster_material, &floor_instance, sizeof(float4x4), 1);
@@ -1230,8 +1237,8 @@ static void _scene_gi_render(scene_t* base, int32_t width, int32_t height, skr_r
 	skr_render_list_clear(&scene->shadow_list);
 
 	// --- Main pass setup ---
-	skr_renderer_set_global_constants(13, &scene->shadow_buffer);
-	skr_renderer_set_global_texture  (14, &scene->shadow_map);
+	skr_renderer_set_global_buffer("ShadowBuffer", &scene->shadow_buffer);
+	skr_renderer_set_global_tex   ("shadow_map",   &scene->shadow_map);
 
 	// Skybox
 	if (scene->cubemap_ready) {

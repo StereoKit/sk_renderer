@@ -242,6 +242,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 	out_tex->sampler = _skr_sampler_create(sampler, mips);
 	if (sampler.sample_compare != skr_compare_none)
 		out_tex->sampler_compare = _skr_sampler_create_ex(sampler, mips);
+	out_tex->bind_uid = _skr_uid_new();
 
 	if (opt_data != NULL) {
 		skr_err_ err = skr_tex_set_data(out_tex, opt_data);
@@ -309,6 +310,7 @@ skr_err_ skr_tex_create_external_wgpu(skr_tex_external_wgpu_info_t info, skr_tex
 	out_tex->sampler = _skr_sampler_create(info.sampler, 1);
 	if (info.sampler.sample_compare != skr_compare_none)
 		out_tex->sampler_compare = _skr_sampler_create_ex(info.sampler, 1);
+	out_tex->bind_uid = _skr_uid_new();
 	return skr_err_success;
 }
 
@@ -330,6 +332,7 @@ skr_err_ skr_tex_update_external_wgpu(skr_tex_t* ref_tex, void* texture) {
 		.arrayLayerCount = ref_tex->layer_count,
 		.aspect          = WGPUTextureAspect_All,
 	});
+	ref_tex->bind_uid = _skr_uid_new();
 	return ref_tex->view != NULL ? skr_err_success : skr_err_device_error;
 }
 
@@ -652,8 +655,8 @@ void skr_tex_set_sampler(skr_tex_t* ref_tex, skr_tex_sampler_t sampler) {
 	ref_tex->sampler         = _skr_sampler_create(sampler, ref_tex->mip_levels);
 	ref_tex->sampler_compare = sampler.sample_compare != skr_compare_none
 		? _skr_sampler_create_ex(sampler, ref_tex->mip_levels) : NULL;
-	// Cached bind groups hold the old sampler; retire them
-	_skr_bind_epoch_bump();
+	// Cached bind groups hold the old sampler; a new identity retires them
+	ref_tex->bind_uid = _skr_uid_new();
 }
 
 skr_tex_sampler_t skr_tex_get_sampler(const skr_tex_t* tex) {

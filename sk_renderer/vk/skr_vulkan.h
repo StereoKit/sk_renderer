@@ -239,6 +239,7 @@ typedef struct  {
 		skr_tex_t*    texture;
 		skr_buffer_t* buffer;
 	};
+	uint64_t   global_hash;   // Name hash globals match, 0 = never reads globals
 	skr_bind_t bind;
 	uint32_t   buffer_offset; // Offset within buffer (for bump-allocated buffers)
 	uint32_t   buffer_range;  // Range to bind (0 = use buffer->size)
@@ -247,7 +248,14 @@ typedef struct  {
 	// _skr_vk.sampler_image_proc instead of the texture's own sampler.
 	bool       image_proc_sampler;
 	bool       array_view;    // The shader declares a 2D array here, see _skr_tex_array_view_src
+	uint8_t    global_bit;    // _skr_global_bit of global_hash, precomputed for the draw-time filter
 } skr_material_bind_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(skr_material_bind_t) == 32, "skr_material_bind_t grew; the bind pool scales with it");
+#else
+_Static_assert(sizeof(skr_material_bind_t) == 32, "skr_material_bind_t grew; the bind pool scales with it");
+#endif
 
 // Internal key struct for pipeline-affecting material parameters only.
 // Excludes queue_offset which affects render list sorting but not pipeline state.

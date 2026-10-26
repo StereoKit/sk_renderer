@@ -117,6 +117,7 @@ typedef enum {
 // its register type. skshaderc applies these when compiling; both runtimes
 // use them to translate between raw register indices (e.g. global binds) and
 // meta slots.
+#define SKSC_SLOT_CONSTANT  0   // b registers
 #define SKSC_SLOT_TEXTURE   100 // t registers (also merged samplers on Vulkan)
 #define SKSC_SLOT_READWRITE 200 // u registers (RW buffers/textures)
 #define SKSC_SLOT_INPUT_ATT 300 // input attachments, + [[vk::input_attachment_index]]

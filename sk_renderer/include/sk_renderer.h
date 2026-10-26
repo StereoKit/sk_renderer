@@ -911,7 +911,7 @@ SKR_API void              skr_compute_get_param            (const skr_compute_t*
 SKR_API skr_err_          skr_material_create              (skr_material_info_t info, skr_material_t* out_material);
 SKR_API void              skr_material_set_pipeline        (      skr_material_t* ref_material, skr_material_info_t info);
 SKR_API bool              skr_material_is_valid            (const skr_material_t*     material);
-SKR_API void              skr_material_set_tex             (      skr_material_t* ref_material, const char* name, skr_tex_t*    texture);  // A Texture2DArray slot also takes a 2D texture as one slice, or a cubemap as six in face order. 3D, multisampled, and external textures bind there as white. Global and compute textures follow the same rule
+SKR_API void              skr_material_set_tex             (      skr_material_t* ref_material, const char* name, skr_tex_t*    opt_texture);  // Wins over a named global; NULL restores the shader's default, which a named global may fill. A Texture2DArray slot also takes a 2D texture as one slice, or a cubemap as six in face order. 3D, multisampled, and external textures bind there as white. Global and compute textures follow the same rule
 SKR_API void              skr_material_set_buffer          (      skr_material_t* ref_material, const char* name, skr_buffer_t* buffer);
 SKR_API void              skr_material_set_params          (      skr_material_t* ref_material, const void* data, uint32_t size);
 SKR_API void              skr_material_destroy             (      skr_material_t* ref_material);
@@ -933,8 +933,10 @@ SKR_API int32_t           skr_renderer_frame_fence_fd      (void);  // Sync FD f
 #endif
 SKR_API void              skr_renderer_begin_pass          (skr_tex_t* color, skr_tex_t* depth, skr_tex_t* opt_resolve, skr_clear_ clear, skr_vec4_t clear_color, float clear_depth, uint32_t clear_stencil, uint32_t view_mask, uint32_t correlation_mask);
 SKR_API void              skr_renderer_end_pass            (void);
-SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);
-SKR_API void              skr_renderer_set_global_texture  (int32_t bind, const skr_tex_t* tex);
+SKR_API void              skr_renderer_set_global_tex      (const char* name, const skr_tex_t*    opt_tex);    // Fills every shader resource with this name that its material left at the shader's default. Not read by skr_compute_dispatch. NULL clears. Call from one thread at a time
+SKR_API void              skr_renderer_set_global_buffer   (const char* name, const skr_buffer_t* opt_buffer); // cbuffer, StructuredBuffer or RWStructuredBuffer with this name its material left unset, as skr_renderer_set_global_tex
+SKR_API void              skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer);         // Deprecated, use skr_renderer_set_global_buffer. Outranks material values and named globals
+SKR_API void              skr_renderer_set_global_texture  (int32_t bind, const skr_tex_t* tex);               // Deprecated, use skr_renderer_set_global_tex. Outranks material values and named globals
 SKR_API void              skr_renderer_set_viewport        (skr_rect_t viewport);
 SKR_API void              skr_renderer_set_scissor         (skr_recti_t scissor);
 SKR_API void              skr_renderer_blit                (skr_material_t* material, skr_tex_t* to, skr_recti_t bounds_px);

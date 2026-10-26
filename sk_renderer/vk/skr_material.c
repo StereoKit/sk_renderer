@@ -143,7 +143,7 @@ skr_material_bind_t* _skr_bind_pool_get(int32_t start) {
 	return chunk ? &chunk[start & _SKR_BIND_CHUNK_MASK] : NULL;
 }
 
-void _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds) {
+void _skr_binds_init(const sksc_shader_meta_t* meta, bool globals, skr_material_bind_t* out_binds) {
 	for (uint32_t i = 0; i < meta->buffer_count; i++)
 		out_binds[i] = (skr_material_bind_t){ .bind = meta->buffers[i].bind };
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
@@ -157,6 +157,7 @@ void _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_bi
 			.array_view         = _skr_resource_is_2d_array(res),
 		};
 	}
+	if (globals) _skr_binds_init_globals(meta, out_binds);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -220,12 +221,12 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		return skr_err_out_of_memory;
 	}
 	skr_material_bind_t* binds = _skr_bind_pool_get(out_material->bind_start);
-	_skr_binds_init(meta, binds);
+	_skr_binds_init(meta, true, binds);
 
 	// Check if we have a buffer bound to the system buffer slot
 	out_material->has_system_buffer = false;
 	for (uint32_t i = 0; i < meta->buffer_count; i++) {
-		if (meta->buffers[i].bind.slot == SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.system_slot && meta->buffers[i].bind.stage_bits != 0) {
+		if (meta->buffers[i].bind.slot == SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.system_slot && meta->buffers[i].bind.stage_bits != 0) {
 			out_material->has_system_buffer = true;
 			break;
 		}
@@ -234,7 +235,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 	// Check if we have a StructuredBuffer bound to the instance buffer slot
 	out_material->instance_buffer_stride = 0;
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
-		if (meta->resources[i].bind.slot == SKR_BIND_SHIFT_TEXTURE + _skr_vk.bind_settings.instance_slot && meta->resources[i].bind.stage_bits != 0) {
+		if (meta->resources[i].bind.slot == SKSC_SLOT_TEXTURE + _skr_vk.bind_settings.instance_slot && meta->resources[i].bind.stage_bits != 0) {
 			out_material->instance_buffer_stride = meta->resources[i].element_size;
 			break;
 		}
@@ -251,13 +252,9 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		return skr_err_device_error;
 	}
 
-	// Fill out default textures
 	for (uint32_t i = 0; i < meta->resource_count; i++) {
-		skr_tex_t* tex = &_skr_vk.default_tex_white;
-		if      (strcmp(meta->resources[i].value, "black") == 0) tex = &_skr_vk.default_tex_black;
-		else if (strcmp(meta->resources[i].value, "gray" ) == 0) tex = &_skr_vk.default_tex_gray;
-		else if (strcmp(meta->resources[i].value, "grey" ) == 0) tex = &_skr_vk.default_tex_gray;
-		skr_material_set_tex(out_material, meta->resources[i].name, tex);
+		if (meta->resources[i].bind.register_type == skr_register_texture)
+			skr_material_set_tex(out_material, meta->resources[i].name, NULL);
 	}
 
 	return skr_err_success;
@@ -319,6 +316,10 @@ void skr_material_set_tex(skr_material_t* ref_material, const char* name, skr_te
 		skr_log(skr_log_warning, "Texture name '%s' not found", name);
 		return;
 	}
+
+	// NULL restores the shader's default, which a named global may replace
+	if (texture == NULL && meta->resources[idx].bind.register_type == skr_register_texture)
+		texture = &_skr_vk.default_tex[_skr_default_for(meta->resources[idx].value)];
 
 	skr_material_bind_t* binds = _skr_bind_pool_get(ref_material->bind_start);
 	binds[meta->buffer_count + idx].texture = texture;
@@ -531,6 +532,7 @@ const char* _skr_material_bind_name(const sksc_shader_meta_t* meta, int32_t bind
 }
 
 int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, _skr_desc_writes_t* ref_writes) {
+	_skr_globals_snap_t globals = _skr_globals_snap();
 	for (uint32_t i = 0; i < bind_ct; i++) {
 		int32_t       slot          = binds[i].bind.slot;
 		skr_register_ register_type = binds[i].bind.register_type;
@@ -551,34 +553,25 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 
 		switch(register_type) {
 		case skr_register_constant: { // cbuffer, (b in HLSL)
-			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_BUFFER];
-			uint32_t      offset  = 0;
-			uint32_t      range   = 0;
-			if (!buffer) {
-				buffer = binds[i].buffer;
-				offset = binds[i].buffer_offset;
-				range  = binds[i].buffer_range;
-			}
+			const skr_buffer_t* buffer = _skr_bind_buffer(globals, &binds[i]);
 			if (!buffer) return (int32_t)i;
+			bool     own    = buffer == binds[i].buffer;
+			uint32_t offset = own ? binds[i].buffer_offset : 0;
+			uint32_t range  = own ? binds[i].buffer_range  : 0;
 
 			_skr_write_buffer(ref_writes, (uint32_t)slot, false, buffer->buffer, buffer->uid, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_read_buffer: { // StructuredBuffer, (t in HLSL)
-			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_TEXTURE];
-			uint32_t      offset  = 0;
-			uint32_t      range   = 0;
-			if (!buffer) {
-				buffer = binds[i].buffer;
-				offset = binds[i].buffer_offset;
-				range  = binds[i].buffer_range;
-			}
+			const skr_buffer_t* buffer = _skr_bind_buffer(globals, &binds[i]);
 			if (!buffer) return (int32_t)i;
+			bool     own    = buffer == binds[i].buffer;
+			uint32_t offset = own ? binds[i].buffer_offset : 0;
+			uint32_t range  = own ? binds[i].buffer_range  : 0;
 
 			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, buffer->uid, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_texture: { // Textures (Texture2D, etc.) (t in HLSL)
-			skr_tex_t* tex = _skr_vk.global_textures[slot-SKR_BIND_SHIFT_TEXTURE];
-			if (!tex)  tex = binds[i].texture;
+			const skr_tex_t* tex = _skr_bind_tex(globals, &binds[i]);
 			if (!tex) return (int32_t)i;
 
 			// imageLayout must match the layout the GPU sees when the descriptor
@@ -615,21 +608,16 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler, view, uid, _skr_tex_sample_layout(view_tex));
 		} break;
 		case skr_register_readwrite: { // RWStructuredBuffer (u in HLSL)
-			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_UAV];
-			uint32_t      offset  = 0;
-			uint32_t      range   = 0;
-			if (!buffer) {
-				buffer = binds[i].buffer;
-				offset = binds[i].buffer_offset;
-				range  = binds[i].buffer_range;
-			}
+			const skr_buffer_t* buffer = _skr_bind_buffer(globals, &binds[i]);
 			if (!buffer) return (int32_t)i;
+			bool     own    = buffer == binds[i].buffer;
+			uint32_t offset = own ? binds[i].buffer_offset : 0;
+			uint32_t range  = own ? binds[i].buffer_range  : 0;
 
 			_skr_write_buffer(ref_writes, (uint32_t)slot, true, buffer->buffer, buffer->uid, offset, range > 0 ? range : buffer->size);
 		} break;
 		case skr_register_readwrite_tex: { // Storage images (RWTexture2D, etc.)
-			skr_tex_t* tex = _skr_vk.global_textures[slot-SKR_BIND_SHIFT_UAV];
-			if (!tex)  tex = binds[i].texture;
+			const skr_tex_t* tex = _skr_bind_tex(globals, &binds[i]);
 			if (!tex) return (int32_t)i;
 
 			// _skr_tex_sample_layout returns GENERAL for compute-flagged textures —

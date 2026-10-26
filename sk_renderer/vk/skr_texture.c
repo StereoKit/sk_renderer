@@ -872,7 +872,7 @@ const skr_tex_t* _skr_tex_array_view_src(const skr_tex_t* tex) {
 	static _skr_atomic(uint32_t) warned = 0;
 	if (!_skr_exchange_u32(&warned, 1))
 		skr_log(skr_log_warning, "A 3D, multisampled, or external texture can't bind to a Texture2DArray slot, binding white instead");
-	return &_skr_vk.default_tex_white;
+	return &_skr_vk.default_tex[_skr_default_white];
 }
 
 skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampler_t sampler, skr_vec3i_t size, int32_t multisample, int32_t mip_count, const skr_tex_data_t* opt_data, skr_tex_t* out_tex) {
@@ -1830,13 +1830,13 @@ static bool _skr_tex_generate_mips_compute(VkDevice device, skr_tex_t* ref_tex, 
 		_skr_desc_writes_t desc;
 		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
 		if (skr_buffer_is_valid(&params_buffer))
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, params_buffer.uid, (mip - 1) * aligned_stride, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, params_buffer.uid, (mip - 1) * aligned_stride, material->param_buffer_size);
 		// Both views are in GENERAL, not the texture's canonical sample layout
 		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, _skr_uid_new(), VK_IMAGE_LAYOUT_GENERAL);
 		_skr_write_image(&desc, bind_dst.slot,    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          VK_NULL_HANDLE,   dst_view, _skr_uid_new(), VK_IMAGE_LAYOUT_GENERAL);
 
 		const int32_t ignore_slots[] = {
-			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
+			SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot,  // Already handled above
 			bind_source.slot,                                             // Source view (per-mip, handled above)
 			bind_dst.slot                                                 // Destination view (per-mip, handled above)
 		};
@@ -2065,14 +2065,14 @@ static void _skr_tex_generate_mips_render(VkDevice device, skr_tex_t* ref_tex, i
 		_skr_desc_writes_t desc;
 		_skr_desc_writes_begin(&desc, material->pipeline_material_idx);
 		if (skr_buffer_is_valid(&params_buffer))
-			_skr_write_buffer(&desc, SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, params_buffer.uid, (mip - 1) * aligned_stride, material->param_buffer_size);
+			_skr_write_buffer(&desc, SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot, false, params_buffer.buffer, params_buffer.uid, (mip - 1) * aligned_stride, material->param_buffer_size);
 		// Both ref_tex mip 0 and scratch mips sit in SHADER_READ_ONLY_OPTIMAL
 		// during the mip loop, whatever ref_tex's canonical sample layout is.
 		_skr_write_image(&desc, bind_source.slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ref_tex->sampler, src_view, _skr_uid_new(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 		// Add any other material bindings (textures/buffers, including globals)
 		const int32_t ignore_slots[] = {
-			SKR_BIND_SHIFT_BUFFER + _skr_vk.bind_settings.material_slot,  // Already handled above
+			SKSC_SLOT_CONSTANT + _skr_vk.bind_settings.material_slot,  // Already handled above
 			bind_source.slot                                               // Source texture (per-mip, handled above)
 		};
 		int32_t fail_idx = _skr_material_add_writes(_skr_bind_pool_get(material->bind_start), material->bind_count, (skr_stage_)(skr_stage_vertex | skr_stage_pixel), ignore_slots, sizeof(ignore_slots)/sizeof(ignore_slots[0]), &desc);

@@ -46,17 +46,9 @@ typedef struct _skr_bump_t {
 	uint32_t   window; // widened past _SKR_BUMP_SLACK when a list needs it, see _skr_bump_window
 } _skr_bump_t;
 
-typedef struct _skr_global_bind_t {
-	int32_t             slot;
-	const skr_buffer_t* buffer;
-	const skr_tex_t*    tex;
-} _skr_global_bind_t;
-
 static _skr_pass_state_t  _pass;
 static _skr_bump_t        _bump_uniform;
 static _skr_bump_t        _bump_storage;
-static _skr_global_bind_t _globals[16];
-static uint32_t           _global_count;
 
 // Most recent system-data allocation, reused by immediate draws
 static uint32_t _system_offset;
@@ -476,32 +468,12 @@ void skr_renderer_set_scissor(skr_recti_t scissor) {
 		wgpuRenderPassEncoderSetScissorRect(_pass.passes[v], (uint32_t)scissor.x, (uint32_t)scissor.y, (uint32_t)scissor.w, (uint32_t)scissor.h);
 }
 
-// Both setters bump the bind epoch only on real changes — scenes re-assert
-// the same globals every frame, and a no-op set must not retire every
-// cached bind group.
-void skr_renderer_set_global_constants(int32_t bind, const skr_buffer_t* buffer) {
-	for (uint32_t i = 0; i < _global_count; i++)
-		if (_globals[i].slot == bind) {
-			if (_globals[i].buffer != buffer) { _globals[i].buffer = buffer; _skr_bind_epoch_bump(); }
-			return;
-		}
-	if (_global_count < 16) {
-		_globals[_global_count++] = (_skr_global_bind_t){ .slot = bind, .buffer = buffer };
-		_skr_bind_epoch_bump();
-	}
-}
-
-void skr_renderer_set_global_texture(int32_t bind, const skr_tex_t* tex) {
-	for (uint32_t i = 0; i < _global_count; i++)
-		if (_globals[i].slot == bind) {
-			if (_globals[i].tex != tex) { _globals[i].tex = tex; _skr_bind_epoch_bump(); }
-			return;
-		}
-	if (_global_count < 16) {
-		_globals[_global_count++] = (_skr_global_bind_t){ .slot = bind, .tex = tex };
-		_skr_bind_epoch_bump();
-	}
-}
+// Cached bind groups key on what they resolve, globals included, so a global
+// change only rebuilds the groups that read it
+void skr_renderer_set_global_tex      (const char* name, const skr_tex_t*    opt_tex)    { _skr_global_set_tex       (name, opt_tex);    }
+void skr_renderer_set_global_buffer   (const char* name, const skr_buffer_t* opt_buffer) { _skr_global_set_buffer    (name, opt_buffer); }
+void skr_renderer_set_global_constants(int32_t     bind, const skr_buffer_t* buffer)     { _skr_global_set_num_buffer(bind, buffer);     }
+void skr_renderer_set_global_texture  (int32_t     bind, const skr_tex_t*    tex)        { _skr_global_set_num_tex   (bind, tex);        }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Bind group assembly. The reserved material/system/instance slots reference
@@ -536,9 +508,9 @@ _skr_bump_slots_t _skr_bump_slots(const sksc_shader_meta_t* meta, uint8_t stage_
 		};
 	}
 	return (_skr_bump_slots_t){
-		.params   = (uint32_t)_skr_wgpu.binds.material_slot,
-		.system   = (uint32_t)_skr_wgpu.binds.system_slot,
-		.instance = SKSC_SLOT_TEXTURE + (uint32_t)_skr_wgpu.binds.instance_slot,
+		.params   = SKSC_SLOT_CONSTANT + (uint32_t)_skr_wgpu.binds.material_slot,
+		.system   = SKSC_SLOT_CONSTANT + (uint32_t)_skr_wgpu.binds.system_slot,
+		.instance = SKSC_SLOT_TEXTURE  + (uint32_t)_skr_wgpu.binds.instance_slot,
 	};
 }
 
@@ -574,53 +546,34 @@ uint32_t _skr_dynamic_offsets(const sksc_shader_meta_t* meta, uint8_t stage_mask
 	return n;
 }
 
-// What a bind reads. Globals take priority over the material's own binds
-// (which include baked-in defaults), matching the Vulkan backend — texture-type
-// bindings only see texture globals, buffer-type only buffer globals.
-// Global binds use raw register indices (t5, b1, ...) while material
-// slots carry the WGSL register shift, so unshift before matching.
-static void _skr_bind_resolve(const skr_material_bind_t* bind, const skr_tex_t** out_tex, const skr_buffer_t** out_buf) {
+// What a bind reads, globals included
+static void _skr_bind_resolve(_skr_globals_snap_t globals, const skr_material_bind_t* bind, const skr_tex_t** out_tex, const skr_buffer_t** out_buf) {
 	bool is_buffer_bind = bind->bind.register_type == skr_register_constant
 	                   || bind->bind.register_type == skr_register_read_buffer
 	                   || bind->bind.register_type == skr_register_readwrite;
-	int32_t global_slot = (int32_t)bind->bind.slot;
-	switch (bind->bind.register_type) {
-		case skr_register_texture:
-		case skr_register_read_buffer:
-		case skr_register_input_attachment: global_slot -= SKSC_SLOT_TEXTURE;   break;
-		case skr_register_readwrite:
-		case skr_register_readwrite_tex:    global_slot -= SKSC_SLOT_READWRITE; break;
-		default: break;
-	}
-
-	*out_tex = NULL;
-	*out_buf = NULL;
-	for (uint32_t g = 0; g < _global_count; g++) {
-		if (_globals[g].slot != global_slot) continue;
-		if (is_buffer_bind) *out_buf = _globals[g].buffer;
-		else                *out_tex = _globals[g].tex;
-		break;
-	}
-	if (*out_tex == NULL && *out_buf == NULL) {
-		if (is_buffer_bind) *out_buf = bind->buffer;
-		else                *out_tex = bind->texture;
-	}
+	*out_tex = is_buffer_bind ? NULL : _skr_bind_tex   (globals, bind);
+	*out_buf = is_buffer_bind ? _skr_bind_buffer(globals, bind) : NULL;
 }
 
-// Identities of the buffers a slice's group binds, so a renamed one rebuilds it
-static uint64_t _skr_bind_buffer_key(const skr_material_bind_t* binds, uint32_t bind_count) {
-	uint64_t key = 0xcbf29ce484222325ull;
+// Identities of everything a slice's group binds, globals included, so the
+// group rebuilds only when one of them changes
+static uint64_t _skr_bind_key(const skr_material_bind_t* binds, uint32_t bind_count) {
+	_skr_globals_snap_t globals = _skr_globals_snap();
+	uint64_t            key     = 0xcbf29ce484222325ull;
 	for (uint32_t i = 0; i < bind_count; i++) {
 		const skr_tex_t*    tex;
 		const skr_buffer_t* buf;
-		_skr_bind_resolve(&binds[i], &tex, &buf);
-		if (buf) key = (key ^ buf->uid) * 0x100000001b3ull;
+		_skr_bind_resolve(globals, &binds[i], &tex, &buf);
+		// Empty binds mix in too, or a value moving between two binds keeps the key
+		uint64_t id = buf ? buf->uid : tex ? tex->bind_uid : 0;
+		key = (key ^ id) * 0x100000001b3ull;
 	}
 	return key;
 }
 
 WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t stage_mask, WGPUBindGroupLayout layout, const skr_material_bind_t* binds, uint32_t bind_count) {
-	_skr_bump_slots_t bump = _skr_bump_slots(meta, stage_mask);
+	_skr_bump_slots_t   bump    = _skr_bump_slots(meta, stage_mask);
+	_skr_globals_snap_t globals = _skr_globals_snap();
 
 	WGPUBindGroupEntry entries[64];
 	uint32_t           entry_count = 0;
@@ -660,7 +613,7 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t
 
 		const skr_tex_t*    tex;
 		const skr_buffer_t* buf;
-		_skr_bind_resolve(bind, &tex, &buf);
+		_skr_bind_resolve(globals, bind, &tex, &buf);
 		if (buf && buf->buffer) {
 			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = buf->buffer, .offset = 0, .size = (buf->size + 3) & ~3u };
 		} else if (tex && tex->view) {
@@ -681,14 +634,13 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t
 		const sksc_shader_sampler_t* samp       = &meta->samplers[s];
 		bool                         comparison = _skr_sampler_is_comparison(meta, samp->paired_slot);
 
-		// Globals first, same as the texture binds above (raw t-register
-		// indices; paired_slot carries the +100 shift)
+		// Resolved like the texture binds above, so globals pair too
 		const skr_tex_t* paired = NULL;
-		for (uint32_t g = 0; g < _global_count; g++)
-			if (_globals[g].slot + SKSC_SLOT_TEXTURE == (int32_t)samp->paired_slot && _globals[g].tex) { paired = _globals[g].tex; break; }
-		if (paired == NULL) {
-			for (uint32_t i = 0; i < bind_count; i++)
-				if (binds[i].bind.slot == samp->paired_slot && binds[i].texture) { paired = binds[i].texture; break; }
+		for (uint32_t i = 0; i < bind_count; i++) {
+			if (binds[i].bind.slot != samp->paired_slot) continue;
+			const skr_buffer_t* unused;
+			_skr_bind_resolve(globals, &binds[i], &paired, &unused);
+			break;
 		}
 		WGPUSampler sampler = NULL;
 		if (paired)
@@ -722,26 +674,26 @@ static WGPUBindGroup _skr_build_bind_group(int32_t material_idx, const skr_mater
 
 // One cached bind group per material slice: dynamic offsets carry the
 // per-draw buffer positions, so a group survives across draws and frames
-// until the slice's binds change, a buffer it binds renames, or the global
-// bind epoch moves. Slices that can't cache (uncacheable = pass-input readers
-// whose views change per stage) get a fresh group the caller must release
-// (*out_owned).
+// until something it binds changes identity (_skr_bind_key, globals
+// included) or the bump-buffer epoch moves. Slices that can't cache
+// (uncacheable = pass-input readers whose views change per stage) get a
+// fresh group the caller must release (*out_owned).
 static WGPUBindGroup _skr_bind_group_get(int32_t material_idx, int32_t bind_start, uint32_t bind_count, bool cacheable, bool* out_owned) {
 	*out_owned = false;
-	const skr_material_bind_t* binds   = _skr_bind_pool_get(bind_start);
-	uint64_t                   epoch   = _skr_bind_epoch();
-	_skr_bind_cache_t*         cache   = cacheable ? _skr_bind_cache_slot(bind_start) : NULL;
-	uint64_t                   buffers = cache ? _skr_bind_buffer_key(binds, bind_count) : 0;
-	if (cache && cache->group && cache->epoch == epoch && cache->buffers == buffers)
+	const skr_material_bind_t* binds = _skr_bind_pool_get(bind_start);
+	uint64_t                   epoch = _skr_bind_epoch();
+	_skr_bind_cache_t*         cache = cacheable ? _skr_bind_cache_slot(bind_start) : NULL;
+	uint64_t                   key   = cache ? _skr_bind_key(binds, bind_count) : 0;
+	if (cache && cache->group && cache->epoch == epoch && cache->key == key)
 		return cache->group;
 
 	WGPUBindGroup group = _skr_build_bind_group(material_idx, binds, bind_count);
 	if (group == NULL) return NULL;
 	if (cache) {
 		if (cache->group) wgpuBindGroupRelease(cache->group);
-		cache->group   = group;
-		cache->epoch   = epoch;
-		cache->buffers = buffers;
+		cache->group = group;
+		cache->epoch = epoch;
+		cache->key   = key;
 	} else {
 		*out_owned = true;
 	}
@@ -1265,8 +1217,7 @@ void _skr_renderer_sys_shutdown(void) {
 	_system_offset = 0;
 	_system_size   = 0;
 
-	memset(_globals, 0, sizeof(_globals));
-	_global_count     = 0;
+	_skr_globals_reset();
 	_pass_input_color = NULL;
 	_pass_input_depth = NULL;
 	if (_fallback_sampler) { wgpuSamplerRelease(_fallback_sampler); _fallback_sampler = NULL; }
