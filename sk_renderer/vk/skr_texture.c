@@ -803,6 +803,78 @@ static skr_err_ _skr_tex_create_yuv(skr_tex_fmt_ format, skr_tex_sampler_t sampl
 	return skr_err_success;
 }
 
+// ASTC decodes to FP16 texels by default, twice the cache footprint 8 bit
+// content needs. sRGB already decodes to 8 bits. UNDEFINED keeps the default.
+static VkFormat _skr_astc_decode_mode(VkFormat format) {
+	if (!_skr_vk.has_astc_decode_mode) return VK_FORMAT_UNDEFINED;
+
+	bool is_ldr_unorm = format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK &&
+	                    (format - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) % 2 == 0;
+	if (is_ldr_unorm) return VK_FORMAT_R8G8B8A8_UNORM;
+
+	// UNORM8 is invalid for HDR blocks. E5B9G9R9 reads alpha as 1.
+	bool is_hdr = format >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && format <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK;
+	if (is_hdr && _skr_vk.has_astc_decode_e5) return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+
+	return VK_FORMAT_UNDEFINED;
+}
+
+static VkImageViewType _skr_tex_view_type(skr_tex_flags_ flags) {
+	if (flags & skr_tex_flags_3d     ) return VK_IMAGE_VIEW_TYPE_3D;
+	if (flags & skr_tex_flags_cubemap) return VK_IMAGE_VIEW_TYPE_CUBE;
+	if (flags & skr_tex_flags_array  ) return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	return VK_IMAGE_VIEW_TYPE_2D;
+}
+
+// Views every mip and layer tex describes, in tex's format and aspect
+static VkResult _skr_tex_create_view(const skr_tex_t* tex, VkImage image, VkImageViewType view_type, VkImageView* out_view) {
+	VkFormat              vk_format = skr_tex_fmt_to_native(tex->format);
+	VkImageViewCreateInfo view_info = {
+		.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image    = image,
+		.viewType = view_type,
+		.format   = vk_format,
+		.subresourceRange = {
+			.aspectMask     = tex->aspect_mask,
+			.baseMipLevel   = 0,
+			.levelCount     = tex->mip_levels,
+			.baseArrayLayer = 0,
+			.layerCount     = tex->layer_count,
+		},
+	};
+	VkImageViewASTCDecodeModeEXT astc_decode = {
+		.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT,
+		.decodeMode = _skr_astc_decode_mode(vk_format),
+	};
+	if (astc_decode.decodeMode != VK_FORMAT_UNDEFINED)
+		view_info.pNext = &astc_decode;
+
+	return vkCreateImageView(_skr_vk.device, &view_info, NULL, out_view);
+}
+
+// Lets cubes and plain 2D textures bind where a shader declares
+// Texture2DArray. Created with the texture, since a view made later could race
+// a caller swapping the skr_tex_t it lives in.
+static void _skr_tex_create_array_view(skr_tex_t* ref_tex) {
+	if ((ref_tex->flags & (skr_tex_flags_array | skr_tex_flags_3d)) || !(ref_tex->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || ref_tex->samples != VK_SAMPLE_COUNT_1_BIT)
+		return;
+
+	if (_skr_tex_create_view(ref_tex, ref_tex->image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, &ref_tex->array_view) != VK_SUCCESS) {
+		skr_log(skr_log_warning, "vkCreateImageView (2D array view) failed");
+		ref_tex->array_view = VK_NULL_HANDLE;
+	}
+}
+
+// 3D, multisampled, and external textures have no array view, and their own
+// view type would mismatch the slot, so they bind as white.
+const skr_tex_t* _skr_tex_array_view_src(const skr_tex_t* tex) {
+	if (tex->array_view != VK_NULL_HANDLE) return tex;
+	static _skr_atomic(uint32_t) warned = 0;
+	if (!_skr_exchange_u32(&warned, 1))
+		skr_log(skr_log_warning, "A 3D, multisampled, or external texture can't bind to a Texture2DArray slot, binding white instead");
+	return &_skr_vk.default_tex_white;
+}
+
 skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampler_t sampler, skr_vec3i_t size, int32_t multisample, int32_t mip_count, const skr_tex_data_t* opt_data, skr_tex_t* out_tex) {
 	if (!out_tex) return skr_err_invalid_parameter;
 
@@ -1038,38 +1110,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		_skr_cmd_release(ctx.cmd);
 	}
 
-	// Create image view
-	VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
-	if      (out_tex->flags & skr_tex_flags_3d     ) view_type = VK_IMAGE_VIEW_TYPE_3D;
-	else if (out_tex->flags & skr_tex_flags_cubemap) view_type = VK_IMAGE_VIEW_TYPE_CUBE;
-	else if (out_tex->flags & skr_tex_flags_array  ) view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-
-	VkImageViewCreateInfo view_info = {
-		.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		.image    = out_tex->image,
-		.viewType = view_type,
-		.format   = vk_format,
-		.subresourceRange = {
-			.aspectMask     = out_tex->aspect_mask,
-			.baseMipLevel   = 0,
-			.levelCount     = image_info.mipLevels,
-			.baseArrayLayer = 0,
-			.layerCount     = image_info.arrayLayers,
-		},
-	};
-
-	// ASTC decodes to FP16 texels by default, twice the cache footprint LDR
-	// needs. sRGB formats already decode to 8 bits, and HDR isn't UNORM.
-	VkImageViewASTCDecodeModeEXT astc_decode = {
-		.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT,
-		.decodeMode = VK_FORMAT_R8G8B8A8_UNORM,
-	};
-	bool is_astc_unorm = vk_format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vk_format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK &&
-	                     (vk_format - VK_FORMAT_ASTC_4x4_UNORM_BLOCK) % 2 == 0;
-	if (_skr_vk.has_astc_decode_mode && is_astc_unorm)
-		view_info.pNext = &astc_decode;
-
-	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
+	vr = _skr_tex_create_view(out_tex, out_tex->image, _skr_tex_view_type(out_tex->flags), &out_tex->view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "vkCreateImageView failed");
 		_skr_mem_free(out_tex->mem);
@@ -1077,6 +1118,7 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		*out_tex = (skr_tex_t){0};
 		return skr_err_device_error;
 	}
+	_skr_tex_create_array_view(out_tex);
 
 	// Store texture properties
 	out_tex->sampler  = _skr_sampler_cache_acquire(sampler);
@@ -1151,25 +1193,7 @@ skr_err_ _skr_tex_create_scratch(const skr_tex_t* template_src, skr_tex_t* out_t
 	out_tex->current_queue_family = _skr_vk.graphics_queue_family;
 	out_tex->first_use            = true;
 
-	VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
-	if      (out_tex->flags & skr_tex_flags_cubemap) view_type = VK_IMAGE_VIEW_TYPE_CUBE;
-	else if (out_tex->flags & skr_tex_flags_array  ) view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-
-	VkImageViewCreateInfo view_info = {
-		.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		.image    = out_tex->image,
-		.viewType = view_type,
-		.format   = vk_format,
-		.subresourceRange = {
-			.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-			.baseMipLevel   = 0,
-			.levelCount     = out_tex->mip_levels,
-			.baseArrayLayer = 0,
-			.layerCount     = out_tex->layer_count,
-		},
-	};
-
-	vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
+	vr = _skr_tex_create_view(out_tex, out_tex->image, _skr_tex_view_type(out_tex->flags), &out_tex->view);
 	if (vr != VK_SUCCESS) {
 		skr_log(skr_log_critical, "vkCreateImageView (scratch) failed: 0x%X", (uint32_t)vr);
 		_skr_mem_free(out_tex->mem);
@@ -1203,6 +1227,7 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 		_skr_sampler_cache_release(ref_tex->sampler_settings);
 	}
 	_skr_destroy_shared_image_view (ref_tex->view);
+	_skr_destroy_shared_image_view (ref_tex->array_view);
 
 	// External images aren't ours to free. LIFO list: memory frees after the image
 	if (!ref_tex->is_external) {
@@ -1364,6 +1389,11 @@ void skr_tex_set_name(skr_tex_t* ref_tex, const char* name) {
 		char view_name[256];
 		snprintf(view_name, sizeof(view_name), "%s_view", name);
 		_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)ref_tex->view, view_name);
+	}
+	if (ref_tex->array_view != VK_NULL_HANDLE) {
+		char view_name[256];
+		snprintf(view_name, sizeof(view_name), "%s_array_view", name);
+		_skr_set_debug_name(_skr_vk.device, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)ref_tex->array_view, view_name);
 	}
 }
 
@@ -2650,21 +2680,7 @@ skr_err_ skr_tex_create_external_vk(skr_tex_external_info_t info, skr_tex_t* out
 	if (info.view != VK_NULL_HANDLE) {
 		out_tex->view = info.view;
 	} else {
-		VkImageViewCreateInfo view_info = {
-			.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.image    = info.image,
-			.viewType = is_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
-			.format   = vk_format,
-			.subresourceRange = {
-				.aspectMask     = aspect_mask,
-				.baseMipLevel   = 0,
-				.levelCount     = 1,
-				.baseArrayLayer = 0,
-				.layerCount     = layer_count,
-			},
-		};
-
-		VkResult vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &out_tex->view);
+		VkResult vr = _skr_tex_create_view(out_tex, info.image, is_array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, &out_tex->view);
 		if (vr != VK_SUCCESS) {
 			skr_log(skr_log_critical, "skr_tex_create_external_vk: vkCreateImageView failed");
 			*out_tex = (skr_tex_t){0};
@@ -2709,28 +2725,7 @@ skr_err_ skr_tex_update_external(skr_tex_t* ref_tex, skr_tex_external_update_t u
 			return skr_err_unsupported;
 		}
 
-		VkFormat vk_format = skr_tex_fmt_to_native(ref_tex->format);
-
-		VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
-		if      (ref_tex->flags & skr_tex_flags_3d)      view_type = VK_IMAGE_VIEW_TYPE_3D;
-		else if (ref_tex->flags & skr_tex_flags_cubemap) view_type = VK_IMAGE_VIEW_TYPE_CUBE;
-		else if (ref_tex->flags & skr_tex_flags_array)   view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-
-		VkImageViewCreateInfo view_info = {
-			.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.image    = update.image,
-			.viewType = view_type,
-			.format   = vk_format,
-			.subresourceRange = {
-				.aspectMask     = ref_tex->aspect_mask,
-				.baseMipLevel   = 0,
-				.levelCount     = ref_tex->mip_levels,
-				.baseArrayLayer = 0,
-				.layerCount     = ref_tex->layer_count,
-			},
-		};
-
-		VkResult vr = vkCreateImageView(_skr_vk.device, &view_info, NULL, &new_view);
+		VkResult vr = _skr_tex_create_view(ref_tex, update.image, _skr_tex_view_type(ref_tex->flags), &new_view);
 		if (vr != VK_SUCCESS) {
 			skr_log(skr_log_critical, "skr_tex_update_external: vkCreateImageView failed");
 			return skr_err_device_error;

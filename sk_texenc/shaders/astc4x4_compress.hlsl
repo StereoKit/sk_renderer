@@ -25,7 +25,7 @@
 // SK_TEXENC_FAST seeds endpoints from the bounding box instead of FPS; at
 // 4x4 the LS refine recovers nearly all of the difference.
 
-Texture2D<float4>         source_tex    : register(t0);
+Texture2DArray<float4>    source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
 // Gamma-encode linear-light sources (float or sRGB-view textures) so the
@@ -33,12 +33,6 @@ RWStructuredBuffer<uint4> output_blocks : register(u1);
 [[vk::constant_id(0)]] const bool SRGB_ENCODE = false;
 // Non-color data: weigh channels evenly rather than perceptually.
 [[vk::constant_id(1)]] const bool LINEAR_DATA = false;
-
-uint mip_level;
-uint image_width;
-uint image_height;
-uint blocks_x;
-uint buffer_offset;
 
 #include "astc_common.hlsli"
 
@@ -307,12 +301,14 @@ uint4 encode_mode_4x4_rgba(in float4 pixels[16]) {
 ///////////////////////////////////////////////////////////////////////////////
 
 [numthreads(8, 8, 1)]
-void cs(uint3 id : SV_DispatchThreadID) {
-	uint bx = id.x;
-	uint by = id.y;
-	uint blocks_y = (image_height + 3u) / 4u;
-	if (bx >= blocks_x || by >= blocks_y)
+void cs(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+	texenc_block_t blk;
+	if (!texenc_block(group, thread, 4u, 4u, blk))
 		return;
+	uint bx           = blk.x;
+	uint by           = blk.y;
+	uint image_width  = blk.width;
+	uint image_height = blk.height;
 
 	// Load 4x4 block of RGBA pixels; alpha bbox drives mode selection.
 	float4 pixels[16];
@@ -322,7 +318,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		[unroll] for (uint px = 0; px < 4; px++) {
 			uint sx = min(bx * 4u + px, image_width  - 1u);
 			uint sy = min(by * 4u + py, image_height - 1u);
-			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			float4 texel = source_tex.Load(int4(sx, sy, blk.layer, blk.mip));
 			if (SRGB_ENCODE)
 				texel.rgb = linear_to_srgb(texel.rgb);
 			pixels[py * 4u + px] = texel;
@@ -348,5 +344,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		block = encode_mode_4x4_rgba(pixels);
 	}
 
-	output_blocks[buffer_offset + by * blocks_x + bx] = block;
+	output_blocks[blk.out_index] = block;
 }

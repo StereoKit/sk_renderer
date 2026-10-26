@@ -152,10 +152,19 @@ bool skr_init(skr_settings_t settings) {
 			if (wgpuAdapterHasFeature(_skr_wgpu.adapter, maybe[i]))
 				wanted[wanted_count++] = maybe[i];
 
+		// Buffer limits default to WebGPU's minimums, 128MB for a storage binding
+		WGPULimits adapter_limits = WGPU_LIMITS_INIT;
+		WGPULimits limits         = WGPU_LIMITS_INIT;
+		if (wgpuAdapterGetLimits(_skr_wgpu.adapter, &adapter_limits) == WGPUStatus_Success) {
+			limits.maxStorageBufferBindingSize = adapter_limits.maxStorageBufferBindingSize;
+			limits.maxBufferSize               = adapter_limits.maxBufferSize;
+		}
+
 		WGPUDeviceDescriptor device_desc = {
 			.label                = { settings.app_name, settings.app_name ? strlen(settings.app_name) : 0 },
 			.requiredFeatureCount = wanted_count,
 			.requiredFeatures     = wanted,
+			.requiredLimits       = &limits,
 			.deviceLostCallbackInfo = {
 				.mode     = WGPUCallbackMode_AllowProcessEvents,
 				.callback = _skr_on_device_lost },
@@ -253,6 +262,13 @@ bool skr_is_capable(skr_capability_ capability) {
 
 int32_t skr_get_max_msaa_samples(void) {
 	return 4; // WebGPU guarantees sample counts 1 and 4, and only those
+}
+
+uint32_t skr_get_max_storage_size(void) {
+	uint64_t size = _skr_wgpu.limits.maxStorageBufferBindingSize < _skr_wgpu.limits.maxBufferSize
+		? _skr_wgpu.limits.maxStorageBufferBindingSize
+		: _skr_wgpu.limits.maxBufferSize;
+	return size < UINT32_MAX ? (uint32_t)size : UINT32_MAX; // skr_buffer_t sizes are 32 bit
 }
 
 ///////////////////////////////////////////////////////////////////////////////

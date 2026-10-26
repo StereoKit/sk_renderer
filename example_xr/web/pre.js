@@ -34,7 +34,14 @@ Module['preRun'].push(function () {
 			.filter(function (s) { return s; }).join(' / '));
 		// Take every feature the adapter offers; the renderer probes what it
 		// actually has at runtime (wgpuDeviceHasFeature)
-		return adapter.requestDevice({ requiredFeatures: Array.from(adapter.features) });
+		// Buffer limits default to WebGPU's minimums, 128MB for a storage binding
+		return adapter.requestDevice({
+			requiredFeatures: Array.from(adapter.features),
+			requiredLimits: {
+				maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+				maxBufferSize:               adapter.limits.maxBufferSize,
+			},
+		});
 	}).then(function (device) {
 		log('WebGPU device ready');
 		// Dawn reports validation failures to the console. In a headset there is

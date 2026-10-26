@@ -46,7 +46,7 @@
 // where a flat secondary plane covers uniform alpha. With one mode per path
 // there's no SSE selection either.
 
-Texture2D<float4>         source_tex    : register(t0);
+Texture2DArray<float4>    source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
 // Gamma-encode linear-light sources (float or sRGB-view textures) so the
@@ -54,12 +54,6 @@ RWStructuredBuffer<uint4> output_blocks : register(u1);
 [[vk::constant_id(0)]] const bool SRGB_ENCODE = false;
 // Non-color data: weigh channels evenly rather than perceptually.
 [[vk::constant_id(1)]] const bool LINEAR_DATA = false;
-
-uint mip_level;
-uint image_width;
-uint image_height;
-uint blocks_x;
-uint buffer_offset;
 
 #include "astc_common.hlsli"
 
@@ -850,12 +844,14 @@ void encode_mode_dual_3x3_rgba(
 ///////////////////////////////////////////////////////////////////////////////
 
 [numthreads(8, 8, 1)]
-void cs(uint3 id : SV_DispatchThreadID) {
-	uint bx = id.x;
-	uint by = id.y;
-	uint blocks_y = (image_height + 5u) / 6u;
-	if (bx >= blocks_x || by >= blocks_y)
+void cs(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+	texenc_block_t blk;
+	if (!texenc_block(group, thread, 6u, 6u, blk))
 		return;
+	uint bx           = blk.x;
+	uint by           = blk.y;
+	uint image_width  = blk.width;
+	uint image_height = blk.height;
 
 	// Load 6x6 block of RGBA pixels, compute bbox.
 	float4 pixels[36];
@@ -867,7 +863,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		[unroll] for (uint px = 0; px < 6; px++) {
 			uint sx = min(bx * 6u + px, image_width  - 1u);
 			uint sy = min(by * 6u + py, image_height - 1u);
-			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			float4 texel = source_tex.Load(int4(sx, sy, blk.layer, blk.mip));
 			if (SRGB_ENCODE)
 				texel.rgb = linear_to_srgb(texel.rgb);
 			pixels[py * 6u + px] = texel;
@@ -945,5 +941,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	}
 #endif
 
-	output_blocks[buffer_offset + by * blocks_x + bx] = best;
+	output_blocks[blk.out_index] = best;
 }

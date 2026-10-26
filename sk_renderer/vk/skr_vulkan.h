@@ -86,6 +86,7 @@ typedef struct skr_tex_t {
 	VkImage                image;
 	_skr_mem_t             mem;
 	VkImageView            view;
+	VkImageView            array_view;              // 2D_ARRAY view for Texture2DArray binds, see _skr_tex_array_view_src
 	VkFramebuffer          framebuffer;             // Cached framebuffer (color only, no depth)
 	VkFramebuffer          framebuffer_depth;       // Cached framebuffer (color + depth, if last used with depth)
 	VkRenderPass           framebuffer_pass;        // Render pass the color-only framebuffer was created for
@@ -245,6 +246,7 @@ typedef struct  {
 	// (BoxFilterQCOM etc., meta shape bit 6) — descriptor writes must bind
 	// _skr_vk.sampler_image_proc instead of the texture's own sampler.
 	bool       image_proc_sampler;
+	bool       array_view;    // The shader declares a 2D array here, see _skr_tex_array_view_src
 } skr_material_bind_t;
 
 // Internal key struct for pipeline-affecting material parameters only.

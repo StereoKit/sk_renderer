@@ -75,17 +75,17 @@ SK_TEXENC_API bool         sk_texenc_prefers_astc (void);
 // has sk_texenc_flags_linear.
 SK_TEXENC_API skr_tex_fmt_ sk_texenc_output_format(sk_texenc_fmt_ format, sk_texenc_flags_ flags);
 
-// Encodes every mip the source has, and adds none. For sRGB output the
-// source's format decides the conversion: sRGB and float sources Load as
-// linear light and get gamma-encoded, while UNORM sources are taken as
-// already gamma-encoded bytes. Returns an invalid texture on failure.
-SK_TEXENC_API skr_tex_t    sk_texenc_2d           (skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler);
-// As sk_texenc_2d, for a 6 layer cubemap source. Output is a cubemap.
-SK_TEXENC_API skr_tex_t    sk_texenc_cube         (skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler);
+// Encodes every mip and layer the source has, in one dispatch, and adds no
+// mips. 2D, array, and cubemap sources give output of the same kind, while 3D
+// and multisampled sources aren't supported. For sRGB output the source's
+// format decides the conversion: sRGB and float sources Load as linear light
+// and get gamma-encoded, while UNORM sources are taken as already
+// gamma-encoded bytes. Returns an invalid texture on failure.
+SK_TEXENC_API skr_tex_t    sk_texenc_encode       (skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler);
 
 #ifdef SK_TEXENC_DEBUG
 // Test builds only, from the SK_TEXENC_DEBUG cmake option. Queues one mip's
-// encode into ref_blocks with no output texture, so it works for formats the
+// encode, layer 0 only, into ref_blocks with no output texture, so it works for formats the
 // GPU can't sample. ref_blocks needs sk_texenc_debug_size bytes of storage.
 SK_TEXENC_API bool         sk_texenc_debug_encode (skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, uint32_t mip, skr_buffer_t* ref_blocks);
 SK_TEXENC_API uint32_t     sk_texenc_debug_size   (const skr_tex_t* source, sk_texenc_fmt_ format, uint32_t mip);

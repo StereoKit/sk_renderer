@@ -144,13 +144,16 @@ static const _te_shader_src_t _te_shader_srcs[_te_shader_count] = {
 #endif
 };
 
-// Every encoder declares these first in $Global, in this order; _te_params_match checks
+#define _TE_MAX_MIPS 16
+
+// texenc_common.hlsli declares these first in every encoder's $Global; _te_params_match checks
 typedef struct {
-	uint32_t mip_level;
-	uint32_t image_width;
-	uint32_t image_height;
-	uint32_t blocks_x;
-	uint32_t buffer_offset;
+	uint32_t base_width;
+	uint32_t base_height;
+	uint32_t mip_count;
+	uint32_t groups_x;
+	uint32_t mip_group_start[_TE_MAX_MIPS];
+	uint32_t mip_block_start[_TE_MAX_MIPS];
 } _te_params_t;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -219,11 +222,12 @@ bool sk_texenc_available(sk_texenc_fmt_ format, sk_texenc_flags_ flags) {
 
 static bool _te_params_match(const sksc_shader_meta_t* meta) {
 	static const struct { const char* name; uint32_t offset; } fields[] = {
-		{ "mip_level",     offsetof(_te_params_t, mip_level)     },
-		{ "image_width",   offsetof(_te_params_t, image_width)   },
-		{ "image_height",  offsetof(_te_params_t, image_height)  },
-		{ "blocks_x",      offsetof(_te_params_t, blocks_x)      },
-		{ "buffer_offset", offsetof(_te_params_t, buffer_offset) },
+		{ "base_width",      offsetof(_te_params_t, base_width)      },
+		{ "base_height",     offsetof(_te_params_t, base_height)     },
+		{ "mip_count",       offsetof(_te_params_t, mip_count)       },
+		{ "groups_x",        offsetof(_te_params_t, groups_x)        },
+		{ "mip_group_start", offsetof(_te_params_t, mip_group_start) },
+		{ "mip_block_start", offsetof(_te_params_t, mip_block_start) },
 	};
 	for (uint32_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
 		int32_t                  idx = sksc_shader_meta_get_var_index(meta, fields[i].name);
@@ -329,24 +333,45 @@ static uint32_t _te_mip_blocks(skr_vec3i_t base, uint32_t mip, const _te_fmt_inf
 	return blocks_x * blocks_y;
 }
 
-static void _te_dispatch_mip(const skr_compute_t* compute, const skr_compute_bind_t* binds, skr_vec3i_t base, uint32_t mip, const _te_fmt_info_t* info, uint32_t buffer_offset) {
-	uint32_t     blocks_x;
-	uint32_t     blocks_y = _te_mip_blocks(base, mip, info, &blocks_x) / blocks_x;
-	skr_vec3i_t  mip_size = skr_tex_calc_mip_dimensions(base, mip);
-	_te_params_t params   = {
-		.mip_level     = mip,
-		.image_width   = (uint32_t)mip_size.x,
-		.image_height  = (uint32_t)mip_size.y,
-		.blocks_x      = blocks_x,
-		.buffer_offset = buffer_offset,
+// One dispatch for mips [mip_first, mip_end) of every layer. Earlier mips get
+// no groups or blocks, so the shader's lookup skips past them.
+static void _te_dispatch(const skr_compute_t* compute, const skr_compute_bind_t* binds, skr_vec3i_t base, uint32_t mip_first, uint32_t mip_end, uint32_t layers, const _te_fmt_info_t* info) {
+	_te_params_t params = {
+		.base_width  = (uint32_t)base.x,
+		.base_height = (uint32_t)base.y,
+		.mip_count   = mip_end,
 	};
-	skr_compute_dispatch(compute, binds, 2, &params, sizeof(params), (blocks_x + 7) / 8, (blocks_y + 7) / 8, 1);
+	uint32_t groups = 0;
+	uint32_t blocks = 0;
+	for (uint32_t m = mip_first; m < mip_end; m++) {
+		uint32_t blocks_x;
+		uint32_t mip_blocks = _te_mip_blocks(base, m, info, &blocks_x);
+		uint32_t blocks_y   = mip_blocks / blocks_x;
+		params.mip_group_start[m] = groups;
+		params.mip_block_start[m] = blocks;
+		groups += ((blocks_x + 7) / 8) * ((blocks_y + 7) / 8);
+		blocks += mip_blocks * layers; // skr_tex_set_buffer's layout: mip-major, each mip's layers back to back
+	}
+	// Each dispatch axis guarantees 65535 groups, so the flat index wraps
+	params.groups_x   = groups < 65535 ? groups : 65535;
+	uint32_t groups_y = (groups + params.groups_x - 1) / params.groups_x;
+	skr_compute_dispatch(compute, binds, 2, &params, sizeof(params), params.groups_x, groups_y, layers);
 }
 
-static skr_tex_t _te_encode(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler, bool cube) {
+static uint64_t _te_total_blocks(skr_vec3i_t base, uint32_t mip_count, uint32_t layers, const _te_fmt_info_t* info) {
+	uint64_t total = 0;
+	for (uint32_t m = 0; m < mip_count; m++)
+		total += (uint64_t)_te_mip_blocks(base, m, info, NULL) * layers;
+	return total;
+}
+
+skr_tex_t sk_texenc_encode(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler) {
 	skr_tex_t result = {0};
 	if (!_te.initialized || !_te_fmt_valid(format) || !skr_tex_is_valid(source)) return result;
-	if (cube && source->layer_count < 6) return result;
+	// The shaders read a Texture2DArray, which 3D and multisampled textures can't fill
+	if ((source->flags & skr_tex_flags_3d) || skr_tex_get_multisample(source) > 1) return result;
+	bool cube = (source->flags & skr_tex_flags_cubemap) != 0;
+	if (cube && source->layer_count != 6) return result;
 
 	const _te_fmt_info_t* info       = &_te_formats[format];
 	skr_tex_fmt_          source_fmt = skr_tex_get_format(source);
@@ -358,69 +383,44 @@ static skr_tex_t _te_encode(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_
 
 	skr_vec3i_t size      = skr_tex_get_size(source);
 	skr_vec3i_t base      = { size.x, size.y, 1 };
-	uint32_t    layers    = cube ? 6 : 1;
-	uint32_t    mip_count = source->mip_levels > 0 ? source->mip_levels : 1;
+	uint32_t    layers    = source->layer_count > 0 ? source->layer_count : 1;
+	uint32_t    mip_count = source->mip_levels  > 0 ? source->mip_levels  : 1;
+	if (mip_count > _TE_MAX_MIPS) return result;
 
-	// skr_tex_set_buffer's layout: mip-major, with each mip's layers back to back
-	uint32_t total_blocks = 0;
-	for (uint32_t m = 0; m < mip_count; m++)
-		total_blocks += _te_mip_blocks(base, m, info, NULL) * layers;
+	uint64_t total_blocks = _te_total_blocks(base, mip_count, layers, info);
+	if (total_blocks * info->block_bytes > skr_get_max_storage_size()) {
+		skr_log(skr_log_warning, "sk_texenc: a %dx%d texture with %u layers needs more storage buffer than this device can bind", size.x, size.y, layers);
+		return result;
+	}
 
 	skr_buffer_t blocks;
-	if (skr_buffer_create(NULL, total_blocks, info->block_bytes, skr_buffer_type_storage, skr_use_compute_readwrite, &blocks) != skr_err_success)
+	if (skr_buffer_create(NULL, (uint32_t)total_blocks, info->block_bytes, skr_buffer_type_storage, skr_use_compute_readwrite, &blocks) != skr_err_success)
 		return result;
 	skr_buffer_set_name(&blocks, "sk_texenc_blocks");
 
 	// dynamic is what grants the transfer destination skr_tex_set_buffer copies into
-	skr_tex_flags_ out_flags = skr_tex_flags_readable | skr_tex_flags_dynamic | (cube ? skr_tex_flags_cubemap : 0);
+	skr_tex_flags_ out_flags = skr_tex_flags_readable | skr_tex_flags_dynamic;
+	if      (cube)                                 out_flags |= skr_tex_flags_cubemap;
+	else if (source->flags & skr_tex_flags_array)  out_flags |= skr_tex_flags_array;
 	if (skr_tex_create(out_fmt, out_flags, sampler, (skr_vec3i_t){ size.x, size.y, (int32_t)layers }, 1, mip_count, NULL, &result) != skr_err_success) {
 		skr_buffer_destroy(&blocks);
 		return (skr_tex_t){0};
 	}
 
-	// The encoders read a Texture2D, so cube faces are copied out one at a time
-	skr_tex_t face = {0};
-	if (cube && skr_tex_create(source_fmt, skr_tex_flags_readable | skr_tex_flags_dynamic, sampler, base, 1, mip_count, NULL, &face) != skr_err_success) {
-		skr_buffer_destroy(&blocks);
-		skr_tex_destroy(&result);
-		return (skr_tex_t){0};
-	}
-
+	// The shaders read a Texture2DArray, which sk_renderer binds through an array view
 	skr_compute_bind_t binds[2] = {
-		{ .bind = skr_compute_get_bind(compute, "source_tex")                        },
-		{ .bind = skr_compute_get_bind(compute, "output_blocks"), .buffer = &blocks  },
+		{ .bind = skr_compute_get_bind(compute, "source_tex"),    .tex    = source  },
+		{ .bind = skr_compute_get_bind(compute, "output_blocks"), .buffer = &blocks },
 	};
 
 	skr_cmd_begin();
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		binds[0].tex = cube ? &face : source;
-		if (cube) {
-			for (uint32_t m = 0; m < mip_count; m++)
-				skr_tex_copy(source, &face, m, layer, m, 0, 1);
-		}
-
-		uint32_t mip_start = 0;
-		for (uint32_t m = 0; m < mip_count; m++) {
-			uint32_t mip_blocks = _te_mip_blocks(base, m, info, NULL);
-			_te_dispatch_mip(compute, binds, base, m, info, mip_start + layer * mip_blocks);
-			mip_start += mip_blocks * layers;
-		}
-	}
+	_te_dispatch(compute, binds, base, 0, mip_count, layers, info);
 	skr_tex_set_buffer(&result, &blocks, 0, mip_count);
 	skr_cmd_end();
 
-	// Destruction is deferred until the GPU is done, so these are safe with the work still queued
+	// Destruction is deferred until the GPU is done, so this is safe with the work still queued
 	skr_buffer_destroy(&blocks);
-	if (cube) skr_tex_destroy(&face);
 	return result;
-}
-
-skr_tex_t sk_texenc_2d(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler) {
-	return _te_encode(source, format, flags, sampler, false);
-}
-
-skr_tex_t sk_texenc_cube(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, skr_tex_sampler_t sampler) {
-	return _te_encode(source, format, flags, sampler, true);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -436,7 +436,7 @@ uint32_t sk_texenc_debug_size(const skr_tex_t* source, sk_texenc_fmt_ format, ui
 
 bool sk_texenc_debug_encode(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_flags_ flags, uint32_t mip, skr_buffer_t* ref_blocks) {
 	if (!_te.initialized || !_te_fmt_valid(format) || !skr_tex_is_valid(source)) return false;
-	if (mip >= (source->mip_levels > 0 ? source->mip_levels : 1))                 return false;
+	if (mip >= (source->mip_levels > 0 ? source->mip_levels : 1) || mip >= _TE_MAX_MIPS) return false;
 	if (skr_buffer_get_size(ref_blocks) < sk_texenc_debug_size(source, format, mip)) return false;
 
 	const _te_fmt_info_t* info    = &_te_formats[format];
@@ -448,7 +448,7 @@ bool sk_texenc_debug_encode(skr_tex_t* source, sk_texenc_fmt_ format, sk_texenc_
 		{ .bind = skr_compute_get_bind(compute, "source_tex"),    .tex    = source     },
 		{ .bind = skr_compute_get_bind(compute, "output_blocks"), .buffer = ref_blocks },
 	};
-	_te_dispatch_mip(compute, binds, (skr_vec3i_t){ size.x, size.y, 1 }, mip, info, 0);
+	_te_dispatch(compute, binds, (skr_vec3i_t){ size.x, size.y, 1 }, mip, mip + 1, 1, info);
 	return true;
 }
 

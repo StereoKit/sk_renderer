@@ -288,6 +288,7 @@ typedef struct {
 	bool                     validation_enabled;
 	bool                     has_push_descriptors;        // VK_KHR_push_descriptor support
 	bool                     has_astc_decode_mode;        // VK_EXT_astc_decode_mode, linear LDR ASTC views decode to UNORM8
+	bool                     has_astc_decode_e5;          // decodeModeSharedExponent, HDR ASTC views decode to E5B9G9R9
 	bool                     has_astc_hdr;                // VK_EXT_texture_compression_astc_hdr, the SFLOAT ASTC formats
 	bool                     has_depth_clamp;             // VkPhysicalDeviceFeatures::depthClamp support
 	bool                     has_fill_mode_non_solid;     // VkPhysicalDeviceFeatures::fillModeNonSolid support
@@ -367,6 +368,7 @@ typedef struct {
 	uint32_t                 min_ubo_offset_align;   // minUniformBufferOffsetAlignment
 	uint32_t                 min_ssbo_offset_align;  // minStorageBufferOffsetAlignment
 	int32_t                  max_msaa_samples;       // Maximum supported MSAA sample count
+	uint32_t                 max_storage_size;       // maxStorageBufferRange, capped by maxMemoryAllocationSize
 	uint64_t                 frame_timestamps[SKR_MAX_FRAMES_IN_FLIGHT][2];  // [frame][start/end]
 
 	// CPU timing (wall-clock time for frame work, excluding vsync)
@@ -440,6 +442,8 @@ const VkSpecializationInfo* _skr_shader_make_spec_info      (const sksc_shader_m
 uint64_t              _skr_time_get_ns                      (void);
 uint64_t              _skr_time_from_host_domain            (uint64_t stamp);  // A raw host_time_domain stamp onto the _skr_time_get_ns scale
 void                  _skr_frame_note_present               (const skr_surface_t* surface, uint64_t id);  // Joins a present to the frame that just ended, when it was that frame's surface
+
+void                  _skr_binds_init                       (const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds); // meta's buffers then resources, nothing bound
 
 // Material descriptor caching. Returns -1 on success, or the failing bind index if a resource is missing.
 int32_t               _skr_material_add_writes              (const skr_material_bind_t* binds, uint32_t bind_ct, skr_stage_ stage_mask, const int32_t* ignore_slots, int32_t ignore_ct, _skr_desc_writes_t* ref_writes);
@@ -529,6 +533,7 @@ void                  _skr_tex_transition_queue_family      (VkCommandBuffer cmd
 void                  _skr_tex_transition_notify_layout     (      skr_tex_t* ref_tex, VkImageLayout new_layout);  // Called after render pass implicit transitions
 bool                  _skr_tex_needs_transition             (const skr_tex_t*     tex, uint8_t type); // Check if texture needs transition for given type (0=shader_read, 1=storage)
 VkImageLayout         _skr_tex_sample_layout                (const skr_tex_t*     tex); // Canonical layout for sampling a sk_renderer-owned texture (matches descriptor imageLayout)
+const skr_tex_t*      _skr_tex_array_view_src               (const skr_tex_t*     tex);
 VkImageLayout         _skr_tex_attachment_layout            (const skr_tex_t*     tex); // Canonical layout for using a texture as a render-pass attachment (color vs depth, picked from aspect_mask)
 void                  _skr_tex_transition_enqueue           (      skr_tex_t* ref_tex, uint8_t type); // Deferred texture transition queue (to avoid in-renderpass barriers) type: 0=shader_read, 1=storage
 void                  _skr_tex_transition_dequeue           (      skr_tex_t* ref_tex);               // Remove from deferred queue (called on texture destroy)

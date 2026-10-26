@@ -231,7 +231,7 @@ typedef enum skr_tex_fmt_ {
 	skr_tex_fmt_astc4x4_rgba,
 	skr_tex_fmt_astc6x6_rgba_srgb,
 	skr_tex_fmt_astc6x6_rgba,
-	skr_tex_fmt_astc8x8_rgba_hdr,
+	skr_tex_fmt_astc8x8_rgba_hdr,  // Alpha may sample as 1, where the GPU decodes HDR ASTC to shared exponent
 
 	// ATC compressed (Adreno)
 	skr_tex_fmt_atc_rgb,
@@ -789,6 +789,7 @@ SKR_API uint32_t          skr_buffer_get_size              (const skr_buffer_t* 
 SKR_API void              skr_buffer_set_name              (      skr_buffer_t* ref_buffer, const char* name);
 SKR_API skr_err_          skr_buffer_readback              (const skr_buffer_t*     buffer, skr_buffer_readback_t* out_readback);
 SKR_API void              skr_buffer_readback_destroy      (      skr_buffer_readback_t* ref_readback);
+SKR_API uint32_t          skr_get_max_storage_size         (void);  // Largest buffer, in bytes, this device can create and bind whole as storage. Constant buffers bind far less
 
 SKR_API skr_err_          skr_vert_type_create             (const skr_vert_component_t* items, int32_t item_count, skr_vert_type_t* out_type);
 SKR_API bool              skr_vert_type_is_valid           (const skr_vert_type_t*     type);
@@ -901,7 +902,7 @@ SKR_API skr_bind_t        skr_compute_get_bind             (const skr_compute_t*
 SKR_API void              skr_compute_execute              (      skr_compute_t* ref_compute, uint32_t x, uint32_t y, uint32_t z);
 SKR_API void              skr_compute_execute_indirect     (      skr_compute_t* ref_compute, skr_buffer_t* indirect_args);
 SKR_API void              skr_compute_dispatch             (const skr_compute_t*     compute, const skr_compute_bind_t* binds, uint32_t bind_count, const void* opt_params, uint32_t params_size, uint32_t x, uint32_t y, uint32_t z); // Stateless execute: binds and $Global params come from the arguments, so threads can share one compute. Params shorter than $Global keep the shader's defaults past params_size
-SKR_API void              skr_compute_set_tex              (      skr_compute_t* ref_compute, const char* name, skr_tex_t*    texture);
+SKR_API void              skr_compute_set_tex              (      skr_compute_t* ref_compute, const char* name, skr_tex_t*    texture);  // Slot rules as in skr_material_set_tex
 SKR_API void              skr_compute_set_buffer           (      skr_compute_t* ref_compute, const char* name, skr_buffer_t* buffer);
 SKR_API void              skr_compute_set_params           (      skr_compute_t* ref_compute, const void* data, uint32_t size);
 SKR_API void              skr_compute_set_param            (      skr_compute_t*     compute, const char* name, sksc_shader_var_ type, uint32_t count, const void* data);
@@ -910,7 +911,7 @@ SKR_API void              skr_compute_get_param            (const skr_compute_t*
 SKR_API skr_err_          skr_material_create              (skr_material_info_t info, skr_material_t* out_material);
 SKR_API void              skr_material_set_pipeline        (      skr_material_t* ref_material, skr_material_info_t info);
 SKR_API bool              skr_material_is_valid            (const skr_material_t*     material);
-SKR_API void              skr_material_set_tex             (      skr_material_t* ref_material, const char* name, skr_tex_t*    texture);
+SKR_API void              skr_material_set_tex             (      skr_material_t* ref_material, const char* name, skr_tex_t*    texture);  // A Texture2DArray slot also takes a 2D texture as one slice, or a cubemap as six in face order. 3D, multisampled, and external textures bind there as white. Global and compute textures follow the same rule
 SKR_API void              skr_material_set_buffer          (      skr_material_t* ref_material, const char* name, skr_buffer_t* buffer);
 SKR_API void              skr_material_set_params          (      skr_material_t* ref_material, const void* data, uint32_t size);
 SKR_API void              skr_material_destroy             (      skr_material_t* ref_material);

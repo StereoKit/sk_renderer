@@ -143,13 +143,13 @@ static void _load_skybox(scene_gltf_t* scene, const char* path) {
 	scene->skybox_is_hdr = (equirect_format == skr_tex_fmt_rg11b10uf);
 	tex_compress_init();
 	if (scene->skybox_is_hdr && tex_compress_available(tex_compress_fmt_bc6h)) {
-		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_bc6h);
+		scene->cubemap_compressed  = tex_compress(&scene->cubemap_texture, tex_compress_fmt_bc6h);
 		scene->compressed_fmt_name = "BC6H";
 	} else if (tex_compress_available(tex_compress_fmt_astc8x8hdr)) {
-		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_astc8x8hdr);
+		scene->cubemap_compressed  = tex_compress(&scene->cubemap_texture, tex_compress_fmt_astc8x8hdr);
 		scene->compressed_fmt_name = "ASTC 8x8 HDR";
 	} else if (!scene->skybox_is_hdr && tex_compress_available(tex_compress_fmt_bc1)) {
-		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_bc1);
+		scene->cubemap_compressed  = tex_compress(&scene->cubemap_texture, tex_compress_fmt_bc1);
 		scene->compressed_fmt_name = "BC1";
 	}
 	if (skr_tex_is_valid(&scene->cubemap_compressed)) {

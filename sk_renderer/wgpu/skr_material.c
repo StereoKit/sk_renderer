@@ -246,6 +246,17 @@ static skr_tex_t* _skr_default_tex(const char* value, uint8_t shape) {
 	return tex->texture ? tex : NULL;
 }
 
+void _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds) {
+	for (uint32_t i = 0; i < meta->buffer_count; i++)
+		out_binds[i] = (skr_material_bind_t){ .bind = meta->buffers[i].bind };
+	for (uint32_t i = 0; i < meta->resource_count; i++)
+		out_binds[meta->buffer_count + i] = (skr_material_bind_t){ .bind = meta->resources[i].bind, .array_view = _skr_resource_is_2d_array(&meta->resources[i]) };
+}
+
+WGPUTextureView _skr_default_white_array_view(void) {
+	return _skr_default_tex("white", SKSC_SHAPE_DIM_2D | SKSC_SHAPE_ARRAYED)->view;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 
@@ -295,8 +306,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		*out_material = (skr_material_t){ .pipeline_material_idx = -1, .bind_start = -1 };
 		return skr_err_out_of_memory;
 	}
-	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i].bind = meta->buffers[i].bind;
-	for (uint32_t i = 0; i < meta->resource_count; i++) binds[i + meta->buffer_count].bind = meta->resources[i].bind;
+	_skr_binds_init(meta, binds);
 
 	uint32_t instance_slot = _skr_bump_slots(meta, (uint8_t)(skr_stage_vertex | skr_stage_pixel)).instance;
 	out_material->instance_buffer_stride = 0;

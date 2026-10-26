@@ -232,6 +232,13 @@ skr_err_ skr_tex_create(skr_tex_fmt_ format, skr_tex_flags_ flags, skr_tex_sampl
 		.aspect          = WGPUTextureAspect_All,
 	};
 	out_tex->view    = wgpuTextureCreateView(out_tex->texture, &view_desc);
+	// Lets cubes and plain 2D textures bind where a shader declares
+	// Texture2DArray. Created with the texture, since a view made later could
+	// race a caller swapping the skr_tex_t it lives in.
+	if (!is_3d && !(flags & skr_tex_flags_array) && multisample <= 1) {
+		view_desc.dimension = WGPUTextureViewDimension_2DArray;
+		out_tex->array_view = wgpuTextureCreateView(out_tex->texture, &view_desc);
+	}
 	out_tex->sampler = _skr_sampler_create(sampler, mips);
 	if (sampler.sample_compare != skr_compare_none)
 		out_tex->sampler_compare = _skr_sampler_create_ex(sampler, mips);
@@ -398,7 +405,8 @@ void skr_tex_destroy(skr_tex_t* ref_tex) {
 	}
 	if (ref_tex->sampler)         wgpuSamplerRelease(ref_tex->sampler);
 	if (ref_tex->sampler_compare) wgpuSamplerRelease(ref_tex->sampler_compare);
-	if (ref_tex->view)    wgpuTextureViewRelease(ref_tex->view);
+	if (ref_tex->view)            wgpuTextureViewRelease(ref_tex->view);
+	if (ref_tex->array_view)      wgpuTextureViewRelease(ref_tex->array_view);
 	if (ref_tex->texture && !ref_tex->is_external) {
 		wgpuTextureRelease(ref_tex->texture);
 		_skr_mem_track(_skr_tex_category(ref_tex), -(int64_t)_skr_tex_bytes(ref_tex));
@@ -831,6 +839,16 @@ void skr_tex_generate_mips(skr_tex_t* ref_tex, const skr_shader_t* opt_filter_sh
 	// A caller-shader material is transient; its registry slot and bind slice
 	// recycle at the next frame boundary as usual
 	if (material == &custom) skr_material_destroy(&custom);
+}
+
+// 3D, multisampled, and external textures have no array view, and their own
+// view type would mismatch the slot, so they bind as white.
+WGPUTextureView _skr_tex_array_view(const skr_tex_t* tex) {
+	if (tex->array_view != NULL) return tex->array_view;
+	static _skr_atomic(uint32_t) warned = 0;
+	if (!_skr_exchange_u32(&warned, 1))
+		skr_log(skr_log_warning, "A 3D, multisampled, or external texture can't bind to a Texture2DArray slot, binding white instead");
+	return _skr_default_white_array_view();
 }
 
 // Single-layer render view, lazily created and cached per layer

@@ -32,14 +32,8 @@
 // ignored (BC6H has none; samples as 1.0). Negative inputs clamp to 0
 // (UF16 is unsigned).
 
-Texture2D<float4>         source_tex    : register(t0);
+Texture2DArray<float4>    source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
-
-uint mip_level;
-uint image_width;
-uint image_height;
-uint blocks_x;
-uint buffer_offset;
 
 #include "bc_common.hlsli"
 
@@ -79,12 +73,14 @@ uint3 quantize10_3(float3 h) {
 ///////////////////////////////////////////////////////////////////////////////
 
 [numthreads(8, 8, 1)]
-void cs(uint3 id : SV_DispatchThreadID) {
-	uint bx = id.x;
-	uint by = id.y;
-	uint blocks_y = (image_height + 3) / 4;
-	if (bx >= blocks_x || by >= blocks_y)
+void cs(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+	texenc_block_t blk;
+	if (!texenc_block(group, thread, 4u, 4u, blk))
 		return;
+	uint bx           = blk.x;
+	uint by           = blk.y;
+	uint image_width  = blk.width;
+	uint image_height = blk.height;
 
 	// Load 4x4 block as half-bit integers (see working-space note above).
 	// min() against 0x7BFF turns +Inf (0x7C00) and NaN payloads into the max
@@ -94,7 +90,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		[unroll] for (uint px = 0; px < 4; px++) {
 			uint sx = min(bx * 4 + px, image_width  - 1);
 			uint sy = min(by * 4 + py, image_height - 1);
-			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			float4 texel = source_tex.Load(int4(sx, sy, blk.layer, blk.mip));
 			uint3  hbits = min(f32tof16(max(texel.rgb, 0.0)), 0x7BFFu);
 			pixels[py * 4 + px] = float3(hbits);
 		}
@@ -225,5 +221,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		write_bits(block, 68 + (j - 1) * 4, 4, k);
 	}
 
-	output_blocks[buffer_offset + by * blocks_x + bx] = block;
+	output_blocks[blk.out_index] = block;
 }

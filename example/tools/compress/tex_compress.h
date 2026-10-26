@@ -37,13 +37,10 @@ void      tex_compress_shutdown(void);
 // True when sk_texenc embeds this encoder and the GPU can sample its output.
 bool      tex_compress_available(tex_compress_fmt_ format);
 
-// Compress a 2D source texture, full mip chain. Returns an invalid texture
-// on failure (unsupported format, invalid source, allocation failure).
+// Compress a 2D, array, or cubemap source, keeping its mips and layers. The
+// result is the same kind of texture. Returns an invalid texture on failure
+// (unsupported format, invalid source, allocation failure).
 skr_tex_t tex_compress         (skr_tex_t* source, tex_compress_fmt_ format);
-
-// Compress a 6-layer cubemap, keeping the source's mip count. The result has
-// skr_tex_flags_cubemap.
-skr_tex_t tex_compress_cube    (skr_tex_t* cube_source, tex_compress_fmt_ format);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Validation & profiling, only when sk_texenc is built with SK_TEXENC_DEBUG

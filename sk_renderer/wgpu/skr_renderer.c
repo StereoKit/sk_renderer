@@ -664,7 +664,10 @@ WGPUBindGroup _skr_build_bind_group_meta(const sksc_shader_meta_t* meta, uint8_t
 		if (buf && buf->buffer) {
 			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .buffer = buf->buffer, .offset = 0, .size = (buf->size + 3) & ~3u };
 		} else if (tex && tex->view) {
-			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .textureView = tex->view };
+			WGPUTextureView view = bind->array_view && (tex->flags & skr_tex_flags_array) == 0
+				? _skr_tex_array_view(tex)
+				: tex->view;
+			entries[entry_count++] = (WGPUBindGroupEntry){ .binding = slot, .textureView = view };
 		} else {
 			skr_log(skr_log_warning, "Material is missing a binding for slot %u", slot);
 			return NULL;

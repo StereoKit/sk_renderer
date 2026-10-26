@@ -143,6 +143,22 @@ skr_material_bind_t* _skr_bind_pool_get(int32_t start) {
 	return chunk ? &chunk[start & _SKR_BIND_CHUNK_MASK] : NULL;
 }
 
+void _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds) {
+	for (uint32_t i = 0; i < meta->buffer_count; i++)
+		out_binds[i] = (skr_material_bind_t){ .bind = meta->buffers[i].bind };
+	for (uint32_t i = 0; i < meta->resource_count; i++) {
+		const sksc_shader_resource_t* res = &meta->resources[i];
+		out_binds[meta->buffer_count + i] = (skr_material_bind_t){
+			.bind               = res->bind,
+			// Shape bit 6 on sampled textures: the shader uses QCOM image-processing
+			// ops, which require the dedicated IMAGE_PROCESSING sampler at descriptor
+			// time. On storage images the same bit records write usage instead.
+			.image_proc_sampler = res->bind.register_type == skr_register_texture && (res->shape & SKSC_SHAPE_WRITTEN) != 0,
+			.array_view         = _skr_resource_is_2d_array(res),
+		};
+	}
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_material) {
@@ -204,14 +220,7 @@ skr_err_ skr_material_create(skr_material_info_t info, skr_material_t* out_mater
 		return skr_err_out_of_memory;
 	}
 	skr_material_bind_t* binds = _skr_bind_pool_get(out_material->bind_start);
-	for (uint32_t i = 0; i < meta->buffer_count;   i++) binds[i                   ].bind = meta->buffers  [i].bind;
-	for (uint32_t i = 0; i < meta->resource_count; i++) {
-		binds[i+meta->buffer_count].bind = meta->resources[i].bind;
-		// Shape bit 6 on sampled textures: the shader uses QCOM image-processing
-		// ops, which require the dedicated IMAGE_PROCESSING sampler at descriptor
-		// time. On storage images the same bit records write usage instead.
-		binds[i+meta->buffer_count].image_proc_sampler = meta->resources[i].bind.register_type == skr_register_texture && (meta->resources[i].shape & SKSC_SHAPE_WRITTEN) != 0; // QCOM sampler bit on sampled textures
-	}
+	_skr_binds_init(meta, binds);
 
 	// Check if we have a buffer bound to the system buffer slot
 	out_material->has_system_buffer = false;
@@ -593,7 +602,17 @@ int32_t _skr_material_add_writes(const skr_material_bind_t* binds, uint32_t bind
 			// this shader and the pipeline is expected to be rejected anyway.
 			VkSampler sampler = (binds[i].image_proc_sampler && _skr_vk.sampler_image_proc != VK_NULL_HANDLE)
 				? _skr_vk.sampler_image_proc : tex->sampler;
-			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler, tex->view, tex->bind_uid, _skr_tex_sample_layout(tex));
+			// A cube or plain 2D texture in a Texture2DArray slot needs a 2D_ARRAY
+			// view. Its identity sets the top bit, which counters never reach.
+			const skr_tex_t* view_tex = tex;
+			VkImageView      view     = tex->view;
+			uint64_t         uid      = tex->bind_uid;
+			if (binds[i].array_view && (tex->flags & skr_tex_flags_array) == 0) {
+				view_tex = _skr_tex_array_view_src(tex);
+				view     = view_tex->array_view;
+				uid      = view_tex->bind_uid | (1ull << 63);
+			}
+			_skr_write_image(ref_writes, (uint32_t)slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler, view, uid, _skr_tex_sample_layout(view_tex));
 		} break;
 		case skr_register_readwrite: { // RWStructuredBuffer (u in HLSL)
 			skr_buffer_t* buffer  = _skr_vk.global_buffers[slot-SKR_BIND_SHIFT_UAV];

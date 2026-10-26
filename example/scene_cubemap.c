@@ -108,10 +108,10 @@ static scene_t* _scene_cubemap_create(void) {
 	// which version the materials sample.
 	tex_compress_init();
 	if (tex_compress_available(tex_compress_fmt_bc1)) {
-		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_bc1);
+		scene->cubemap_compressed  = tex_compress(&scene->cubemap_texture, tex_compress_fmt_bc1);
 		scene->compressed_fmt_name = "BC1";
 	} else if (tex_compress_available(tex_compress_fmt_astc6x6)) {
-		scene->cubemap_compressed  = tex_compress_cube(&scene->cubemap_texture, tex_compress_fmt_astc6x6);
+		scene->cubemap_compressed  = tex_compress(&scene->cubemap_texture, tex_compress_fmt_astc6x6);
 		scene->compressed_fmt_name = "ASTC 6x6";
 	}
 	if (skr_tex_is_valid(&scene->cubemap_compressed)) {

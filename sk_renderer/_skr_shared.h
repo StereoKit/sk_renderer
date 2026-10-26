@@ -18,6 +18,12 @@ void* _skr_calloc (size_t count, size_t size);
 void* _skr_realloc(void* ptr, size_t size);
 void  _skr_free   (void* ptr);
 
+// A Texture2DArray slot, which cubes and plain 2D textures fill through their 2D array view
+static inline bool _skr_resource_is_2d_array(const sksc_shader_resource_t* res) {
+	return res->bind.register_type == skr_register_texture
+	    && (res->shape & (SKSC_SHAPE_DIM_MASK | SKSC_SHAPE_ARRAYED | SKSC_SHAPE_MS)) == (SKSC_SHAPE_DIM_2D | SKSC_SHAPE_ARRAYED);
+}
+
 // Presentation timeline ring (skr_present.c), embedded in each backend's surface
 skr_present_info_t* _skr_present_begin     (skr_present_ring_t* ref_ring, uint64_t cpu_present_ns);  // Claims the next id
 skr_present_info_t* _skr_present_slot      (skr_present_ring_t* ref_ring, uint64_t id);              // NULL once the id has left the ring

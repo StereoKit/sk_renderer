@@ -258,3 +258,6 @@ void     _skr_frame_forget_surface(const skr_surface_t* surface);
 
 // Lazily-created single-layer render view for layered targets (skr_texture.c)
 WGPUTextureView _skr_tex_layer_view(skr_tex_t* tex, uint32_t layer);
+WGPUTextureView _skr_tex_array_view(const skr_tex_t* tex);
+WGPUTextureView _skr_default_white_array_view(void);  // skr_material.c
+void            _skr_binds_init(const sksc_shader_meta_t* meta, skr_material_bind_t* out_binds);  // meta's buffers then resources, nothing bound

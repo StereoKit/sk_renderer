@@ -76,6 +76,7 @@ typedef struct skr_mesh_t {
 typedef struct skr_tex_t {
 	WGPUTexture            texture;
 	WGPUTextureView        view;             // Whole-resource view for sampling
+	WGPUTextureView        array_view;       // 2D-array view for Texture2DArray binds, see _skr_tex_array_view
 	WGPUTextureView*       layer_views;      // Lazily-created single-layer render views (layer_count
 	                                         // entries, NULL until first layered render) — WebGPU has no
 	                                         // multiview, so layered targets render one pass per layer
@@ -140,6 +141,7 @@ typedef struct  {
 		skr_buffer_t* buffer;
 	};
 	skr_bind_t bind;
+	bool       array_view; // The shader declares a 2D array here, see _skr_tex_array_view
 } skr_material_bind_t;
 
 // Internal key struct for pipeline-affecting material parameters only.

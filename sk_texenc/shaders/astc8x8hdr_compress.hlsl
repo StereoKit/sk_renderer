@@ -31,14 +31,8 @@
 // will display magenta. Hardware ASTC (Adreno, Mali, Apple, NV with HDR
 // extension) decodes correctly. astcenc -dh decodes for offline validation.
 
-Texture2D<float4>         source_tex    : register(t0);
+Texture2DArray<float4>    source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
-
-uint mip_level;
-uint image_width;
-uint image_height;
-uint blocks_x;
-uint buffer_offset;
 
 #include "astc_common.hlsli"
 
@@ -88,12 +82,14 @@ static const uint B_BL_J[8] = { 0u, 0u, 0u, 1u, 1u, 2u, 2u, 3u };
 static const uint B_BL_W[8] = { 0u, 7u, 14u, 5u, 11u, 2u, 9u, 0u };
 
 [numthreads(8, 8, 1)]
-void cs(uint3 id : SV_DispatchThreadID) {
-	uint bx = id.x;
-	uint by = id.y;
-	uint blocks_y = (image_height + 7u) / 8u;
-	if (bx >= blocks_x || by >= blocks_y)
+void cs(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+	texenc_block_t blk;
+	if (!texenc_block(group, thread, 8u, 8u, blk))
 		return;
+	uint bx           = blk.x;
+	uint by           = blk.y;
+	uint image_width  = blk.width;
+	uint image_height = blk.height;
 
 	// Load 8x8 block; convert each pixel to LNS so all subsequent math
 	// (bbox, axis projection, weight quantization, endpoint pack, SSE)
@@ -105,7 +101,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		[unroll] for (uint px = 0; px < 8; px++) {
 			uint sx = min(bx * 8u + px, image_width  - 1u);
 			uint sy = min(by * 8u + py, image_height - 1u);
-			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			float4 texel = source_tex.Load(int4(sx, sy, blk.layer, blk.mip));
 			float3 lns = float3(
 				astc_float_to_lns(max(texel.r, 0.0)),
 				astc_float_to_lns(max(texel.g, 0.0)),
@@ -132,7 +128,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		uint4 b = uint4(0, 0, 0, 0);
 		astc_write_header_8x8_hdr_rgb_4x4_r12(b);
 		astc_write_endpoints_v6(b, v0, v1, v2, v3, v4, v5);
-		output_blocks[buffer_offset + by * blocks_x + bx] = b;
+		output_blocks[blk.out_index] = b;
 		return;
 	}
 
@@ -256,5 +252,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		astc_write_weights16_trit_2bit(block, weights_B);
 	}
 #endif
-	output_blocks[buffer_offset + by * blocks_x + bx] = block;
+	output_blocks[blk.out_index] = block;
 }

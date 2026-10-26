@@ -7,7 +7,7 @@
 //
 // Port of the CPU bounding-box encoder from tools/tex_compress.c.
 
-Texture2D<float4>         source_tex    : register(t0);
+Texture2DArray<float4>    source_tex    : register(t0);
 RWStructuredBuffer<uint2> output_blocks : register(u1);
 
 // Pipeline-specialized: the C side creates one compute per value, so the
@@ -33,23 +33,19 @@ uint pack565(float3 c) {
 	return (r << 11) | (g << 5) | b;
 }
 
-uint mip_level;
-uint image_width;
-uint image_height;
-uint blocks_x;
-uint buffer_offset;
-
 ///////////////////////////////////////////////////////////////////////////////
 // BC1 block encoder
 ///////////////////////////////////////////////////////////////////////////////
 
 [numthreads(8, 8, 1)]
-void cs(uint3 id : SV_DispatchThreadID) {
-	uint bx = id.x;
-	uint by = id.y;
-	uint blocks_y = (image_height + 3) / 4;
-	if (bx >= blocks_x || by >= blocks_y)
+void cs(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+	texenc_block_t blk;
+	if (!texenc_block(group, thread, 4u, 4u, blk))
 		return;
+	uint bx           = blk.x;
+	uint by           = blk.y;
+	uint image_width  = blk.width;
+	uint image_height = blk.height;
 
 	// Load 4x4 block.
 	float3 pixels[16];
@@ -61,7 +57,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		[unroll] for (uint px = 0; px < 4; px++) {
 			uint sx = min(bx * 4 + px, image_width  - 1);
 			uint sy = min(by * 4 + py, image_height - 1);
-			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			float4 texel = source_tex.Load(int4(sx, sy, blk.layer, blk.mip));
 			if (SRGB_ENCODE)
 				texel.rgb = linear_to_srgb(texel.rgb);
 
@@ -78,7 +74,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 
 	// Alpha path: fully transparent block early-out
 	if (ENABLE_ALPHA && !has_opaque) {
-		output_blocks[buffer_offset + by * blocks_x + bx] = uint2(0, 0xFFFFFFFF);
+		output_blocks[blk.out_index] = uint2(0, 0xFFFFFFFF);
 		return;
 	}
 
@@ -309,5 +305,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 	}
 
 	// Pack output: [c0_lo, c0_hi, c1_lo, c1_hi] [idx0..idx3]
-	output_blocks[buffer_offset + by * blocks_x + bx] = uint2(best_c0 | (best_c1 << 16), best_indices);
+	output_blocks[blk.out_index] = uint2(best_c0 | (best_c1 << 16), best_indices);
 }

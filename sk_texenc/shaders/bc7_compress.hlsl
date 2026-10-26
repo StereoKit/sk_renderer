@@ -39,7 +39,7 @@
 // Remaining headroom (deliberate, same flavor as BC6H's mode-11-only):
 // hard color edges would prefer mode 1/3 partitions. Measure first.
 
-Texture2D<float4>         source_tex    : register(t0);
+Texture2DArray<float4>    source_tex    : register(t0);
 RWStructuredBuffer<uint4> output_blocks : register(u1);
 
 // Encode linear-light input to sRGB before quantizing, for cube sources
@@ -50,12 +50,6 @@ RWStructuredBuffer<uint4> output_blocks : register(u1);
 [[vk::constant_id(1)]] const bool LINEAR_DATA = false;
 
 #include "bc_common.hlsli"
-
-uint mip_level;
-uint image_width;
-uint image_height;
-uint blocks_x;
-uint buffer_offset;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Mode 6 quantization + packing
@@ -99,12 +93,14 @@ void quantize_ep(float4 target, bool opaque, out uint4 q, out uint p) {
 ///////////////////////////////////////////////////////////////////////////////
 
 [numthreads(8, 8, 1)]
-void cs(uint3 id : SV_DispatchThreadID) {
-	uint bx = id.x;
-	uint by = id.y;
-	uint blocks_y = (image_height + 3) / 4;
-	if (bx >= blocks_x || by >= blocks_y)
+void cs(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+	texenc_block_t blk;
+	if (!texenc_block(group, thread, 4u, 4u, blk))
 		return;
+	uint bx           = blk.x;
+	uint by           = blk.y;
+	uint image_width  = blk.width;
+	uint image_height = blk.height;
 
 	// Load 4x4 block in [0,255] float4 — the space mode 6 endpoints live in.
 	float4 pixels[16];
@@ -113,7 +109,7 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		[unroll] for (uint px = 0; px < 4; px++) {
 			uint sx = min(bx * 4 + px, image_width  - 1);
 			uint sy = min(by * 4 + py, image_height - 1);
-			float4 texel = source_tex.Load(int3(sx, sy, mip_level));
+			float4 texel = source_tex.Load(int4(sx, sy, blk.layer, blk.mip));
 			if (SRGB_ENCODE)
 				texel.rgb = linear_to_srgb(texel.rgb);
 			pixels[py * 4 + px] = saturate(texel) * 255.0;
@@ -337,5 +333,5 @@ void cs(uint3 id : SV_DispatchThreadID) {
 		}
 	}
 
-	output_blocks[buffer_offset + by * blocks_x + bx] = block;
+	output_blocks[blk.out_index] = block;
 }

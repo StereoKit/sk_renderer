@@ -168,9 +168,7 @@ skr_err_ skr_compute_create(const skr_shader_t* shader, skr_compute_info_t info,
 	// The bind pool slice doubles as this dispatch's descriptor cache key
 	out_compute->bind_count = shader->meta.resource_count + shader->meta.buffer_count;
 	out_compute->bind_start = _skr_bind_pool_alloc(out_compute->bind_count);
-	skr_material_bind_t* binds = _skr_bind_pool_get(out_compute->bind_start);
-	for (uint32_t i = 0; i < shader->meta.buffer_count;   i++) binds[i                          ].bind = shader->meta.buffers  [i].bind;
-	for (uint32_t i = 0; i < shader->meta.resource_count; i++) binds[i+shader->meta.buffer_count].bind = shader->meta.resources[i].bind;
+	_skr_binds_init(&shader->meta, _skr_bind_pool_get(out_compute->bind_start));
 
 	// Initialize parameter buffer if shader has $Global cbuffer
 	const sksc_shader_meta_t* meta = &shader->meta;
@@ -506,8 +504,7 @@ void skr_compute_dispatch(const skr_compute_t* compute, const skr_compute_bind_t
 		skr_log(skr_log_critical, "skr_compute_dispatch: shader '%s' has %u binds, above the %u it supports", meta->name, slot_count, (uint32_t)(sizeof(slots) / sizeof(slots[0])));
 		return;
 	}
-	const skr_material_bind_t* own = _skr_bind_pool_get(compute->bind_start);
-	for (uint32_t i = 0; i < slot_count; i++) slots[i].bind = own[i].bind;
+	_skr_binds_init(meta, slots);
 	for (uint32_t b = 0; b < bind_count; b++) {
 		for (uint32_t i = 0; i < slot_count; i++) {
 			if (slots[i].bind.slot != binds[b].bind.slot || slots[i].bind.register_type != binds[b].bind.register_type) continue;

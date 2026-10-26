@@ -52,11 +52,7 @@ static sk_texenc_fmt_ _texenc_fmt(tex_compress_fmt_ format) {
 }
 
 skr_tex_t tex_compress(skr_tex_t* source, tex_compress_fmt_ format) {
-	return sk_texenc_2d(source, _texenc_fmt(format), sk_texenc_flags_none, su_sampler_linear_clamp);
-}
-
-skr_tex_t tex_compress_cube(skr_tex_t* cube_source, tex_compress_fmt_ format) {
-	return sk_texenc_cube(cube_source, _texenc_fmt(format), sk_texenc_flags_none, su_sampler_linear_clamp);
+	return sk_texenc_encode(source, _texenc_fmt(format), sk_texenc_flags_none, su_sampler_linear_clamp);
 }
 
 bool tex_compress_available(tex_compress_fmt_ format) {

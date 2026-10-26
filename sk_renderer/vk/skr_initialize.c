@@ -547,6 +547,19 @@ static void _skr_register_internal_requests(void) {
 		.device_extension_count = 1,
 	});
 
+	// A separate request, so a missing shared exponent bit can't disable UNORM8.
+	static const VkPhysicalDeviceASTCDecodeFeaturesEXT astc_decode_features = {
+		.sType                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ASTC_DECODE_FEATURES_EXT,
+		.decodeModeSharedExponent = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                   = "astc_decode_e5",
+		.device_extensions      = (const char*[]){ VK_EXT_ASTC_DECODE_MODE_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &astc_decode_features, sizeof(astc_decode_features) } },
+		.feature_count          = 1,
+	});
+
 	static const VkPhysicalDeviceTextureCompressionASTCHDRFeaturesEXT astc_hdr_features = {
 		.sType                      = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES_EXT,
 		.textureCompressionASTC_HDR = VK_TRUE,
@@ -1412,6 +1425,7 @@ bool skr_init(skr_settings_t settings) {
 	_skr_vk.has_present_timing          = skr_vk_request_enabled("present_timing");
 	_skr_vk.has_present_wait2           = skr_vk_request_enabled("present_wait2");
 	_skr_vk.has_astc_decode_mode        = skr_vk_request_enabled("astc_decode_mode");
+	_skr_vk.has_astc_decode_e5          = skr_vk_request_enabled("astc_decode_e5");
 	_skr_vk.has_astc_hdr                = skr_vk_request_enabled("astc_hdr");
 	_skr_vk.has_present_wait            = skr_vk_request_enabled("present_wait");
 	_skr_vk.has_display_timing_google   = skr_vk_request_enabled(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
@@ -1500,13 +1514,17 @@ bool skr_init(skr_settings_t settings) {
 		.shaderStorageImageReadWithoutFormat  = available_features.shaderStorageImageReadWithoutFormat,
 	};
 
-	// Query multiview properties (and subgroup size limits if supported)
+	// Query multiview and allocation limits (and subgroup size limits if supported)
 	VkPhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_props = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT,
 	};
+	VkPhysicalDeviceMaintenance3Properties maintenance3_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
+		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_props : NULL,
+	};
 	VkPhysicalDeviceMultiviewProperties multiview_props = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES,
-		.pNext = _skr_vk.has_subgroup_size_control ? &subgroup_props : NULL,
+		.pNext = &maintenance3_props,
 	};
 	VkPhysicalDeviceProperties2 props2 = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -1522,6 +1540,9 @@ bool skr_init(skr_settings_t settings) {
 	vkGetPhysicalDeviceProperties2(_skr_vk.physical_device, &props2);
 	_skr_vk.max_tile_apron = _skr_vk.has_qcom_tile_shading ? tile_shading_props.maxApronSize : 0;
 	_skr_vk.max_multiview_view_count = multiview_props.maxMultiviewViewCount;
+	_skr_vk.max_storage_size         = maintenance3_props.maxMemoryAllocationSize < device_props.limits.maxStorageBufferRange
+		? (uint32_t)maintenance3_props.maxMemoryAllocationSize
+		: device_props.limits.maxStorageBufferRange;
 	if (_skr_vk.has_subgroup_size_control) {
 		_skr_vk.min_subgroup_size             = subgroup_props.minSubgroupSize;
 		_skr_vk.max_subgroup_size             = subgroup_props.maxSubgroupSize;
@@ -1906,6 +1927,10 @@ void skr_get_vk_device_uuid(uint8_t out_uuid[VK_UUID_SIZE]) {
 
 int32_t skr_get_max_msaa_samples(void) {
 	return _skr_vk.max_msaa_samples;
+}
+
+uint32_t skr_get_max_storage_size(void) {
+	return _skr_vk.max_storage_size;
 }
 
 bool skr_is_capable(skr_capability_ capability) {
