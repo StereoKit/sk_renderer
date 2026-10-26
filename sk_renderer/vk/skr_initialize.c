@@ -514,6 +514,19 @@ static void _skr_register_internal_requests(void) {
 		.feature_count = 1,
 	});
 
+	// 16-bit float arithmetic (sksc_feature_bit_float16), packed fp16 math in compute
+	static const VkPhysicalDeviceShaderFloat16Int8Features float16_features = {
+		.sType         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+		.shaderFloat16 = VK_TRUE,
+	};
+	skr_vk_request(&(skr_vk_request_t){
+		.name                   = "float16",
+		.device_extensions      = (const char*[]){ VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME },
+		.device_extension_count = 1,
+		.features               = (skr_vk_feature_t[]){ { &float16_features, sizeof(float16_features) } },
+		.feature_count          = 1,
+	});
+
 	// Float atomics (sksc_feature_bit_float_atomics): the coarse bit promises
 	// exchange + add + min/max, and min/max lives in atomic_float2's struct.
 	static const VkPhysicalDeviceShaderAtomicFloatFeaturesEXT float_atomic_features = {
@@ -1483,6 +1496,7 @@ bool skr_init(skr_settings_t settings) {
 	// Any enabled op means image-processing bindings can occur, hence the sampler
 	_skr_vk.has_qcom_image_proc = enable_sample_weighted || enable_box_filter || enable_block_match;
 	bool enable_storage16       = skr_vk_request_enabled("storage16");
+	bool enable_float16         = skr_vk_request_enabled("float16");
 	bool enable_atomic_float    = skr_vk_request_enabled("float_atomics");
 
 	// Query available device features
@@ -1738,6 +1752,8 @@ bool skr_init(skr_settings_t settings) {
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_int16;
 	if (enable_storage16)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_storage16;
+	if (enable_float16)
+		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_float16;
 	if (enable_atomic_float)
 		_skr_vk.enabled_features |= (uint64_t)1 << sksc_feature_bit_float_atomics;
 
