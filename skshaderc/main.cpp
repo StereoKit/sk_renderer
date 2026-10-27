@@ -872,9 +872,9 @@ class Material%s : Material
 		fprintf(fp, "	public Tex %s { get { return GetTexture(\"%s\"); } set { SetTexture(\"%s\", value); } }\n", cs_varname, res->name, res->name);
 	}
 
-	sksc_shader_buffer_t *buff = &file->meta.buffers[file->meta.global_buffer_id];
-	for (uint32_t i=0; i<buff->var_count; i+=1) {
-		sksc_shader_var_t *v = &buff->vars[i];
+	int32_t var_ct = sksc_shader_meta_get_var_count(&file->meta);
+	for (int32_t i=0; i<var_ct; i+=1) {
+		const sksc_shader_var_t *v = sksc_shader_meta_get_var_info(&file->meta, i);
 
 		make_cs_name(v->name, cs_varname);
 

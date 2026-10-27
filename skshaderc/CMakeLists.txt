@@ -408,6 +408,14 @@ if(MINGW)
 	target_link_options(skshaderc PRIVATE -static-libgcc -static-libstdc++ -static)
 endif()
 
+# skshaderc_lib compiles with per-function sections, so drop the unused ones.
+# MSVC already does this in Release with /OPT:REF.
+if(APPLE)
+	target_link_options(skshaderc PRIVATE -Wl,-dead_strip)
+elseif(NOT MSVC)
+	target_link_options(skshaderc PRIVATE -Wl,--gc-sections)
+endif()
+
 # Enable LTO for native builds, but not MinGW (GCC LTO + static libs = symbol issues)
 if(NOT MINGW)
 	set_target_properties(skshaderc PROPERTIES
