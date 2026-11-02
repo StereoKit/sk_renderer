@@ -305,8 +305,9 @@ _Static_assert(sizeof(_skr_pipeline_material_key_t) == 152,
 
 typedef struct skr_material_t {
 	int32_t                      pipeline_material_idx; // Index into pipeline cache
+	int8_t                       queue_offset;          // Render queue offset (not pipeline-affecting)
+	bool                         has_system_buffer;
 	_skr_pipeline_material_key_t key;                   // Pipeline-affecting state
-	int32_t                      queue_offset;          // Render queue offset (not pipeline-affecting)
 
 	int32_t                bind_start;            // Index into global bind pool (-1 if none)
 	uint32_t               bind_count;
@@ -314,7 +315,6 @@ typedef struct skr_material_t {
 	void*                  param_buffer;          // CPU-side parameter data
 	uint32_t               param_buffer_size;     // Size of parameter buffer in bytes
 
-	bool                   has_system_buffer;
 	uint32_t               instance_buffer_stride; // Element size of instance buffer (0 = no instance buffer)
 } skr_material_t;
 

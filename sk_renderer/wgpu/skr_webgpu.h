@@ -200,8 +200,8 @@ _Static_assert(sizeof(_skr_pipeline_material_key_t) == (sizeof(void*) == 8 ? 128
 
 typedef struct skr_material_t {
 	int32_t                      pipeline_material_idx; // Index into pipeline cache
+	int8_t                       queue_offset;          // Render queue offset (not pipeline-affecting)
 	_skr_pipeline_material_key_t key;                   // Pipeline-affecting state
-	int32_t                      queue_offset;          // Render queue offset (not pipeline-affecting)
 
 	int32_t                bind_start;            // Index into global bind pool (-1 if none)
 	uint32_t               bind_count;

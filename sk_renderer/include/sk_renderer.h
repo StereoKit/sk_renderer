@@ -635,9 +635,9 @@ typedef struct skr_material_info_t {
 	bool                 alpha_to_coverage;
 	bool                 depth_clamp;   // Clamp depth to [0,1] instead of clipping (useful for shadow mapping)
 	bool                 wireframe;    // Render as wireframe lines instead of filled polygons
+	int8_t               queue_offset; // Render queue offset for sorting (lower draws first)
 	skr_stencil_state_t  stencil_front;
 	skr_stencil_state_t  stencil_back;
-	int32_t              queue_offset;  // Render queue offset for sorting (lower draws first)
 
 	// Spec constant overrides; unlisted constants keep their HLSL defaults.
 	// Values are copied out, the array doesn't need to outlive this call.
