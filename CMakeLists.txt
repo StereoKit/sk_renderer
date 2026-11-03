@@ -28,6 +28,10 @@ cmake_minimum_required(VERSION 3.19)
 if(POLICY CMP0135)
 	cmake_policy(SET CMP0135 NEW)
 endif()
+# Fetch dependencies directly instead of through a sub-build for each one.
+if(POLICY CMP0168)
+	cmake_policy(SET CMP0168 NEW)
+endif()
 
 project(sk_renderer VERSION 0.1.0)
 

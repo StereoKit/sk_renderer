@@ -38,6 +38,10 @@ cmake_minimum_required(VERSION 3.19)
 if(POLICY CMP0135)
 	cmake_policy(SET CMP0135 NEW)
 endif()
+# Fetch dependencies directly instead of through a sub-build for each one.
+if(POLICY CMP0168)
+	cmake_policy(SET CMP0168 NEW)
+endif()
 
 project(skshaderc VERSION 1.0 DESCRIPTION "Shader compiler for sk_renderer")
 
@@ -393,6 +397,8 @@ target_include_directories(skshaderc_lib PUBLIC
 	${CMAKE_CURRENT_SOURCE_DIR}
 	../sk_renderer/include
 )
+# skshaderc only calls mz_compress2, the rest of miniz can go.
+target_compile_definitions(skshaderc_lib PUBLIC MINIZ_NO_INFLATE_APIS MINIZ_NO_STDIO MINIZ_NO_TIME)
 
 ###############################################################################
 # Executable: skshaderc
