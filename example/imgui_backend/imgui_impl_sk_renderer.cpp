@@ -60,7 +60,7 @@ static void ImGui_ImplSkRenderer_UpdateTexture(ImTextureData* tex) {
 		skr_tex_sampler_t sampler = {
 			.sample         = skr_tex_sample_linear,
 			.address        = skr_tex_address_clamp,
-			.sample_compare = skr_compare_never,
+			.sample_compare = skr_compare_none,
 		};
 
 		skr_tex_t* skr_tex = (skr_tex_t*)calloc(1, sizeof(skr_tex_t));
