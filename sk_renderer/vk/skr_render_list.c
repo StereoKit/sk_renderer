@@ -141,8 +141,8 @@ void skr_render_list_add_indexed(skr_render_list_t* ref_list, skr_mesh_t* mesh, 
 	skr_render_item_t* item = &ref_list->items[ref_list->count++];
 
 	// Copy mesh Vulkan handles
-	for (uint32_t i = 0; i < mesh->vertex_buffer_count && i < SKR_MAX_VERTEX_BUFFERS; i++) {
-		item->vertex_buffers[i] = mesh->vertex_buffers[i].buffer;
+	for (uint32_t i = 0; i < SKR_MAX_VERTEX_BUFFERS; i++) {
+		item->vertex_buffers[i] = i < mesh->vertex_buffer_count ? mesh->vertex_buffers[i].buffer : VK_NULL_HANDLE;
 	}
 	item->index_buffer      = mesh->index_buffer.buffer;
 	item->vert_count        = mesh->vert_count;

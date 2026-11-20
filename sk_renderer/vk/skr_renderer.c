@@ -914,7 +914,7 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		while (i + batch_count < list->count) {
 			const skr_render_item_t* next = &list->items[i + batch_count];
 			// Can only batch if mesh, material, AND draw parameters all match
-			if (next->vertex_buffers[0]      != item->vertex_buffers[0]      ||
+			if (memcmp(next->vertex_buffers, item->vertex_buffers, sizeof(item->vertex_buffers)) != 0 ||
 			    next->index_buffer           != item->index_buffer           ||
 			    next->pipeline_material_idx  != item->pipeline_material_idx  ||
 			    next->bind_start             != item->bind_start             ||
