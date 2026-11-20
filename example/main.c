@@ -92,7 +92,6 @@ typedef struct main_loop_t {
 	skr_surface_t surface;
 	int           frame_count;
 	bool          running;
-	bool          suspended;
 	double        last_time;
 	uint64_t      last_frame_ns;
 	int           test_frames;
@@ -187,23 +186,8 @@ static bool main_frame(void* user_data) {
 				s->running = false;
 				break;
 
-			case ska_event_window_minimized:
-				s->suspended = true;
-				break;
-
-			case ska_event_window_restored:
-				s->suspended = false;
-				break;
-
-			case ska_event_app_background:
-				su_log(su_log_info, "App entering background - suspending rendering");
-				s->suspended = true;
-				break;
-
-			case ska_event_app_foreground:
-				su_log(su_log_info, "App entering foreground - resuming rendering");
-				s->suspended = false;
-				break;
+			case ska_event_window_occluded: su_log(su_log_info, "Window occluded, pausing rendering"); break;
+			case ska_event_window_exposed:  su_log(su_log_info, "Window exposed, resuming rendering"); break;
 
 			case ska_event_window_hidden:
 				// Native window destroyed (screen off, backgrounded).
@@ -232,10 +216,10 @@ static bool main_frame(void* user_data) {
 	}
 	if (!s->running) { main_shutdown(s); return false; }
 
-	// Skip rendering and updates while suspended (backgrounded/minimized)
-	if (s->suspended) {
+	// Presenting to a window that can't be seen may block until it's shown again
+	if (ska_window_get_occluded(s->window)) {
 #ifndef __EMSCRIPTEN__
-		ska_time_sleep(100);  // Reduce CPU usage while suspended
+		ska_time_sleep(100);
 #endif
 		return true;
 	}
@@ -575,7 +559,6 @@ int main(int argc, char* argv[]) {
 	_loop.app           = app;
 	_loop.frame_count   = 0;
 	_loop.running       = true;
-	_loop.suspended     = false;
 	_loop.last_time     = ska_time_get_elapsed_s();
 	_loop.last_frame_ns = ska_time_get_elapsed_ns();
 	_loop.test_frames   = test_frames;

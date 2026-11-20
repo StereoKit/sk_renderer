@@ -219,6 +219,7 @@ typedef struct skr_surface_t {
 	int64_t            timing_stage_offset_ns[4]; // host ns = stamp + offset, per present stage bit; stage-local domains give every stage its own clock
 	uint64_t           timing_seq_id;       // Next id for in-order results when no present ids are chained
 	uint32_t           timing_frames;       // Frames since the refresh duration was last read
+	uint32_t           timing_pending;      // Timed presents not read back yet; a full queue fails the present
 } skr_surface_t;
 
 typedef struct skr_shader_stage_t {

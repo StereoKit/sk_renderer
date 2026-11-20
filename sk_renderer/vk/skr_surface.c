@@ -105,6 +105,7 @@ static void _skr_surface_timing_setup(skr_surface_t* ref_surface, bool timing, u
 	ref_surface->timing_domain           = VK_TIME_DOMAIN_DEVICE_KHR;
 	ref_surface->timing_domain_id        = 0;
 	ref_surface->timing_frames           = 0;
+	ref_surface->timing_pending          = 0;
 	memset(ref_surface->timing_stage_offset_ns, 0, sizeof(ref_surface->timing_stage_offset_ns));
 	ref_surface->ring.refresh_reported_ns = 0;
 	_skr_surface_timing_read_refresh(ref_surface);
@@ -197,6 +198,7 @@ static void _skr_surface_poll_timing(skr_surface_t* ref_surface) {
 	props.pPresentationTimings    = results;
 	vr = vkGetPastPresentationTimingEXT(_skr_vk.device, &info, &props);
 	if (vr != VK_SUCCESS && vr != VK_INCOMPLETE) return;
+	ref_surface->timing_pending -= props.presentationTimingCount < ref_surface->timing_pending ? props.presentationTimingCount : ref_surface->timing_pending;
 
 	for (uint32_t i = 0; i < props.presentationTimingCount; i++) {
 		// Without present ids chained the results carry 0 and arrive in order
@@ -743,7 +745,10 @@ skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 		.presentStageQueries = ref_surface->timing_stages,
 	};
 	VkPresentTimingsInfoEXT timings_info = { .sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT, .swapchainCount = 1, .pTimingInfos = &timing_info };
-	if (ref_surface->timing) {
+	// Reports only retire once a present reaches the screen, so a hidden or
+	// outpaced window fills the queue; past that, present without asking
+	bool timed = ref_surface->timing && ref_surface->timing_pending < SKR_PRESENT_RING;
+	if (timed) {
 		timings_info.pNext = chain;
 		chain              = &timings_info;
 	}
@@ -769,6 +774,7 @@ skr_acquire_ skr_surface_present(skr_surface_t* ref_surface) {
 	mtx_unlock(_skr_vk.present_queue_mutex);
 
 	ref_surface->frame_idx = (ref_surface->frame_idx + 1) % SKR_MAX_FRAMES_IN_FLIGHT;
+	if (timed && (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)) ref_surface->timing_pending++;
 
 	if (result == VK_ERROR_SURFACE_LOST_KHR)                                    return skr_acquire_surface_lost;
 	if (result == VK_ERROR_OUT_OF_DATE_KHR)                                     return skr_acquire_needs_resize;

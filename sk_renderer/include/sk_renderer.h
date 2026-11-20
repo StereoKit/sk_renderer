@@ -801,8 +801,9 @@ SKR_API void              skr_mesh_destroy                 (      skr_mesh_t* re
 SKR_API uint32_t          skr_mesh_get_vert_count          (const skr_mesh_t*     mesh);
 SKR_API uint32_t          skr_mesh_get_ind_count           (const skr_mesh_t*     mesh);
 SKR_API void              skr_mesh_set_name                (      skr_mesh_t* ref_mesh, const char* name);
-SKR_API skr_err_          skr_mesh_set_verts               (      skr_mesh_t* ref_mesh, const void* vert_data, uint32_t vert_count);
-SKR_API skr_err_          skr_mesh_set_inds                (      skr_mesh_t* ref_mesh, const void* ind_data,  uint32_t ind_count);
+SKR_API skr_err_          skr_mesh_set_verts               (      skr_mesh_t* ref_mesh, const void* vert_data, uint32_t vert_count);  // Fills binding 0. NULL data drops all of the mesh's vertex buffers
+SKR_API skr_err_          skr_mesh_set_verts_binding       (      skr_mesh_t* ref_mesh, uint32_t binding, const void* vert_data, uint32_t vert_count);  // NULL data drops just this binding's buffer
+SKR_API skr_err_          skr_mesh_set_inds                (      skr_mesh_t* ref_mesh, skr_index_fmt_ ind_format, const void* ind_data, uint32_t ind_count);  // A different ind_format than last time rebuilds the index buffer
 SKR_API skr_err_          skr_mesh_set_data                (      skr_mesh_t* ref_mesh, const void* vert_data, uint32_t vert_count, const void* ind_data, uint32_t ind_count);
 SKR_API skr_err_          skr_mesh_set_vertex_buffer       (      skr_mesh_t* ref_mesh, uint32_t binding, const skr_buffer_t* buffer, uint32_t vert_count);
 SKR_API skr_buffer_t*     skr_mesh_get_vertex_buffer       (const skr_mesh_t*     mesh, uint32_t binding);

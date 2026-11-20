@@ -265,52 +265,61 @@ skr_err_ skr_mesh_set_verts(skr_mesh_t* ref_mesh, const void* vert_data, uint32_
 		return skr_err_success;
 	}
 
-	// Need vert_type to create buffer
-	if (!ref_mesh->vert_type) {
+	return skr_mesh_set_verts_binding(ref_mesh, 0, vert_data, vert_count);
+}
+
+skr_err_ skr_mesh_set_verts_binding(skr_mesh_t* ref_mesh, uint32_t binding, const void* vert_data, uint32_t vert_count) {
+	if (!ref_mesh || !ref_mesh->vert_type || binding >= ref_mesh->vert_type->binding_count || binding >= SKR_MAX_VERTEX_BUFFERS) {
 		return skr_err_invalid_parameter;
 	}
 
-	// For legacy single-buffer mode, we assume binding 0 contains all data
-	// Calculate total stride from first binding (assumes interleaved data at binding 0)
-	uint32_t vert_stride = ref_mesh->vert_type->bindings[0].stride;
-	uint32_t vert_size   = vert_count * vert_stride;
+	skr_buffer_t* buffer = &ref_mesh->vertex_buffers[binding];
+	uint32_t      bit    = 1u << binding;
+	bool          owned  = (ref_mesh->vertex_buffer_owned & bit) && skr_buffer_is_valid(buffer);
 
-	// Ensure we have at least one buffer slot in use
-	if (ref_mesh->vertex_buffer_count == 0) {
-		ref_mesh->vertex_buffer_count = 1;
+	if (!vert_data || vert_count == 0) {
+		if (owned) skr_buffer_destroy(buffer);
+		*buffer = (skr_buffer_t){0};
+		ref_mesh->vertex_buffer_owned &= ~bit;
+		return skr_err_success;
 	}
 
-	// If buffer exists, check if we need to resize or convert to dynamic
-	if (skr_buffer_is_valid(&ref_mesh->vertex_buffers[0])) {
-		bool needs_resize = vert_size > ref_mesh->vertex_buffers[0].size;
-		bool is_static    = ref_mesh->vertex_buffers[0].use & skr_use_static;
+	uint32_t vert_stride = ref_mesh->vert_type->bindings[binding].stride;
+	uint32_t vert_size   = vert_count * vert_stride;
+
+	// The first upload makes a static buffer, later ones convert it to
+	// dynamic, or just update it once it's dynamic and big enough.
+	if (owned) {
+		bool needs_resize = vert_size > buffer->size;
+		bool is_static    = buffer->use & skr_use_static;
 
 		if (is_static || needs_resize) {
-			skr_err_ err = _skr_mesh_buffer_replace(&ref_mesh->vertex_buffers[0], skr_buffer_type_vertex, vert_data, vert_count, vert_stride);
+			skr_err_ err = _skr_mesh_buffer_replace(buffer, skr_buffer_type_vertex, vert_data, vert_count, vert_stride);
 			if (err != skr_err_success) {
 				skr_log(skr_log_critical, "Failed to create dynamic vertex buffer for mesh");
 				return err;
 			}
-			ref_mesh->vertex_buffer_owned |= (1u << 0);  // Mark as owned
 		} else {
-			// Already dynamic and large enough, just update
-			skr_buffer_set(&ref_mesh->vertex_buffers[0], vert_data, vert_size);
+			skr_buffer_set(buffer, vert_data, vert_size);
 		}
 	} else {
-		// First time setting verts, create static buffer
-		skr_err_ err = skr_buffer_create(vert_data, vert_count, vert_stride, skr_buffer_type_vertex, skr_use_static, &ref_mesh->vertex_buffers[0]);
+		// An external buffer at this binding is only dropped, never destroyed
+		skr_err_ err = skr_buffer_create(vert_data, vert_count, vert_stride, skr_buffer_type_vertex, skr_use_static, buffer);
 		if (err != skr_err_success) {
 			skr_log(skr_log_critical, "Failed to create vertex buffer for mesh");
 			return err;
 		}
-		ref_mesh->vertex_buffer_owned |= (1u << 0);  // Mark as owned
 	}
+	ref_mesh->vertex_buffer_owned |= bit;
 
+	if (ref_mesh->vertex_buffer_count < binding + 1) {
+		ref_mesh->vertex_buffer_count = binding + 1;
+	}
 	ref_mesh->vert_count = vert_count;
 	return skr_err_success;
 }
 
-skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, const void* ind_data, uint32_t ind_count) {
+skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, skr_index_fmt_ ind_format, const void* ind_data, uint32_t ind_count) {
 	if (!ref_mesh) {
 		return skr_err_invalid_parameter;
 	}
@@ -323,6 +332,20 @@ skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, const void* ind_data, uint32_t 
 		ref_mesh->ind_count = ind_count;
 		return skr_err_success;
 	}
+
+	// A buffer of another index width can't be updated in place
+	if (ref_mesh->ind_format != ind_format && skr_buffer_is_valid(&ref_mesh->index_buffer)) {
+		skr_err_ err = _skr_mesh_buffer_replace(&ref_mesh->index_buffer, skr_buffer_type_index, ind_data, ind_count, _skr_index_fmt_to_size(ind_format));
+		if (err != skr_err_success) {
+			skr_log(skr_log_critical, "Failed to create dynamic index buffer for mesh");
+			return err;
+		}
+		ref_mesh->ind_format    = ind_format;
+		ref_mesh->ind_format_vk = _skr_to_vk_index_fmt(ind_format);
+		ref_mesh->ind_count     = ind_count;
+		return skr_err_success;
+	}
+	ref_mesh->ind_format = ind_format;
 
 	uint32_t ind_stride = _skr_index_fmt_to_size(ref_mesh->ind_format);
 	uint32_t ind_size   = ind_count * ind_stride;
@@ -371,7 +394,7 @@ skr_err_ skr_mesh_set_data(skr_mesh_t* ref_mesh, const void* vert_data, uint32_t
 
 	// Set indices second
 	if (ind_data && ind_count > 0) {
-		skr_err_ err = skr_mesh_set_inds(ref_mesh, ind_data, ind_count);
+		skr_err_ err = skr_mesh_set_inds(ref_mesh, ref_mesh->ind_format, ind_data, ind_count);
 		if (err != skr_err_success) {
 			return err;
 		}

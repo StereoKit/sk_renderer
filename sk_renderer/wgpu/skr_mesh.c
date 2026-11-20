@@ -129,7 +129,7 @@ skr_err_ skr_mesh_create(const skr_vert_type_t* vert_type, skr_index_fmt_ ind_ty
 		if (err != skr_err_success) { skr_mesh_destroy(out_mesh); return err; }
 	}
 	if (opt_ind_data != NULL && ind_count > 0) {
-		skr_err_ err = skr_mesh_set_inds(out_mesh, opt_ind_data, ind_count);
+		skr_err_ err = skr_mesh_set_inds(out_mesh, ind_type, opt_ind_data, ind_count);
 		if (err != skr_err_success) { skr_mesh_destroy(out_mesh); return err; }
 	}
 	return skr_err_success;
@@ -163,30 +163,62 @@ void skr_mesh_set_name(skr_mesh_t* ref_mesh, const char* name) {
 ///////////////////////////////////////////////////////////////////////////////
 
 skr_err_ skr_mesh_set_verts(skr_mesh_t* ref_mesh, const void* vert_data, uint32_t vert_count) {
-	if (ref_mesh == NULL || vert_data == NULL || vert_count == 0) return skr_err_invalid_parameter;
-	if (ref_mesh->vert_type == NULL || ref_mesh->vert_type->binding_count == 0) return skr_err_invalid_parameter; // vertex-pulling meshes have no CPU vertex stream
+	if (ref_mesh == NULL) return skr_err_invalid_parameter;
 
-	// Interleaved data targets binding 0; multi-buffer meshes attach their
-	// extra streams via skr_mesh_set_vertex_buffer
-	uint32_t stride = (uint32_t)ref_mesh->vert_type->bindings[0].arrayStride;
+	if (vert_data == NULL || vert_count == 0) {
+		for (uint32_t i = 0; i < ref_mesh->vertex_buffer_count; i++) {
+			if (ref_mesh->vertex_buffer_owned & (1u << i)) skr_buffer_destroy(&ref_mesh->vertex_buffers[i]);
+			ref_mesh->vertex_buffers[i] = (skr_buffer_t){0};
+		}
+		ref_mesh->vertex_buffer_count = 0;
+		ref_mesh->vertex_buffer_owned = 0;
+		ref_mesh->vert_count          = vert_count;
+		return skr_err_success;
+	}
+	return skr_mesh_set_verts_binding(ref_mesh, 0, vert_data, vert_count);
+}
+
+skr_err_ skr_mesh_set_verts_binding(skr_mesh_t* ref_mesh, uint32_t binding, const void* vert_data, uint32_t vert_count) {
+	// Vertex-pulling meshes have no bindings, so no CPU vertex stream
+	if (ref_mesh == NULL || ref_mesh->vert_type == NULL || binding >= ref_mesh->vert_type->binding_count) return skr_err_invalid_parameter;
+
+	skr_buffer_t* buffer = &ref_mesh->vertex_buffers[binding];
+	uint32_t      bit    = 1u << binding;
+	bool          owned  = (ref_mesh->vertex_buffer_owned & bit) && buffer->buffer != NULL;
+
+	if (vert_data == NULL || vert_count == 0) {
+		if (owned) skr_buffer_destroy(buffer);
+		*buffer = (skr_buffer_t){0};
+		ref_mesh->vertex_buffer_owned &= ~bit;
+		return skr_err_success;
+	}
+
+	uint32_t stride = (uint32_t)ref_mesh->vert_type->bindings[binding].arrayStride;
 	uint32_t size   = stride * vert_count;
 
-	skr_buffer_t* buffer = &ref_mesh->vertex_buffers[0];
-	if (buffer->buffer != NULL && (ref_mesh->vertex_buffer_owned & 1u) && size <= buffer->size) {
+	if (owned && size <= buffer->size) {
 		skr_buffer_set(buffer, vert_data, size);
 	} else {
-		if (ref_mesh->vertex_buffer_owned & 1u) skr_buffer_destroy(buffer);
+		// An external buffer at this binding is only dropped, never destroyed
+		if (owned) skr_buffer_destroy(buffer);
 		skr_err_ err = skr_buffer_create(vert_data, vert_count, stride, skr_buffer_type_vertex, skr_use_static, buffer);
 		if (err != skr_err_success) return err;
-		ref_mesh->vertex_buffer_owned |= 1u;
+		ref_mesh->vertex_buffer_owned |= bit;
 	}
-	if (ref_mesh->vertex_buffer_count < 1) ref_mesh->vertex_buffer_count = 1;
+	if (ref_mesh->vertex_buffer_count < binding + 1) ref_mesh->vertex_buffer_count = binding + 1;
 	ref_mesh->vert_count = vert_count;
 	return skr_err_success;
 }
 
-skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, const void* ind_data, uint32_t ind_count) {
+skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, skr_index_fmt_ ind_format, const void* ind_data, uint32_t ind_count) {
 	if (ref_mesh == NULL || ind_data == NULL || ind_count == 0) return skr_err_invalid_parameter;
+
+	// A buffer of another index width can't be updated in place
+	if (ref_mesh->ind_format != ind_format) {
+		skr_buffer_destroy(&ref_mesh->index_buffer);
+		ref_mesh->ind_format      = ind_format;
+		ref_mesh->ind_format_wgpu = ind_format == skr_index_fmt_u16 ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
+	}
 
 	uint32_t stride = ref_mesh->ind_format == skr_index_fmt_u16 ? 2 : 4;
 	uint32_t size   = stride * ind_count;
@@ -205,7 +237,7 @@ skr_err_ skr_mesh_set_inds(skr_mesh_t* ref_mesh, const void* ind_data, uint32_t 
 skr_err_ skr_mesh_set_data(skr_mesh_t* ref_mesh, const void* vert_data, uint32_t vert_count, const void* ind_data, uint32_t ind_count) {
 	skr_err_ err = skr_mesh_set_verts(ref_mesh, vert_data, vert_count);
 	if (err != skr_err_success) return err;
-	return skr_mesh_set_inds(ref_mesh, ind_data, ind_count);
+	return skr_mesh_set_inds(ref_mesh, ref_mesh->ind_format, ind_data, ind_count);
 }
 
 skr_err_ skr_mesh_set_vertex_buffer(skr_mesh_t* ref_mesh, uint32_t binding, const skr_buffer_t* buffer, uint32_t vert_count) {

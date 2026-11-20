@@ -855,6 +855,19 @@ static bool _skr_list_bind_descriptors(const _skr_cmd_ctx_t* ctx, const skr_rend
 		_skr_pipeline_get_descriptor_layout(item->pipeline_material_idx), &desc);
 }
 
+// Binds each run of filled slots at its own index, as a null handle needs nullDescriptor
+static void _skr_bind_vertex_buffers(VkCommandBuffer cmd, const VkBuffer* buffers, uint32_t count) {
+	static const VkDeviceSize offsets[SKR_MAX_VERTEX_BUFFERS] = {0};
+	uint32_t start = 0;
+	while (start < count) {
+		if (buffers[start] == VK_NULL_HANDLE) { start++; continue; }
+		uint32_t end = start + 1;
+		while (end < count && buffers[end] != VK_NULL_HANDLE) end++;
+		vkCmdBindVertexBuffers(cmd, start, end - start, &buffers[start], offsets);
+		start = end;
+	}
+}
+
 void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_t system_data_size) {
 	if (!list || list->count == 0) return;
 
@@ -949,21 +962,7 @@ void skr_renderer_draw(skr_render_list_t* list, const void* system_data, uint32_
 		// Sorted lists repeat a mesh across batches, so only rebind what changed
 		if (memcmp(bound_vertex_buffers, item->vertex_buffers, sizeof(bound_vertex_buffers)) != 0) {
 			uint32_t vb_count = (item->flags & skr_item_flag_vb_count_mask) >> skr_item_flag_vb_count_shift;
-			VkBuffer     buffers[SKR_MAX_VERTEX_BUFFERS];
-			VkDeviceSize offsets[SKR_MAX_VERTEX_BUFFERS];
-			uint32_t     bind_count = 0;
-
-			for (uint32_t j = 0; j < vb_count; j++) {
-				if (item->vertex_buffers[j] != VK_NULL_HANDLE) {
-					buffers[bind_count] = item->vertex_buffers[j];
-					offsets[bind_count] = 0;
-					bind_count++;
-				}
-			}
-
-			if (bind_count > 0) {
-				vkCmdBindVertexBuffers(cmd, 0, bind_count, buffers, offsets);
-			}
+			_skr_bind_vertex_buffers(cmd, item->vertex_buffers, vb_count);
 			memcpy(bound_vertex_buffers, item->vertex_buffers, sizeof(bound_vertex_buffers));
 		}
 
@@ -1039,24 +1038,10 @@ void skr_renderer_draw_mesh_immediate(skr_mesh_t* mesh, skr_material_t* material
 		return;
 	}
 
-	// Bind vertex buffers
-	if (mesh->vertex_buffer_count > 0) {
-		VkBuffer     buffers[16];
-		VkDeviceSize offsets[16];
-		uint32_t     bind_count = 0;
-
-		for (uint32_t i = 0; i < mesh->vertex_buffer_count; i++) {
-			if (skr_buffer_is_valid(&mesh->vertex_buffers[i])) {
-				buffers[bind_count] = mesh->vertex_buffers[i].buffer;
-				offsets[bind_count] = 0;
-				bind_count++;
-			}
-		}
-
-		if (bind_count > 0) {
-			vkCmdBindVertexBuffers(cmd, 0, bind_count, buffers, offsets);
-		}
-	}
+	VkBuffer vertex_buffers[SKR_MAX_VERTEX_BUFFERS];
+	for (uint32_t i = 0; i < mesh->vertex_buffer_count; i++)
+		vertex_buffers[i] = mesh->vertex_buffers[i].buffer;
+	_skr_bind_vertex_buffers(cmd, vertex_buffers, mesh->vertex_buffer_count);
 
 	// Draw
 	if (skr_buffer_is_valid(&mesh->index_buffer)) {
